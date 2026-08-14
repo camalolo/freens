@@ -14,6 +14,17 @@
 // least-recently-used (§12 line 908). The just-put entry is protected from the
 // LRU pass so it always survives the post-accept sweep.
 //
+// Superseded-envelope history (§8.3 lines 666-688): every envelope that leaves
+// the live map — displaced by a winning successor in Put, or dropped by the
+// expired/LRU sweeps — is retained in a bounded history keyed by its H_record
+// (GetHistory). §8.3 chains transfers via prev_hash "into an auditable chain",
+// and the network accepts a transfer "because the previous owner ... signed
+// it"; verifying a transferred TLD root therefore requires the PREDECESSOR
+// envelopes, which the single-winner live map alone would forget. History
+// entries never expire by record time (they are audit trail, not live
+// records); they are bounded only by count (historyMax), evicting the
+// least-recently-touched first.
+//
 // This file ports archive/python-v0.1/freens/dht/store.py. It is pure stdlib
 // (bytes, sync, time) plus internal/constants and internal/wire; it does NOT
 // import internal/crypto (signature verification is delegated to
@@ -46,6 +57,12 @@ type entry struct {
 	lastAccess int64 // unix seconds; refreshed on every successful Put/Get
 }
 
+// historyMax bounds the superseded-envelope history (§8.3 audit trail): the
+// number of displaced/swept envelopes retained for transfer-chain
+// verification. At this size a map + linear min-scan eviction is fine — no
+// heap or LRU list bookkeeping is warranted.
+const historyMax = 4096
+
 // EnvelopeStore is the in-process DHT envelope store implementing the §6.4
 // winner rule and the §12 eviction policy. Each 32-byte key retains at most
 // one winning *wire.SignedEnvelope.
@@ -56,6 +73,11 @@ type EnvelopeStore struct {
 	nowFn    func() int64
 	mu       sync.Mutex
 	entries  map[[constants.SHA256Len]byte]*entry
+
+	// history retains superseded envelopes (§8.3) keyed by THEIR OWN H_record
+	// (not by DHT key): the displaced incumbent on every winning Put, plus
+	// everything dropped by the expired/LRU sweeps. Bounded by historyMax.
+	history map[[constants.SHA256Len]byte]*entry
 }
 
 // NewEnvelopeStore constructs an empty EnvelopeStore. If maxBytes <= 0 it
@@ -76,6 +98,7 @@ func NewEnvelopeStore(maxBytes int, nowFn func() int64) *EnvelopeStore {
 		maxBytes: maxBytes,
 		nowFn:    clock,
 		entries:  make(map[[constants.SHA256Len]byte]*entry),
+		history:  make(map[[constants.SHA256Len]byte]*entry),
 	}
 }
 
@@ -155,6 +178,12 @@ func (s *EnvelopeStore) Put(key []byte, env *wire.SignedEnvelope, now int64, ver
 	if err != nil {
 		return false, fmt.Errorf("dht: encode envelope: %w", err)
 	}
+	// §8.3 retention: the displaced incumbent — alive loser of the winner
+	// check, or an already-dead envelope the newcomer recycles the slot from —
+	// becomes audit history keyed by its own H_record.
+	if cur, ok := s.entries[k]; ok {
+		s.retainHistoryLocked(cur)
+	}
 	s.entries[k] = &entry{env: env, size: len(b), lastAccess: now}
 
 	// --- rule 4: post-accept eviction sweeps (§6.4 step 4 + §12) --------
@@ -186,7 +215,9 @@ func (s *EnvelopeStore) Get(key []byte, now int64) (*wire.SignedEnvelope, error)
 		return nil, nil
 	}
 	if !s.aliveLocked(e, now) {
-		// Lazy eviction of a dead entry (§6.4 step 4 / §12).
+		// Lazy eviction of a dead entry (§6.4 step 4 / §12) — retained in the
+		// §8.3 history like every other envelope leaving the live map.
+		s.retainHistoryLocked(e)
 		delete(s.entries, k)
 		return nil, nil
 	}
@@ -215,7 +246,9 @@ func (s *EnvelopeStore) Has(key []byte, now int64) bool {
 
 // Remove unconditionally drops the entry for key and returns true iff
 // something was removed. Not on the §6.4 critical path; provided for
-// administration and testability. A wrong-length key reports false.
+// administration and testability. A wrong-length key reports false. Unlike the
+// eviction sweeps, Remove does NOT retain the envelope in the §8.3 history —
+// it is an explicit administrative drop, not an organic supersession.
 func (s *EnvelopeStore) Remove(key []byte) bool {
 	if len(key) != constants.SHA256Len {
 		return false
@@ -372,11 +405,14 @@ func (s *EnvelopeStore) totalBytesLocked() int {
 }
 
 // evictExpiredLocked drops every entry past expires + ExpiryGrace and returns
-// the count. Caller must hold s.mu.
+// the count. Swept entries are retained in the §8.3 history (audit trail —
+// expired predecessors remain verifiable transfer-chain links). Caller must
+// hold s.mu.
 func (s *EnvelopeStore) evictExpiredLocked(now int64) int {
 	evicted := 0
 	for k, e := range s.entries {
 		if !s.aliveLocked(e, now) {
+			s.retainHistoryLocked(e)
 			delete(s.entries, k)
 			evicted++
 		}
@@ -396,7 +432,8 @@ func (s *EnvelopeStore) evictExpiredLocked(now int64) int {
 // is excluded from the candidate set. A single oversized entry that alone
 // exceeds maxBytes is retained — the LRU loop stops when fewer than two
 // evictable candidates remain, so one oversized envelope does not cause an
-// infinite eviction cycle. Caller must hold s.mu.
+// infinite eviction cycle. Swept entries are retained in the §8.3 history.
+// Caller must hold s.mu.
 func (s *EnvelopeStore) enforceCapLocked(now int64, protected [constants.SHA256Len]byte) int {
 	evicted := 0
 	// --- expired-first re-check (excludes the protected key) ------------
@@ -405,6 +442,7 @@ func (s *EnvelopeStore) enforceCapLocked(now int64, protected [constants.SHA256L
 			continue
 		}
 		if !s.aliveLocked(e, now) {
+			s.retainHistoryLocked(e)
 			delete(s.entries, k)
 			evicted++
 		}
@@ -433,8 +471,160 @@ func (s *EnvelopeStore) enforceCapLocked(now int64, protected [constants.SHA256L
 			// edge case).
 			break
 		}
+		s.retainHistoryLocked(s.entries[lruKey])
 		delete(s.entries, lruKey)
 		evicted++
 	}
 	return evicted
+}
+
+// ----------------------------------------------------------------------
+// Superseded-envelope history (§8.3 audit trail)
+// ----------------------------------------------------------------------
+
+// GetHistory returns the superseded envelope whose H_record
+// (SHA-256(canonical_cbor(SignedEnvelope)), §4.2) equals h, or nil when no
+// such envelope is retained. This is the §8.3 transfer-chain predecessor
+// lookup: a transferred record's prev_hash names exactly this hash, and the
+// predecessor need not be inside its validity window (it is audit history,
+// not a live record). The returned pointer is shared with the store;
+// envelopes are never mutated in place (matching Get). A wrong-length h
+// yields nil.
+func (s *EnvelopeStore) GetHistory(h []byte) *wire.SignedEnvelope {
+	if len(h) != constants.SHA256Len {
+		return nil
+	}
+	var k [constants.SHA256Len]byte
+	copy(k[:], h)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.history[k]; ok {
+		return e.env
+	}
+	return nil
+}
+
+// HistoryCount returns the number of superseded envelopes currently retained
+// (bounded by historyMax). Entries never leave the history by record time —
+// only by the bound (oldest lastAccess first).
+func (s *EnvelopeStore) HistoryCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.history)
+}
+
+// RetainHistory force-inserts env into the §8.3 audit history keyed by its own
+// H_record, without touching the live map. It is the seeding path for
+// persisted history files: a reloaded predecessor envelope must land in
+// history even though Put would reject it as a stale loser of the winner rule
+// (the live winner at that key is its successor). A nil/invalid env or an
+// encoding failure is ignored. Retention is idempotent (re-retaining the same
+// envelope refreshes its lastAccess only).
+func (s *EnvelopeStore) RetainHistory(env *wire.SignedEnvelope) {
+	if env == nil || env.Record == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Build a synthetic entry and reuse the bounded-insert path.
+	s.retainHistoryLocked(&entry{env: env, lastAccess: s.nowFn()})
+}
+
+// HistoryEntries returns a snapshot of the retained audit-history envelopes,
+// sorted by bytewise-ascending H_record for deterministic iteration. It is the
+// PersistHistoryTo source (live entries come from Entries/PersistTo).
+func (s *EnvelopeStore) HistoryEntries() []StoreEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]StoreEntry, 0, len(s.history))
+	for k, e := range s.history {
+		key := make([]byte, constants.SHA256Len)
+		copy(key, k[:])
+		out = append(out, StoreEntry{Key: key, Env: e.env})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Key, out[j].Key) < 0
+	})
+	return out
+}
+
+// PersistHistoryTo writes every retained audit-history envelope as
+// <H_record hex>.cbor into dir (created if missing), using the same
+// temp-file-then-rename atomic write as [EnvelopeStore.PersistTo]. Files are
+// named by H_record — a DIFFERENT digest namespace than the live files'
+// storage keys — so one directory can hold both. Returns the number written.
+func (s *EnvelopeStore) PersistHistoryTo(dir string) (int, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, fmt.Errorf("dht: persist-history mkdir %q: %w", dir, err)
+	}
+	written := 0
+	for _, e := range s.HistoryEntries() {
+		b, err := e.Env.Bytes()
+		if err != nil {
+			continue
+		}
+		final := filepath.Join(dir, hex.EncodeToString(e.Key)+".cbor")
+		tmp, err := os.CreateTemp(dir, "."+hex.EncodeToString(e.Key)+".tmp-*")
+		if err != nil {
+			return written, fmt.Errorf("dht: persist-history temp file in %q: %w", dir, err)
+		}
+		if _, err := tmp.Write(b); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist-history write %q: %w", tmp.Name(), err)
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist-history close %q: %w", tmp.Name(), err)
+		}
+		if err := os.Rename(tmp.Name(), final); err != nil {
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist-history rename %q: %w", tmp.Name(), err)
+		}
+		written++
+	}
+	return written, nil
+}
+
+// retainHistoryLocked moves a departing envelope (displaced by a winning Put
+// or dropped by an expired/LRU sweep) into the bounded §8.3 history, keyed by
+// its own H_record. On overflow the entry with the smallest lastAccess is
+// evicted (bytewise-smaller hash breaks ties for determinism, mirroring
+// enforceCapLocked). An envelope whose CBOR encoding fails is silently not
+// retained — retention must never fail the caller's accept/evict path.
+// Caller must hold s.mu.
+func (s *EnvelopeStore) retainHistoryLocked(e *entry) {
+	if e == nil || e.env == nil || e.env.Record == nil {
+		return
+	}
+	h, err := e.env.RecordHash()
+	if err != nil {
+		return
+	}
+	var hk [constants.SHA256Len]byte
+	copy(hk[:], h)
+	// The entry pointer left the live map on every call path, so owning it
+	// here is exclusive; its lastAccess freezes at the retention order.
+	s.history[hk] = e
+	if len(s.history) > historyMax {
+		s.evictHistoryOldestLocked()
+	}
+}
+
+// evictHistoryOldestLocked deletes the history entry with the smallest
+// lastAccess (bytewise-smaller hash key breaks ties), mirroring the
+// min-scan shape of enforceCapLocked. Caller must hold s.mu.
+func (s *EnvelopeStore) evictHistoryOldestLocked() {
+	var oldestKey [constants.SHA256Len]byte
+	var oldest int64
+	found := false
+	for k, e := range s.history {
+		if !found || e.lastAccess < oldest ||
+			(e.lastAccess == oldest && bytes.Compare(k[:], oldestKey[:]) < 0) {
+			oldestKey, oldest, found = k, e.lastAccess, true
+		}
+	}
+	if found {
+		delete(s.history, oldestKey)
+	}
 }

@@ -40,8 +40,10 @@ import (
 //
 // Semantics:
 //
-//   - The local store's copy at K_claim (if any) is included — this node may
-//     itself be one of the storing nodes.
+//   - The local offer set is the union of the store's single §6.4 winner at
+//     K_claim AND this node's §7.4 top-2 claim pool (claims_pool.go) — this
+//     node may itself be one of the storing nodes, and the pool may hold a
+//     competitor the single-slot store dropped.
 //   - Every envelope offered by a probed peer must decode and pass
 //     env.VerifySignature (§6.4: caching nodes never mutate envelopes; a
 //     signature-failing envelope is dropped, not fatal).
@@ -87,10 +89,14 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 		collected[string(h)] = env
 	}
 
-	// The local store's copy participates in the merge (this node may be a
-	// K_claim storer). Pass n.now() so a claim past expires+grace is not
-	// offered (§6.4 eviction).
+	// The local offer set joins the merge (this node may be a K_claim
+	// storer): the store's §6.4 winner AND the §7.4 top-2 claim pool (which
+	// may hold the competitor the single-slot store dropped). Pass n.now()
+	// so a claim past expires+grace is not offered (§6.4 eviction).
 	if env, _ := n.store.Get(key, n.now()); env != nil {
+		add(env)
+	}
+	for _, env := range n.claims.Top2(key) {
 		add(env)
 	}
 
@@ -120,7 +126,7 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 		}
 
 		type res struct {
-			env   *wire.SignedEnvelope
+			envs  []*wire.SignedEnvelope // every offer (§7.4 `envelopes` + legacy `envelope`)
 			nodes []*NodeContact
 			err   error // probe failure (drives §6.2 eviction)
 		}
@@ -136,8 +142,8 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 				// effectively unavailable.
 				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 				defer cancel()
-				e, ns, err := n.getFromPeer(pctx, key, c)
-				results[i] = res{e, ns, err}
+				es, ns, err := n.getFromPeer(pctx, key, c)
+				results[i] = res{es, ns, err}
 			}(i, c)
 		}
 		wg.Wait()
@@ -159,7 +165,9 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 					shortlist = append(shortlist, nc)
 				}
 			}
-			add(r.env)
+			for _, e := range r.envs {
+				add(e)
+			}
 		}
 	}
 
@@ -177,7 +185,7 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	if len(reachable) > constants.GetClosest {
 		reachable = reachable[:constants.GetClosest]
 	}
-	finals := make([]*wire.SignedEnvelope, len(reachable))
+	finals := make([][]*wire.SignedEnvelope, len(reachable))
 	var fwg sync.WaitGroup
 	for i, c := range reachable {
 		fwg.Add(1)
@@ -185,15 +193,17 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 			defer fwg.Done()
 			pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 			defer cancel()
-			e, _, err := n.getFromPeer(pctx, key, c)
+			envs, _, err := n.getFromPeer(pctx, key, c)
 			if err == nil {
-				finals[i] = e
+				finals[i] = envs
 			}
 		}(i, c)
 	}
 	fwg.Wait()
-	for _, env := range finals {
-		add(env)
+	for _, envs := range finals {
+		for _, e := range envs {
+			add(e)
+		}
 	}
 
 	return sortedByRecordHash(collected), nil
@@ -264,15 +274,21 @@ func setKeyLess(a, b *wire.SignedEnvelope) bool {
 // Local-first, like [DHTLookup.Lookup]: the local store's copy is always
 // included, then the network walk runs under the same dhtLookupTimeout budget.
 //
-// Cache-back is EMPTY-SLOT-ONLY: if this node holds no envelope at K_claim,
-// the first collected envelope is cached (offline replay / island resilience);
-// if the slot is occupied — by this node's own published offer or a previous
-// cache — nothing is written. A blind cache-back Put at equal sequence
-// resolves by the H_record tie-break and DISPLACES the storer's own offer,
-// collapsing the network-wide set the next collector merges (§7.4: "storing
-// nodes keep the top 2 by ordering" — a single-slot store cannot; verified
-// live: a two-node split converged to one envelope after the first resolver
-// pass).
+// Cache-back is EMPTY-SLOT-ONLY on the single-slot EnvelopeStore: if this
+// node holds no envelope at K_claim, the first collected envelope is cached
+// (offline replay / island resilience); if the slot is occupied — by this
+// node's own published offer or a previous cache — nothing is written. A
+// blind cache-back Put at equal sequence resolves by the H_record tie-break
+// and DISPLACES the storer's own offer, collapsing the network-wide set the
+// next collector merges (verified live: a two-node split converged to one
+// envelope after the first resolver pass).
+//
+// The multi-claim home is the ClaimPool instead (§7.4 line 602-604: "storing
+// nodes keep the top 2 by ordering"): EVERY collected envelope is Offered
+// into the node's pool. Because the pool holds TWO claims per K_claim, a
+// collector-side cache-back cannot collapse a contested split — the second
+// claim has its own slot and is re-offered to the next verifier via the
+// `envelopes` extension of hGet.
 //
 // A network-collection error is propagated — with only a local view the §7.4
 // merge would silently degrade to the single-claim behavior, which is exactly
@@ -315,6 +331,15 @@ func (l *DHTLookup) CollectClaims(ctx context.Context, alias string, now int64) 
 		add(env)
 	}
 	set := sortedByRecordHash(collected)
+	// §7.4 "storing nodes keep the top 2 by ordering": every collected claim
+	// is Offered into the node's ClaimPool (the multi-claim home — see the
+	// doc comment for why the single-slot store cache-back below stays
+	// empty-slot-only).
+	if l.node != nil {
+		for _, env := range set {
+			l.node.claims.Offer(key, env)
+		}
+	}
 	// Empty-slot-only cache-back (see doc comment): an occupied slot is never
 	// displaced — that is what collapses a contested split.
 	if len(set) > 0 && !l.store.Has(key, now) {

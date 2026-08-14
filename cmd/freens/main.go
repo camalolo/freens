@@ -14,7 +14,7 @@
 //
 //	freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]
 //	       [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]
-//	       [-passive] [-persist <dir>] [-idna]
+//	       [-passive] [-advertise <addr>] [-persist <dir>] [-idna]
 //
 // If -config is absent a built-in default config is used (127.0.0.1:53,
 // upstreams 9.9.9.9 / 1.1.1.1, "* = dns-first"). If binding UDP/TCP port 53 is
@@ -86,7 +86,7 @@ func run(args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]")
 		fmt.Fprintln(fs.Output(), "             [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
-		fmt.Fprintln(fs.Output(), "             [-passive] [-persist <dir>] [-idna]")
+		fmt.Fprintln(fs.Output(), "             [-passive] [-advertise <addr>] [-persist <dir>] [-idna]")
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "path to resolver config file (optional; built-in default if absent)")
@@ -97,6 +97,10 @@ func run(args []string) error {
 	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this node's DHT identity; generated if empty")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as addr#<64-hex-pubkey>")
 	passive := fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
+	advertiseAddr := fs.String("advertise", "", "address peers should dial to reach this node's DHT transport, host:port "+
+		"(spec §6.2 \"nodes advertise (ip, port, node_pubkey)\") — for NAT/port-forward setups where the observed UDP "+
+		"source is a private address peers cannot dial back; validated at startup, empty = peers learn the observed source "+
+		"(requires -dht)")
 	persistDir := fs.String("persist", "", "directory to persist the envelope store to (<keyhex>.cbor files) every 60s and at shutdown (requires -dht)")
 	idnaFlag := fs.Bool("idna", false, "accept IDNA2008 U-label aliases (spec §3.2): normalize non-ASCII (raw\n"+
 		"UTF-8) alias/TLD components of query names to punycode A-labels via UTS #46\n"+
@@ -187,6 +191,7 @@ func run(args []string) error {
 			Store:      store,
 			Logger:     logger,
 			Passive:    *passive,
+			Advertise:  *advertiseAddr,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)
@@ -218,6 +223,10 @@ func run(args []string) error {
 			"node_id", hex.EncodeToString(node.ID()),
 			"node_pk", hex.EncodeToString(node.PublicKey()),
 			"passive", *passive,
+			// §6.2 advertised address: empty means peers learn the observed
+			// source (Node.Start logs a warning if a passed -advertise was
+			// invalid and could not be honored).
+			"advertise", *advertiseAddr,
 		)
 		if peers := parsePeers(*peersCSV); len(peers) > 0 {
 			logger.Info("bootstrapping DHT peers", "count", len(peers))
@@ -294,6 +303,11 @@ func run(args []string) error {
 			logger.Info("persisted envelopes at shutdown", "dir", *persistDir, "count", count)
 		}
 		persistFetchMeta(dhtLookup, *persistDir, logger)
+		if hc, herr := store.PersistHistoryTo(filepath.Join(*persistDir, "history")); herr != nil {
+			logger.Error("final persist history failed", "error", herr)
+		} else if hc > 0 {
+			logger.Info("persisted audit history at shutdown", "count", hc)
+		}
 	}
 	return firstErr
 }
@@ -333,6 +347,11 @@ func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, st
 			}
 			logger.Info("persisted envelopes", "dir", dir, "count", count)
 			persistFetchMeta(lookup, dir, logger)
+			if hc, herr := store.PersistHistoryTo(filepath.Join(dir, "history")); herr != nil {
+				logger.Error("persist history failed", "error", herr)
+			} else if hc > 0 {
+				logger.Info("persisted audit history", "dir", filepath.Join(dir, "history"), "count", hc)
+			}
 		case <-stop:
 			return
 		}
@@ -446,6 +465,29 @@ func seedFromDir(store *dht.EnvelopeStore, dir string, logger *slog.Logger) (int
 			continue
 		}
 		count++
+	}
+	// §8.3 audit-history seeding: <dir>/history/*.cbor are superseded
+	// predecessors persisted by PersistHistoryTo. They must land in HISTORY,
+	// not the live map — Put would reject them as stale losers of the winner
+	// rule (their successor is the live winner), so they are force-retained;
+	// this is what makes transferred-TLD verification survive restarts.
+	histDir := filepath.Join(dir, "history")
+	if hentries, err := os.ReadDir(histDir); err == nil {
+		for _, e := range hentries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".cbor") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(histDir, e.Name()))
+			if err != nil {
+				return count, err
+			}
+			env, err := wire.DecodeEnvelope(data)
+			if err != nil {
+				logger.Warn("skipping malformed history envelope", "file", e.Name(), "error", err)
+				continue
+			}
+			store.RetainHistory(env)
+		}
 	}
 	return count, nil
 }

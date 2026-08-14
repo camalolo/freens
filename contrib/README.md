@@ -103,6 +103,24 @@ Revert by deleting the file and restarting systemd-resolved. For
 NetworkManager-managed `/etc/resolv.conf` instead, see the notes in
 `resolv.conf.example`.
 
+## 5. NAT / port forwarding (DHT dialability)
+
+The DHT speaks UDP (default port 15353). Behind NAT, peers learn your RFC1918
+source address from packets — undialable. Forward external UDP 15353 to the
+machine and tell the daemon what the world sees:
+
+```bash
+freens -dht :15353 -advertise 203.0.113.7:15353 ...
+```
+
+`-advertise` publishes that address in `find_node`/`get` contact lists
+(§6.2 "nodes advertise (ip, port, node_pubkey)") instead of the observed
+source. Caveat: two peers behind different NATs, both without forwards, still
+cannot reach each other directly — hole-punching/STUN/TURN is future work;
+today at least one side needs a reachable address (the same assumption
+`-peers` bootstrapping makes). Alternative: IPv6 prefix delegation — a routed
+/64 gives the host a global address, no forward needed.
+
 ## Files
 
 - `port53-redirect.sh` — iptables/nftables REDIRECT :53 → :5300 (UDP+TCP),

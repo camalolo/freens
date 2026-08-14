@@ -69,6 +69,42 @@ type ClaimSetResolver interface {
 	CollectClaims(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, error)
 }
 
+// HistoryResolver is the OPTIONAL §8.3 transfer-history source: it returns the
+// SignedEnvelope whose H_record (SHA-256 of the canonical envelope CBOR, §4.2)
+// is h — from this node's retained history or any peer's — or (nil, nil) if no
+// such envelope is obtainable. §8.3 (lines 681-684): "prev_hash links the
+// transfer into an auditable chain so third parties can verify the hand-off
+// history offline"; storing nodes retain superseded envelopes for exactly
+// that audit, so the predecessor of a whole-TLD hand-off stays fetchable by
+// hash (locally or across the network) long after it lost its K_tld slot.
+//
+// A RecordLookup MAY implement HistoryResolver; the resolver discovers that
+// with a type assertion when the walked chain[0] is a §8.3 hand-off (signer !=
+// owner with a non-nil prev_hash). Trust model: a resolver can verify a
+// hand-off IFF the predecessor is obtainable — without this source a
+// transferred TLD root is unprovable and the name NXDOMAINs (the pre-§8.3
+// behavior). The returned envelope is UNTRUSTED input: the transfer walk
+// re-checks its signature, self-certification, and prev_hash linkage.
+type HistoryResolver interface {
+	LookupByHash(ctx context.Context, h []byte) (*wire.SignedEnvelope, error)
+}
+
+// DifficultyOracle is the OPTIONAL Appendix A.4 gossip-difficulty source: the
+// claim-PoW floor this node learned from the network. A.4 (lines 1004-1006):
+// "Nodes gossip the current D in witness responses; clients use the median of
+// the GET_CLOSEST nodes' advertised values" — dht.DHTLookup implements this
+// over its recently observed gossip values (median, floored at
+// POW_DIFFICULTY_INIT, nil-node safe).
+//
+// A RecordLookup MAY implement DifficultyOracle; the resolver takes the floor
+// into account when verifying claim PoW (see effectivePoWDifficulty): a claim
+// minted at a difficulty below the network's current floor stops verifying
+// once the network has retargeted upward. A source without it keeps the exact
+// legacy claims.InferDifficulty behavior (no floor).
+type DifficultyOracle interface {
+	NetworkDifficulty() int
+}
+
 // Upstream forwards a DNS message to conventional recursive resolvers and
 // returns the response. Implementations may do UDP/TCP fallback, DoH, etc.
 type Upstream interface {
@@ -302,12 +338,12 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	}
 
 	// Step 3c: verify the terminal envelope (basic validity) and the full
-	// authority chain (§3.4).
+	// authority chain (§3.4, with §8.3 transferred TLD roots).
 	terminal := chain[len(chain)-1]
 	if !wire.IsBasicValid(terminal, uint64(now)) {
 		return nil, dns.RcodeNameError, nil
 	}
-	if !wire.VerifyAuthorityChain(chain) {
+	if !r.verifyAuthorityChain(ctx, chain) {
 		return nil, dns.RcodeNameError, nil
 	}
 
@@ -344,6 +380,58 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	return out, dns.RcodeSuccess, nil
 }
 
+// verifyAuthorityChain verifies the walked chain per §3.4, additionally
+// accepting a §8.3 whole-TLD transfer record as chain[0] when — and only when
+// — the record source can produce the superseded predecessors by hash.
+//
+// §8.3 (lines 666-687) defines the hand-off record as: owner = the NEW owner
+// key, delegation = the same new key ("subtree authority follows"),
+// prev_hash = H_record(previous signed envelope), sequence = prev + 1, and
+// "signature: by ... (current owner key)" — i.e. signed by the PREVIOUS
+// owner, "because the previous owner — whose key the current authority chain
+// names — signed it" (line 681). "For a whole-TLD transfer, the same
+// operation on the TLD record transfers the alias and all undelegated names
+// at once" (lines 686-687). Such a root necessarily fails the plain
+// wire.VerifyAuthorityChain, whose chain[0] rule demands signer == owner of a
+// self-certifying root — correct for every un-transferred TLD and for every
+// sub-name hand-off (those verify via the parent/child authorization rules).
+//
+// Dispatch (zero behavior change outside the transferred case):
+//
+//   - chain[0].Signer == chain[0].Record.Owner, or no prev_hash assertion:
+//     wire.VerifyAuthorityChain exactly as before (a signer != owner record
+//     without prev_hash is NOT a §8.3 hand-off and still rejects).
+//   - signer != owner AND chain[0].Record.PrevHash non-nil (a §8.3 hand-off):
+//     if r.Freens implements HistoryResolver, verify via
+//     wire.VerifyAuthorityChainWithTransfers, which walks the prev_hash links
+//     through a fetcher over LookupByHash (this node's retained history or
+//     any peer's — storing nodes retain superseded envelopes for audit per
+//     §8.3) back to the original self-certifying root; each hop's prev_hash
+//     must equal the fetched predecessor's H_record, predecessors must be
+//     signature-valid (their own liveness window is NOT required — §8.3 is
+//     an auditable OFFLINE history, and v1 may have expired or been
+//     superseded), and the terminal predecessor must be the self-certifying
+//     root. On false the caller NXDOMAINs as usual. If the source does NOT
+//     implement HistoryResolver the hand-off is unprovable from this vantage
+//     point, so today's behavior stands: reject.
+func (r *Resolver) verifyAuthorityChain(ctx context.Context, chain []*wire.SignedEnvelope) bool {
+	root := chain[0]
+	if root.Record == nil || bytes.Equal(root.Signer, root.Record.Owner) || len(root.Record.PrevHash) == 0 {
+		// Ordinary (or malformed) root: the §3.4 rules alone apply —
+		// identical to the pre-§8.3 resolver for every input.
+		return wire.VerifyAuthorityChain(chain)
+	}
+	hr, ok := r.Freens.(HistoryResolver)
+	if !ok {
+		// A §8.3 hand-off with no way to fetch predecessors: keep today's
+		// reject (the plain chain rules fail signer != owner).
+		return wire.VerifyAuthorityChain(chain)
+	}
+	return wire.VerifyAuthorityChainWithTransfers(chain, func(prevHash []byte) (*wire.SignedEnvelope, error) {
+		return hr.LookupByHash(ctx, prevHash)
+	})
+}
+
 // resolveAliasClaim implements the network side of §9.2 step 3a (alias →
 // tld_id without a local pin). Source discovery is by capability, newest
 // first, so wiring stays automatic and backward compatible:
@@ -374,7 +462,8 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 	if err != nil || env == nil || env.Record == nil {
 		return nil, false // transient error is a miss here — the freens branch NXDOMAINs
 	}
-	claim := verifyClaimEnvelope(env, alias, now)
+	oracle, _ := r.Freens.(DifficultyOracle)
+	claim := verifyClaimEnvelope(env, alias, now, oracle)
 	if claim == nil {
 		return nil, false
 	}
@@ -389,7 +478,9 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 //  2. Filter: each envelope individually passes the §7 checklist
 //     (verifyClaimEnvelope: structural validity, alias match, claimant
 //     binding, PoW, and ≥ W = 5 distinct verified witnesses via
-//     claims.VerifyFull with InferDifficulty — the Appendix A.4 convention).
+//     claims.VerifyFull — with the Appendix A.4 difficulty inference floored
+//     at the source's gossiped network difficulty when it implements
+//     DifficultyOracle; see effectivePoWDifficulty).
 //  3. Order the surviving claims ascending by the §7.4 step-3 lexicographic
 //     tuple (timestamp, pow_hash, tld_id) via claims.OrderClaims — "earliest
 //     asserted time wins; ties broken by lower PoW hash (a public lottery),
@@ -420,8 +511,9 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 		return nil, false // transient error / no claim anywhere: a miss
 	}
 	survivors := make([]*claims.AliasClaim, 0, len(envs))
+	oracle, _ := r.Freens.(DifficultyOracle)
 	for _, env := range envs {
-		if claim := verifyClaimEnvelope(env, alias, now); claim != nil {
+		if claim := verifyClaimEnvelope(env, alias, now, oracle); claim != nil {
 			survivors = append(survivors, claim)
 		}
 	}
@@ -456,21 +548,23 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 //     tld_id == claim.TldID). Together with step 1's signature check this
 //     means the claimant key itself published the claim — the §3.1
 //     self-certification that step 3b's chain walk then re-proves at K_tld.
-//  5. claims.VerifyFull(claim, InferDifficulty, nil, constants.W): claimant
-//     consistency (tld_id == SHA-256(claimant_pk)), recomputed PoW at the
-//     difficulty recorded in nonce[0] (Appendix A.4) or the network default,
-//     and ≥ W = 5 DISTINCT verified witness attestations (each node_pk bound
-//     to its node_id and each signature verifying over the canonical §7.3
-//     witness message). witnessSetIDs is nil — a resolver without a global
-//     routing-table view cannot honestly compute the WITNESS_SET restriction;
-//     distinctness + signature validity still hold (see the deviation note in
-//     the package report).
+//  5. claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), nil,
+//     constants.W): claimant consistency (tld_id == SHA-256(claimant_pk)),
+//     recomputed PoW at the difficulty recorded in nonce[0] (Appendix A.4)
+//     or the network default — floored at the source's gossiped difficulty
+//     when it implements DifficultyOracle — and ≥ W = 5 DISTINCT verified
+//     witness attestations (each node_pk bound to its node_id and each
+//     signature verifying over the canonical §7.3 witness message).
+//     witnessSetIDs is nil — a resolver without a global routing-table view
+//     cannot honestly compute the WITNESS_SET restriction; distinctness +
+//     signature validity still hold (see the deviation note in the
+//     package report).
 //
 // On success the returned claim's TldID is SHA-256(claimant_pk); resolution
 // then PROCEEDS with the normal §9.2 step 3b chain walk, where the TLD record
 // at K_tld must still verify against that tld_id — self-certification, so a
 // bogus claim cannot manufacture records, only point elsewhere (§3.2, §10.3).
-func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64) *claims.AliasClaim {
+func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64, oracle DifficultyOracle) *claims.AliasClaim {
 	// (1) envelope signature + time window.
 	if env == nil || !wire.IsBasicValid(env, uint64(now)) {
 		return nil
@@ -494,10 +588,70 @@ func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64) *cla
 		return nil
 	}
 	// (5) claimant consistency + PoW + ≥ W distinct verified witnesses.
-	if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
+	// The PoW difficulty is the A.4 inference (nonce[0] when sane, else
+	// PoWDifficultyInit), floored at the source's gossiped network
+	// difficulty when it implements DifficultyOracle.
+	if !claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), nil, constants.W) {
 		return nil
 	}
 	return claim
+}
+
+// effectivePoWDifficulty computes the difficulty bits a verified claim's PoW
+// must meet — the ONE shared helper behind the §7.4 step-2 PoW check
+// (verifyClaimEnvelope, used by both the legacy single-claim path and
+// resolveClaimSet's per-claim filter).
+//
+// Appendix A.4 (lines 1004-1008): "claims are individually verified against
+// any historically valid D ≥ POW_DIFFICULTY_INIT recorded with the claim
+// (pow_bits SHOULD be recorded in nonce's first byte for this purpose)" —
+// that is the legacy inference, exactly what claims.VerifyPoW applies for the
+// InferDifficulty sentinel (-1): if Nonce is non-empty and Nonce[0] >=
+// PoWDifficultyInit the difficulty is Nonce[0], else PoWDifficultyInit. A.4
+// also retargets D network-wide ("Nodes gossip the current D in witness
+// responses; clients use the median of the GET_CLOSEST nodes' advertised
+// values"), so when the source implements DifficultyOracle the verifying node
+// floors the check at its gossiped median:
+//
+//	effective = max(inferred-from-nonce, oracle floor)
+//
+// A claim minted below the network's current difficulty then fails
+// verification even though its own recorded pow_bits are satisfied — the
+// verifier-side enforcement of the retarget. Without an oracle the
+// claims.InferDifficulty sentinel is returned, so the PoW check is
+// byte-for-byte today's behavior.
+//
+// Coordinate systems: the oracle's floor is a NETWORK value anchored at the
+// protocol baseline constants.PoWDifficultyInit (the dht gossip machinery
+// floors there), while this verifier's inference baseline is the
+// claims.PoWDifficultyInit shadow, which tests lower wholesale for fast
+// mining (production leaves it at the constant). The floor is therefore
+// translated into the verifier's baseline — floor -= (constants.PoWDifficultyInit -
+// claims.PoWDifficultyInit) — so a lowered baseline shifts the whole
+// difficulty scale uniformly. In production the translation is the identity
+// and the rule is exactly max(inferred, floor); under the test downshift an
+// oracle reporting the initial D behaves like no oracle at all.
+func effectivePoWDifficulty(c *claims.AliasClaim, oracle DifficultyOracle) int {
+	if oracle == nil {
+		return claims.InferDifficulty
+	}
+	// Replicate claims.VerifyPoW's InferDifficulty inference (the sentinel's
+	// documented rule); the hash itself is recomputed inside VerifyPoW at
+	// whatever difficulty is returned here.
+	inferred := claims.PoWDifficultyInit
+	if c != nil && len(c.Nonce) >= 1 && int(c.Nonce[0]) >= claims.PoWDifficultyInit {
+		inferred = int(c.Nonce[0])
+	}
+	floor := oracle.NetworkDifficulty() - (constants.PoWDifficultyInit - claims.PoWDifficultyInit)
+	// A.4: the check never drops below the verifier's POW_DIFFICULTY_INIT
+	// baseline (a misbehaving oracle cannot lower it either).
+	if floor < claims.PoWDifficultyInit {
+		floor = claims.PoWDifficultyInit
+	}
+	if floor > inferred {
+		return floor
+	}
+	return inferred
 }
 
 // forwardDNS implements §9.2 step 4: forward the question verbatim to the

@@ -181,6 +181,16 @@ type NodeConfig struct {
 	// number of queries an idle source may send back-to-back). Zero ⇒ 100.
 	// Ignored when GetRateLimit < 0.
 	GetBurst int
+	// Advertise is the address peers should dial to reach this node (§6.2
+	// line 422-423: "nodes advertise (ip, port, node_pubkey)"). Empty ⇒
+	// today's behavior (peers learn the OBSERVED UDP source address, which
+	// is correct except behind NAT/port-forwarding). When set it must be a
+	// resolvable host:port; it is validated once at Start (a bad value logs
+	// a warning and falls back to observed) and then stamped into every
+	// outbound query ("advertise" arg), so peers learnPeer this node at the
+	// advertised — e.g. public — address instead of a private observed
+	// source.
+	Advertise string
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -208,9 +218,16 @@ type Node struct {
 	store  *EnvelopeStore
 	rt     *RoutingTable
 	tokens *TokenStore
-	getLim *rateLimiter // per-source-IP get/find_node throttle (§12); nil = off
+	claims *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
+	diff   *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
+	getLim *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
 	log    *slog.Logger
 	nowFn  func() int64
+
+	// advertise is the validated §6.2 advertised address ("" ⇒ peers learn
+	// the observed source). Parsed from NodeConfig.Advertise once at Start;
+	// written before any goroutine reads it.
+	advertise string
 
 	// §6.2 live eviction: readLoop-side callers (learnPeer runs on the read
 	// goroutine) hand full-bucket contacts to a single serialized maintenance
@@ -326,9 +343,12 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		store:          cfg.Store,
 		rt:             rt,
 		tokens:         tokens,
+		claims:         NewClaimPool(),
+		diff:           newDifficultyState(now()),
 		getLim:         getLim,
 		log:            log,
 		nowFn:          now,
+		advertise:      cfg.Advertise,
 		evictCh:        make(chan *NodeContact, evictQueueCap),
 		evictPending:   make(map[int]bool),
 		witnessLast:    make(map[string]witnessSigned),
@@ -362,6 +382,18 @@ func (n *Node) RoutingTable() *RoutingTable { return n.rt }
 // maintenance loops (§6.2 bucket refresh; §6.4 step 4 republish timer unless
 // Passive). It returns once the socket is bound; the loops run until Close.
 func (n *Node) Start() error {
+	// §6.2 advertised address: validate ONCE here. A non-resolvable
+	// host:port (or a missing host/port) logs a warning and falls back to
+	// the observed-source behavior — a bad Advertise must not brick the node.
+	if n.advertise != "" {
+		if a, err := net.ResolveUDPAddr("udp", n.advertise); err != nil || a.IP == nil || a.Port == 0 {
+			n.log.Warn("dht: invalid Advertise address (want resolvable host:port); "+
+				"peers will learn the observed source address", "advertise", n.advertise)
+			n.advertise = ""
+		} else {
+			n.advertise = a.String() // canonical resolved form
+		}
+	}
 	addr, err := net.ResolveUDPAddr("udp", n.listenAddr)
 	if err != nil {
 		return fmt.Errorf("dht: resolve %q: %w", n.listenAddr, err)
@@ -438,7 +470,10 @@ func (n *Node) handle(data []byte, raddr *net.UDPAddr) {
 		return
 	}
 	// Learn/refresh the sender in the routing table from any signed traffic.
-	n.learnPeer(m.PK, raddr)
+	// A peer with a validated Advertise (§6.2) stamps it on its queries; a
+	// syntactically bad value is ignored in favor of the observed source.
+	adv, _ := m.A["advertise"].(string)
+	n.learnPeer(m.PK, raddr, adv)
 	switch m.Y {
 	case wire.MsgTypeResponse, wire.MsgTypeError:
 		n.deliver(m)
@@ -466,19 +501,52 @@ func (n *Node) deliver(m *wire.Message) {
 }
 
 // learnPeer adds/refreshes a contact learned from inbound traffic. The sender's
-// public key and Node ID come from the (already-verified) message; the address
-// is the observed source (resistant to spoofing precisely because the message
-// was signed to OUR id).
-func (n *Node) learnPeer(pk []byte, raddr *net.UDPAddr) {
+// public key and Node ID come from the (already-verified) message. The address
+// is the OBSERVED source (resistant to spoofing precisely because the message
+// was signed to OUR id) — unless the sender advertised a concrete host:port
+// (§6.2 line 422-423: "nodes advertise (ip, port, node_pubkey)"), in which
+// case the advertised address wins: behind NAT/port-forwarding the observed
+// source is a private address peers cannot dial back. The advertised value is
+// only trusted as an ADDRESS (never as an identity — the key/ID still come
+// from the verified signature), and only when it parses as a literal
+// host:port with a port (no DNS on the read-loop hot path; honest -advertise
+// values are pre-resolved at the sender's Start).
+func (n *Node) learnPeer(pk []byte, raddr *net.UDPAddr, advertised string) {
 	id, err := crypto.NodeID(pk)
 	if err != nil || bytes.Equal(id, n.id) {
 		return
 	}
-	c, err := NewNodeContact(id, pk, raddr.String(), n.now())
+	addr := raddr.String()
+	if advertised != "" {
+		if a, ok := parseAdvertisedAddr(advertised); ok {
+			addr = a
+		}
+	}
+	c, err := NewNodeContact(id, pk, addr, n.now())
 	if err != nil {
 		return
 	}
 	n.learn(c)
+}
+
+// parseAdvertisedAddr validates a peer-advertised address as a literal
+// host:port with a non-zero port, returning its canonical "ip:port" string.
+// It performs NO name resolution (the read loop must never block on DNS);
+// hostnames are rejected in favor of the observed source.
+func parseAdvertisedAddr(s string) (string, bool) {
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil || host == "" || portStr == "" {
+		return "", false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return "", false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "", false // hostname: not resolvable without DNS; ignore
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), true
 }
 
 // rtAddOrIgnore adds c, returning a non-nil eviction candidate if the bucket is
@@ -657,8 +725,30 @@ func (n *Node) hFindNode(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	})
 }
 
-// hGet returns the stored envelope for {key} if present; otherwise the K closest
-// contacts (§6.4 GET). Either way a write token is included.
+// hGet answers a get(key) with everything this node can offer for key:
+//
+//   - `envelope`: the store winner (§6.4 single-envelope get), if present.
+//
+//   - `envelopes`: DEVIATION from §6.3's single-envelope get response
+//     (documented; the table's response shape is `{envelope} or {nodes}` and
+//     cannot express §7.4 line 602-604: "storing nodes keep the top 2 by
+//     ordering"): a CBOR array of bstr, each a canonical SignedEnvelope
+//     ("bstr .cbor SignedEnvelope"), BEST-FIRST by the §7.4 ordering, carried
+//     whenever the ClaimPool holds claims for the key — on a store HIT (where
+//     it refines the single `envelope`, which stays the §6.4 winner for
+//     legacy clients) and on a MISS (alongside `nodes`, so an iterative
+//     collector merges the competing claims instead of settling for whatever
+//     one envelope a node happened to keep).
+//
+//   - `nodes`: the K closest contacts on a store miss (§6.4 GET), absent on a
+//     hit.
+//
+//   - Audit fallback (§8.3 transfer chains): on a store miss with len(key)==32
+//     the store's superseded-envelope history is consulted by the key — which
+//     for this path is an H_record — so a superseded envelope stays fetchable
+//     network-wide by its hash and third parties can verify hand-off history
+//     offline. A history hit is returned as `envelope` exactly like a live
+//     winner.
 //
 // §12 line 914 ("Implementations MAY throttle passive clients' get rates"):
 // each source IP draws from a token bucket (NodeConfig.GetRateLimit /
@@ -677,6 +767,12 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	}
 	now := n.now()
 	env, _ := n.store.Get(key, now)
+	if env == nil {
+		// §8.3 audit path: fetch a superseded envelope by its H_record.
+		if h := n.store.GetHistory(key); h != nil {
+			env = h
+		}
+	}
 	args := map[string]any{"token": n.issueToken(raddr)}
 	if env != nil {
 		if eb, err := env.Bytes(); err == nil {
@@ -685,6 +781,19 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	} else {
 		// Miss: return the closest known contacts so the requester iterates.
 		args["nodes"] = encodeNodes(n.rt.Closest(key, constants.K))
+	}
+	// §7.4 top-2 claim offers: whenever the pool holds claims for this key,
+	// advertise them best-first (see the doc comment for the wire shape).
+	if pooled := n.claims.Top2(key); len(pooled) > 0 {
+		arr := make([]any, 0, len(pooled))
+		for _, e := range pooled {
+			if eb, err := e.Bytes(); err == nil {
+				arr = append(arr, eb)
+			}
+		}
+		if len(arr) > 0 {
+			args["envelopes"] = arr
+		}
 	}
 	return n.okResp(m, args)
 }
@@ -707,6 +816,12 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 // A Passive node (§6.1) refuses the method outright with error 301 "passive
 // node" — before any token or signature work — so passivity is observable on
 // the wire rather than inferred from silence.
+//
+// §7.4 top-2 pool: an explicit-K_claim put ALSO offers the envelope into the
+// node's ClaimPool ("storing nodes keep the top 2 by ordering", lines
+// 602-604). A claim that loses the single-slot §6.4 winner race but is
+// retained by the pool answers SUCCESS, not 304 — the node did keep it;
+// 304 is reserved for an envelope retained nowhere.
 func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if n.passive {
 		return n.errResp(m, 301, "passive node")
@@ -728,13 +843,27 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if err != nil {
 		return n.errResp(m, 305, "bad record name or key")
 	}
+	// §7.4 line 602-604 ("storing nodes keep the top 2 by ordering"): a put
+	// landing at K_claim ALSO offers the envelope into the top-2 claim pool —
+	// REGARDLESS of the winner-slot outcome below. Two competing claims at
+	// equal sequence resolve the single store slot by the H_record
+	// tie-break, but both belong in the pool so verifiers collecting "all
+	// competing claims nodes offer" still see the pair.
+	poolKept := false
+	if claim, cerr := claims.DecodeAliasClaim(env.Record.Claim); cerr == nil {
+		if kClaim, kerr := KeyForClaim(claim.Alias); kerr == nil && bytes.Equal(key, kClaim) {
+			n.claims.Offer(kClaim, env)
+			poolKept = n.claims.Contains(kClaim, recordHashOrNil(env)) // offered now or already pooled
+		}
+	}
 	accepted, err := n.store.Put(key, env, n.now(), false) // sig already verified
 	if err != nil {
 		return n.errResp(m, 301, "store error")
 	}
 	if !accepted {
 		// Distinguish idempotent republication (same envelope) from a strictly
-		// stale loser of the winner rule (§6.4 step 3).
+		// stale loser of the winner rule (§6.4 step 3). A claim retained by
+		// the §7.4 top-2 pool is ALSO a success: the node did keep it.
 		if inc, _ := n.store.Get(key, n.now()); inc != nil {
 			ih, e1 := inc.RecordHash()
 			ph, e2 := env.RecordHash()
@@ -742,9 +871,22 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 				return n.okResp(m, map[string]any{}) // idempotent: already the winner
 			}
 		}
+		if poolKept {
+			return n.okResp(m, map[string]any{}) // §7.4: retained in the top-2
+		}
 		return n.errResp(m, 304, "stale record")
 	}
 	return n.okResp(m, map[string]any{})
+}
+
+// recordHashOrNil returns env's H_record or nil (a nil never matches a pooled
+// 32-byte hash, so Contains simply reports false for an unhashable envelope).
+func recordHashOrNil(env *wire.SignedEnvelope) []byte {
+	h, err := env.RecordHash()
+	if err != nil {
+		return nil
+	}
+	return h
 }
 
 // putKeyFor resolves the storage key for an inbound put per the hPut key rule:
@@ -873,11 +1015,14 @@ func (n *Node) hWitness(m *wire.Message, _ *net.UDPAddr) *wire.Message {
 	if err != nil {
 		return n.errResp(m, 301, "attestation encode failed")
 	}
+	// Appendix A.4: count the accepted claim; every PoWRetargetBlock
+	// acceptances the node's own difficulty retargets over the block span.
+	n.diff.recordAccepted(now)
 	n.log.Info("dht: witnessed alias claim",
 		"alias", aliasN, "claimant", HexID(claimant), "ts", now)
 	return n.okResp(m, map[string]any{
-		"attestation": attBytes,                         // bstr .cbor WitnessAttestation
-		"difficulty":  uint64(claims.PoWDifficultyInit), // Appendix A.4 gossip
+		"attestation": attBytes,                           // bstr .cbor WitnessAttestation
+		"difficulty":  uint64(n.diff.currentDifficulty()), // Appendix A.4 gossip
 	})
 }
 
@@ -909,6 +1054,17 @@ func claimPrefixHash(alias string, tldID, claimantPK []byte, ts uint64) ([]byte,
 // (correlated by txid via readLoop→deliver). Returns ErrTimeout on no response
 // within RPC_TIMEOUT, or ctx.Err() if the caller's context expires first.
 func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []byte, method string, args map[string]any) (*wire.Message, error) {
+	// §6.2 advertised address: stamp it on every outbound query so the peer
+	// learns THIS node at the advertised (public) address, not a NAT'd
+	// private observed source. The map is copied, never the caller's.
+	if n.advertise != "" {
+		stamped := make(map[string]any, len(args)+1)
+		for k, v := range args {
+			stamped[k] = v
+		}
+		stamped["advertise"] = n.advertise
+		args = stamped
+	}
 	txid := make([]byte, 8)
 	if _, err := rand.Read(txid); err != nil {
 		return nil, err
@@ -1046,7 +1202,7 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 		}
 
 		type res struct {
-			env   *wire.SignedEnvelope
+			envs  []*wire.SignedEnvelope // every envelope the peer offered (§7.4 `envelopes` + legacy `envelope`)
 			nodes []*NodeContact
 			err   error // probe failure (timeout/unreachable) — triggers eviction
 		}
@@ -1064,8 +1220,8 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 				// candidate makes misses unboundedly slow (§6.4 GET latency).
 				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 				defer cancel()
-				e, ns, err := n.getFromPeer(pctx, key, c)
-				results[i] = res{e, ns, err}
+				es, ns, err := n.getFromPeer(pctx, key, c)
+				results[i] = res{es, ns, err}
 			}(i, c)
 		}
 		wg.Wait()
@@ -1087,9 +1243,11 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 					shortlist = append(shortlist, nc)
 				}
 			}
-			if r.env != nil && r.env.VerifySignature() {
-				if bestEnv == nil || wire.EnvelopeWins(r.env, bestEnv) {
-					bestEnv = r.env
+			for _, e := range r.envs {
+				if e != nil && e.VerifySignature() {
+					if bestEnv == nil || wire.EnvelopeWins(e, bestEnv) {
+						bestEnv = e
+					}
 				}
 			}
 		}
@@ -1097,11 +1255,15 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 	return bestEnv, nil
 }
 
-// getFromPeer issues a single get(key) RPC to c and parses the response into the
-// envelope (if the peer had it) and/or the closer-contacts list (if it didn't).
-// The returned error signals probe failure (drives §6.2 eviction in IterativeGet);
-// a y="e" response is a successful exchange and yields a nil error.
-func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) (*wire.SignedEnvelope, []*NodeContact, error) {
+// getFromPeer issues a single get(key) RPC to c and parses the response into
+// the envelopes offered by the peer and/or the closer-contacts list. The
+// offers are, best-first: the §7.4 `envelopes` extension (top-2 claim pool,
+// see hGet) when present, then the legacy single `envelope` (the §6.4 store
+// winner — a pool-carrying peer repeats it inside `envelopes`, deduplicated
+// by callers via H_record / EnvelopeWins). The returned error signals probe
+// failure (drives §6.2 eviction in IterativeGet); a y="e" response is a
+// successful exchange and yields a nil error.
+func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*wire.SignedEnvelope, []*NodeContact, error) {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve: %w", err)
@@ -1113,17 +1275,26 @@ func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) (*wi
 	if resp == nil || resp.Y == wire.MsgTypeError {
 		return nil, nil, nil
 	}
-	var env *wire.SignedEnvelope
+	var envs []*wire.SignedEnvelope
+	if raw, ok := resp.A["envelopes"].([]any); ok {
+		for _, e := range raw {
+			if eb, ok := e.([]byte); ok && len(eb) > 0 {
+				if env, derr := wire.DecodeEnvelope(eb); derr == nil {
+					envs = append(envs, env)
+				}
+			}
+		}
+	}
 	if eb, ok := resp.A["envelope"].([]byte); ok && len(eb) > 0 {
-		if e, derr := wire.DecodeEnvelope(eb); derr == nil {
-			env = e
+		if env, derr := wire.DecodeEnvelope(eb); derr == nil {
+			envs = append(envs, env)
 		}
 	}
 	var nodes []*NodeContact
 	if raw, ok := resp.A["nodes"]; ok {
 		nodes = parseNodes(raw)
 	}
-	return env, nodes, nil
+	return envs, nodes, nil
 }
 
 // learnContact refreshes/inserts a contact discovered via find_node/get (a
@@ -1306,6 +1477,12 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 	})
 	if err != nil || resp == nil || resp.Y != wire.MsgTypeResponse {
 		return nil
+	}
+	// Appendix A.4 ("Nodes gossip the current D in witness responses"):
+	// record the advertised difficulty in the observed ring for
+	// DHTLookup.NetworkDifficulty's median.
+	if d, ok := asUint64(resp.A["difficulty"]); ok {
+		n.diff.observe(int(d))
 	}
 	raw, _ := resp.A["attestation"].([]byte)
 	if len(raw) == 0 {

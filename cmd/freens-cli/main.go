@@ -103,7 +103,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "subcommands:")
 	fmt.Fprintln(w, "  gen-key               generate an Ed25519 keypair")
 	fmt.Fprintln(w, "  mine-claim            mine an AliasClaim PoW")
-	fmt.Fprintln(w, "  make-record           build + sign a freens record")
+	fmt.Fprintln(w, "  make-record           build + sign a freens record (optional -recovery-* embed a spec 5.4 policy; -out writes the .cbor)")
 	fmt.Fprintln(w, "  transfer              hand a name to a new owner key (spec 8.3; -prev-envelope, -new-owner-seed, -signer-seed)")
 	fmt.Fprintln(w, "  rotate                key hygiene: transfer to a fresh key (spec 8.6 = 8.3 hand-off)")
 	fmt.Fprintln(w, "  recover               gather threshold recovery-key signatures (spec 8.4; -prev-envelope, -new-owner-seed, -recovery-seeds)")
@@ -220,6 +220,10 @@ func cmdMakeRecord(args []string) error {
 	expiresStr := fs.String("expires", "", "expires unix timestamp (default: now+86400)")
 	seq := fs.Uint64("seq", 1, "record sequence number")
 	ttl := fs.Uint64("ttl", 300, "A record TTL in seconds")
+	out := fs.String("out", "", "write the envelope's canonical CBOR to this .cbor path (for publish -files)")
+	recoveryKeysCSV := fs.String("recovery-keys", "", "comma-separated hex Ed25519 public keys (64 hex chars each) embedding a spec 5.4 recovery policy (field 10); empty = no policy")
+	recoveryThreshold := fs.Uint64("recovery-threshold", 0, "recovery quorum size (spec 5.4 threshold); required with -recovery-keys, must be 1..len(keys)")
+	recoveryTimelock := fs.Uint64("recovery-timelock", 0, "seconds a recovery waits before taking effect (spec 5.4 timelock; 0 = default 259200 = 72 h)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -279,6 +283,28 @@ func cmdMakeRecord(args []string) error {
 		return err
 	}
 	rec.RRset = []*wire.RR{aRR}
+	// Spec 5.4 (lines 373-394): a record MAY embed a recovery policy
+	// (field 10) so that threshold-of-keys can later re-point the name per
+	// §8.4 — only when -recovery-keys is given; absent flags leave Recovery
+	// nil (field 10 omitted from the CBOR map).
+	if *recoveryKeysCSV != "" {
+		keys, err := decodeRecoveryKeys(*recoveryKeysCSV)
+		if err != nil {
+			return err
+		}
+		if *recoveryThreshold < 1 || *recoveryThreshold > uint64(len(keys)) {
+			return usageErr("invalid -recovery-threshold %d: must be 1..%d (the size of -recovery-keys, spec 5.4)", *recoveryThreshold, len(keys))
+		}
+		timelock := *recoveryTimelock
+		if timelock == 0 {
+			timelock = constants.RecoveryTimelock
+		}
+		policy, err := wire.NewRecoveryPolicyWire(*recoveryThreshold, keys, timelock)
+		if err != nil {
+			return err
+		}
+		rec.Recovery = policy
+	}
 	env, err := wire.SignRecord(rec, signerKP)
 	if err != nil {
 		return err
@@ -294,7 +320,43 @@ func cmdMakeRecord(args []string) error {
 	} else {
 		fmt.Printf("k_name=%s\n", hex.EncodeToString(naming.DHTKeyName(wireName)))
 	}
+	if rec.Recovery != nil {
+		// Policy summary lines (spec 5.4), styled like the other extras.
+		fmt.Printf("recovery_threshold=%d\n", rec.Recovery.Threshold)
+		fmt.Printf("recovery_keys=%d\n", len(rec.Recovery.Keys))
+		fmt.Printf("recovery_timelock=%d\n", rec.Recovery.Timelock)
+	}
+	if *out != "" {
+		if err := os.WriteFile(*out, envBytes, 0o644); err != nil {
+			return fmt.Errorf("write %q: %w", *out, err)
+		}
+		fmt.Printf("wrote=%s\n", *out)
+	}
 	return nil
+}
+
+// decodeRecoveryKeys parses the -recovery-keys CSV into 32-byte Ed25519
+// public keys (spec 5.4 field 2: "array of bstr(32)"); each CSV entry must
+// be exactly 64 hex chars. Empty entries (stray commas) are skipped.
+func decodeRecoveryKeys(csv string) ([][]byte, error) {
+	var keys [][]byte
+	for i, field := range strings.Split(csv, ",") {
+		if field = strings.TrimSpace(field); field == "" {
+			continue
+		}
+		k, err := hex.DecodeString(field)
+		if err != nil {
+			return nil, usageErr("invalid -recovery-keys[%d] hex: %v", i, err)
+		}
+		if len(k) != constants.Ed25519PublicKeyLen {
+			return nil, usageErr("-recovery-keys[%d] is %d bytes, expected %d (64 hex chars)", i, len(k), constants.Ed25519PublicKeyLen)
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		return nil, usageErr("-recovery-keys must name at least one public key")
+	}
+	return keys, nil
 }
 
 // decodePin decodes a base32 tld_id pin (RFC 4648; case-insensitive, padding

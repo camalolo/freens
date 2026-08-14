@@ -28,14 +28,17 @@ Implemented and fully tested (130 test functions, `go test ./...` green,
 | `internal/claims` | `AliasClaim`, witness attestations, PoW, deterministic §7.4 ordering | §7 |
 | `internal/dht` | XOR metric, 256 k-bucket routing table, rotating HMAC write tokens, envelope store (winner rule + LRU/grace eviction) | §6 |
 | `internal/resolver` | §9.3 INI config parser, per-alias routing, live UDP+TCP DNS server via `miekg/dns`, DNS fallback | §9 |
-| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
+| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
 | `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `publish`, `resolve`, `get`, `demo` subcommands | §6.4, §8 |
 
 Multi-node operation: with `-dht <addr>` the daemon joins the Kademlia
 network — records seeded locally are served to (and fetched from) peers via
 iterative GET, aliases without a local pin are resolved from claim envelopes
 stored at `K_claim` (pin-first policy: `alias-pins` always win), and due
-records are republished at 80% of lifetime (§6.4). Without `-dht` the daemon
+records are republished at 80% of lifetime (§6.4). `-advertise <addr>`
+publishes a dialable address (e.g. your public `ip:15353` behind NAT/port
+forwarding) instead of the observed source in peer contact lists (§6.2) —
+see "NAT / port forwarding" in `contrib/README.md`. Without `-dht` the daemon
 is a single-node island (spec §9.4 stage 1).
 
 ## Requirements
