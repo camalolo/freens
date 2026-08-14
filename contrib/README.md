@@ -80,8 +80,8 @@ systemctl --user enable --now freens.service
 journalctl --user -u freens.service -f      # watch the startup log
 ```
 
-Adjust `ExecStart` (add `-dht`/`-peers`/`-config`/`-idna` as needed — the
-startup log line reports whether IDNA is on).
+Adjust `ExecStart` (add `-dht`/`-peers`/`-turn`/`-config`/`-idna` as
+needed — the startup log line reports whether IDNA is on).
 
 ## 4. systemd-resolved coexistence
 
@@ -103,45 +103,103 @@ Revert by deleting the file and restarting systemd-resolved. For
 NetworkManager-managed `/etc/resolv.conf` instead, see the notes in
 `resolv.conf.example`.
 
-## 5. NAT / port forwarding (DHT dialability)
+## 5. NAT traversal — the connectivity ladder
 
-The DHT speaks UDP (default port 15353). Behind NAT, peers learn your RFC1918
-source address from packets — undialable. Forward external UDP 15353 to the
-machine and tell the daemon what the world sees:
+The DHT speaks UDP (default port 15353). What a peer dials is the address
+the node advertises, and the daemon picks the first rung of this ladder
+that applies — precedence: explicit `-advertise` > relayed address from
+`-turn-relay` > `-stun`-discovered reflexive address > observed source —
+falling back to direct when a rung is unavailable:
+
+1. **Direct — observed source.** On a host with a dialable address, do
+   nothing: peers learn the working source address from your packets.
+   IPv6 prefix delegation counts here — a routed /64 gives the host a
+   global address, no forward needed. Behind IPv4 NAT this rung fails:
+   peers learn your RFC1918 source address instead, which is undialable.
+2. **`-advertise` — port forward / known public address.** Forward
+   external UDP 15353 to the machine and tell the daemon what the world
+   sees:
+
+   ```bash
+   freens -dht :15353 -advertise 203.0.113.7:15353 ...
+   ```
+
+   `-advertise` publishes that address in `find_node`/`get` contact
+   lists (§6.2 "nodes advertise (ip, port, node_pubkey)") instead of the
+   observed source, and always wins over any discovered or relayed
+   address below.
+3. **`-stun` — discovered reflexive address.** `-stun <server>` (RFC
+   5389 Binding request, e.g. `-stun stun.example.net:3478`) makes the
+   DHT node periodically ask a STUN server what its public reflexive
+   address is and advertise THAT to peers — exactly like a hand-set
+   `-advertise`, but discovered. This resolves the common full-cone /
+   restricted-cone NAT with no port forward; it does NOT resolve
+   symmetric NAT (the NAT assigns a different external port per
+   destination, so the reflexive address one STUN server reports is
+   useless to other peers). A freens `-turn` relay also answers STUN
+   Binding, so one instance can serve as your `-stun` server too (next
+   section).
+4. **`-turn-relay` — symmetric NAT, via a community relay.** The node
+   opens an allocation on a freens TURN relay (RFC 8656 subset) and
+   tunnels ALL peer DHT traffic through it, advertising the RELAYED
+   address. Every packet rides an allocation that already punched the
+   NAT it needs, so this works even when both sides are behind
+   symmetric NATs — no inbound dialability required. If the relay is
+   unreachable, the node falls back to direct. Server side + trust
+   caveats: next section.
+5. **External generic options.** A WireGuard tunnel or a cheap VPS
+   fronting the node gives a stable dialable address — then `-advertise`
+   it (rung 2). Works everywhere; costs a box.
+
+Without a relay, at least one side of each peer pair needs a directly
+dialable address — that limitation is inherent to UDP. The community
+relay tier is what removes it.
+
+## 6. Running a community TURN relay (`-turn`)
+
+`freens -turn 0.0.0.0:3478 …` runs a relay for nodes stuck on rung 4: a
+public UDP address other freens nodes tunnel through with `-turn-relay`
+(3478 is the conventional TURN port; any free port works). The same
+listener answers STUN Binding requests, so one instance also serves
+`-stun` (rung 3) — point both flags at it:
 
 ```bash
-freens -dht :15353 -advertise 203.0.113.7:15353 ...
+# on the public host (the relay operator):
+freens -turn 0.0.0.0:3478 ...
+# on each symmetric-NAT node:
+freens -dht :15353 -turn-relay relay.example.net:3478 \
+    -stun relay.example.net:3478 ...
 ```
 
-`-advertise` publishes that address in `find_node`/`get` contact lists
-(§6.2 "nodes advertise (ip, port, node_pubkey)") instead of the observed
-source. Caveat: two peers behind different NATs, both without forwards, still
-cannot reach each other directly — see "STUN / NAT traversal" below for the
-`-stun` reflexive-address discovery and the TURN/relay story. Alternative:
-IPv6 prefix delegation — a routed /64 gives the host a global address, no
-forward needed.
+**Cost.** Bandwidth ≈ the sum of the relayed nodes' DHT traffic —
+keepalives, lookups, record fetches. That is small (the DHT is a control
+plane, not media streaming), but it is your uplink doing other nodes'
+work; the `freens_turn_allocations` gauge on the `-metrics` endpoint
+shows how many allocations are riding you.
 
-## 6. STUN / NAT traversal (`-stun`)
+**Auth model.** freens-turn is an RFC 8656 subset with freens-native
+auth, not a generic TURN server: every allocation must carry a valid
+freens node-key signature over
+`"freens-turn-v1" || txid || key || lifetime`. Stock TURN clients (coturn
+& co.) will not interop, and neither will random non-freens UDP
+senders. The signature binds usage to a freens node key, but any freens
+node can mint one — it is an identity, not an ACL. The real gates are
+operational:
 
-`-stun <server>` (RFC 5389 Binding request, e.g. `-stun
-stun.example.net:3478`) makes the DHT node periodically ask a STUN server
-what its public reflexive address is and advertise THAT to peers — exactly
-like a hand-set `-advertise`, but discovered. An explicit `-advertise`
-always wins (the discovered address is only a fallback for nodes that know
-no dialable address). This resolves the common "full-cone / restricted-cone
-NAT with no port forward" case; it does NOT resolve symmetric NATs (see
-below).
+- **per-IP allocation cap** — at most 8 concurrent allocations per
+  source IP (default);
+- **bounded lifetimes, mandatory refresh** — an allocation lives 600 s
+  by default (hard max 3600 s) and is freed unless refreshed;
+- **per-allocation permissions** — at most 64 peer addresses (default)
+  may send through one allocation.
 
-**TURN guidance:** freens ships no TURN relay — relaying is deliberately out
-of scope. If both sides are behind address-restricted NATs that STUN cannot
-punch through (symmetric NAT: the NAT assigns a different external port per
-destination, so the reflexive address a STUN server reports is useless to
-other peers), run a relay such as
-[coturn](https://github.com/coturn/coturn) and point peers at it with an
-explicit `-advertise <relay-ip>:<relay-port>` — peers then dial the relay
-exactly as they would any advertised address. The symmetric-NAT limitation is
-inherent: without a relay, at least one side needs a directly dialable
-address.
+No relay-tuning flags exist yet; those caps are internal defaults (as of
+this writing — check the daemon `-h` output once the flags land).
+
+**Trust caveat.** DHT RPCs are signed (§6.3) but NOT encrypted: a relay
+operator can read every relayed byte — lookups, records, who talks to
+whom. Relaying fixes dialability, not confidentiality. Use a relay you
+trust, or wrap the relay path in a tunnel you control (rung 5).
 
 ## 7. N-node interop testnet (`testnet.sh`)
 
@@ -153,11 +211,27 @@ republishes a `sequence+1` update and asserts every node converges on the
 new IP within 30 s:
 
 ```bash
-./contrib/testnet.sh            # 5 nodes, workdir = mktemp -d
-./contrib/testnet.sh 3          # 3 nodes
-./contrib/testnet.sh 5 /tmp/tn  # 5 nodes, keep the workdir for inspection
+./contrib/testnet.sh               # 5 nodes, direct mode, workdir = mktemp -d
+./contrib/testnet.sh 3             # 3 nodes
+./contrib/testnet.sh 3 relay       # 3 nodes, relay mode (below)
+./contrib/testnet.sh 5 /tmp/tn     # 5 nodes, keep the workdir for inspection
 # last line on success: "PASS: 5 nodes converged"
+#                    (or "PASS: 5 nodes converged via TURN relay")
 ```
+
+**Relay mode** simulates symmetric NAT: node 1 additionally runs the
+community relay (`-turn 127.0.0.1:3470` — the port is FIXED, not `:0`,
+so nodes 2..N can aim `-turn-relay` at it by flag; 3470 rather than the
+conventional 3478 leaves that port free for a real relay on the host),
+while nodes 2..N drop
+`-advertise` and get `-turn-relay 127.0.0.1:3470` instead: all their
+peer DHT traffic rides an allocation on node 1, and peers see only the
+relayed address (`-advertise` must be dropped for them — it takes
+precedence over `-turn-relay` and keeping it would short-circuit the
+test). The same publish/update/`dig` assertions must pass, proving the
+relayed transport end to end — relayed-address advertising, allocations
+that stay alive, convergence on every node — with only node 1 directly
+dialable.
 
 Requirements: `go`, `dig` (bind9 dnsutils); run it from the repo root. Each
 node's state lives under `<workdir>/n<i>/` (`log`, `records/`,
@@ -234,9 +308,11 @@ Quick operational knobs that override/extend the config file (all optional):
 
 ## Files
 
-- `testnet.sh` — N-node localhost interop testnet: build, launch N daemons,
-  publish once, `dig` every node, publish an update, `dig` every node again
-  (kills everything on exit; needs `go` + `dig`).
+- `testnet.sh` — N-node localhost interop testnet, `direct` or `relay`
+  mode: build, launch N daemons, publish once, `dig` every node, publish
+  an update, `dig` every node again (kills everything on exit; needs `go`
+  + `dig`; relay mode additionally runs `-turn`/`-turn-relay` through
+  node 1, see §7).
 - `port53-redirect.sh` — iptables/nftables REDIRECT :53 → :5300 (UDP+TCP),
   idempotent, with `remove`/`status` actions (needs root to *run*; validated
   with `bash -n` only).

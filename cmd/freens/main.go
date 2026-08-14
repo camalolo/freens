@@ -15,7 +15,7 @@
 //	freens [-config <path>] [-listen <addr>] [-dns <addr>] [-upstream <csv>]
 //	       [-load <dir>] [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]
 //	       [-peers-file <path>] [-passive] [-advertise <addr>] [-stun <addr>]
-//	       [-persist <dir>] [-metrics <addr>] [-idna]
+//	       [-turn <addr>] [-turn-relay <addr>] [-persist <dir>] [-metrics <addr>] [-idna]
 //
 // If -config is absent a built-in default config is used (127.0.0.1:53,
 // upstreams 9.9.9.9 / 1.1.1.1, "* = dns-first"). If binding UDP/TCP port 53 is
@@ -64,6 +64,7 @@ import (
 	"github.com/laurent/freens/internal/metrics"
 	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/resolver"
+	"github.com/laurent/freens/internal/turn"
 	"github.com/laurent/freens/internal/wire"
 )
 
@@ -91,44 +92,17 @@ func run(args []string) error {
 		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-dns <addr>] [-upstream <csv>]")
 		fmt.Fprintln(fs.Output(), "             [-load <dir>] [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
 		fmt.Fprintln(fs.Output(), "             [-peers-file <path>] [-passive] [-advertise <addr>] [-stun <addr>]")
-		fmt.Fprintln(fs.Output(), "             [-persist <dir>] [-metrics <addr>] [-idna]")
+		fmt.Fprintln(fs.Output(), "             [-turn <addr>] [-turn-relay <addr>] [-persist <dir>] [-metrics <addr>] [-idna]")
 		fs.PrintDefaults()
 	}
-	configPath := fs.String("config", "", "path to resolver config file (optional; built-in default if absent)")
-	listenAddr := fs.String("listen", "", "override UDP listen address (default from config)")
-	dnsAddr := fs.String("dns", "", "override BOTH the UDP and TCP DNS listen addresses, e.g. 127.0.0.1:5300 "+
-		"(default from config; empty leaves the config addresses untouched)")
-	upstreamCSV := fs.String("upstream", "", "override upstream DNS servers (comma/space separated)")
-	loadDir := fs.String("load", "", "directory of *.cbor envelope files to seed the in-process store on startup")
-	dhtAddr := fs.String("dht", "", "UDP address for the DHT transport (e.g. :15353); empty disables the DHT node")
-	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this node's DHT identity; generated if empty")
-	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as addr#<64-hex-pubkey>")
-	peersFile := fs.String("peers-file", "", "newline-separated peers file (one addr#<64-hex-pubkey> per line; blank lines\n"+
-		"and lines starting with # are skipped), loaded at startup and re-loaded on SIGHUP\n"+
-		"(re-parse + AddPeer each entry, idempotent)")
-	metricsAddr := fs.String("metrics", "", "listen address for the operational HTTP endpoint exposing /metrics\n"+
-		"(Prometheus text format) and /healthz, e.g. :9153; empty disables the endpoint")
-	passive := fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
-	advertiseAddr := fs.String("advertise", "", "address peers should dial to reach this node's DHT transport, host:port "+
-		"(spec §6.2 \"nodes advertise (ip, port, node_pubkey)\") — for NAT/port-forward setups where the observed UDP "+
-		"source is a private address peers cannot dial back; validated at startup, empty = peers learn the observed source "+
-		"(requires -dht)")
-	stunAddr := fs.String("stun", "", "STUN server host:port (RFC 5389 Binding) used to discover this node's "+
-		"server-reflexive public address and advertise it to peers exactly like -advertise (spec §6.2); refreshed "+
-		"every 60s so address changes are picked up. Ignored when -advertise is set (an explicit address always "+
-		"wins over a discovered one). freens ships no TURN relay — for symmetric NAT run an external relay (e.g. "+
-		"coturn) and set -advertise to the relay address (see contrib/README.md) (requires -dht)")
-	persistDir := fs.String("persist", "", "directory to persist the envelope store to (<keyhex>.cbor files) every 60s and at shutdown (requires -dht)")
-	idnaFlag := fs.Bool("idna", false, "accept IDNA2008 U-label aliases (spec §3.2): normalize non-ASCII (raw\n"+
-		"UTF-8) alias/TLD components of query names to punycode A-labels via UTS #46\n"+
-		"(transitional=false, useSTD3Rules=true). NOTE: this only affects queries that\n"+
-		"carry a raw U-label as bytes — real stub resolvers and browsers already send\n"+
-		"punycode (xn--…) ASCII, which strict LDH accepts either way; subdomain labels\n"+
-		"(the part before the alias) stay strict ASCII LDH regardless. Equivalent to\n"+
-		"[options] \"idna = true\" in the config file; an explicit -idna=false overrides it.")
+	f := defineFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	configPath, listenAddr, dnsAddr, upstreamCSV, loadDir := f.configPath, f.listenAddr, f.dnsAddr, f.upstreamCSV, f.loadDir
+	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr := f.dhtAddr, f.nodeSeedHex, f.peersCSV, f.peersFile, f.metricsAddr
+	passive, advertiseAddr, stunAddr := f.passive, f.advertiseAddr, f.stunAddr
+	turnAddr, turnRelayAddr, persistDir, idnaFlag := f.turnAddr, f.turnRelayAddr, f.persistDir, f.idna
 
 	// -idna override semantics (mirroring -listen/-upstream): an explicitly
 	// passed flag wins; otherwise the config file's [options] idna decides;
@@ -214,10 +188,29 @@ func run(args []string) error {
 	var dhtNode *dht.Node
 	var dhtLookup *dht.DHTLookup
 	var freens resolver.RecordLookup = dht.NewStoreLookup(store)
+	// -turn / -turn-relay both require the DHT transport; warn-and-ignore
+	// mirrors -persist (a relay server without a node serves no one; a node
+	// without the DHT transport has no peer UDP to tunnel).
+	if *dhtAddr == "" {
+		if *turnAddr != "" {
+			logger.Warn("-turn requires -dht; ignoring", "turn", *turnAddr)
+		}
+		if *turnRelayAddr != "" {
+			logger.Warn("-turn-relay requires -dht; ignoring", "turn-relay", *turnRelayAddr)
+		}
+	}
 	if *dhtAddr != "" {
 		nodeKP, err := loadNodeKey(*nodeSeedHex)
 		if err != nil {
 			return fmt.Errorf("node key: %w", err)
+		}
+		// -turn: co-located community relay server. Zero values for every
+		// knob except ListenAddr/Log let internal/turn's defaults apply
+		// (MaxAllocsPerIP, DefaultLifetime/MaxLifetime, MaxPermissions —
+		// see the flag help).
+		var turnSrvCfg *turn.ServerConfig
+		if *turnAddr != "" {
+			turnSrvCfg = &turn.ServerConfig{ListenAddr: *turnAddr, Log: logger}
 		}
 		node, err := dht.NewNode(dht.NodeConfig{
 			Keypair:    nodeKP,
@@ -227,6 +220,8 @@ func run(args []string) error {
 			Passive:    *passive,
 			Advertise:  *advertiseAddr,
 			Stun:       *stunAddr,
+			TurnRelay:  *turnRelayAddr,
+			TurnServer: turnSrvCfg,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)
@@ -262,7 +257,26 @@ func run(args []string) error {
 			// source (Node.Start logs a warning if a passed -advertise was
 			// invalid and could not be honored).
 			"advertise", *advertiseAddr,
+			"turn_server", *turnAddr,
+			"turn_relay", *turnRelayAddr,
 		)
+		// TURN startup verdicts, mirroring the -advertise/-stun style logs:
+		// the relay outcome is known right after Start (the allocation dials
+		// inside it — dht logged the relayed address on success); the TURN
+		// server's concrete bound address (e.g. for :0) only exists now.
+		if *turnRelayAddr != "" {
+			if node.RelayedMode() {
+				logger.Info("TURN relay mode active; advertising the relayed address", "relay", *turnRelayAddr)
+			} else {
+				logger.Warn("TURN relay mode inactive; using direct UDP + observed source", "relay", *turnRelayAddr)
+			}
+		}
+		if ts := node.TURNServer(); ts != nil {
+			if a, aerr := ts.Addr(); aerr == nil {
+				logger.Info("TURN server listening (also answers STUN Binding; usable as a -stun target)",
+					"addr", a.String())
+			}
+		}
 		if peers := parsePeers(*peersCSV); len(peers) > 0 {
 			logger.Info("bootstrapping DHT peers", "count", len(peers))
 			node.Bootstrap(context.Background(), peers)
@@ -303,6 +317,10 @@ func run(args []string) error {
 	histEnvGauge := reg.NewGauge("freens_dht_history_envelopes", "Superseded envelopes retained as §8.3 audit history.")
 	gossipDiffGauge := reg.NewGauge("freens_dht_gossip_difficulty", "Network PoW difficulty in bits: median of peers' advertised witness difficulties (Appendix A.4).")
 	cacheEntriesGauge := reg.NewGauge("freens_resolver_cache_entries", "Entries currently held in the §10.4 response cache.")
+	turnAllocGauge := reg.NewGauge("freens_turn_allocations",
+		"Active TURN allocations on this node's co-located TURN server (-turn; absent when the server is off).")
+	turnRelayGauge := reg.NewGauge("freens_turn_relay",
+		"1 when this node routes its peer UDP through a TURN allocation (-turn-relay), 0 otherwise.")
 	dnsQueriesCounter := reg.NewCounter("freens_dns_queries_total",
 		"DNS queries answered, by question type and response status (noerror/nxdomain/servfail).", "qtype", "status")
 
@@ -338,6 +356,10 @@ func run(args []string) error {
 		uptimeGauge.With().Set(time.Since(processStart).Seconds())
 		if dhtNode != nil {
 			dhtPeersGauge.With().Set(float64(dhtNode.RoutingTable().Size()))
+			if ts := dhtNode.TURNServer(); ts != nil {
+				turnAllocGauge.With().Set(float64(ts.Allocations()))
+			}
+			turnRelayGauge.With().Set(boolGauge(dhtNode.RelayedMode()))
 		}
 		storeEnvGauge.With().Set(float64(store.Count()))
 		histEnvGauge.With().Set(float64(store.HistoryCount()))
@@ -630,6 +652,72 @@ func newMetricsHandler(reg *metrics.Registry) http.Handler {
 // K_tld / else → K_name routing rule lives in dht.KeyForWireName; the daemon's
 // -load seeding below uses the same rule when keying envelopes.
 
+// flags bundles the command-line flag pointers returned by defineFlags. It
+// exists so tests can exercise the flag definitions (names, defaults, help)
+// without spinning up the daemon; run() unpacks them into the same local
+// variables it always used.
+type flags struct {
+	configPath, listenAddr, dnsAddr, upstreamCSV, loadDir        *string
+	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr       *string
+	advertiseAddr, stunAddr, turnAddr, turnRelayAddr, persistDir *string
+	passive, idna                                                *bool
+}
+
+// defineFlags registers every freens flag on fs and returns their value
+// pointers (flag.Parse must be called by the caller).
+func defineFlags(fs *flag.FlagSet) *flags {
+	f := &flags{}
+	f.configPath = fs.String("config", "", "path to resolver config file (optional; built-in default if absent)")
+	f.listenAddr = fs.String("listen", "", "override UDP listen address (default from config)")
+	f.dnsAddr = fs.String("dns", "", "override BOTH the UDP and TCP DNS listen addresses, e.g. 127.0.0.1:5300 "+
+		"(default from config; empty leaves the config addresses untouched)")
+	f.upstreamCSV = fs.String("upstream", "", "override upstream DNS servers (comma/space separated)")
+	f.loadDir = fs.String("load", "", "directory of *.cbor envelope files to seed the in-process store on startup")
+	f.dhtAddr = fs.String("dht", "", "UDP address for the DHT transport (e.g. :15353); empty disables the DHT node")
+	f.nodeSeedHex = fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this node's DHT identity; generated if empty")
+	f.peersCSV = fs.String("peers", "", "comma-separated bootstrap peers as addr#<64-hex-pubkey>")
+	f.peersFile = fs.String("peers-file", "", "newline-separated peers file (one addr#<64-hex-pubkey> per line; blank lines\n"+
+		"and lines starting with # are skipped), loaded at startup and re-loaded on SIGHUP\n"+
+		"(re-parse + AddPeer each entry, idempotent)")
+	f.metricsAddr = fs.String("metrics", "", "listen address for the operational HTTP endpoint exposing /metrics\n"+
+		"(Prometheus text format) and /healthz, e.g. :9153; empty disables the endpoint")
+	f.passive = fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
+	f.advertiseAddr = fs.String("advertise", "", "address peers should dial to reach this node's DHT transport, host:port "+
+		"(spec §6.2 \"nodes advertise (ip, port, node_pubkey)\") — for NAT/port-forward setups where the observed UDP "+
+		"source is a private address peers cannot dial back; validated at startup, empty = peers learn the observed source "+
+		"(requires -dht)")
+	f.stunAddr = fs.String("stun", "", "STUN server host:port (RFC 5389 Binding) used to discover this node's "+
+		"server-reflexive public address and advertise it to peers exactly like -advertise (spec §6.2); refreshed "+
+		"every 60s so address changes are picked up. Ignored when -advertise is set (an explicit address always "+
+		"wins over a discovered one) and in -turn-relay mode (the relayed address is advertised instead; STUN "+
+		"remains the fallback when the allocation fails). For symmetric NAT — no usable reflexive mapping — "+
+		"prefer -turn-relay (requires -dht)")
+	f.turnAddr = fs.String("turn", "", "run a freens TURN server (RFC 8656 subset) alongside the DHT node so\n"+
+		"symmetric-NAT peers can relay through this daemon's spare bandwidth (community\n"+
+		"relay tier): host:port to bind, e.g. :3478 (requires -dht). Auth is freens-\n"+
+		"native node-key signatures; the socket also answers STUN Binding requests,\n"+
+		"so it doubles as a -stun target. Server knobs — MaxAllocsPerIP (allocations\n"+
+		"per source IP), DefaultLifetime / MaxLifetime of allocations, and\n"+
+		"MaxPermissions per allocation — are left at zero here so internal/turn's\n"+
+		"defaults apply")
+	f.turnRelayAddr = fs.String("turn-relay", "", "route ALL of this node's peer UDP through a TURN allocation on the\n"+
+		"given freens TURN server (host:port) and advertise the RELAYED address to\n"+
+		"peers (spec §6.2) — the dialable address for nodes behind symmetric NAT\n"+
+		"(requires -dht). Precedence: -advertise > -turn-relay > -stun (an explicit\n"+
+		"address always wins; STUN is skipped in relay mode and remains the fallback).\n"+
+		"If the allocation fails the node logs a warning and falls back to direct\n"+
+		"UDP + observed source")
+	f.persistDir = fs.String("persist", "", "directory to persist the envelope store to (<keyhex>.cbor files) every 60s and at shutdown (requires -dht)")
+	f.idna = fs.Bool("idna", false, "accept IDNA2008 U-label aliases (spec §3.2): normalize non-ASCII (raw\n"+
+		"UTF-8) alias/TLD components of query names to punycode A-labels via UTS #46\n"+
+		"(transitional=false, useSTD3Rules=true). NOTE: this only affects queries that\n"+
+		"carry a raw U-label as bytes — real stub resolvers and browsers already send\n"+
+		"punycode (xn--…) ASCII, which strict LDH accepts either way; subdomain labels\n"+
+		"(the part before the alias) stay strict ASCII LDH regardless. Equivalent to\n"+
+		"[options] \"idna = true\" in the config file; an explicit -idna=false overrides it.")
+	return f
+}
+
 // loadConfig parses the config file at path, or the built-in default if path is
 // empty.
 func loadConfig(path string) (*resolver.Config, error) {
@@ -746,6 +834,14 @@ func seedFromDir(store *dht.EnvelopeStore, dir string, logger *slog.Logger) (int
 		}
 	}
 	return count, nil
+}
+
+// boolGauge renders a bool as a gauge value (1/0).
+func boolGauge(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // splitCSV splits a comma/space/tab-separated list, dropping empties.

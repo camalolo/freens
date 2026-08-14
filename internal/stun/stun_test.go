@@ -51,7 +51,7 @@ func tAttr(typ uint16, val []byte) []byte {
 func tXORValue(ip net.IP, port int, txid []byte) []byte {
 	cookie := [4]byte{0x21, 0x12, 0xa4, 0x42}
 	p := uint16(port) ^ 0x2112
-	v := []byte{familyIPv4, byte(p >> 8), byte(p)}
+	v := []byte{0, familyIPv4, byte(p >> 8), byte(p)} // §15.2: zero byte first
 	ip4 := ip.To4()
 	for i := range ip4 {
 		v = append(v, ip4[i]^cookie[i])
@@ -62,7 +62,7 @@ func tXORValue(ip net.IP, port int, txid []byte) []byte {
 // tPlainValue encodes a §15.1 MAPPED-ADDRESS value (no XOR).
 func tPlainValue(ip net.IP, port int) []byte {
 	p := uint16(port)
-	v := []byte{familyIPv4, byte(p >> 8), byte(p)}
+	v := []byte{0, familyIPv4, byte(p >> 8), byte(p)} // §15.1: zero byte first
 	return append(v, ip.To4()...)
 }
 
@@ -199,7 +199,7 @@ func TestClientRejectsMalformedResponses(t *testing.T) {
 		}},
 		{"ipv4 value with ipv6 length", func(req []byte, src *net.UDPAddr) []byte {
 			return tHeader(msgBindingSuccess, req[8:headerLen],
-				tAttr(attrXORMappedAddress, append([]byte{familyIPv6, 0, 0}, replyIP.To4()...)))
+				tAttr(attrXORMappedAddress, append([]byte{0, familyIPv6, 0, 0}, replyIP.To4()...)))
 		}},
 	}
 	for _, tc := range cases {
@@ -271,7 +271,7 @@ func TestParseXORAddressIPv6(t *testing.T) {
 	copy(key[4:], txid)
 	val := make([]byte, 0, 20)
 	p := uint16(4040) ^ 0x2112
-	val = append(val, familyIPv6, byte(p>>8), byte(p))
+	val = append(val, 0, familyIPv6, byte(p>>8), byte(p)) // §15.2: zero byte first
 	for i := 0; i < 16; i++ {
 		val = append(val, ip.To16()[i]^key[i])
 	}

@@ -12,16 +12,35 @@
 # update once, converge everywhere.
 #
 # Usage:
-#	testnet.sh [N=5] [workdir]
+#	testnet.sh [N=5] [mode=direct] [workdir]
 #
 #   N        number of nodes (>= 2; default 5)
+#   mode     "direct" (default) or "relay" — see "Relay mode" below;
+#            -h/--help prints this header
 #   workdir  scratch dir (default: mktemp -d); per-node state in n<i>/,
-#            binaries in bin/, records in records/, daemon log in log
+#            binaries in bin/, records in records/, daemon log in log.
+#            A second argument containing "/" (a path) is still taken as
+#            the workdir — the pre-mode calling convention keeps working
 #
 # Node i listens on DHT 127.0.0.1:$((15353+i)) and DNS 127.0.0.1:$((5300+i));
 # nodes 2..N bootstrap from node 1 (-peers 127.0.0.1:15354#<pk1>), node 1 has
-# no -peers. Every node passes -advertise (§6.2) and -persist so the run also
-# exercises the advertised-address and persistence paths.
+# no -peers. Every node passes -persist so the run exercises the persistence
+# path; in direct mode every node also passes -advertise (§6.2) so the
+# advertised-address path is exercised as well.
+#
+# Relay mode (simulated symmetric NAT — nodes 2..N are undialable directly):
+# node 1 additionally runs a community TURN relay, -turn 127.0.0.1:3470. The
+# TURN port is FIXED at $((3470 + 0)) rather than :0 because nodes 2..N must
+# be able to aim their -turn-relay flags at it by address (and 3470 keeps the
+# conventional TURN port 3478 free for a real relay on the host). Nodes 2..N
+# DROP -advertise and instead get -turn-relay 127.0.0.1:3470: ALL their peer
+# DHT traffic is tunneled through an allocation on node 1's relay and peers
+# see only the RELAYED address. (-advertise must go for them: it takes
+# precedence over -turn-relay, so keeping it would short-circuit the relayed
+# path and defeat the test.) Node 1 keeps -advertise — it plays the one
+# public, directly-dialable node. The same assertions run, so a PASS proves
+# publish + seq+1 update converge on every node when only node 1 is dialable
+# and everyone else relays.
 #
 # Alias resolution: the test alias "tn" is routed freens-side and pinned via
 # [alias-pins] (§9.3; a pin always wins). The §7 network-claim path
@@ -33,25 +52,51 @@
 #
 # Requirements: bash, GNU coreutils, go (>= 1.25), dig (bind9 dnsutils).
 # Run from the repo root. Exits 0 and prints "PASS: N nodes converged" on
-# success; on any failure it dumps the tail of every node log and exits 1.
-# All daemons are killed on exit (trap).
+# success ("PASS: N nodes converged via TURN relay" in relay mode); on any
+# failure it dumps the tail of every node log and exits 1. All daemons are
+# killed on exit (trap).
 
 set -euo pipefail
 
+case "${1:-}" in
+-h | --help)
+	sed -n '2,/^$/p' "$0" # -h/--help: print the usage header above
+	exit 0
+	;;
+esac
+
 N="${1:-5}"
-WORK="${2:-$(mktemp -d)}"
+MODE="${2:-direct}"
+WORK="${3:-}"
+
+# Pre-mode compatibility: the second argument used to be the workdir —
+# path-shaped values (containing a "/") are still taken as one; anything
+# else must be a mode name.
+if [ -n "${2:-}" ] && [ "$MODE" != "direct" ] && [ "$MODE" != "relay" ]; then
+	case "$MODE" in
+	*/*) WORK="$MODE" MODE="direct" ;;
+	esac
+fi
 
 die() { echo "testnet: FAIL: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$2"; }
 
 [[ "$N" =~ ^[0-9]+$ ]] || die "N must be an integer, got '$N'"
 [ "$N" -ge 2 ] || die "N must be >= 2 (the point is multi-node convergence), got $N"
+case "$MODE" in
+direct | relay) ;;
+*) die "mode must be 'direct' or 'relay', got '$MODE'" ;;
+esac
+[ -n "$WORK" ] || WORK="$(mktemp -d)"
 need dig "dig (bind9/bind9-dnsutils) is required for the DNS assertions"
 need go "go (>= 1.25) is required to build the binaries"
 
 # Node 1's fixed ports (peers of nodes 2..N point here).
 DHT_PORT_BASE=15353   # node i -> $((DHT_PORT_BASE + i)); node 1 = 15354
 DNS_PORT_BASE=5300    # node i -> $((DNS_PORT_BASE + i)); node 1 = 5301
+TURN_PORT=$((3470 + 0)) # relay mode, node 1's fixed -turn port = 3470 (not :0
+                         # — nodes 2..N aim -turn-relay here by flag; also
+                         # leaves the conventional 3478 free on the host)
 ALIAS="tn"            # the test alias (routed freens + pinned per node)
 
 mkdir -p "$WORK/bin"
@@ -93,7 +138,7 @@ wait_for_ip() {
 	return 1
 }
 
-echo "testnet: workdir=$WORK nodes=$N"
+echo "testnet: workdir=$WORK nodes=$N mode=$MODE"
 
 # --- build (run from repo root) -------------------------------------------------
 echo "testnet: building freens + freens-cli"
@@ -150,15 +195,33 @@ EOF
 		-node-seed "${SEEDS[$i]}"
 		-persist "$WORK/n$i/records"
 		-idna
-		-advertise "127.0.0.1:$dht_port"
 		-config "$WORK/n$i/resolver.conf"
 	)
+	if [ "$MODE" = "relay" ] && [ "$i" -eq 1 ]; then
+		# node 1: the one public node — keeps -advertise, hosts the relay
+		args+=(-advertise "127.0.0.1:$dht_port" -turn "127.0.0.1:$TURN_PORT")
+	elif [ "$MODE" = "relay" ]; then
+		# nodes 2..N: symmetric-NAT stand-ins — no -advertise (it would win
+		# over -turn-relay), all peer traffic via the allocation
+		args+=(-turn-relay "127.0.0.1:$TURN_PORT")
+	else
+		args+=(-advertise "127.0.0.1:$dht_port")
+	fi
 	if [ "$i" -gt 1 ]; then
 		args+=(-peers "127.0.0.1:$((DHT_PORT_BASE + 1))#$PK1")
 	fi
 	"$FREENS" "${args[@]}" >"$WORK/n$i/log" 2>&1 &
 	PIDS+=("$!")
-	echo "testnet: node $i started (dht :$dht_port, dns :$dns_port, pid ${PIDS[-1]})"
+	if [ "$MODE" = "relay" ]; then
+		if [ "$i" -eq 1 ]; then
+			sleep 1 # let node 1's -turn listener bind before nodes 2..N allocate on it
+			echo "testnet: node 1 started (dht :$dht_port, dns :$dns_port, turn :$TURN_PORT, pid ${PIDS[-1]})"
+		else
+			echo "testnet: node $i started (dht :$dht_port, dns :$dns_port, via -turn-relay :$TURN_PORT, pid ${PIDS[-1]})"
+		fi
+	else
+		echo "testnet: node $i started (dht :$dht_port, dns :$dns_port, pid ${PIDS[-1]})"
+	fi
 done
 
 # --- readiness: node 1's DNS port answers (any rcode counts — incl. the
@@ -208,4 +271,8 @@ for i in $(seq 1 "$N"); do
 	wait_for_ip $((DNS_PORT_BASE + i)) "$IP_V2" "update"
 done
 
-echo "PASS: $N nodes converged"
+if [ "$MODE" = "relay" ]; then
+	echo "PASS: $N nodes converged via TURN relay"
+else
+	echo "PASS: $N nodes converged"
+fi

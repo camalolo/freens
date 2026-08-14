@@ -9,6 +9,12 @@ package dht
 // on every outbound query's "advertise" arg, so peers learnPeer this node at
 // its public address instead of the NAT'd private observed source.
 //
+// Precedence note: Advertise > TurnRelay > Stun. In TURN relay mode
+// (NodeConfig.TurnRelay, transport.go step (b)) the allocation's relayed
+// address is already advertised when startSTUN runs, so the monitor's
+// no-op-when-advertised check below skips it naturally; STUN remains the
+// discovery fallback when the allocation failed and direct UDP survived.
+//
 // Lifecycle note (why the monitor is NOT registered in n.bgWg): Close()
 // runs stopBackground() — which WAITS on n.bgWg — BEFORE storing n.closed,
 // and this monitor's only shutdown signal is n.closed. Registering it in

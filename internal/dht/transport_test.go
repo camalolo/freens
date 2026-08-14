@@ -430,7 +430,7 @@ func TestUnverifiedMessageDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ := msg.Bytes()
-	if _, err := a.conn.WriteToUDP(data, addr); err != nil {
+	if _, err := a.conn.WriteTo(data, addr); err != nil {
 		t.Fatal(err)
 	}
 	// No response channel was registered (we bypassed sendQuery), so a dropped

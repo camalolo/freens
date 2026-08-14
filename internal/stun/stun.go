@@ -295,12 +295,18 @@ func parseBindingResponse(msg, txid []byte) (*net.UDPAddr, error) {
 // splitAddress splits an address-attribute value (§15.1 layout) into family,
 // port and raw address bytes, validating the raw length against the family.
 func splitAddress(val []byte) (fam byte, port uint16, raw []byte, err error) {
-	if len(val) < 4 {
-		return 0, 0, nil, fmt.Errorf("value is %d bytes, want at least 4 (family+port+address)", len(val))
+	// §15.1/§15.2 value layout: one zero byte, family(1), port(2),
+	// address(4|16) — the leading zero byte is REQUIRED by RFC 5389
+	// (accepted by RFC 3489 parsers as a reserved byte).
+	if len(val) < 8 {
+		return 0, 0, nil, fmt.Errorf("value is %d bytes, want at least 8 (zero+family+port+address)", len(val))
 	}
-	fam = val[0]
-	port = binary.BigEndian.Uint16(val[1:3])
-	raw = val[3:]
+	if val[0] != 0 {
+		return 0, 0, nil, fmt.Errorf("address leading byte is 0x%02x, want 0", val[0])
+	}
+	fam = val[1]
+	port = binary.BigEndian.Uint16(val[2:4])
+	raw = val[4:]
 	switch fam {
 	case familyIPv4:
 		if len(raw) != 4 {
@@ -494,7 +500,11 @@ func buildBindingSuccess(txid []byte, raddr *net.UDPAddr) []byte {
 		fam = familyIPv6
 		raw = raddr.IP.To16()
 	}
-	vlen := 3 + len(raw) // family(1) + port(2) + address
+	// §15.2 value layout: one zero byte, family(1), port(2), address(4|16).
+	// (The leading zero byte is REQUIRED by RFC 5389 — it is what makes
+	// this reply parseable by standard STUN implementations such as
+	// coturn, not just by this package's client.)
+	vlen := 4 + len(raw)
 
 	msg := make([]byte, headerLen+attrHdrLen+vlen)
 	binary.BigEndian.PutUint16(msg[0:2], msgBindingSuccess)
@@ -506,9 +516,10 @@ func buildBindingSuccess(txid []byte, raddr *net.UDPAddr) []byte {
 	binary.BigEndian.PutUint16(msg[off:off+2], attrXORMappedAddress)
 	binary.BigEndian.PutUint16(msg[off+2:off+4], uint16(vlen))
 	off += attrHdrLen
-	msg[off] = fam
-	binary.BigEndian.PutUint16(msg[off+1:off+3], uint16(raddr.Port)^uint16(magicCookie>>16))
-	off += 3
+	msg[off] = 0 // §15.2: the first 8 bits of the address are zero
+	msg[off+1] = fam
+	binary.BigEndian.PutUint16(msg[off+2:off+4], uint16(raddr.Port)^uint16(magicCookie>>16))
+	off += 4
 	if fam == familyIPv4 {
 		var cookie [4]byte
 		binary.BigEndian.PutUint32(cookie[:], magicCookie)

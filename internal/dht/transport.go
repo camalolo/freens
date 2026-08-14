@@ -61,6 +61,7 @@ import (
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/crypto"
 	"github.com/laurent/freens/internal/naming"
+	"github.com/laurent/freens/internal/turn"
 	"github.com/laurent/freens/internal/wire"
 )
 
@@ -198,6 +199,18 @@ type NodeConfig struct {
 	// changes are picked up. Empty ⇒ off. Ignored when Advertise is set
 	// (an explicit address always wins over a discovered one).
 	Stun string
+	// TurnRelay is a freens TURN server "host:port" (RFC 8656 subset, internal/turn).
+	// When set (and Advertise empty), the node allocates a relayed address on that
+	// server, routes ALL peer UDP through the allocation, and advertises the
+	// RELAYED address to peers (§6.2) — for symmetric-NAT nodes no dialable
+	// address exists otherwise. Precedence: Advertise > TurnRelay > Stun, with
+	// graceful fallback to direct UDP when the allocation fails (warn log).
+	TurnRelay string
+	// TurnServer, when non-nil, runs a TURN server alongside the node: nodes with
+	// spare bandwidth relay for the network (community relay tier). Auth is
+	// freens-native (node-key signatures, internal/turn docs); the socket also
+	// answers STUN Binding, so it doubles as a -stun target.
+	TurnServer *turn.ServerConfig
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -212,7 +225,7 @@ type Node struct {
 	kp             *crypto.Keypair
 	id             []byte
 	listenAddr     string
-	conn           *net.UDPConn
+	conn           net.PacketConn
 	closed         atomic.Bool
 	passive        bool
 	refreshEvery   time.Duration // resolved: >0 = run refresh loop
@@ -244,6 +257,20 @@ type Node struct {
 
 	// stun is the raw NodeConfig.Stun server address ("" ⇒ no monitor).
 	stun string
+
+	// TURN wiring (see Start steps (b)/(d)): turnRelay is the raw
+	// NodeConfig.TurnRelay server address ("" ⇒ client relay off);
+	// turnSrvCfg is the NodeConfig.TurnServer config (nil ⇒ no co-located
+	// server). turnServer is the running server handle once ListenTURN
+	// succeeded at Start (nil otherwise; read via TURNServer). turnConn is
+	// the active allocation in relay mode (nil in direct mode — including
+	// the graceful fallback). relayed mirrors turnConn != nil atomically so
+	// RelayedMode is race-free from any goroutine.
+	turnRelay  string
+	turnSrvCfg *turn.ServerConfig
+	turnServer *turn.Server
+	turnConn   *turn.Conn
+	relayed    atomic.Bool
 
 	// §6.2 live eviction: readLoop-side callers (learnPeer runs on the read
 	// goroutine) hand full-bucket contacts to a single serialized maintenance
@@ -366,6 +393,8 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		nowFn:          now,
 		advertise:      cfg.Advertise,
 		stun:           cfg.Stun,
+		turnRelay:      cfg.TurnRelay,
+		turnSrvCfg:     cfg.TurnServer,
 		evictCh:        make(chan *NodeContact, evictQueueCap),
 		evictPending:   make(map[int]bool),
 		witnessLast:    make(map[string]witnessSigned),
@@ -395,6 +424,18 @@ func (n *Node) PublicKey() []byte { return append([]byte(nil), n.kp.Public()...)
 // RoutingTable returns the node's routing table (for diagnostics/tests).
 func (n *Node) RoutingTable() *RoutingTable { return n.rt }
 
+// TURNServer returns the co-located TURN server started from
+// NodeConfig.TurnServer, or nil when none is running — the daemon's
+// freens_turn_allocations gauge guards on this.
+func (n *Node) TURNServer() *turn.Server { return n.turnServer }
+
+// RelayedMode reports whether this node's transport currently routes peer
+// UDP through a TURN allocation (the NodeConfig.TurnRelay dial succeeded at
+// Start): every datagram flows via the relayed address, which is also the
+// address advertised to peers. False in direct-UDP mode, including the
+// graceful fallback when the allocation failed.
+func (n *Node) RelayedMode() bool { return n.relayed.Load() }
+
 // advertised returns the current §6.2 advertised address ("" ⇒ observed
 // source). Safe for concurrent use; the STUN monitor may change it at runtime.
 func (n *Node) advertised() string {
@@ -413,7 +454,12 @@ func (n *Node) setAdvertise(a string) {
 
 // Start binds the UDP socket and launches the read loop and the background
 // maintenance loops (§6.2 bucket refresh; §6.4 step 4 republish timer unless
-// Passive). It returns once the socket is bound; the loops run until Close.
+// Passive). In relay mode (NodeConfig.TurnRelay set, Advertise empty) it
+// first allocates a TURN relayed address and REPLACES the direct socket with
+// the tunnel; the STUN monitor then no-ops naturally (an address is already
+// advertised). With NodeConfig.TurnServer set it finally starts the
+// co-located TURN server. It returns once the socket is bound (and the
+// allocation, if any, is active); the loops run until Close.
 func (n *Node) Start() error {
 	// §6.2 advertised address: validate ONCE here. A non-resolvable
 	// host:port (or a missing host/port) logs a warning and falls back to
@@ -427,6 +473,9 @@ func (n *Node) Start() error {
 			n.advertise = a.String() // canonical resolved form
 		}
 	}
+	// (a) Direct UDP bind. The socket is ALWAYS the node's own; in relay
+	// mode (step b) the tunnel replaces it — peers then reach this node
+	// only at its relayed address.
 	addr, err := net.ResolveUDPAddr("udp", n.listenAddr)
 	if err != nil {
 		return fmt.Errorf("dht: resolve %q: %w", n.listenAddr, err)
@@ -436,27 +485,120 @@ func (n *Node) Start() error {
 		return fmt.Errorf("dht: listen %q: %w", n.listenAddr, err)
 	}
 	n.conn = conn
-	// Reasonable socket buffers for bursty small DHT datagrams.
-	_ = conn.SetReadBuffer(1 << 20)
-	_ = conn.SetWriteBuffer(1 << 20)
+	// Reasonable socket buffers for bursty small DHT datagrams. The field is
+	// typed net.PacketConn so it can hold a tunneled (TURN-relayed) conn in
+	// relay mode; kernel buffer knobs only exist on a real *net.UDPConn, so
+	// the assertion doubles as the guard — tunneled conns skip it. (On THIS
+	// path conn is always the direct UDP socket; the swap happens below.)
+	if u, ok := n.conn.(*net.UDPConn); ok {
+		_ = u.SetReadBuffer(1 << 20)
+		_ = u.SetWriteBuffer(1 << 20)
+	}
+
+	// (b) TURN client relay (§6.2 dialable address via the RFC 8656 subset
+	// in internal/turn): with no explicit Advertise, allocate a relayed
+	// address and route ALL peer UDP through the allocation — for a
+	// symmetric-NAT node no dialable address exists otherwise. Precedence:
+	// Advertise > TurnRelay > Stun. An unreachable relay degrades to direct
+	// UDP + observed source (warn; never fail Start). The refresh loop for
+	// the allocation lives INSIDE turn.Conn (its Close deallocates); none of
+	// this runs on a bgWg-tracked goroutine, so Close ordering is safe.
+	if n.turnRelay != "" && n.advertised() == "" {
+		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		tc, derr := (&turn.Client{Server: n.turnRelay, NodeKey: n.kp, Log: n.log}).Dial(dctx)
+		dcancel()
+		switch {
+		case derr != nil:
+			n.log.Warn("dht: TURN relay allocation failed; falling back to direct UDP + observed source",
+				"relay", n.turnRelay, "err", derr)
+		case tc.RelayedAddr() == nil:
+			// Defensive: an allocation without a relayed address is useless.
+			n.log.Warn("dht: TURN relay returned no relayed address; falling back to direct UDP + observed source",
+				"relay", n.turnRelay)
+			_ = tc.Close()
+		default:
+			relayed := tc.RelayedAddr()
+			_ = conn.Close() // the direct socket is replaced by the tunnel
+			n.conn = turnPacketConn{tc}
+			n.turnConn = tc
+			n.relayed.Store(true)
+			n.setAdvertise(relayed.String())
+			n.log.Info("dht: TURN relay active; routing peer UDP via allocation",
+				"relay", n.turnRelay, "relayed", relayed.String())
+		}
+	} else if n.turnRelay != "" {
+		n.log.Info("dht: explicit Advertise set; TURN relay disabled (explicit address wins)",
+			"advertise", n.advertised(), "relay", n.turnRelay)
+	}
+
 	n.startBackground()
+	// (c) STUN AFTER the relay attempt: in relay mode an address (the
+	// relayed one) is already advertised, so startSTUN's existing
+	// no-op-when-advertised check skips the monitor naturally; when the
+	// allocation failed the direct socket survived and STUN remains the
+	// discovery fallback.
 	n.startSTUN()
 	go n.readLoop()
+
+	// (d) Co-located TURN server (community relay tier): nodes with spare
+	// bandwidth relay for the network. A listen failure fails Start — the
+	// operator explicitly requested a server, and a silently missing one is
+	// an outage — after tearing down what already started above.
+	if n.turnSrvCfg != nil {
+		srv, serr := turn.ListenTURN(*n.turnSrvCfg)
+		if serr != nil {
+			n.stopBackground()
+			n.closed.Store(true)
+			_ = n.conn.Close()
+			return fmt.Errorf("dht: TURN server listen %q: %w", n.turnSrvCfg.ListenAddr, serr)
+		}
+		n.turnServer = srv
+		if a, aerr := srv.Addr(); aerr == nil {
+			n.log.Info("dht: TURN server listening (community relay tier; socket also answers STUN Binding)",
+				"addr", a.String())
+		}
+	}
 	return nil
 }
 
 // Close stops the background loops (blocking until they have exited — their
 // in-flight RPCs return promptly via context cancellation, so no goroutines
-// leak), stops the read loop, and closes the UDP socket. Pending sendQuery
-// callers will time out normally.
+// leak), stops the read loop, closes the transport socket (in relay mode
+// this deallocates the TURN allocation via turn.Conn.Close) and the
+// co-located TURN server. The TURN server closes FIRST so relaying peers
+// observe the shutdown before the node's own transport does. Pending
+// sendQuery callers will time out normally.
 func (n *Node) Close() error {
 	n.stopBackground()
 	n.closed.Store(true)
-	if n.conn != nil {
-		return n.conn.Close()
+	var errs []error
+	if n.turnServer != nil {
+		if err := n.turnServer.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	if n.conn != nil {
+		if err := n.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
+
+// turnPacketConn adapts a *turn.Conn (the pinned internal/turn client API:
+// ReadFrom/WriteTo/LocalAddr/Close/SetDeadline) to the net.PacketConn that
+// Node.conn requires. The two per-direction deadline setters have no turn
+// counterpart and both map to SetDeadline; nothing in the dht transport
+// sets deadlines on n.conn, so the collapsing is unobservable here.
+type turnPacketConn struct{ c *turn.Conn }
+
+func (t turnPacketConn) ReadFrom(p []byte) (int, net.Addr, error)  { return t.c.ReadFrom(p) }
+func (t turnPacketConn) WriteTo(p []byte, a net.Addr) (int, error) { return t.c.WriteTo(p, a) }
+func (t turnPacketConn) LocalAddr() net.Addr                       { return t.c.LocalAddr() }
+func (t turnPacketConn) Close() error                              { return t.c.Close() }
+func (t turnPacketConn) SetDeadline(tm time.Time) error            { return t.c.SetDeadline(tm) }
+func (t turnPacketConn) SetReadDeadline(tm time.Time) error        { return t.c.SetDeadline(tm) }
+func (t turnPacketConn) SetWriteDeadline(tm time.Time) error       { return t.c.SetDeadline(tm) }
 
 func (n *Node) now() int64 {
 	if n.nowFn != nil {
@@ -475,7 +617,7 @@ func rpcTimeout() time.Duration { return time.Duration(constants.RPCTimeoutSec) 
 func (n *Node) readLoop() {
 	buf := make([]byte, 65535)
 	for {
-		nread, raddr, err := n.conn.ReadFromUDP(buf)
+		nread, raddr, err := n.conn.ReadFrom(buf)
 		if err != nil {
 			if n.closed.Load() {
 				return
@@ -483,10 +625,38 @@ func (n *Node) readLoop() {
 			n.log.Debug("dht: read error", "err", err)
 			continue
 		}
-		// Copy out of the read buffer (the next ReadFromUDP overwrites it).
+		// Copy out of the read buffer (the next ReadFrom overwrites it).
 		pkt := make([]byte, nread)
 		copy(pkt, buf[:nread])
-		n.handle(pkt, raddr)
+		// Narrow the interface-typed remote address; a non-UDP-shaped one
+		// (nil — see asUDP) is dropped: the §6.3 handlers key on the UDP
+		// observed source and have nothing to act on without it.
+		if u := asUDP(raddr); u != nil {
+			n.handle(pkt, u)
+		}
+	}
+}
+
+// asUDP narrows a read-loop remote address to *net.UDPAddr, keeping the
+// inbound handlers (handle/learnPeer/token binding) on the concrete UDP
+// address type. The direct socket always yields *net.UDPAddr; a tunneled
+// (TURN-relayed, relay mode) conn reports whatever net.Addr its ReadFrom
+// returns — normally also *net.UDPAddr (peers dial the relayed address over
+// UDP). Any other address type is recovered from its "ip:port" string form,
+// and a nil is returned when even that fails, in which case readLoop drops
+// the datagram (nothing downstream can address it).
+func asUDP(a net.Addr) *net.UDPAddr {
+	switch v := a.(type) {
+	case *net.UDPAddr:
+		return v
+	case nil:
+		return nil
+	default:
+		u, err := net.ResolveUDPAddr("udp", v.String())
+		if err != nil {
+			return nil
+		}
+		return u
 	}
 }
 
@@ -726,7 +896,7 @@ func (n *Node) handleQuery(m *wire.Message, raddr *net.UDPAddr) {
 		n.log.Debug("dht: encode response", "err", err)
 		return
 	}
-	if _, err := n.conn.WriteToUDP(data, raddr); err != nil {
+	if _, err := n.conn.WriteTo(data, raddr); err != nil {
 		n.log.Debug("dht: write response", "err", err)
 	}
 }
@@ -1147,7 +1317,7 @@ func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []b
 	if n.conn == nil {
 		return nil, errors.New("dht: transport not started")
 	}
-	if _, err := n.conn.WriteToUDP(data, addr); err != nil {
+	if _, err := n.conn.WriteTo(data, addr); err != nil {
 		return nil, err
 	}
 	select {
