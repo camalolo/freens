@@ -381,6 +381,56 @@ type Mapping struct {
 	externalPort int
 	internalIP   net.IP
 	internalPort int
+	desc         string // mapping description, reused by EnsureFresh re-maps
+}
+
+// probeMapping asks GetSpecificPortMappingEntry whether externalPort is
+// still mapped (714 NoSuchEntryInArray ⇒ the router forgot it — reboot,
+// firmware reset, lease purge).
+func (g *Gateway) probeMapping(ctx context.Context, externalPort int) error {
+	_, err := g.soapCall(ctx, "GetSpecificPortMappingEntry", map[string]string{
+		"NewRemotePort": strconv.Itoa(externalPort),
+		"NewProtocol":   "UDP",
+	})
+	return err
+}
+
+// EnsureFresh re-validates the mapping and heals it after router events:
+//
+//   - mapping GONE (714 — router reboot/reset): re-map from scratch on the
+//     same gateway and report the replacement (changed = true). If the
+//     re-map fails, returns (nil, false, nil): the mapping is confirmed
+//     lost but not recoverable right now — the caller keeps the old
+//     advertised address and retries on the next tick rather than flapping
+//     to observed-source on a transient refusal.
+//   - mapping alive but the EXTERNAL IP changed (dynamic PPPoE etc.):
+//     returns a copy carrying the new address (changed = true).
+//   - probe error (router unreachable mid-reboot): (nil, false, err) —
+//     transient, nothing concluded.
+//
+// A mapping whose port the router moves on re-map is reported changed
+// regardless (Addr differs).
+func (m *Mapping) EnsureFresh(ctx context.Context) (*Mapping, bool, error) {
+	err := m.gw.probeMapping(ctx, m.externalPort)
+	if err != nil {
+		var se *soapError
+		if errors.As(err, &se) && se.Code == 714 {
+			nm, merr := m.gw.MapUDP(ctx, m.internalPort, m.desc)
+			if merr != nil {
+				return nil, false, nil // lost and unrecoverable for now
+			}
+			return nm, true, nil
+		}
+		return nil, false, err
+	}
+	// Alive: follow external-address changes without touching the mapping.
+	ip, iperr := m.gw.externalIP(ctx)
+	if iperr != nil || ip.Equal(m.externalIP) {
+		return m, false, nil
+	}
+	cp := *m
+	cp.externalIP = ip
+	return &cp, true, nil
 }
 
 // Map asks the LAN's gateway(s) (Discover) for a UDP mapping of internalPort

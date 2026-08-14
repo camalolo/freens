@@ -134,7 +134,10 @@ observed source — falling back to direct when a rung is unavailable:
    as fallback), and advertises the resulting external address exactly
    like `-advertise` — zero configuration on the most common NAT there
    is, the home router. The mapping is labeled and UDP-only, points
-   solely at this host, and is released at shutdown; the rung silently
+   solely at this host, is released at shutdown, and is re-asserted every
+   5 minutes — a router reboot self-heals (probe `GetSpecificPortMappingEntry`,
+   re-map on loss) and external-address changes are followed at runtime via
+   the node's live advertised-address update, no restart needed; the rung silently
    stands down whenever it does not apply (an explicit `-advertise` or
    `-turn-relay`, no IGD answering SSDP, the router refusing the
    mapping, or a CGNAT-fronted gateway reporting a 0.0.0.0 external

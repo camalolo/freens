@@ -10,8 +10,11 @@ package upnp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,16 +27,18 @@ import (
 type fakeIGD struct {
 	srv       *httptest.Server
 	mu        sync.Mutex
-	calls     []string // SOAP actions seen, in order
-	v2        bool     // support AddAnyPortMapping
-	conflict  int      // emit 718 on the first N AddPortMapping calls
-	extIP     string   // GetExternalIPAddress answer
-	mappedExt int      // port AddAnyPortMapping reserves
+	calls     []string     // SOAP actions seen, in order
+	v2        bool         // support AddAnyPortMapping
+	conflict  int          // emit 718 on the first N AddPortMapping calls
+	extIP     string       // GetExternalIPAddress answer
+	mappedExt int          // port AddAnyPortMapping reserves
+	mapped    map[int]bool // live entries (external ports)
+	refuseAdd bool         // fail all Add* (simulates a locked-down router)
 }
 
 func newFakeIGD(t *testing.T) *fakeIGD {
 	t.Helper()
-	f := &fakeIGD{v2: true, extIP: "203.0.113.7", mappedExt: 0}
+	f := &fakeIGD{v2: true, extIP: "203.0.113.7", mappedExt: 0, mapped: make(map[int]bool)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rootDesc.xml", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, `<?xml version="1.0"?>
@@ -61,23 +66,39 @@ func newFakeIGD(t *testing.T) *fakeIGD {
 	})
 	mux.HandleFunc("/ctl", func(w http.ResponseWriter, r *http.Request) {
 		action := strings.TrimSuffix(strings.TrimPrefix(r.Header.Get("SOAPACTION"), `"urn:schemas-upnp-org:service:WANIPConnection:1#`), `"`)
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		arg := func(name string) string {
+			m := regexp.MustCompile("<" + name + ">([0-9]+)</" + name + ">").FindSubmatch(body)
+			if m == nil {
+				return ""
+			}
+			return string(m[1])
+		}
 		f.mu.Lock()
 		f.calls = append(f.calls, action)
 		v2, conflict, extIP, mappedExt := f.v2, f.conflict, f.extIP, f.mappedExt
+		refuse := f.refuseAdd
 		f.mu.Unlock()
 		switch action {
 		case "GetExternalIPAddress":
 			fmt.Fprintf(w, `<s:Envelope><s:Body><u:GetExternalIPAddressResponse><NewExternalIPAddress>%s</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>`, extIP)
 		case "AddAnyPortMapping":
-			if !v2 {
+			if !v2 || refuse {
 				soapFault(w, 401, "InvalidAction")
 				return
 			}
 			if mappedExt == 0 {
 				mappedExt = 15353
 			}
+			f.mu.Lock()
+			f.mapped[mappedExt] = true
+			f.mu.Unlock()
 			fmt.Fprintf(w, `<s:Envelope><s:Body><u:AddAnyPortMappingResponse><NewReservedPort>%d</NewReservedPort></u:AddAnyPortMappingResponse></s:Body></s:Envelope>`, mappedExt)
 		case "AddPortMapping":
+			if refuse {
+				soapFault(w, 401, "InvalidAction")
+				return
+			}
 			if conflict > 0 {
 				f.mu.Lock()
 				f.conflict--
@@ -85,8 +106,29 @@ func newFakeIGD(t *testing.T) *fakeIGD {
 				soapFault(w, 718, "ConflictInMappingEntry")
 				return
 			}
+			f.mu.Lock()
+			if p := arg("NewExternalPort"); p != "" {
+				if n, err := strconv.Atoi(p); err == nil {
+					f.mapped[n] = true
+				}
+			}
+			f.mu.Unlock()
 			fmt.Fprint(w, `<s:Envelope><s:Body><u:AddPortMappingResponse></u:AddPortMappingResponse></s:Body></s:Envelope>`)
+		case "GetSpecificPortMappingEntry":
+			p, _ := strconv.Atoi(arg("NewRemotePort"))
+			f.mu.Lock()
+			_, alive := f.mapped[p]
+			f.mu.Unlock()
+			if !alive {
+				soapFault(w, 714, "NoSuchEntryInArray")
+				return
+			}
+			fmt.Fprint(w, `<s:Envelope><s:Body><u:GetSpecificPortMappingEntryResponse><NewInternalPort>15353</NewInternalPort><NewInternalClient>127.0.0.1</NewInternalClient><NewEnabled>1</NewEnabled></u:GetSpecificPortMappingEntryResponse></s:Body></s:Envelope>`)
 		case "DeletePortMapping":
+			p, _ := strconv.Atoi(arg("NewExternalPort"))
+			f.mu.Lock()
+			delete(f.mapped, p)
+			f.mu.Unlock()
 			fmt.Fprint(w, `<s:Envelope><s:Body><u:DeletePortMappingResponse></u:DeletePortMappingResponse></s:Body></s:Envelope>`)
 		default:
 			soapFault(w, 401, "InvalidAction")
@@ -245,5 +287,84 @@ func TestSortedKeysAndEscape(t *testing.T) {
 	}
 	if got := xmlEscape(`a<b>&"c"`); got != `a&lt;b&gt;&amp;&#34;c&#34;` {
 		t.Fatalf("xmlEscape = %s", got)
+	}
+}
+
+// reboot simulates the router restarting: every mapping is forgotten, the
+// external address optionally changes (dynamic PPPoE), and the reserved
+// port drifts (AddAnyPortMapping hands out a different one).
+func (f *fakeIGD) reboot(newExtIP string, newReserved int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mapped = make(map[int]bool)
+	if newExtIP != "" {
+		f.extIP = newExtIP
+	}
+	f.mappedExt = newReserved
+}
+
+func (f *fakeIGD) setExtIP(ip string) {
+	f.mu.Lock()
+	f.extIP = ip
+	f.mu.Unlock()
+}
+
+func TestEnsureFreshAliveUnchanged(t *testing.T) {
+	f := newFakeIGD(t)
+	f.mappedExt = 53535
+	m, err := gwFor(t, f).MapUDP(context.Background(), 15353, "freens")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nm, changed, err := m.EnsureFresh(context.Background())
+	if err != nil || changed || nm == nil || nm.Addr() != m.Addr() {
+		t.Fatalf("EnsureFresh on a healthy mapping: nm=%v changed=%v err=%v", nm, changed, err)
+	}
+}
+
+func TestEnsureFreshFollowsIPChange(t *testing.T) {
+	f := newFakeIGD(t)
+	f.mappedExt = 53535
+	m, _ := gwFor(t, f).MapUDP(context.Background(), 15353, "freens")
+	f.setExtIP("198.51.100.9")
+	nm, changed, err := m.EnsureFresh(context.Background())
+	if err != nil || !changed || nm == nil {
+		t.Fatalf("EnsureFresh missed an external IP change: %v %v %v", nm, changed, err)
+	}
+	if nm.Addr() != "198.51.100.9:53535" {
+		t.Fatalf("Addr after IP change = %s", nm.Addr())
+	}
+}
+
+func TestEnsureFreshRemapsAfterReboot(t *testing.T) {
+	f := newFakeIGD(t)
+	f.mappedExt = 53535
+	m, _ := gwFor(t, f).MapUDP(context.Background(), 15353, "freens")
+	// Router reboots: mappings forgotten, new external IP, new reserved port.
+	f.reboot("198.51.100.99", 61000)
+	nm, changed, err := m.EnsureFresh(context.Background())
+	if err != nil || !changed || nm == nil {
+		t.Fatalf("EnsureFresh did not heal a reboot: %v %v %v", nm, changed, err)
+	}
+	if nm.Addr() != "198.51.100.99:61000" {
+		t.Fatalf("Addr after reboot-heal = %s, want 198.51.100.99:61000", nm.Addr())
+	}
+	// And the replacement is itself healthy.
+	if _, changed, err := nm.EnsureFresh(context.Background()); err != nil || changed {
+		t.Fatalf("re-made mapping not stable: %v %v", changed, err)
+	}
+}
+
+func TestEnsureFreshLostAndUnrecoverable(t *testing.T) {
+	f := newFakeIGD(t)
+	f.mappedExt = 53535
+	m, _ := gwFor(t, f).MapUDP(context.Background(), 15353, "freens")
+	f.reboot("", 0)
+	f.mu.Lock()
+	f.refuseAdd = true // the locked-down rebooted router refuses re-mapping
+	f.mu.Unlock()
+	nm, changed, err := m.EnsureFresh(context.Background())
+	if err != nil || changed || nm != nil {
+		t.Fatalf("EnsureFresh on lost+refused mapping: nm=%v changed=%v err=%v (want nil,false,nil)", nm, changed, err)
 	}
 }

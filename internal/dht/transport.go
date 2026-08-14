@@ -452,6 +452,34 @@ func (n *Node) setAdvertise(a string) {
 	n.advMu.Unlock()
 }
 
+// validateAdvertise canonicalizes an advertised address exactly as Start
+// does: resolvable host:port with a concrete IP and non-zero port. The empty
+// string passes through (observed-source mode).
+func validateAdvertise(addr string) (string, error) {
+	if addr == "" {
+		return "", nil
+	}
+	a, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil || a.IP == nil || a.Port == 0 {
+		return "", fmt.Errorf("dht: invalid advertise address %q (want resolvable host:port)", addr)
+	}
+	return a.String(), nil
+}
+
+// UpdateAdvertise replaces the §6.2 advertised address at RUNTIME (after
+// Start): peers learn the new address from the stamp on this node's next
+// outbound query, no restart needed. The UPnP renewal loop and the STUN
+// monitor are the callers. An empty address returns to observed-source
+// mode; an invalid one is rejected without changing anything.
+func (n *Node) UpdateAdvertise(addr string) error {
+	canonical, err := validateAdvertise(addr)
+	if err != nil {
+		return err
+	}
+	n.setAdvertise(canonical)
+	return nil
+}
+
 // Start binds the UDP socket and launches the read loop and the background
 // maintenance loops (§6.2 bucket refresh; §6.4 step 4 republish timer unless
 // Passive). In relay mode (NodeConfig.TurnRelay set, Advertise empty) it
@@ -464,14 +492,12 @@ func (n *Node) Start() error {
 	// §6.2 advertised address: validate ONCE here. A non-resolvable
 	// host:port (or a missing host/port) logs a warning and falls back to
 	// the observed-source behavior — a bad Advertise must not brick the node.
-	if n.advertise != "" {
-		if a, err := net.ResolveUDPAddr("udp", n.advertise); err != nil || a.IP == nil || a.Port == 0 {
-			n.log.Warn("dht: invalid Advertise address (want resolvable host:port); "+
-				"peers will learn the observed source address", "advertise", n.advertise)
-			n.advertise = ""
-		} else {
-			n.advertise = a.String() // canonical resolved form
-		}
+	if canonical, verr := validateAdvertise(n.advertise); verr != nil {
+		n.log.Warn("dht: invalid Advertise address (want resolvable host:port); "+
+			"peers will learn the observed source address", "advertise", n.advertise)
+		n.advertise = ""
+	} else {
+		n.advertise = canonical
 	}
 	// (a) Direct UDP bind. The socket is ALWAYS the node's own; in relay
 	// mode (step b) the tunnel replaces it — peers then reach this node

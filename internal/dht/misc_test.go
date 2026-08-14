@@ -263,3 +263,40 @@ func TestGetByHashHistoryFallback(t *testing.T) {
 		t.Error("live key fetch did not return the current winner v2")
 	}
 }
+
+// TestUpdateAdvertise — the runtime §6.2 address update (UPnP renewal /
+// STUN monitor path): a valid address replaces what outbound queries stamp,
+// an invalid one is rejected without change, and empty returns to
+// observed-source mode.
+func TestUpdateAdvertise(t *testing.T) {
+	n, err := NewNode(NodeConfig{Keypair: mustKeypair(t), ListenAddr: "127.0.0.1:0", Store: NewEnvelopeStore(0, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+
+	if got := n.advertised(); got != "" {
+		t.Fatalf("fresh node advertises %q", got)
+	}
+	if err := n.UpdateAdvertise("127.0.0.1:15353"); err != nil {
+		t.Fatalf("UpdateAdvertise: %v", err)
+	}
+	if got := n.advertised(); got != "127.0.0.1:15353" {
+		t.Fatalf("advertised = %q", got)
+	}
+	if err := n.UpdateAdvertise("not an address"); err == nil {
+		t.Fatal("invalid address accepted")
+	}
+	if got := n.advertised(); got != "127.0.0.1:15353" {
+		t.Fatalf("rejected update changed the address to %q", got)
+	}
+	if err := n.UpdateAdvertise(""); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if got := n.advertised(); got != "" {
+		t.Fatalf("empty address did not clear: %q", got)
+	}
+}

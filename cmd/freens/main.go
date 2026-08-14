@@ -57,6 +57,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -191,7 +192,11 @@ func run(args []string) error {
 	// store first and falls back to an iterative network GET on a miss.
 	var dhtNode *dht.Node
 	var dhtLookup *dht.DHTLookup
-	var upnpMapping *upnp.Mapping // live router port mapping (released at shutdown)
+	// upnpMapping is the live router port mapping (released at shutdown);
+	// the renewal goroutine may replace it, and the metrics ticker reads it,
+	// so access goes through upnpMu.
+	var upnpMapping *upnp.Mapping
+	var upnpMu sync.Mutex
 	var freens resolver.RecordLookup = dht.NewStoreLookup(store)
 	// -turn / -turn-relay both require the DHT transport; warn-and-ignore
 	// mirrors -persist (a relay server without a node serves no one; a node
@@ -222,7 +227,9 @@ func run(args []string) error {
 			m, merr := upnp.Map(mctx, port, "freens", logger)
 			mcancel()
 			if merr == nil {
+				upnpMu.Lock()
 				upnpMapping = m
+				upnpMu.Unlock()
 				advertise = m.Addr()
 				logger.Info("upnp: router port mapping active",
 					"advertise", m.Addr(),
@@ -390,7 +397,9 @@ func run(args []string) error {
 				turnAllocGauge.With().Set(float64(ts.Allocations()))
 			}
 			turnRelayGauge.With().Set(boolGauge(dhtNode.RelayedMode()))
+			upnpMu.Lock()
 			upnpGauge.With().Set(boolGauge(upnpMapping != nil))
+			upnpMu.Unlock()
 		}
 		storeEnvGauge.With().Set(float64(store.Count()))
 		histEnvGauge.With().Set(float64(store.HistoryCount()))
@@ -402,6 +411,51 @@ func run(args []string) error {
 	// bgStop ends the background goroutines (gauge refresh, SIGHUP reload)
 	// during shutdown so no reload ever races the teardown below.
 	bgStop := make(chan struct{})
+	// UPnP renewal: routers forget mappings across reboots/resets, and
+	// external addresses change (dynamic PPPoE). Probe every 5 minutes,
+	// re-map when the entry vanished, follow address changes — the node's
+	// advertised address updates at runtime (Node.UpdateAdvertise), no
+	// restart. A confirmed-lost mapping that cannot be re-established keeps
+	// the old advertised address (better stale than flapping); the next
+	// tick retries.
+	go func() {
+		t := time.NewTicker(upnpRenewInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-bgStop:
+				return
+			case <-t.C:
+			}
+			upnpMu.Lock()
+			m := upnpMapping
+			upnpMu.Unlock()
+			if m == nil || dhtNode == nil {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			nm, changed, err := m.EnsureFresh(ctx)
+			cancel()
+			if err != nil {
+				logger.Debug("upnp: renewal probe failed; keeping mapping", "error", err)
+				continue
+			}
+			if nm == nil {
+				logger.Warn("upnp: router lost the mapping and re-mapping failed; will retry")
+				continue
+			}
+			upnpMu.Lock()
+			upnpMapping = nm
+			upnpMu.Unlock()
+			if changed {
+				if uerr := dhtNode.UpdateAdvertise(nm.Addr()); uerr != nil {
+					logger.Warn("upnp: renewed mapping address rejected; keeping previous", "addr", nm.Addr(), "error", uerr)
+				} else {
+					logger.Info("upnp: mapping renewed; advertising updated address", "addr", nm.Addr(), "external_port", nm.ExternalPort())
+				}
+			}
+		}
+	}()
 	go func() {
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()
@@ -492,8 +546,11 @@ func run(args []string) error {
 	// Release the UPnP port mapping after the DHT transport has stopped
 	// (best-effort; a router that forgot it is not an error worth failing
 	// the shutdown over).
-	if upnpMapping != nil {
-		if err := upnpMapping.Release(); err != nil {
+	upnpMu.Lock()
+	mapping := upnpMapping
+	upnpMu.Unlock()
+	if mapping != nil {
+		if err := mapping.Release(); err != nil {
 			logger.Warn("upnp: port mapping release failed", "error", err)
 		} else {
 			logger.Info("upnp: port mapping released")
@@ -726,7 +783,7 @@ func defineFlags(fs *flag.FlagSet) *flags {
 		"advertise the external address (spec 6.2) — the zero-config NAT rung; best-effort "+
 		"and silently skipped when -advertise/-turn-relay is set, no gateway answers (SSDP), "+
 		"the router refuses, or the edge is CGNAT-fronted (0.0.0.0 external address). "+
-		"The mapping is labeled, UDP-only, and released at shutdown (requires -dht)")
+		"The mapping is labeled, UDP-only, released at shutdown, and re-asserted every 5 minutes (router reboots self-heal; external-address changes are followed at runtime) (requires -dht)")
 	f.passive = fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
 	f.advertiseAddr = fs.String("advertise", "", "address peers should dial to reach this node's DHT transport, host:port "+
 		"(spec §6.2 \"nodes advertise (ip, port, node_pubkey)\") — for NAT/port-forward setups where the observed UDP "+
@@ -889,6 +946,12 @@ func boolGauge(b bool) float64 {
 	}
 	return 0
 }
+
+// upnpRenewInterval is how often the daemon re-asserts its UPnP port
+// mapping (probe GetSpecificPortMappingEntry; re-map on loss; follow
+// external-address changes). Five minutes bounds router-reboot downtime
+// without meaningful SOAP chatter.
+const upnpRenewInterval = 5 * time.Minute
 
 // dhtPort extracts the UDP port of a -dht listen address (":15353",
 // "0.0.0.0:15353"); the protocol default when absent.
