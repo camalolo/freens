@@ -107,9 +107,9 @@ NetworkManager-managed `/etc/resolv.conf` instead, see the notes in
 
 The DHT speaks UDP (default port 15353). What a peer dials is the address
 the node advertises, and the daemon picks the first rung of this ladder
-that applies — precedence: explicit `-advertise` > relayed address from
-`-turn-relay` > `-stun`-discovered reflexive address > observed source —
-falling back to direct when a rung is unavailable:
+that applies — precedence: explicit `-advertise` > UPnP router mapping >
+relayed address from `-turn-relay` > `-stun`-discovered reflexive address >
+observed source — falling back to direct when a rung is unavailable:
 
 1. **Direct — observed source.** On a host with a dialable address, do
    nothing: peers learn the working source address from your packets.
@@ -128,7 +128,19 @@ falling back to direct when a rung is unavailable:
    lists (§6.2 "nodes advertise (ip, port, node_pubkey)") instead of the
    observed source, and always wins over any discovered or relayed
    address below.
-3. **`-stun` — discovered reflexive address.** `-stun <server>` (RFC
+3. **`-upnp` — router-requested port mapping (default ON).** The daemon
+   SSDP-discovers the LAN's router (UPnP IGD), asks it to forward the
+   DHT's UDP port (`AddAnyPortMapping`, with the older `AddPortMapping`
+   as fallback), and advertises the resulting external address exactly
+   like `-advertise` — zero configuration on the most common NAT there
+   is, the home router. The mapping is labeled and UDP-only, points
+   solely at this host, and is released at shutdown; the rung silently
+   stands down whenever it does not apply (an explicit `-advertise` or
+   `-turn-relay`, no IGD answering SSDP, the router refusing the
+   mapping, or a CGNAT-fronted gateway reporting a 0.0.0.0 external
+   address — a mapping behind carrier NAT is meaningless). Disable with
+   `-upnp=false`. Exposed as the `freens_upnp_mapping` gauge.
+4. **`-stun` — discovered reflexive address.** `-stun <server>` (RFC
    5389 Binding request, e.g. `-stun stun.example.net:3478`) makes the
    DHT node periodically ask a STUN server what its public reflexive
    address is and advertise THAT to peers — exactly like a hand-set
@@ -139,7 +151,7 @@ falling back to direct when a rung is unavailable:
    useless to other peers). A freens `-turn` relay also answers STUN
    Binding, so one instance can serve as your `-stun` server too (next
    section).
-4. **`-turn-relay` — symmetric NAT, via a community relay.** The node
+5. **`-turn-relay` — symmetric NAT, via a community relay.** The node
    opens an allocation on a freens TURN relay (RFC 8656 subset) and
    tunnels ALL peer DHT traffic through it, advertising the RELAYED
    address. Every packet rides an allocation that already punched the
@@ -147,7 +159,7 @@ falling back to direct when a rung is unavailable:
    symmetric NATs — no inbound dialability required. If the relay is
    unreachable, the node falls back to direct. Server side + trust
    caveats: next section.
-5. **External generic options.** A WireGuard tunnel or a cheap VPS
+6. **External generic options.** A WireGuard tunnel or a cheap VPS
    fronting the node gives a stable dialable address — then `-advertise`
    it (rung 2). Works everywhere; costs a box.
 

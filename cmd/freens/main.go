@@ -50,10 +50,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +67,7 @@ import (
 	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/resolver"
 	"github.com/laurent/freens/internal/turn"
+	"github.com/laurent/freens/internal/upnp"
 	"github.com/laurent/freens/internal/wire"
 )
 
@@ -92,7 +95,7 @@ func run(args []string) error {
 		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-dns <addr>] [-upstream <csv>]")
 		fmt.Fprintln(fs.Output(), "             [-load <dir>] [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
 		fmt.Fprintln(fs.Output(), "             [-peers-file <path>] [-passive] [-advertise <addr>] [-stun <addr>]")
-		fmt.Fprintln(fs.Output(), "             [-turn <addr>] [-turn-relay <addr>] [-persist <dir>] [-metrics <addr>] [-idna]")
+		fmt.Fprintln(fs.Output(), "             [-turn <addr>] [-turn-relay <addr>] [-upnp] [-persist <dir>] [-metrics <addr>] [-idna]")
 		fs.PrintDefaults()
 	}
 	f := defineFlags(fs)
@@ -103,6 +106,7 @@ func run(args []string) error {
 	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr := f.dhtAddr, f.nodeSeedHex, f.peersCSV, f.peersFile, f.metricsAddr
 	passive, advertiseAddr, stunAddr := f.passive, f.advertiseAddr, f.stunAddr
 	turnAddr, turnRelayAddr, persistDir, idnaFlag := f.turnAddr, f.turnRelayAddr, f.persistDir, f.idna
+	upnpEnabled := f.upnpEnabled
 
 	// -idna override semantics (mirroring -listen/-upstream): an explicitly
 	// passed flag wins; otherwise the config file's [options] idna decides;
@@ -187,6 +191,7 @@ func run(args []string) error {
 	// store first and falls back to an iterative network GET on a miss.
 	var dhtNode *dht.Node
 	var dhtLookup *dht.DHTLookup
+	var upnpMapping *upnp.Mapping // live router port mapping (released at shutdown)
 	var freens resolver.RecordLookup = dht.NewStoreLookup(store)
 	// -turn / -turn-relay both require the DHT transport; warn-and-ignore
 	// mirrors -persist (a relay server without a node serves no one; a node
@@ -204,6 +209,29 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("node key: %w", err)
 		}
+		// -upnp (default ON "when convenient"): map the DHT port on the
+		// LAN's router and advertise the external address — BEFORE the node
+		// starts, feeding NodeConfig.Advertise the same way an explicit
+		// -advertise would. Skipped when a better rung is already set; any
+		// failure falls to the rest of the ladder (-stun, observed source)
+		// with at most a Debug line.
+		advertise := *advertiseAddr
+		if *upnpEnabled && advertise == "" && *turnRelayAddr == "" {
+			port := dhtPort(*dhtAddr)
+			mctx, mcancel := context.WithTimeout(context.Background(), 6*time.Second)
+			m, merr := upnp.Map(mctx, port, "freens", logger)
+			mcancel()
+			if merr == nil {
+				upnpMapping = m
+				advertise = m.Addr()
+				logger.Info("upnp: router port mapping active",
+					"advertise", m.Addr(),
+					"internal_port", port,
+					"external_port", m.ExternalPort())
+			} else {
+				logger.Debug("upnp: no mapping; continuing down the NAT ladder", "reason", merr)
+			}
+		}
 		// -turn: co-located community relay server. Zero values for every
 		// knob except ListenAddr/Log let internal/turn's defaults apply
 		// (MaxAllocsPerIP, DefaultLifetime/MaxLifetime, MaxPermissions —
@@ -218,7 +246,7 @@ func run(args []string) error {
 			Store:      store,
 			Logger:     logger,
 			Passive:    *passive,
-			Advertise:  *advertiseAddr,
+			Advertise:  advertise,
 			Stun:       *stunAddr,
 			TurnRelay:  *turnRelayAddr,
 			TurnServer: turnSrvCfg,
@@ -253,10 +281,10 @@ func run(args []string) error {
 			"node_id", hex.EncodeToString(node.ID()),
 			"node_pk", hex.EncodeToString(node.PublicKey()),
 			"passive", *passive,
-			// §6.2 advertised address: empty means peers learn the observed
-			// source (Node.Start logs a warning if a passed -advertise was
-			// invalid and could not be honored).
-			"advertise", *advertiseAddr,
+			// §6.2 advertised address: explicit -advertise, the UPnP mapping,
+			// or empty (peers learn the observed source; Node.Start logs a
+			// warning if a passed address could not be honored).
+			"advertise", advertise,
 			"turn_server", *turnAddr,
 			"turn_relay", *turnRelayAddr,
 		)
@@ -319,6 +347,8 @@ func run(args []string) error {
 	cacheEntriesGauge := reg.NewGauge("freens_resolver_cache_entries", "Entries currently held in the §10.4 response cache.")
 	turnAllocGauge := reg.NewGauge("freens_turn_allocations",
 		"Active TURN allocations on this node's co-located TURN server (-turn; absent when the server is off).")
+	upnpGauge := reg.NewGauge("freens_upnp_mapping",
+		"1 when this daemon holds a live UPnP IGD port mapping for its DHT port (0/absent otherwise).")
 	turnRelayGauge := reg.NewGauge("freens_turn_relay",
 		"1 when this node routes its peer UDP through a TURN allocation (-turn-relay), 0 otherwise.")
 	dnsQueriesCounter := reg.NewCounter("freens_dns_queries_total",
@@ -360,6 +390,7 @@ func run(args []string) error {
 				turnAllocGauge.With().Set(float64(ts.Allocations()))
 			}
 			turnRelayGauge.With().Set(boolGauge(dhtNode.RelayedMode()))
+			upnpGauge.With().Set(boolGauge(upnpMapping != nil))
 		}
 		storeEnvGauge.With().Set(float64(store.Count()))
 		histEnvGauge.With().Set(float64(store.HistoryCount()))
@@ -456,6 +487,16 @@ func run(args []string) error {
 	if dhtNode != nil {
 		if err := dhtNode.Close(); err != nil {
 			logger.Error("dht node shutdown error", "error", err)
+		}
+	}
+	// Release the UPnP port mapping after the DHT transport has stopped
+	// (best-effort; a router that forgot it is not an error worth failing
+	// the shutdown over).
+	if upnpMapping != nil {
+		if err := upnpMapping.Release(); err != nil {
+			logger.Warn("upnp: port mapping release failed", "error", err)
+		} else {
+			logger.Info("upnp: port mapping released")
 		}
 	}
 	// Final persistence AFTER the servers (and the DHT node) have stopped, so
@@ -660,7 +701,7 @@ type flags struct {
 	configPath, listenAddr, dnsAddr, upstreamCSV, loadDir        *string
 	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr       *string
 	advertiseAddr, stunAddr, turnAddr, turnRelayAddr, persistDir *string
-	passive, idna                                                *bool
+	passive, idna, upnpEnabled                                   *bool
 }
 
 // defineFlags registers every freens flag on fs and returns their value
@@ -681,6 +722,11 @@ func defineFlags(fs *flag.FlagSet) *flags {
 		"(re-parse + AddPeer each entry, idempotent)")
 	f.metricsAddr = fs.String("metrics", "", "listen address for the operational HTTP endpoint exposing /metrics\n"+
 		"(Prometheus text format) and /healthz, e.g. :9153; empty disables the endpoint")
+	f.upnpEnabled = fs.Bool("upnp", true, "ask the LAN's router (UPnP IGD) to forward the DHT UDP port and "+
+		"advertise the external address (spec 6.2) — the zero-config NAT rung; best-effort "+
+		"and silently skipped when -advertise/-turn-relay is set, no gateway answers (SSDP), "+
+		"the router refuses, or the edge is CGNAT-fronted (0.0.0.0 external address). "+
+		"The mapping is labeled, UDP-only, and released at shutdown (requires -dht)")
 	f.passive = fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
 	f.advertiseAddr = fs.String("advertise", "", "address peers should dial to reach this node's DHT transport, host:port "+
 		"(spec §6.2 \"nodes advertise (ip, port, node_pubkey)\") — for NAT/port-forward setups where the observed UDP "+
@@ -842,6 +888,17 @@ func boolGauge(b bool) float64 {
 		return 1
 	}
 	return 0
+}
+
+// dhtPort extracts the UDP port of a -dht listen address (":15353",
+// "0.0.0.0:15353"); the protocol default when absent.
+func dhtPort(addr string) int {
+	if _, p, err := net.SplitHostPort(addr); err == nil && p != "" {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
+			return n
+		}
+	}
+	return 15353 // FREENS_PORT (spec Appendix A)
 }
 
 // splitCSV splits a comma/space/tab-separated list, dropping empties.

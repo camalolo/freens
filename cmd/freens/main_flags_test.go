@@ -86,3 +86,20 @@ func TestTurnFlagHelpText(t *testing.T) {
 		t.Errorf("-stun help still claims freens ships no TURN relay:\n%s", stun.Usage)
 	}
 }
+
+// TestUPnPFlagDefaults: -upnp is ON by default (the "when convenient"
+// contract — silently skipped whenever a better rung or no -dht), and its
+// help text states the skip conditions.
+func TestUPnPFlagDefaults(t *testing.T) {
+	fs := flag.NewFlagSet("freens", flag.ContinueOnError)
+	f := defineFlags(fs)
+	if !*f.upnpEnabled {
+		t.Fatal("-upnp should default to true")
+	}
+	if err := fs.Parse([]string{"-upnp=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if *f.upnpEnabled {
+		t.Fatal("-upnp=false did not stick")
+	}
+}

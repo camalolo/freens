@@ -28,7 +28,7 @@ Implemented and fully tested (130 test functions, `go test ./...` green,
 | `internal/claims` | `AliasClaim`, witness attestations, PoW, deterministic §7.4 ordering | §7 |
 | `internal/dht` | XOR metric, 256 k-bucket routing table, rotating HMAC write tokens, envelope store (winner rule + LRU/grace eviction) | §6 |
 | `internal/resolver` | §9.3 INI config parser, per-alias routing, live UDP+TCP DNS server via `miekg/dns`, DNS fallback | §9 |
-| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`, `-stun`, `-turn`, `-turn-relay`, `-dns`, `-metrics`, `-peers-file` + SIGHUP reload): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
+| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`, `-upnp` (router-requested port mapping, default on), `-stun`, `-turn`, `-turn-relay`, `-dns`, `-metrics`, `-peers-file` + SIGHUP reload): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
 | `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `publish` (incl. `-evidence` for §8.4 recovery transport), `resolve`, `get`, `transfer`/`rotate`/`recover`/`verify-recovery`, `demo` subcommands | §6.4, §8 |
 
 Multi-node operation: with `-dht <addr>` the daemon joins the Kademlia
@@ -38,11 +38,13 @@ stored at `K_claim` (pin-first policy: `alias-pins` always win), and due
 records are republished at 80% of lifetime (§6.4). `-advertise <addr>`
 publishes a dialable address (e.g. your public `ip:15353` behind NAT/port
 forwarding) instead of the observed source in peer contact lists (§6.2) —
-see "NAT traversal" in `contrib/README.md`; `-stun <server>`
+see "NAT traversal" in `contrib/README.md`; `-upnp` (default on) asks the
+LAN's router to forward the DHT port and advertises the external address
+with zero configuration, `-stun <server>`
 discovers that reflexive address automatically, and for symmetric NAT
 `-turn-relay <server>` routes ALL peer DHT traffic through an allocation
 on a community relay and advertises the relayed address (precedence
-`-advertise` > `-turn-relay` > `-stun`, with graceful fallback to
+`-advertise` > `-upnp` > `-turn-relay` > `-stun`, with graceful fallback to
 direct). `-turn <addr>` runs such a relay — a public node can donate
 bandwidth to nodes that cannot be dialed directly; see "Running a
 community TURN relay" in `contrib/README.md`. `-dns <addr>` overrides the
