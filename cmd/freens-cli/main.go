@@ -65,6 +65,12 @@ func main() {
 		err = cmdMineClaim(args)
 	case "make-record":
 		err = cmdMakeRecord(args)
+	case "transfer":
+		err = cmdTransfer(args)
+	case "rotate":
+		err = cmdRotate(args)
+	case "recover":
+		err = cmdRecover(args)
 	case "publish":
 		err = cmdPublish(args)
 	case "resolve":
@@ -98,6 +104,9 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  gen-key               generate an Ed25519 keypair")
 	fmt.Fprintln(w, "  mine-claim            mine an AliasClaim PoW")
 	fmt.Fprintln(w, "  make-record           build + sign a freens record")
+	fmt.Fprintln(w, "  transfer              hand a name to a new owner key (spec 8.3; -prev-envelope, -new-owner-seed, -signer-seed)")
+	fmt.Fprintln(w, "  rotate                key hygiene: transfer to a fresh key (spec 8.6 = 8.3 hand-off)")
+	fmt.Fprintln(w, "  recover               gather threshold recovery-key signatures (spec 8.4; -prev-envelope, -new-owner-seed, -recovery-seeds)")
 	fmt.Fprintln(w, "  publish               put envelope .cbor files onto the DHT (-files, -peers)")
 	fmt.Fprintln(w, "  resolve               fetch + display a record from the DHT (-name, -tld-id-b32, -peers)")
 	fmt.Fprintln(w, "  get                   raw DHT get by key (-key, -peers)")

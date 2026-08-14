@@ -67,6 +67,7 @@ freens/
 │   ├── dht/                       # §6 ids / tokens / routing / store
 │   ├── resolver/                  # §9 config + miekg/dns server + routing
 │   └── integration/               # end-to-end + golden-vector tests
+├── contrib/                       # §9.1/§9.4 OS-integration recipes (port-53 redirect, resolv.conf, systemd)
 └── archive/python-v0.1/           # the earlier Python prototype (archived)
 ```
 
@@ -101,6 +102,22 @@ The daemon was validated end-to-end with `dig`: a freens record served from the
 in-process store answers authoritatively (`aa` bit, `203.0.113.42` per spec
 Appendix C.2), while conventional names fall through to upstream recursive
 resolvers (`dns-first` default).
+
+## OS integration (§9.4)
+
+Spec §9.4 stage 1 is the local resolver itself: apps keep using the OS stub,
+which points at the daemon's `127.0.0.1:53` (§9.1). Because port 53 is
+privileged, `contrib/` ships the §9.1 forwarding recipes — see
+`contrib/README.md` for the full guide:
+
+- `contrib/port53-redirect.sh` — iptables/nftables REDIRECT of :53 → :5300
+  (UDP+TCP) when the daemon runs on a high port (`-listen 127.0.0.1:5300`),
+  idempotent, with a `remove` action;
+- `contrib/resolv.conf.example` and `contrib/systemd/freens-resolved.conf` —
+  point the stub (`/etc/resolv.conf` or systemd-resolved) at the daemon;
+- `CAP_NET_BIND_SERVICE` via `setcap` to bind :53 directly.
+
+The daemon logs guidance automatically when binding :53 fails (§9.1).
 
 ## Key design decisions (chosen interpretations; documented in source)
 

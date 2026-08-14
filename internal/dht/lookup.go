@@ -11,6 +11,15 @@
 // K_name = SHA-256(0x02 || wire_name). The resolver walks the authority chain
 // hop-by-hop, calling Lookup with each hop's wire_name, so this routing makes
 // both the TLD record and descendant name records resolve correctly.
+//
+// §7.4 note (claims_lookup.go carries the code): DHTLookup.LookupClaim
+// (defined in transport.go) is the SINGLE-WINNER claim path — it returns the
+// one envelope the §6.4 (sequence, H_record) store rule kept at K_claim.
+// That is not the §7.4 verifier-side selection: resolvers wanting full
+// contested-alias semantics ("collect all competing claims nodes offer",
+// spec lines 602-604) use [DHTLookup.CollectClaims] instead, which merges the
+// local K_claim envelope with the network-collected set so the resolver can
+// apply the (timestamp, pow_hash, tld_id) ordering itself.
 package dht
 
 import (

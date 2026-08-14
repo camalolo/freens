@@ -14,7 +14,7 @@
 //
 //	freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]
 //	       [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]
-//	       [-passive] [-persist <dir>]
+//	       [-passive] [-persist <dir>] [-idna]
 //
 // If -config is absent a built-in default config is used (127.0.0.1:53,
 // upstreams 9.9.9.9 / 1.1.1.1, "* = dns-first"). If binding UDP/TCP port 53 is
@@ -30,6 +30,11 @@
 // -passive (spec §6.1 "clients MAY disable participation"): the DHT node still
 // answers ping/find_node/get from its store but refuses put and never
 // republishes others' records.
+//
+// -idna / [options] "idna = true" (spec §3.2 MAY: IDNA2008 U-labels): calls
+// naming.EnableIDNA() before any name parsing happens (it flips a
+// package-global normalizer, so it must precede config parsing and server
+// start). See the flag help for exactly what it changes on the wire.
 //
 // -persist <dir> (requires -dht): snapshots the envelope store to <dir> as
 // <keyhex>.cbor every 60s and once at shutdown, so records fetched over the
@@ -53,6 +58,7 @@ import (
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/crypto"
 	"github.com/laurent/freens/internal/dht"
+	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/resolver"
 	"github.com/laurent/freens/internal/wire"
 )
@@ -80,7 +86,7 @@ func run(args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]")
 		fmt.Fprintln(fs.Output(), "             [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
-		fmt.Fprintln(fs.Output(), "             [-passive] [-persist <dir>]")
+		fmt.Fprintln(fs.Output(), "             [-passive] [-persist <dir>] [-idna]")
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "path to resolver config file (optional; built-in default if absent)")
@@ -92,16 +98,43 @@ func run(args []string) error {
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as addr#<64-hex-pubkey>")
 	passive := fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
 	persistDir := fs.String("persist", "", "directory to persist the envelope store to (<keyhex>.cbor files) every 60s and at shutdown (requires -dht)")
+	idnaFlag := fs.Bool("idna", false, "accept IDNA2008 U-label aliases (spec §3.2): normalize non-ASCII (raw\n"+
+		"UTF-8) alias/TLD components of query names to punycode A-labels via UTS #46\n"+
+		"(transitional=false, useSTD3Rules=true). NOTE: this only affects queries that\n"+
+		"carry a raw U-label as bytes — real stub resolvers and browsers already send\n"+
+		"punycode (xn--…) ASCII, which strict LDH accepts either way; subdomain labels\n"+
+		"(the part before the alias) stay strict ASCII LDH regardless. Equivalent to\n"+
+		"[options] \"idna = true\" in the config file; an explicit -idna=false overrides it.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	// -idna override semantics (mirroring -listen/-upstream): an explicitly
+	// passed flag wins; otherwise the config file's [options] idna decides;
+	// otherwise IDNA stays off.
+	idnaFlagSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "idna" {
+			idnaFlagSet = true
+		}
+	})
+
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
+
+	// Enable IDNA BEFORE any name parsing: ParseConfig validates [tld-routes]
+	// and [alias-pins] keys through naming, and the servers below parse query
+	// names through naming too — it is package-global state (spec §3.2).
+	if *idnaFlag {
+		naming.EnableIDNA()
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
+	}
+	if !idnaFlagSet && cfg.EnableIDNA {
+		naming.EnableIDNA()
 	}
 
 	// Apply CLI overrides.
@@ -120,6 +153,7 @@ func run(args []string) error {
 		"listen_tcp", cfg.ListenTCP,
 		"upstream", cfg.UpstreamServers,
 		"load_dir", *loadDir,
+		"idna", naming.IDNANormalizer != nil, // §3.2 U-labels accepted?
 	)
 
 	// In-process envelope store: the freens record source. When the DHT
@@ -140,6 +174,7 @@ func run(args []string) error {
 	// store-only adapter (an island). With it on, DHTLookup consults the local
 	// store first and falls back to an iterative network GET on a miss.
 	var dhtNode *dht.Node
+	var dhtLookup *dht.DHTLookup
 	var freens resolver.RecordLookup = dht.NewStoreLookup(store)
 	if *dhtAddr != "" {
 		nodeKP, err := loadNodeKey(*nodeSeedHex)
@@ -160,7 +195,20 @@ func run(args []string) error {
 			return fmt.Errorf("dht start: %w", err)
 		}
 		dhtNode = node
-		freens = dht.NewDHTLookup(store, node)
+		dhtLookup = dht.NewDHTLookup(store, node)
+		freens = dhtLookup
+		// Restore the network-cache metadata (which envelopes were FETCHED,
+		// vs authoritative -load seeds) so a restart does not launder cached
+		// copies into always-fresh local data (§6.4 cache freshness).
+		if *loadDir != "" {
+			if meta, err := os.ReadFile(filepath.Join(*loadDir, fetchMetaFile)); err == nil {
+				if err := dhtLookup.LoadFetchMetaJSON(meta); err != nil {
+					logger.Warn("could not restore cache metadata", "file", fetchMetaFile, "error", err)
+				} else {
+					logger.Info("restored network-cache metadata", "file", fetchMetaFile)
+				}
+			}
+		}
 		// DHTLookup also implements the resolver's optional ClaimResolver, so
 		// network alias claims (spec §7) resolve automatically from here on —
 		// no further wiring needed; the resolver type-asserts it.
@@ -187,7 +235,7 @@ func run(args []string) error {
 			logger.Warn("-persist requires -dht; ignoring", "dir", *persistDir)
 		} else {
 			persistStop = make(chan struct{})
-			go persistLoop(store, *persistDir, persistStop, logger)
+			go persistLoop(store, dhtLookup, *persistDir, persistStop, logger)
 		}
 	}
 
@@ -245,14 +293,34 @@ func run(args []string) error {
 		} else {
 			logger.Info("persisted envelopes at shutdown", "dir", *persistDir, "count", count)
 		}
+		persistFetchMeta(dhtLookup, *persistDir, logger)
 	}
 	return firstErr
+}
+
+// fetchMetaFile is the sidecar (next to the *.cbor envelopes) recording which
+// persisted envelopes are network caches and when they were fetched.
+const fetchMetaFile = "fetched.json"
+
+// persistFetchMeta best-effort-writes the DHTLookup fetch metadata into dir.
+func persistFetchMeta(l *dht.DHTLookup, dir string, logger *slog.Logger) {
+	if l == nil {
+		return
+	}
+	meta, err := l.FetchMetaJSON()
+	if err != nil {
+		logger.Error("encode cache metadata failed", "error", err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, fetchMetaFile), meta, 0o644); err != nil {
+		logger.Error("write cache metadata failed", "error", err)
+	}
 }
 
 // persistLoop snapshots the envelope store into dir every 60s until stop is
 // closed. Errors are logged, never fatal: the next tick (or the final
 // shutdown-time PersistTo) retries.
-func persistLoop(store *dht.EnvelopeStore, dir string, stop <-chan struct{}, logger *slog.Logger) {
+func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, stop <-chan struct{}, logger *slog.Logger) {
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
 	for {
@@ -264,6 +332,7 @@ func persistLoop(store *dht.EnvelopeStore, dir string, stop <-chan struct{}, log
 				continue
 			}
 			logger.Info("persisted envelopes", "dir", dir, "count", count)
+			persistFetchMeta(lookup, dir, logger)
 		case <-stop:
 			return
 		}
@@ -353,20 +422,27 @@ func seedFromDir(store *dht.EnvelopeStore, dir string, logger *slog.Logger) (int
 			logger.Warn("skipping malformed envelope file", "file", path, "error", err)
 			continue
 		}
-		// Canonical key (K_tld for TLD-root records, K_name otherwise) is the
-		// single rule shared with the store lookup and the get/put handlers.
-		key, err := dht.KeyForWireName(env.Record.Name)
+		// Canonical keys (dht.StorageKeys): K_tld/K_name from the record name,
+		// PLUS K_claim for claim-bearing TLD records — the claim envelope is
+		// published at both keys (§7.4/C.1), and PersistTo writes one file per
+		// key, so seeding by name alone would drop K_claim on reload.
+		keys, err := dht.StorageKeys(env)
 		if err != nil {
 			logger.Warn("skipping envelope with undecodable name", "file", path, "error", err)
 			continue
 		}
-		accepted, err := store.Put(key, env, now, true)
-		if err != nil {
-			return count, fmt.Errorf("put %s: %w", path, err)
+		put := false
+		for _, key := range keys {
+			accepted, err := store.Put(key, env, now, true)
+			if err != nil {
+				return count, fmt.Errorf("put %s: %w", path, err)
+			}
+			put = put || accepted
 		}
-		if !accepted {
-			logger.Warn("envelope not accepted (signature invalid or lost the winner rule)",
-				"file", path)
+		if !put {
+			// Every key already held this exact (or a strictly newer) envelope —
+			// the normal idempotent case when -load points at the -persist dir.
+			logger.Debug("envelope already seeded or superseded", "file", path)
 			continue
 		}
 		count++

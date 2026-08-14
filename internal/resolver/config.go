@@ -50,11 +50,22 @@ type Config struct {
 	UpstreamDoH     string            // optional DoH URL from [upstream]
 	TLDRoutes       map[string]Route  // alias -> Route; "*" always present
 	AliasPins       map[string][]byte // alias -> 32-byte tld_id
+	// EnableIDNA mirrors [options] "idna = true" (spec §3.2 MAY:
+	// IDNA2008 U-labels). It is pure data: ParseConfig itself never touches
+	// the naming package-global normalizer — the daemon decides when to call
+	// naming.EnableIDNA (cmd/freens applies the flag, then this field,
+	// before any query is parsed). Note the ordering consequence: alias keys
+	// inside [tld-routes] / [alias-pins] are validated during parsing, so a
+	// U-label key in the config file itself only normalizes when IDNA was
+	// already enabled by the -idna flag; config authors should write A-labels
+	// (xn--) there, as DNS wire traffic does.
+	EnableIDNA bool
 }
 
 // ParseConfig parses a §9.3 INI config string into a *Config.
 //
-// Sections handled: [listen], [upstream], [tld-routes], [alias-pins]. Unknown
+// Sections handled: [listen], [upstream], [tld-routes], [alias-pins], and the
+// optional [options] section (currently just the §3.2 "idna" boolean). Unknown
 // sections are silently ignored (forward-compat). Missing sections yield the
 // corresponding field defaults. Comment prefixes are ';' and '#' as FULL-LINE
 // comments only (matching Python configparser defaults); inline comments are
@@ -62,8 +73,9 @@ type Config struct {
 //
 // Returns an error on: an unterminated section header, a malformed key/value
 // line, an unknown route token, a bad base32 pin, a pin whose decoded length is
-// not 32 bytes, or an alias that fails naming.ValidateAlias (for [tld-routes]
-// and [alias-pins] entries other than the "*" wildcard).
+// not 32 bytes, an alias that fails naming.ValidateAlias (for [tld-routes]
+// and [alias-pins] entries other than the "*" wildcard), or a non-boolean
+// [options] value.
 //
 // Empty / whitespace-only text returns a *Config with defaults
 // (TLDRoutes == {"*": DefaultRoute}).
@@ -141,6 +153,15 @@ func ParseConfig(text string) (*Config, error) {
 				return nil, err
 			}
 			routes[alias] = rt
+		case "options":
+			switch key {
+			case "idna":
+				b, err := parseConfigBool(value)
+				if err != nil {
+					return nil, err
+				}
+				cfg.EnableIDNA = b
+			}
 		case "alias-pins":
 			// No "*" wildcard for pins; every alias must validate.
 			alias, err := naming.ValidateAlias(key)
@@ -245,6 +266,20 @@ func parseRouteToken(value string) (Route, error) {
 		return Route(tok), nil
 	default:
 		return "", fmt.Errorf("resolver: unknown route %q (expected one of: dns, freens, freens-first, dns-first, deny)", value)
+	}
+}
+
+// parseConfigBool parses a boolean config value. Accepted spellings follow
+// Python's configparser.getboolean: 1/yes/true/on and 0/no/false/off in any
+// letter case.
+func parseConfigBool(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "yes", "true", "on":
+		return true, nil
+	case "0", "no", "false", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("resolver: invalid boolean %q (expected one of: 1/yes/true/on, 0/no/false/off)", value)
 	}
 }
 

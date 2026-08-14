@@ -1,0 +1,34 @@
+# /etc/resolv.conf example for freens (spec §9.1 deployment model, §9.4
+# stage 1: "local resolver — zero app changes").
+#
+# !!! READ BEFORE REPLACING YOUR resolv.conf !!!
+#
+# 1. BACK UP your current file first:
+#        cp /etc/resolv.conf /etc/resolv.conf.bak
+#
+# 2. Do NOT blindly overwrite it. Your existing file may carry settings you
+#    still want (search domains, options, other nameservers your network
+#    requires, e.g. from DHCP or a VPN). The safe change is to ADD one line
+#    at the TOP and keep the rest as fallback:
+#
+#        nameserver 127.0.0.1     <- add (freens answers, DNS falls through)
+#        nameserver 192.168.1.1   <- keep (fallback if the daemon is down)
+#        search example.net       <- keep
+#
+#    resolv.conf uses the FIRST nameserver that answers; later entries are
+#    only consulted on timeouts, so an existing nameserver below the freens
+#    line is a safety net, not a bypass of freens policy routes.
+#
+# 3. REVERT (restore your previous DNS settings):
+#        cp /etc/resolv.conf.bak /etc/resolv.conf
+#
+# 4. Modern distros MANAGE /etc/resolv.conf for you (systemd-resolved,
+#    NetworkManager, dhclient, ...). Editing it directly may be overwritten
+#    on the next reconnect. Prefer, in order:
+#      - systemd-resolved: see contrib/systemd/freens-resolved.conf
+#      - NetworkManager:   `nmcli con mod <name> ipv4.dns 127.0.0.1`
+#                          (+ ipv4.ignore-auto-dns yes)
+#      - or make /etc/resolv.conf immutable afterwards:
+#          chattr +i /etc/resolv.conf   (revert: chattr -i)
+
+nameserver 127.0.0.1

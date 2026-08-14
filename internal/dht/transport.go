@@ -4,7 +4,10 @@
 // the 256-bucket routing table (§6.2), the iterative Kademlia GET lookup
 // (§6.4) that turns a set of independent envelope-store "islands" into a real
 // multi-node network, and the background maintenance loops: the §6.2 bucket
-// refresh and the §6.4 step 4 republish timer.
+// refresh, the §6.4 step 4 republish timer, and the §6.2 live-eviction check
+// (ping-oldest, replace on failure) that keeps full buckets healthy. Read
+// queries (get / find_node) are additionally rate-limited per source IP per
+// §12 line 914 ("Implementations MAY throttle passive clients' get rates").
 //
 // It also carries the §7 registration machinery that touches the network: the
 // §6.3 `witness` RPC (§7.3 witness attestations, §7.4 registration steps 3-4),
@@ -42,6 +45,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -86,6 +91,27 @@ const lookupProbeTimeout = 2 * time.Second
 // due (past RefreshFraction = 80% of its lifetime, checked on every scan).
 const defaultRepublishInterval = 60 * time.Second
 
+// Default per-source-IP get/find_node throttle (§12 line 914). 50 req/s with a
+// burst of 100 is ~2 orders of magnitude above honest lookup traffic (an
+// iterative GET issues one get per round-trip per ALPHA=3 candidate) while
+// still capping a single source's read amplification.
+const (
+	defaultGetRateLimit = 50.0 // req/s per source IP
+	defaultGetBurst     = 100  // back-to-back queries per idle source
+	// limiterMaxEntries triggers a lazy sweep of idle per-IP buckets (the map
+	// is keyed by observed source IP of SIGNED queries, so reaching it implies
+	// 10k distinct abusive sources).
+	limiterMaxEntries = 10_000
+	// limiterIdle is how long an entry must be unused before a sweep may drop
+	// it (well above burst/rate for the defaults).
+	limiterIdle = 10 * time.Minute
+)
+
+// evictQueueCap bounds the pending §6.2 live-eviction requests. Combined with
+// the per-bucket coalescing (evictPending) it guarantees the maintenance path
+// can never accumulate unbounded work under a contact flood.
+const evictQueueCap = 64
+
 // Peer is a bootstrap peer: a UDP address plus the peer's 32-byte node public
 // key (required because recipient_id is part of every message signature, so a
 // node can only send a signed RPC to a peer whose key it knows).
@@ -128,14 +154,41 @@ type NodeConfig struct {
 	// RefreshFraction = 80% of their lifetime). Zero ⇒ 60s. Negative disables
 	// the republish loop; Passive disables it regardless.
 	RepublishInterval time.Duration
+	// BucketCapacity overrides the per-bucket capacity of the §6.2 routing
+	// table (K). Zero ⇒ constants.K (20). It exists mainly so tests can
+	// exercise bucket-full behavior (including live eviction) without minting
+	// K real peers; production nodes leave it at the spec default.
+	BucketCapacity int
+	// PingTimeout overrides the deadline of the §6.2 live-eviction liveness
+	// ping (ping-oldest-then-replace, spec lines 410-424). Zero ⇒ RPC_TIMEOUT
+	// (5s, Appendix A). It bounds ONLY the maintenance ping — solicited
+	// client-side RPCs (Ping, publish handshakes, lookups) keep their own
+	// deadlines — so tests can shorten the eviction wait without loosening
+	// any other timing.
+	PingTimeout time.Duration
+	// GetRateLimit caps get and find_node queries per observed source IP
+	// (token bucket, requests/second) per §12 line 914: "Implementations MAY
+	// throttle passive clients' get rates". A node cannot distinguish passive
+	// freeloaders from active clients on the wire, so the limit applies to
+	// every source; the default (50/s) is far above honest lookup traffic.
+	// Zero ⇒ 50. Negative disables throttling. Excess queries are answered
+	// with error 301 "throttled" (not silently dropped: the spec's error
+	// table, §6.3, has no flood row requiring silence, a signed error is as
+	// cheap as the query it answers, and explicit feedback lets well-behaved
+	// clients back off instead of hammering through full RPC timeouts).
+	GetRateLimit float64
+	// GetBurst is the token-bucket burst size paired with GetRateLimit (the
+	// number of queries an idle source may send back-to-back). Zero ⇒ 100.
+	// Ignored when GetRateLimit < 0.
+	GetBurst int
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
 // table, a rotating write-token store, and a shared envelope store. It serves
-// inbound RPCs and offers client-side Ping / IterativeGet / Publish, plus two
-// background maintenance loops started by Start and stopped by Close: the
-// §6.2 bucket refresh and the §6.4 step 4 republish timer (the latter only
-// when not Passive).
+// inbound RPCs and offers client-side Ping / IterativeGet / Publish, plus
+// background maintenance started by Start and stopped by Close: the §6.2
+// bucket refresh, the §6.4 step 4 republish timer (only when not Passive),
+// and the §6.2 live-eviction check (ping-oldest, replace on failure).
 //
 // All public methods are safe for concurrent use.
 type Node struct {
@@ -147,6 +200,7 @@ type Node struct {
 	passive        bool
 	refreshEvery   time.Duration // resolved: >0 = run refresh loop
 	republishEvery time.Duration // resolved: >0 = run republish loop
+	pingTimeout    time.Duration // resolved: §6.2 eviction-ping deadline
 	bgCancel       context.CancelFunc
 	bgOnce         sync.Once
 	bgWg           sync.WaitGroup
@@ -154,8 +208,18 @@ type Node struct {
 	store  *EnvelopeStore
 	rt     *RoutingTable
 	tokens *TokenStore
+	getLim *rateLimiter // per-source-IP get/find_node throttle (§12); nil = off
 	log    *slog.Logger
 	nowFn  func() int64
+
+	// §6.2 live eviction: readLoop-side callers (learnPeer runs on the read
+	// goroutine) hand full-bucket contacts to a single serialized maintenance
+	// goroutine via evictCh; evictPending coalesces per bucket index so at
+	// most one request per bucket is queued or in flight. Nothing in the
+	// inbound path ever blocks on the maintenance goroutine.
+	evictCh      chan *NodeContact
+	evictMu      sync.Mutex
+	evictPending map[int]bool
 
 	// witnessLast implements the §7.3 WITNESS_COOLDOWN rule: alias → the last
 	// claim this node co-signed (identified by its §7.3 PoW prefix hash) and
@@ -177,9 +241,10 @@ type witnessSigned struct {
 }
 
 // NewNode validates cfg and constructs (but does not Start) a Node. The routing
-// table (K entries/bucket) and token store (300s rotation) are created
-// internally; the token root secret is derived deterministically from the node
-// seed so a stable identity yields stable token epochs across restarts.
+// table (NodeConfig.BucketCapacity, default K entries/bucket) and token store
+// (300s rotation) are created internally; the token root secret is derived
+// deterministically from the node seed so a stable identity yields stable token
+// epochs across restarts.
 func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.Keypair == nil {
 		return nil, errors.New("dht: NodeConfig.Keypair is required")
@@ -191,10 +256,6 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		return nil, errors.New("dht: NodeConfig.Store is required")
 	}
 	id, err := crypto.NodeID(cfg.Keypair.Public())
-	if err != nil {
-		return nil, err
-	}
-	rt, err := NewRoutingTable(id, constants.K)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +277,18 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if now == nil {
 		now = func() int64 { return time.Now().Unix() }
 	}
+	bucketCap := cfg.BucketCapacity
+	if bucketCap <= 0 {
+		bucketCap = constants.K
+	}
+	rt, err := NewRoutingTable(id, bucketCap)
+	if err != nil {
+		return nil, err
+	}
+	pingTimeout := cfg.PingTimeout
+	if pingTimeout <= 0 {
+		pingTimeout = rpcTimeout()
+	}
 	// Resolve the background-loop periods: zero ⇒ default, negative ⇒ off.
 	refreshEvery := cfg.BucketRefreshInterval
 	if refreshEvery == 0 {
@@ -229,6 +302,19 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	} else if republishEvery < 0 {
 		republishEvery = 0
 	}
+	// Per-source-IP read throttle (§12 line 914): negative rate ⇒ disabled.
+	var getLim *rateLimiter
+	if cfg.GetRateLimit >= 0 {
+		rate := cfg.GetRateLimit
+		if rate == 0 {
+			rate = defaultGetRateLimit
+		}
+		burst := cfg.GetBurst
+		if burst <= 0 {
+			burst = defaultGetBurst
+		}
+		getLim = newRateLimiter(rate, burst)
+	}
 	return &Node{
 		kp:             cfg.Keypair,
 		id:             id,
@@ -236,11 +322,15 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		passive:        cfg.Passive,
 		refreshEvery:   refreshEvery,
 		republishEvery: republishEvery,
+		pingTimeout:    pingTimeout,
 		store:          cfg.Store,
 		rt:             rt,
 		tokens:         tokens,
+		getLim:         getLim,
 		log:            log,
 		nowFn:          now,
+		evictCh:        make(chan *NodeContact, evictQueueCap),
+		evictPending:   make(map[int]bool),
 		witnessLast:    make(map[string]witnessSigned),
 		pending:        make(map[string]chan *wire.Message),
 	}, nil
@@ -388,23 +478,126 @@ func (n *Node) learnPeer(pk []byte, raddr *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	if evict := n.rtAddOrIgnore(c); evict != nil {
-		// Bucket full and the sender is new. A full implementation would
-		// ping-oldest-then-replace (§6.2); for the transport layer we simply
-		// drop the new contact. Refreshing an existing contact (above) still
-		// succeeds.
-	}
+	n.learn(c)
 }
 
 // rtAddOrIgnore adds c, returning a non-nil eviction candidate if the bucket is
-// full (so callers may, in future, perform live eviction). It never errors on a
-// self/unknown contact.
+// full (the §6.2 ping-oldest signal — see learn/evictCandidate). It never
+// errors on a self/unknown contact.
 func (n *Node) rtAddOrIgnore(c *NodeContact) *NodeContact {
 	evict, err := n.rt.Add(c)
 	if err != nil {
 		return nil
 	}
 	return evict
+}
+
+// learn inserts or refreshes c, performing §6.2 live eviction when c's bucket
+// is full (spec lines 410-424: "standard Kademlia eviction (ping-oldest,
+// replace on failure)"). The eviction check is ASYNC — learn runs on the
+// readLoop goroutine (learnPeer) and must not block on a network round-trip
+// that only readLoop itself could deliver — so a full bucket schedules the
+// candidate on the maintenance channel and returns immediately. Coalescing:
+// at most one request per bucket index is queued or in flight; later
+// candidates for the same bucket are dropped (the bucket has one contested
+// slot, and the next verified traffic retries cheaply).
+func (n *Node) learn(c *NodeContact) {
+	if evict := n.rtAddOrIgnore(c); evict != nil {
+		n.scheduleEviction(c)
+	}
+}
+
+// scheduleEviction hands c to the maintenance goroutine unless a check for its
+// bucket is already queued or in flight. Never blocks (bounded channel,
+// non-blocking send): a flooded bucket degrades to "drop the newcomer", never
+// to backpressure on readLoop.
+func (n *Node) scheduleEviction(c *NodeContact) {
+	b, err := n.rt.BucketFor(c.NodeID)
+	if err != nil {
+		return // self/invalid: nothing to maintain
+	}
+	n.evictMu.Lock()
+	if n.evictPending[b.Index] {
+		n.evictMu.Unlock()
+		return // coalesce: a check for this bucket is already pending
+	}
+	n.evictPending[b.Index] = true
+	n.evictMu.Unlock()
+	select {
+	case n.evictCh <- c:
+	default: // queue full: back out the pending mark and drop the request
+		n.evictMu.Lock()
+		delete(n.evictPending, b.Index)
+		n.evictMu.Unlock()
+	}
+}
+
+// evictionLoop is the single serialized §6.2 maintenance goroutine. It serves
+// the evictCh queue one request at a time — a request may block for up to
+// NodeConfig.PingTimeout inside the liveness ping, which is exactly why this
+// work must not run inline on readLoop. Started by Start, stopped by Close
+// (the shared background context cancels an in-flight ping promptly).
+func (n *Node) evictionLoop(ctx context.Context) {
+	defer n.bgWg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case c := <-n.evictCh:
+			n.evictCandidate(ctx, c)
+			if b, err := n.rt.BucketFor(c.NodeID); err == nil {
+				n.evictMu.Lock()
+				delete(n.evictPending, b.Index)
+				n.evictMu.Unlock()
+			}
+		}
+	}
+}
+
+// evictCandidate performs the §6.2 ping-oldest check for newcomer c, whose
+// bucket was full when the request was scheduled:
+//
+//   - Re-add c first: the table may have changed while the request waited
+//     (contact evicted elsewhere, bucket drained). A nil return from
+//     rtAddOrIgnore means c was inserted or refreshed — done.
+//   - Otherwise ping the CURRENT oldest (head) of c's bucket with the
+//     maintenance deadline. Any verified response proves the oldest is live
+//     (readLoop→learnPeer refreshes it as a side effect, moving it to the
+//     tail): keep it, drop c — the §6.2 rule favors retained, live contacts.
+//   - On timeout / unreachable, remove the oldest and insert c in the freed
+//     slot. A shutdown cancellation (ctx.Err) is NOT a peer failure: never
+//     evict for it.
+//
+// The ping runs on the maintenance goroutine, so its response is delivered by
+// the still-running readLoop — no self-deadlock with sendQuery.
+func (n *Node) evictCandidate(ctx context.Context, c *NodeContact) {
+	if ctx.Err() != nil || n.conn == nil {
+		return
+	}
+	oldest := n.rtAddOrIgnore(c)
+	if oldest == nil {
+		return // bucket got room (or c became known) while queued: inserted
+	}
+	pctx, cancel := context.WithTimeout(ctx, n.pingTimeout)
+	defer cancel()
+	addr, err := net.ResolveUDPAddr("udp", oldest.Addr)
+	if err != nil {
+		n.log.Debug("dht: eviction ping address unresolvable", "addr", oldest.Addr, "err", err)
+		return // keep the incumbent on our own failure; drop the newcomer
+	}
+	resp, err := n.sendQuery(pctx, addr, oldest.NodeID, "ping", map[string]any{})
+	if err == nil && resp != nil {
+		// Oldest answered (verified by handle before delivery): alive — keep
+		// it, and with it the rest of the bucket; the newcomer loses (§6.2).
+		return
+	}
+	if ctx.Err() != nil {
+		return // our shutdown, not the peer's failure: evict nothing
+	}
+	n.rt.Remove(oldest.NodeID)
+	n.rtAddOrIgnore(c)
+	n.log.Debug("dht: evicted unresponsive oldest contact",
+		"addr", oldest.Addr, "err", err)
 }
 
 func (n *Node) handleQuery(m *wire.Message, raddr *net.UDPAddr) {
@@ -446,8 +639,13 @@ func (n *Node) hPing(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	return n.okResp(m, map[string]any{"token": n.issueToken(raddr)})
 }
 
-// hFindNode returns the K contacts nearest to {target} (§6.3).
+// hFindNode returns the K contacts nearest to {target} (§6.3). It shares the
+// per-source-IP read throttle with get (§12 line 914 names get; find_node is
+// the same unauthenticated-read lookup shape, so it is throttled alike).
 func (n *Node) hFindNode(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	if !n.allowRead(raddr) {
+		return n.errResp(m, 301, "throttled")
+	}
 	target, _ := m.A["target"].([]byte)
 	if len(target) != constants.NodeIDLen {
 		return n.errResp(m, 305, "bad target")
@@ -461,7 +659,18 @@ func (n *Node) hFindNode(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 
 // hGet returns the stored envelope for {key} if present; otherwise the K closest
 // contacts (§6.4 GET). Either way a write token is included.
+//
+// §12 line 914 ("Implementations MAY throttle passive clients' get rates"):
+// each source IP draws from a token bucket (NodeConfig.GetRateLimit /
+// GetBurst; default 50/s burst 100). A node cannot distinguish passive
+// freeloaders from active clients on the wire, so the limit is uniform; the
+// generous default leaves honest lookups untouched while capping one source's
+// read amplification. Excess queries get a signed error 301 "throttled" — see
+// NodeConfig.GetRateLimit for why an answer beats a silent drop.
 func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	if !n.allowRead(raddr) {
+		return n.errResp(m, 301, "throttled")
+	}
 	key, _ := m.A["key"].([]byte)
 	if len(key) != constants.SHA256Len {
 		return n.errResp(m, 305, "bad key")
@@ -758,9 +967,11 @@ func (n *Node) Ping(ctx context.Context, peer Peer) error {
 	return nil
 }
 
-// AddPeer adds a bootstrap contact to the routing table (no network IO). The
-// peer's public key is required because it determines the recipient_id used to
-// sign any subsequent RPC to it.
+// AddPeer adds a bootstrap contact to the routing table (no synchronous
+// network IO). The peer's public key is required because it determines the
+// recipient_id used to sign any subsequent RPC to it. If the target bucket is
+// already full, the §6.2 eviction check is merely SCHEDULED (async; see learn)
+// — at bootstrap time tables are empty, so in practice this inserts directly.
 func (n *Node) AddPeer(pk []byte, addr string) error {
 	id, err := crypto.NodeID(pk)
 	if err != nil {
@@ -770,7 +981,7 @@ func (n *Node) AddPeer(pk []byte, addr string) error {
 	if err != nil {
 		return err
 	}
-	n.rtAddOrIgnore(c)
+	n.learn(c)
 	return nil
 }
 
@@ -916,13 +1127,14 @@ func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) (*wi
 }
 
 // learnContact refreshes/inserts a contact discovered via find_node/get (a
-// parsed node list, so LastSeen is stamped here).
+// parsed node list, so LastSeen is stamped here). A full bucket schedules the
+// async §6.2 eviction check (see learn).
 func (n *Node) learnContact(c *NodeContact) {
 	if c == nil || bytes.Equal(c.NodeID, n.id) {
 		return
 	}
 	c.LastSeen = n.now()
-	n.rtAddOrIgnore(c)
+	n.learn(c)
 }
 
 // Publish stores env on the R closest nodes to its key (§6.4 PUT), obtaining a
@@ -1154,14 +1366,18 @@ func (n *Node) putToPeer(ctx context.Context, key, envBytes []byte, c *NodeConta
 // Background maintenance: §6.2 bucket refresh + §6.4 step 4 republish timer
 // ---------------------------------------------------------------------------
 
-// startBackground launches the background loops: the §6.2 bucket refresh
-// (always, unless disabled via NodeConfig.BucketRefreshInterval < 0) and the
-// §6.4 step 4 republish timer (skipped for Passive nodes and when disabled via
-// NodeConfig.RepublishInterval < 0). Both loops share one context that Close
-// cancels, and are tracked by bgWg so Close can wait for their exit.
+// startBackground launches the background loops: the §6.2 live-eviction
+// maintenance goroutine (always — full buckets can fill from inbound traffic
+// alone), the §6.2 bucket refresh (unless disabled via
+// NodeConfig.BucketRefreshInterval < 0), and the §6.4 step 4 republish timer
+// (skipped for Passive nodes and when disabled via NodeConfig.RepublishInterval
+// < 0). All loops share one context that Close cancels, and are tracked by bgWg
+// so Close can wait for their exit.
 func (n *Node) startBackground() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.bgCancel = cancel
+	n.bgWg.Add(1)
+	go n.evictionLoop(ctx)
 	if n.refreshEvery > 0 {
 		n.bgWg.Add(1)
 		go n.bucketRefreshLoop(ctx)
@@ -1344,40 +1560,133 @@ func (n *Node) republishDue(ctx context.Context) {
 type DHTLookup struct {
 	store *EnvelopeStore
 	node  *Node
+
+	// fetchedAt records when THIS lookup last fetched each key from the
+	// network (unix seconds). A key absent from the map is authoritative-
+	// local (seeded via -load or published by this node) and is always
+	// served without re-validation; a key present is a NETWORK CACHE entry
+	// whose freshness window is the record's own TTL (§6.4 caching "subject
+	// to expiry", in DNS-cache semantics — an update published elsewhere
+	// propagates here within one record TTL instead of one record LIFETIME).
+	fetchedAt map[[constants.SHA256Len]byte]int64
+	mu        sync.Mutex
 }
 
 // NewDHTLookup wraps store (local) and node (network) into a RecordLookup.
 func NewDHTLookup(store *EnvelopeStore, node *Node) *DHTLookup {
-	return &DHTLookup{store: store, node: node}
+	return &DHTLookup{store: store, node: node, fetchedAt: make(map[[constants.SHA256Len]byte]int64)}
 }
 
-// Lookup returns the winning SignedEnvelope for wireName: the local store first,
-// then an iterative network GET (cached on success). Returns (nil, nil) when no
-// record is available locally or across the reachable network.
+// cacheFreshness returns the re-validation window for env: the minimum RR TTL
+// across its RRset (a delegation-only record with an empty RRset falls back to
+// RecordDefaultTTL), capped at constants.ResponseTTLCap (1 h) so very long
+// record TTLs cannot pin a stale cache for the record's whole lifetime.
+func cacheFreshness(env *wire.SignedEnvelope) int64 {
+	if env == nil || env.Record == nil || len(env.Record.RRset) == 0 {
+		return int64(constants.RecordDefaultTTL)
+	}
+	min := int64(env.Record.RRset[0].TTL)
+	for _, rr := range env.Record.RRset[1:] {
+		if int64(rr.TTL) < min {
+			min = int64(rr.TTL)
+		}
+	}
+	if min < 1 {
+		min = 1
+	}
+	if min > int64(constants.ResponseTTLCap) {
+		min = int64(constants.ResponseTTLCap)
+	}
+	return min
+}
+
+// freshLocked reports whether the cached env under key is still fresh at now.
+// Keys never fetched by this lookup (authoritative-local) are always fresh.
+func (l *DHTLookup) freshLocked(key []byte, env *wire.SignedEnvelope, now int64) bool {
+	var k [constants.SHA256Len]byte
+	copy(k[:], key)
+	fa, ok := l.fetchedAt[k]
+	if !ok {
+		return true
+	}
+	return now < fa+cacheFreshness(env)
+}
+
+// Lookup returns the winning SignedEnvelope for wireName: a fresh local hit
+// first; a stale network-cached hit triggers re-validation via an iterative
+// GET (on fetch failure the stale copy is served — offline resilience, the
+// §6.4 grace analogue); a total miss fetches and caches. Returns (nil, nil)
+// when no record is available locally or across the reachable network.
 func (l *DHTLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wire.SignedEnvelope, error) {
 	key, err := KeyForWireName(wireName)
 	if err != nil {
 		return nil, err
 	}
-	if env, _ := l.store.Get(key, now); env != nil {
-		return env, nil
+	cached, _ := l.store.Get(key, now)
+	l.mu.Lock()
+	fresh := cached != nil && l.freshLocked(key, cached, now)
+	l.mu.Unlock()
+	if fresh {
+		return cached, nil
 	}
 	if l.node == nil {
-		return nil, nil
+		return cached, nil // island: serve the stale cache or nil
 	}
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
 	env, err := l.node.IterativeGet(c, key)
-	if err != nil {
-		return nil, err
-	}
-	if env == nil {
-		return nil, nil
+	if err != nil || env == nil {
+		// Fetch failure or a network-wide miss: fall back to the stale cache
+		// (better a still-valid-signature stale record than NXDOMAIN).
+		return cached, nil
 	}
 	// Cache the fetched envelope locally (verifySignature=true defensively
-	// re-checks the signature before storing).
+	// re-checks the signature before storing) and stamp its fetch time.
 	_, _ = l.store.Put(key, env, now, true)
+	l.mu.Lock()
+	var k [constants.SHA256Len]byte
+	copy(k[:], key)
+	l.fetchedAt[k] = now
+	l.mu.Unlock()
 	return env, nil
+}
+
+// FetchMetaJSON serializes the fetched-keys metadata (key hex → fetchedAt unix
+// seconds) so a daemon can persist WHICH envelopes are network caches (vs
+// authoritative-local seeds) across restarts — without it, a restart launders
+// every cached envelope into an always-fresh authoritative copy.
+func (l *DHTLookup) FetchMetaJSON() ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]int64, len(l.fetchedAt))
+	for k, v := range l.fetchedAt {
+		out[hex.EncodeToString(k[:])] = v
+	}
+	if len(out) == 0 {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(out)
+}
+
+// LoadFetchMetaJSON restores fetched-keys metadata written by FetchMetaJSON.
+// Malformed entries are skipped.
+func (l *DHTLookup) LoadFetchMetaJSON(data []byte) error {
+	var m map[string]int64
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for kh, v := range m {
+		k, err := hex.DecodeString(kh)
+		if err != nil || len(k) != constants.SHA256Len {
+			continue
+		}
+		var key [constants.SHA256Len]byte
+		copy(key[:], k)
+		l.fetchedAt[key] = v
+	}
+	return nil
 }
 
 // LookupClaim returns the SignedEnvelope stored at K_claim for alias — the
@@ -1414,6 +1723,85 @@ func (l *DHTLookup) LookupClaim(ctx context.Context, alias string, now int64) (*
 	// path MAY cache"; verifySignature=true defensively re-checks it).
 	_, _ = l.store.Put(key, env, now, true)
 	return env, nil
+}
+
+// ---------------------------------------------------------------------------
+// Per-source-IP read throttling (§12 line 914; §10.2)
+// ---------------------------------------------------------------------------
+
+// allowRead consumes one read-RPC token for the observed source of raddr, per
+// §12 line 914. Keyed on normIP(raddr.IP) — the same canonical observed-source
+// binding the write-token defense uses (§6.3), so a flooder cannot rotate
+// ports to dodge it and a spoofer cannot pre-fill someone else's bucket.
+// Always true when throttling is disabled (nil limiter).
+func (n *Node) allowRead(raddr *net.UDPAddr) bool {
+	if n.getLim == nil {
+		return true
+	}
+	return n.getLim.allow(normIP(raddr.IP))
+}
+
+// rateLimiter is a mutex-guarded map of token buckets keyed by source IP:
+// each key holds `burst` tokens, refilled at `rate` per second; a query costs
+// one. State is tiny (two fields/IP) and lazily expired: once the map exceeds
+// limiterMaxEntries, entries unused for limiterIdle are swept (reaching the
+// cap requires 10k distinct SIGNED sources, i.e. sustained abuse — and if all
+// entries are somehow recent, new keys are still admitted rather than letting
+// an attacker lock honest IPs out of the map).
+type rateLimiter struct {
+	rate    float64 // tokens/second
+	burst   float64 // bucket capacity
+	mu      sync.Mutex
+	buckets map[string]*tokenBucket
+}
+
+type tokenBucket struct {
+	tokens float64
+	last   time.Time // last allow() attempt, drives the idle sweep
+}
+
+func newRateLimiter(rate float64, burst int) *rateLimiter {
+	return &rateLimiter{
+		rate:    rate,
+		burst:   float64(burst),
+		buckets: make(map[string]*tokenBucket),
+	}
+}
+
+// allow reports whether one request from key fits the bucket, refilling it
+// lazily from the elapsed time since the previous request.
+func (l *rateLimiter) allow(key []byte) bool {
+	k := string(key)
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[k]
+	if !ok {
+		if len(l.buckets) >= limiterMaxEntries {
+			l.sweepIdleLocked(now)
+		}
+		b = &tokenBucket{tokens: l.burst, last: now}
+		l.buckets[k] = b
+	}
+	if dt := now.Sub(b.last); dt > 0 {
+		b.tokens = min(l.burst, b.tokens+dt.Seconds()*l.rate)
+	}
+	b.last = now
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+// sweepIdleLocked drops entries no request has touched within limiterIdle.
+// Caller must hold l.mu.
+func (l *rateLimiter) sweepIdleLocked(now time.Time) {
+	for k, b := range l.buckets {
+		if now.Sub(b.last) > limiterIdle {
+			delete(l.buckets, k)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

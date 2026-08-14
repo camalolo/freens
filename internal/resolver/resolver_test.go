@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -1437,12 +1438,44 @@ type claimedWorld struct {
 // newClaimedWorld mines a difficulty-8 claim for alias (with W distinct
 // witnesses, §7.3 quorum), embeds it in the TLD record (field 11), and builds
 // the www.<alias> A record — the state the network would hold at K_claim,
-// K_tld, and K_name after a §7.4/C.1 registration.
+// K_tld, and K_name after a §7.4/C.1 registration. The claimant-asserted
+// timestamp is fixedNow-50 (inside the §7.5 CONTEST_WINDOW, i.e. contested).
 func newClaimedWorld(t *testing.T, alias string) *claimedWorld {
 	t.Helper()
-	withFastPoW(t)
+	return newClaimedWorldAt(t, alias, uint64(fixedNow-50), net.IPv4(203, 0, 113, 77))
+}
 
-	w := &claimedWorld{wwwIPv4: net.IPv4(203, 0, 113, 77)}
+// newClaimedWorldAt is newClaimedWorld with an explicit claimant-asserted
+// timestamp and www answer address, so §7.4 set tests can build COMPETING
+// worlds for one alias with a known (timestamp, pow_hash, tld_id) order.
+func newClaimedWorldAt(t *testing.T, alias string, claimTS uint64, ip net.IP) *claimedWorld {
+	t.Helper()
+	return newClaimedWorldUntil(t, alias, claimTS, ip, nil)
+}
+
+// newClaimedWorldUntil additionally re-mines (fresh world each attempt) until
+// pred accepts the mined claim. The §7.4 pow_hash tie-break is a lottery, so
+// tests that need a specific pow_hash ORDER between two claims (e.g. proving
+// the earlier timestamp beats a lower hash) retry the mining; at difficulty 8
+// each draw costs ~2^8 hashes, so a handful of attempts is instant.
+func newClaimedWorldUntil(t *testing.T, alias string, claimTS uint64, ip net.IP, pred func(*claims.AliasClaim) bool) *claimedWorld {
+	t.Helper()
+	withFastPoW(t)
+	for attempt := 0; ; attempt++ {
+		w := buildClaimedWorldOnce(t, alias, claimTS, ip)
+		if pred == nil || pred(w.claim) {
+			return w
+		}
+		if attempt >= 500 {
+			t.Fatal("fixture: mining did not satisfy the test predicate in 500 attempts")
+		}
+	}
+}
+
+// buildClaimedWorldOnce is the single-attempt body of newClaimedWorldAt.
+func buildClaimedWorldOnce(t *testing.T, alias string, claimTS uint64, ip net.IP) *claimedWorld {
+	t.Helper()
+	w := &claimedWorld{wwwIPv4: ip}
 	tldKP, err := crypto.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -1455,7 +1488,7 @@ func newClaimedWorld(t *testing.T, alias string) *claimedWorld {
 	w.tldID = tldID
 
 	// §7.3: mine the PoW at difficulty 8 (nonce_size 16 pins nonce[0]=8).
-	claim, err := claims.MineAliasClaim(alias, tldKP, uint64(fixedNow-50), 8, 2_000_000, 16)
+	claim, err := claims.MineAliasClaim(alias, tldKP, claimTS, 8, 2_000_000, 16)
 	if err != nil {
 		t.Fatalf("MineAliasClaim: %v", err)
 	}
@@ -1466,7 +1499,7 @@ func newClaimedWorld(t *testing.T, alias string) *claimedWorld {
 		if err != nil {
 			t.Fatal(err)
 		}
-		w, err := claims.NewWitnessAttestation(wkp, uint64(fixedNow-50)+uint64(i), alias, tldID, tldKP.Public())
+		w, err := claims.NewWitnessAttestation(wkp, claimTS+uint64(i), alias, tldID, tldKP.Public())
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}
@@ -1506,7 +1539,7 @@ func newClaimedWorld(t *testing.T, alias string) *claimedWorld {
 	if err != nil {
 		t.Fatal(err)
 	}
-	aRR, err := wire.A([]byte{203, 0, 113, 77}, 600)
+	aRR, err := wire.A(ip.To4(), 600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1856,5 +1889,312 @@ func TestResolveQuestionNoClaimResolver(t *testing.T) {
 	}
 	if rcode != dns.RcodeNameError {
 		t.Errorf("rcode = %d, want NXDOMAIN(%d) without a claim-capable source", rcode, dns.RcodeNameError)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §7.4/§7.5 — contested-alias resolution over a COLLECTED claim set
+// (ClaimSetResolver) + the §10.4 contested caching rule
+// ---------------------------------------------------------------------------
+
+// fakeClaimSetLookup is a RecordLookup + ClaimResolver + ClaimSetResolver
+// backed by maps: chain hops by wire_name, and for the claim layer BOTH the
+// legacy single-envelope view (claims, used by LookupClaim) and the §7.4
+// merged-set view (set, returned by CollectClaims in the caller's chosen
+// order). calls counts CollectClaims invocations so cache tests can prove
+// whether a second resolution re-consulted the network.
+type fakeClaimSetLookup struct {
+	fakeClaimLookup
+	set   []*wire.SignedEnvelope
+	calls int
+}
+
+// CollectClaims returns the configured set (the competing claims "nodes
+// offer", §7.4 step 1) — order deliberately caller-controlled to prove the
+// §7.4 step-3 ordering is observation-order-independent.
+func (f *fakeClaimSetLookup) CollectClaims(_ context.Context, alias string, _ int64) ([]*wire.SignedEnvelope, error) {
+	f.calls++
+	if _, ok := f.claims[alias]; !ok {
+		return nil, nil
+	}
+	return f.set, nil
+}
+
+// newFakeClaimSetLookup registers both competing worlds' chain hops and claim
+// envelopes for alias, with the claim SET in the given envelope order.
+func newFakeClaimSetLookup(alias string, order []*wire.SignedEnvelope, worlds ...*claimedWorld) *fakeClaimSetLookup {
+	f := &fakeClaimSetLookup{fakeClaimLookup: *newFakeClaimLookup(), set: order}
+	for _, w := range worlds {
+		f.putClaim(alias, w.tldEnv)
+		f.put(w.wwwEnv)
+	}
+	return f
+}
+
+// TestResolveQuestionClaimSetWinnerOrderIndependent — THE §7.4 verifier-side
+// test: two fully valid competing claims for "foo" (ts=T and ts=T+1, i.e. a
+// §7.5 SKEW_TOLERANCE race) are offered as a collected set; the resolver must
+// pick the §7.4 deterministic winner — the EARLIEST timestamp — regardless of
+// the order the set arrived in ("This total order is computable by any client
+// from claim contents alone — convergence without consensus", spec lines
+// 613-615).
+func TestResolveQuestionClaimSetWinnerOrderIndependent(t *testing.T) {
+	wEarly := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 101))
+	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 102))
+
+	for name, order := range map[string][]*wire.SignedEnvelope{
+		"early-first": {wEarly.tldEnv, wLate.tldEnv},
+		"late-first":  {wLate.tldEnv, wEarly.tldEnv},
+	} {
+		lookup := newFakeClaimSetLookup("foo", order, wEarly, wLate)
+		rrs, rcode, err := resolveFoo(t, lookup)
+		if err != nil {
+			t.Fatalf("%s: ResolveQuestion: %v", name, err)
+		}
+		if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+			t.Fatalf("%s: rcode=%d len=%d, want NOERROR/1", name, rcode, len(rrs))
+		}
+		a, ok := rrs[0].(*dns.A)
+		if !ok {
+			t.Fatalf("%s: rrs[0] is %T, want *dns.A", name, rrs[0])
+		}
+		if !a.A.Equal(wEarly.wwwIPv4) {
+			t.Errorf("%s: winner = %s, want the earlier-ts claimant's %s", name, a.A, wEarly.wwwIPv4)
+		}
+	}
+}
+
+// TestResolveQuestionClaimSetEarlierTSBeatsLowerPowHash proves the ordering is
+// ts-FIRST (§7.4 step 3, spec lines 606-615: "earliest asserted time wins;
+// ties broken by lower PoW hash"): a later-ts claim whose pow_hash is
+// bytewise LOWER (a better lottery ticket — it would win any equal-timestamp
+// tie) still LOSES to an earlier-ts claim whose pow_hash is higher. The early
+// world is re-mined until that hash relation actually holds.
+func TestResolveQuestionClaimSetEarlierTSBeatsLowerPowHash(t *testing.T) {
+	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-10), net.IPv4(203, 0, 113, 112))
+	wEarly := newClaimedWorldUntil(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 111),
+		func(c *claims.AliasClaim) bool {
+			return bytes.Compare(c.PowHash, wLate.claim.PowHash) > 0
+		})
+	if bytes.Compare(wEarly.claim.PowHash, wLate.claim.PowHash) <= 0 {
+		t.Fatal("fixture: early claim's pow_hash must be bytewise GREATER than the late claim's")
+	}
+
+	for name, order := range map[string][]*wire.SignedEnvelope{
+		"early-first": {wEarly.tldEnv, wLate.tldEnv},
+		"late-first":  {wLate.tldEnv, wEarly.tldEnv},
+	} {
+		lookup := newFakeClaimSetLookup("foo", order, wEarly, wLate)
+		rrs, rcode, err := resolveFoo(t, lookup)
+		if err != nil {
+			t.Fatalf("%s: ResolveQuestion: %v", name, err)
+		}
+		if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+			t.Fatalf("%s: rcode=%d len=%d, want NOERROR/1", name, rcode, len(rrs))
+		}
+		a := rrs[0].(*dns.A)
+		if !a.A.Equal(wEarly.wwwIPv4) {
+			t.Errorf("%s: winner = %s, want the earlier-ts claimant's %s despite its higher pow_hash",
+				name, a.A, wEarly.wwwIPv4)
+		}
+	}
+}
+
+// TestResolveQuestionClaimSetDropsInvalidClaims: a set member failing the
+// per-claim §7.4 step-2 filter is DROPPED, not fatal — here a broken-witness
+// envelope with the EARLIEST timestamp loses (no quorum) and the valid
+// earlier-ts claim wins among the survivors.
+func TestResolveQuestionClaimSetDropsInvalidClaims(t *testing.T) {
+	wValid1 := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 121))
+	wValid2 := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 122))
+	wBroken := newClaimedWorldAt(t, "foo", uint64(fixedNow-90), net.IPv4(203, 0, 113, 120))
+	broken := wBroken.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+		c.Witnesses[0].Sig[0] ^= 0xff // earliest ts, but quorum broken → filtered
+	})
+
+	lookup := newFakeClaimSetLookup("foo",
+		[]*wire.SignedEnvelope{broken, wValid2.tldEnv, wValid1.tldEnv}, wValid1, wValid2, wBroken)
+	rrs, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("ResolveQuestion: %v", err)
+	}
+	if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+		t.Fatalf("rcode=%d len=%d, want NOERROR/1", rcode, len(rrs))
+	}
+	if a := rrs[0].(*dns.A); !a.A.Equal(wValid1.wwwIPv4) {
+		t.Errorf("winner = %s, want the earliest VALID claimant's %s", a.A, wValid1.wwwIPv4)
+	}
+}
+
+// TestResolveQuestionClaimSetAllInvalidNXDOMAIN: when every collected claim
+// fails the filter, the set path misses like the single path → NXDOMAIN.
+func TestResolveQuestionClaimSetAllInvalidNXDOMAIN(t *testing.T) {
+	w1 := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 131))
+	w2 := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 132))
+	brokenPoW := w1.resignWithClaim(t, "foo", func(c *claims.AliasClaim) { c.PowHash[0] ^= 0xff })
+	brokenWit := w2.resignWithClaim(t, "foo", func(c *claims.AliasClaim) { c.Witnesses[1].Sig[0] ^= 0xff })
+
+	lookup := newFakeClaimSetLookup("foo",
+		[]*wire.SignedEnvelope{brokenPoW, brokenWit}, w1, w2)
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("ResolveQuestion: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) when every set member fails the filter", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionContestedWinnerTTLCapped — §10.4 line 853 via §7.5: the
+// winning claim's timestamp (fixedNow-50) is inside the CONTEST_WINDOW
+// (48 h), so the winner is NOT final ("clients MUST NOT treat either as final
+// until ... no earlier-ordered valid claim appears within CONTEST_WINDOW",
+// §7.5 lines 627-630) and its answers are capped at 60 s ("Alias claim
+// winners cached per 7.5 (contested: 60 s; uncontested: 6 h)", §10.4 line
+// 853): the answer RR TTL becomes 60 (the www record says 600) AND the
+// ResponseCache entry derived from it expires after 60 s.
+func TestResolveQuestionContestedWinnerTTLCapped(t *testing.T) {
+	wEarly := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 141))
+	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 142))
+	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{wLate.tldEnv, wEarly.tldEnv}, wEarly, wLate)
+
+	rrs, rcode, err := resolveFoo(t, lookup)
+	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
+		t.Fatalf("resolve: rcode=%d len=%d err=%v", rcode, len(rrs), err)
+	}
+	if got := rrs[0].Header().Ttl; got != contestedClaimTTLCap {
+		t.Errorf("contested winner TTL = %d, want %d (§10.4 contested: 60 s; record TTL 600 must be capped)", got, contestedClaimTTLCap)
+	}
+
+	// The §10.4 ResponseCache consequence: putFreens derives its expiry from
+	// the (capped) RR TTL, so the entry is gone 61 s later — a contested
+	// alias cannot be pinned by the cache past the contest.
+	clock := fixedNow
+	cache := NewResponseCache(16, func() int64 { return clock })
+	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
+	if _, _, _, ok := cache.get(cacheKeyFor(q)); !ok {
+		t.Fatal("contested entry missing from cache immediately after put")
+	}
+	clock += contestedClaimTTLCap + 1
+	if _, _, _, ok := cache.get(cacheKeyFor(q)); ok {
+		t.Error("contested alias answer still cached past the §10.4 60 s cap")
+	}
+}
+
+// TestResolveQuestionUncontestedWinnerNotCapped: a winner older than the
+// CONTEST_WINDOW is FINAL per §7.5(b) — no earlier-ordered claim can appear
+// inside the window anymore — so §10.4 allows the uncontested 6 h caching
+// (> RESPONSE_TTL_CAP, i.e. the normal TTL applies): the answer keeps its
+// 600 s TTL and the cache entry survives past 60 s.
+func TestResolveQuestionUncontestedWinnerNotCapped(t *testing.T) {
+	old := uint64(fixedNow - constants.ContestWindow - 1000) // final per §7.5(b)
+	wEarly := newClaimedWorldAt(t, "foo", old, net.IPv4(203, 0, 113, 151))
+	wLate := newClaimedWorldAt(t, "foo", old+1, net.IPv4(203, 0, 113, 152))
+	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{wLate.tldEnv, wEarly.tldEnv}, wEarly, wLate)
+
+	rrs, rcode, err := resolveFoo(t, lookup)
+	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
+		t.Fatalf("resolve: rcode=%d len=%d err=%v", rcode, len(rrs), err)
+	}
+	if got := rrs[0].Header().Ttl; got != 600 {
+		t.Errorf("uncontested winner TTL = %d, want the record's 600 (§10.4 uncontested allowance is 6 h; no 60 s cap)", got)
+	}
+
+	// ...and the §10.4 cache entry outlives the contested 60 s bound.
+	clock := fixedNow
+	cache := NewResponseCache(16, func() int64 { return clock })
+	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
+	clock += contestedClaimTTLCap + 1
+	if _, _, _, ok := cache.get(cacheKeyFor(q)); !ok {
+		t.Error("uncontested alias answer wrongly evicted within the §10.4 6 h allowance")
+	}
+}
+
+// TestResolveQuestionContestedCacheReconsultsNetwork: end-to-end §10.4 on the
+// SERVER path (ServeDNS consults and populates the ResponseCache): after a
+// contested answer's 60 s cache lifetime lapses, the next query re-consults
+// the claim set (CollectClaims called again), so a contest that flipped (an
+// earlier-ordered claim appeared) is picked up within 60 s; an uncontested
+// (final) winner is still served from cache at +120 s with no re-collection.
+func TestResolveQuestionContestedCacheReconsultsNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		claimTS      uint64
+		wantRecalled bool
+	}{
+		{"contested (inside CONTEST_WINDOW)", uint64(fixedNow - 50), true},
+		{"uncontested (outside CONTEST_WINDOW)", uint64(fixedNow - constants.ContestWindow - 1000), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w1 := newClaimedWorldAt(t, "foo", tc.claimTS, net.IPv4(203, 0, 113, 161))
+			w2 := newClaimedWorldAt(t, "foo", tc.claimTS+1, net.IPv4(203, 0, 113, 162))
+			lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{w2.tldEnv, w1.tldEnv}, w1, w2)
+
+			clock := fixedNow
+			r := New(claimConfig(), lookup, nil)
+			r.Now = func() int64 { return clock }
+			r.Cache = NewResponseCache(16, func() int64 { return clock })
+
+			// Two server-path queries for www.foo around a 120 s clock jump.
+			query := func() {
+				t.Helper()
+				w := &captureWriter{}
+				r.ServeDNS(w, new(dns.Msg).SetQuestion("www.foo.", dns.TypeA))
+				if w.msg == nil || w.msg.Rcode != dns.RcodeSuccess || len(w.msg.Answer) != 1 {
+					t.Fatalf("ServeDNS: resp=%v", w.msg)
+				}
+			}
+			query() // 1st query resolves and populates the cache.
+			clock += contestedClaimTTLCap + 60
+			query()
+			callsAfter := lookup.calls
+			if tc.wantRecalled && callsAfter != 2 {
+				t.Errorf("CollectClaims calls = %d after the cache lifetime, want 2 (contested entry must expire per §10.4)", callsAfter)
+			}
+			if !tc.wantRecalled && callsAfter != 1 {
+				t.Errorf("CollectClaims calls = %d after the cache lifetime, want 1 (uncontested entry must still be served from cache)", callsAfter)
+			}
+		})
+	}
+}
+
+// captureWriter is a minimal dns.ResponseWriter capturing the written reply
+// so ServeDNS can be driven without a socket.
+type captureWriter struct{ msg *dns.Msg }
+
+func (w *captureWriter) WriteMsg(m *dns.Msg) error { w.msg = m; return nil }
+func (w *captureWriter) LocalAddr() net.Addr       { return nil }
+func (w *captureWriter) RemoteAddr() net.Addr      { return nil }
+func (w *captureWriter) Write([]byte) (int, error) { return 0, nil }
+func (w *captureWriter) Close() error              { return nil }
+func (w *captureWriter) TsigStatus() error         { return nil }
+func (w *captureWriter) TsigTimersOnly(bool)       {}
+func (w *captureWriter) TsigGenerate([]byte, bool) {}
+func (w *captureWriter) Hijack()                   {}
+
+// TestResolveQuestionClaimResolverOnlyBackcompat: a source implementing only
+// ClaimResolver (no ClaimSetResolver) keeps the legacy single-claim behavior —
+// it serves ONE envelope and the resolver trusts that envelope's claim (here
+// the LATER claim that would lose a §7.4 set race) without any set ordering.
+func TestResolveQuestionClaimResolverOnlyBackcompat(t *testing.T) {
+	wEarly := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 171))
+	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 172))
+
+	lookup := newFakeClaimLookup() // ClaimResolver only
+	lookup.putClaim("foo", wLate.tldEnv)
+	lookup.put(wLate.wwwEnv)
+	lookup.put(wEarly.wwwEnv)
+
+	rrs, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("ResolveQuestion: %v", err)
+	}
+	if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+		t.Fatalf("rcode=%d len=%d, want NOERROR/1", rcode, len(rrs))
+	}
+	if a := rrs[0].(*dns.A); !a.A.Equal(wLate.wwwIPv4) {
+		t.Errorf("legacy single-claim path resolved %s, want the SERVED envelope's claimant (%s)", a.A, wLate.wwwIPv4)
 	}
 }

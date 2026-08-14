@@ -49,11 +49,47 @@ type ClaimResolver interface {
 	LookupClaim(ctx context.Context, alias string, now int64) (*wire.SignedEnvelope, error)
 }
 
+// ClaimSetResolver is the OPTIONAL §7.4 verifier-side claim-SET source: it
+// returns EVERY distinct claim envelope the source can offer for alias — the
+// local K_claim copy merged with the set collected across the network (spec
+// lines 602-604: "get(K_claim); collect all competing claims nodes offer
+// (storing nodes keep the top 2 by ordering; clients SHOULD probe GET_CLOSEST
+// nodes and merge)"). It exists because different storing nodes may
+// temporarily hold different §6.4 winners for the same K_claim, so a single
+// envelope (ClaimResolver) cannot feed the §7.4 step-3 ordering; only the
+// merged set can. dht.DHTLookup satisfies it structurally.
+//
+// A RecordLookup MAY implement ClaimSetResolver (it then usually also
+// implements ClaimResolver); the resolver prefers the set path via a type
+// assertion and falls back to the single-claim ClaimResolver path for older
+// sources, so wiring is still automatic and backward compatible. The returned
+// envelopes are UNTRUSTED input: each one individually passes the full §7
+// checklist (see verifyClaimEnvelope) before it may join the §7.4 ordering.
+type ClaimSetResolver interface {
+	CollectClaims(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, error)
+}
+
 // Upstream forwards a DNS message to conventional recursive resolvers and
 // returns the response. Implementations may do UDP/TCP fallback, DoH, etc.
 type Upstream interface {
 	Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 }
+
+// contestedClaimTTLCap implements the §10.4 contested-alias caching rule (spec
+// lines 849-857, esp. line 853): "Alias claim winners cached per 7.5
+// (contested: 60 s; uncontested: 6 h)". Per §7.5 (lines 625-633) a winning
+// claim is NOT final while it is younger than CONTEST_WINDOW (48 h) — an
+// earlier-ordered valid claim may still appear inside that window and displace
+// it ("clients MUST NOT treat either as final until ... the deterministic
+// order picks a winner and no earlier-ordered valid claim appears within
+// CONTEST_WINDOW"). §7.5 also permits resolvers to answer with the current
+// deterministic winner in the meantime, so the contested state is expressed as
+// a TTL cap, not a refusal: answers resolved through a contested winner carry
+// TTL <= 60 s, which bounds the ResponseCache entry (putFreens derives its
+// expiry from the minimum answer RR TTL, §10.4 line 851) and any downstream
+// cache alike. Uncontested winners need no extra cap: their 6 h allowance
+// exceeds constants.ResponseTTLCap (1 h), which already bounds every answer.
+const contestedClaimTTLCap = 60 // seconds
 
 // Resolver answers DNS questions from the freens namespace, applying the §9.3
 // routing policy. It is safe for concurrent use (no mutable state per query).
@@ -112,7 +148,12 @@ func (r *Resolver) now() int64 {
 func (r *Resolver) ResolveQuestion(ctx context.Context, q dns.Question) (rrs []dns.RR, rcode int, aa bool, err error) {
 	now := r.now()
 
-	labels, alias, derr := naming.DecomposeName(q.Name)
+	// Undo miekg/dns's RFC 4343 presentation escaping so a raw-UTF-8 U-label
+	// alias sent on the wire (opaque octets) reaches naming as its original
+	// bytes, where the §3.2 IDNA normalization (when enabled) applies. The
+	// echoed answer owner names still use q.Name verbatim.
+	parseName := unescapeName(q.Name)
+	labels, alias, derr := naming.DecomposeName(parseName)
 	if derr != nil {
 		// §9.2 step 1: an unparseable name has no answer.
 		return nil, dns.RcodeNameError, false, nil
@@ -197,13 +238,17 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 
 	// Step 3a: alias → tld_id. Pin first (§9.3 [alias-pins]: local policy,
 	// bypasses the claim race — a pin ALWAYS wins). Without a pin, consult the
-	// network alias-claim layer (§7): the ClaimResolver returns the envelope
-	// stored at K_claim, which resolveAliasClaim fully verifies (§7.4 step 2
-	// filter) before trusting its tld_id. On no source, no claim, or any
-	// verification failure the freens branch misses → NXDOMAIN.
+	// network alias-claim layer (§7): a ClaimSetResolver yields the merged set
+	// of competing claims on which resolveAliasClaim applies the full §7.4
+	// ordering (contested aliases resolve to the deterministic winner while
+	// the §7.5/§10.4 contest state is reported back for the TTL cap); a
+	// ClaimResolver-only source keeps the legacy single-claim behavior. On no
+	// source, no claim, or any verification failure the freens branch misses →
+	// NXDOMAIN.
 	tldID := ResolvePin(r.Cfg, alias)
+	contested := false
 	if len(tldID) == 0 {
-		tldID = r.resolveAliasClaim(ctx, alias, now)
+		tldID, contested = r.resolveAliasClaim(ctx, alias, now)
 		if len(tldID) == 0 {
 			return nil, dns.RcodeNameError, nil
 		}
@@ -283,36 +328,135 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 		// Name exists, type absent → NODATA (NOERROR with empty answer).
 		return nil, dns.RcodeSuccess, nil
 	}
+	// §10.4 line 853 (via §7.5): an answer whose alias resolution went through
+	// a CONTEST_WINDOW-young winning claim is not final — cap its TTL at
+	// contestedClaimTTLCap so neither this resolver's ResponseCache
+	// (putFreens expires with the minimum RR TTL) nor a downstream cache holds
+	// it past the contest. Only lowered, never raised; pin-resolved names
+	// (contested == false) and final winners keep their §9.2 TTL.
+	if contested {
+		for _, rr := range out {
+			if rr.Header().Ttl > contestedClaimTTLCap {
+				rr.Header().Ttl = contestedClaimTTLCap
+			}
+		}
+	}
 	return out, dns.RcodeSuccess, nil
 }
 
 // resolveAliasClaim implements the network side of §9.2 step 3a (alias →
-// tld_id without a local pin): fetch the claim envelope at K_claim from the
-// wired RecordLookup when it is also a [ClaimResolver], then apply the §7
-// verification checklist before returning the claim's tld_id. It returns nil
-// (freens branch miss → NXDOMAIN) on ANY failure — an unresolvable alias and
-// an unprovable one are indistinguishable to the caller by design.
+// tld_id without a local pin). Source discovery is by capability, newest
+// first, so wiring stays automatic and backward compatible:
 //
-// The checklist (§7.4 step 2 "Filter: structurally valid, PoW valid, witness
-// quorum valid", plus the record-side bindings):
+//   - ClaimSetResolver (§7.4 verifier side): collect the merged SET of
+//     competing claim envelopes, filter each through the §7 checklist
+//     (verifyClaimEnvelope), order the survivors per §7.4 step 3, and select
+//     the deterministic winner (resolveClaimSet). Returns the winner's
+//     tld_id and whether the winner is still inside the §7.5 CONTEST_WINDOW
+//     (drives the §10.4 contested TTL cap in freensResolve).
+//   - ClaimResolver only (legacy): the single K_claim envelope, verified by
+//     the same checklist. §7.4 set semantics cannot be assessed from one
+//     envelope, so the legacy path keeps its historical behavior (no contest
+//     flag); sources wanting full §7.4 semantics implement ClaimSetResolver.
 //
-//  1. Source: r.Freens implements ClaimResolver, and LookupClaim returns a
-//     non-nil envelope (nil, nil) = "no claim on the network").
-//  2. Envelope: wire.IsBasicValid at `now` — §4.4 structural validity, the
+// It returns (nil, false) (freens branch miss → NXDOMAIN) on ANY failure — an
+// unresolvable alias and an unprovable one are indistinguishable to the caller
+// by design.
+func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int64) (tldID []byte, contested bool) {
+	if csr, ok := r.Freens.(ClaimSetResolver); ok {
+		return r.resolveClaimSet(ctx, csr, alias, now)
+	}
+	cr, ok := r.Freens.(ClaimResolver)
+	if !ok {
+		return nil, false // record source is not claim-capable: pins only
+	}
+	env, err := cr.LookupClaim(ctx, alias, now)
+	if err != nil || env == nil || env.Record == nil {
+		return nil, false // transient error is a miss here — the freens branch NXDOMAINs
+	}
+	claim := verifyClaimEnvelope(env, alias, now)
+	if claim == nil {
+		return nil, false
+	}
+	return claim.TldID, false
+}
+
+// resolveClaimSet implements §7.4 verifier steps 1-4 (spec lines 600-617) on
+// the claim set a ClaimSetResolver collected:
+//
+//  1. Collect (done by the source): "get(K_claim); collect all competing
+//     claims nodes offer".
+//  2. Filter: each envelope individually passes the §7 checklist
+//     (verifyClaimEnvelope: structural validity, alias match, claimant
+//     binding, PoW, and ≥ W = 5 distinct verified witnesses via
+//     claims.VerifyFull with InferDifficulty — the Appendix A.4 convention).
+//  3. Order the surviving claims ascending by the §7.4 step-3 lexicographic
+//     tuple (timestamp, pow_hash, tld_id) via claims.OrderClaims — "earliest
+//     asserted time wins; ties broken by lower PoW hash (a public lottery),
+//     then by lower TLD ID. This total order is computable by any client from
+//     claim contents alone — convergence without consensus."
+//  4. Select the winner via claims.SelectWinner (the minimum OrderKey over
+//     the ordered survivors — SelectWinner does NOT itself encode the §7.5
+//     contest window; it is the pure §7.4 step-3 minimum). The winner's
+//     tld_id "is the resolution of the alias".
+//
+// The second return value is the §7.5/§10.4 contest state: the winner is
+// CONTESTED while now - winner.timestamp < CONTEST_WINDOW (48 h), because
+// §7.5 says clients "MUST NOT treat either as final until ... the
+// deterministic order picks a winner and no earlier-ordered valid claim
+// appears within CONTEST_WINDOW (48 h)" — a younger winner can still be
+// displaced by a later-appearing earlier-ordered claim. (The live-race case
+// of §7.5 — two claims within SKEW_TOLERANCE = 60 s — is subsumed: such a
+// winner is necessarily younger than the window. Conversely an old winner
+// whose runner-up is near-in-time has already survived the window with no
+// earlier-ordered claim appearing, hence final per §7.5(b).) §7.5 lets a
+// resolver "resolve contested aliases to the current deterministic winner
+// while flagging the name as contested in diagnostics"; the flag surfaces
+// here as the contested return value, consumed by freensResolve as the §10.4
+// 60 s TTL cap (a diagnostics channel does not exist in this resolver).
+func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, alias string, now int64) (tldID []byte, contested bool) {
+	envs, err := csr.CollectClaims(ctx, alias, now)
+	if err != nil || len(envs) == 0 {
+		return nil, false // transient error / no claim anywhere: a miss
+	}
+	survivors := make([]*claims.AliasClaim, 0, len(envs))
+	for _, env := range envs {
+		if claim := verifyClaimEnvelope(env, alias, now); claim != nil {
+			survivors = append(survivors, claim)
+		}
+	}
+	if len(survivors) == 0 {
+		return nil, false // every competing claim failed the §7.4 step-2 filter
+	}
+	winner := claims.SelectWinner(claims.OrderClaims(survivors))
+	if winner == nil {
+		return nil, false // unreachable (survivors passed the same filter)
+	}
+	return winner.TldID, now-int64(winner.Timestamp) < int64(constants.ContestWindow)
+}
+
+// verifyClaimEnvelope applies the per-claim §7.4 step-2 filter ("Filter:
+// structurally valid, PoW valid, witness quorum valid", spec line 605) plus
+// the record-side bindings, to ONE claim envelope. It returns the decoded
+// AliasClaim on success or nil on any failure (the caller drops the claim —
+// for the set path a failing claim loses the race by not surviving the
+// filter; for the legacy single-claim path nil means "no claim"):
+//
+//  1. Envelope: wire.IsBasicValid at `now` — §4.4 structural validity, the
 //     record signature over the canonical CBOR (which covers the embedded
 //     claim as ordinary content, §4.2), and the created <= now < expires
 //     window. A forged or stale carrier record is rejected here.
-//  3. Claim decode: claims.DecodeAliasClaim on Record.Claim (raw canonical
+//  2. Claim decode: claims.DecodeAliasClaim on Record.Claim (raw canonical
 //     CBOR of field 11) — a decode error is treated as "no claim".
-//  4. Alias match: claim.Alias == the normalized requested alias, so a claim
+//  3. Alias match: claim.Alias == the normalized requested alias, so a claim
 //     served under the wrong K_claim cannot redirect a different alias.
-//  5. Claimant binding to the carrier record: the envelope must be signed by
+//  4. Claimant binding to the carrier record: the envelope must be signed by
 //     the claimant's TLD key (env.Signer == claim.ClaimantPK) AND be the TLD
 //     record for the claimed tld_id (Record.Name decodes to zero labels with
-//     tld_id == claim.TldID). Together with step 2's signature check this
+//     tld_id == claim.TldID). Together with step 1's signature check this
 //     means the claimant key itself published the claim — the §3.1
 //     self-certification that step 3b's chain walk then re-proves at K_tld.
-//  6. claims.VerifyFull(claim, InferDifficulty, nil, constants.W): claimant
+//  5. claims.VerifyFull(claim, InferDifficulty, nil, constants.W): claimant
 //     consistency (tld_id == SHA-256(claimant_pk)), recomputed PoW at the
 //     difficulty recorded in nonce[0] (Appendix A.4) or the network default,
 //     and ≥ W = 5 DISTINCT verified witness attestations (each node_pk bound
@@ -322,42 +466,26 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 //     distinctness + signature validity still hold (see the deviation note in
 //     the package report).
 //
-// On success the returned tld_id is SHA-256(claimant_pk); resolution then
-// PROCEEDS with the normal §9.2 step 3b chain walk, where the TLD record at
-// K_tld must still verify against that tld_id — self-certification, so a
+// On success the returned claim's TldID is SHA-256(claimant_pk); resolution
+// then PROCEEDS with the normal §9.2 step 3b chain walk, where the TLD record
+// at K_tld must still verify against that tld_id — self-certification, so a
 // bogus claim cannot manufacture records, only point elsewhere (§3.2, §10.3).
-//
-// Deviation from §7.4's contested-alias procedure (noted, accepted): the spec
-// has verifiers collect ALL competing claims at K_claim and order them by
-// (timestamp, pow_hash, tld_id). This implementation sees the single envelope
-// the §6.4 (sequence, H_record) DHT winner rule serves, which is the claim the
-// storing network converged on. Merging competing claims and applying the §7.5
-// contest window remains future work; §10.4's contested-cache guidance is
-// likewise deferred.
-func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int64) []byte {
-	cr, ok := r.Freens.(ClaimResolver)
-	if !ok {
-		return nil // record source is not claim-capable: pins only
-	}
-	env, err := cr.LookupClaim(ctx, alias, now)
-	if err != nil || env == nil || env.Record == nil {
-		return nil // transient error is a miss here — the freens branch NXDOMAINs
-	}
-	// (2) envelope signature + time window.
-	if !wire.IsBasicValid(env, uint64(now)) {
+func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64) *claims.AliasClaim {
+	// (1) envelope signature + time window.
+	if env == nil || !wire.IsBasicValid(env, uint64(now)) {
 		return nil
 	}
-	// (3) claim decode (field 11 raw canonical CBOR).
+	// (2) claim decode (field 11 raw canonical CBOR).
 	claim, cerr := claims.DecodeAliasClaim(env.Record.Claim)
 	if cerr != nil {
 		return nil
 	}
-	// (4) alias match.
+	// (3) alias match.
 	aliasN, aerr := naming.ValidateAlias(alias)
 	if aerr != nil || claim.Alias != aliasN {
 		return nil
 	}
-	// (5) claimant binding: the carrier is the claimant's own TLD record.
+	// (4) claimant binding: the carrier is the claimant's own TLD record.
 	if !bytes.Equal(env.Signer, claim.ClaimantPK) {
 		return nil
 	}
@@ -365,11 +493,11 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 	if derr != nil || len(labels) != 0 || !bytes.Equal(nameTldID, claim.TldID) {
 		return nil
 	}
-	// (6) claimant consistency + PoW + ≥ W distinct verified witnesses.
+	// (5) claimant consistency + PoW + ≥ W distinct verified witnesses.
 	if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
 		return nil
 	}
-	return claim.TldID
+	return claim
 }
 
 // forwardDNS implements §9.2 step 4: forward the question verbatim to the
