@@ -191,6 +191,13 @@ type NodeConfig struct {
 	// advertised — e.g. public — address instead of a private observed
 	// source.
 	Advertise string
+	// Stun is a STUN server "host:port" (RFC 5389 Binding; e.g.
+	// "stun.example.net:3478") used to discover this node's
+	// server-reflexive public address, which is then advertised to peers
+	// exactly like Advertise (§6.2). Refreshed periodically so address
+	// changes are picked up. Empty ⇒ off. Ignored when Advertise is set
+	// (an explicit address always wins over a discovered one).
+	Stun string
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -226,8 +233,17 @@ type Node struct {
 
 	// advertise is the validated §6.2 advertised address ("" ⇒ peers learn
 	// the observed source). Parsed from NodeConfig.Advertise once at Start;
-	// written before any goroutine reads it.
+	// written before any goroutine reads it — EXCEPT by the STUN monitor
+	// (stun_loop.go), which may update it at runtime under advMu. All
+	// runtime READS go through advertised(); all runtime WRITES through
+	// setAdvertise().
 	advertise string
+	// advMu guards advertise across the readLoop/sendQuery goroutines and
+	// the STUN monitor's runtime updates.
+	advMu sync.RWMutex
+
+	// stun is the raw NodeConfig.Stun server address ("" ⇒ no monitor).
+	stun string
 
 	// §6.2 live eviction: readLoop-side callers (learnPeer runs on the read
 	// goroutine) hand full-bucket contacts to a single serialized maintenance
@@ -349,6 +365,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		log:            log,
 		nowFn:          now,
 		advertise:      cfg.Advertise,
+		stun:           cfg.Stun,
 		evictCh:        make(chan *NodeContact, evictQueueCap),
 		evictPending:   make(map[int]bool),
 		witnessLast:    make(map[string]witnessSigned),
@@ -377,6 +394,22 @@ func (n *Node) PublicKey() []byte { return append([]byte(nil), n.kp.Public()...)
 
 // RoutingTable returns the node's routing table (for diagnostics/tests).
 func (n *Node) RoutingTable() *RoutingTable { return n.rt }
+
+// advertised returns the current §6.2 advertised address ("" ⇒ observed
+// source). Safe for concurrent use; the STUN monitor may change it at runtime.
+func (n *Node) advertised() string {
+	n.advMu.RLock()
+	defer n.advMu.RUnlock()
+	return n.advertise
+}
+
+// setAdvertise atomically replaces the advertised address (used by the STUN
+// monitor after a successful reflexive-address discovery).
+func (n *Node) setAdvertise(a string) {
+	n.advMu.Lock()
+	n.advertise = a
+	n.advMu.Unlock()
+}
 
 // Start binds the UDP socket and launches the read loop and the background
 // maintenance loops (§6.2 bucket refresh; §6.4 step 4 republish timer unless
@@ -407,6 +440,7 @@ func (n *Node) Start() error {
 	_ = conn.SetReadBuffer(1 << 20)
 	_ = conn.SetWriteBuffer(1 << 20)
 	n.startBackground()
+	n.startSTUN()
 	go n.readLoop()
 	return nil
 }
@@ -774,13 +808,29 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		}
 	}
 	args := map[string]any{"token": n.issueToken(raddr)}
+	// evidenceFor is the H_record key the §8.4 evidence piggyback below is
+	// served for: the served envelope's own hash, or the probed key itself
+	// on a miss (a hash-keyed evidence probe — the key IS the H_record).
+	var evidenceFor []byte
 	if env != nil {
 		if eb, err := env.Bytes(); err == nil {
 			args["envelope"] = eb // bstr .cbor SignedEnvelope
 		}
+		if h, err := env.RecordHash(); err == nil {
+			evidenceFor = h
+		}
 	} else {
 		// Miss: return the closest known contacts so the requester iterates.
 		args["nodes"] = encodeNodes(n.rt.Closest(key, constants.K))
+		evidenceFor = key
+	}
+	// §8.4 evidence piggyback: whatever recovery evidence this node retained
+	// for the record the response is about rides along, so verifiers can
+	// re-check the §8.4 quorum without a second round trip (LookupEvidence).
+	if len(evidenceFor) == constants.SHA256Len {
+		if ev := n.store.GetEvidence(evidenceFor); ev != nil {
+			args["evidence"] = ev
+		}
 	}
 	// §7.4 top-2 claim offers: whenever the pool holds claims for this key,
 	// advertise them best-first (see the doc comment for the wire shape).
@@ -828,6 +878,11 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	}
 	token, _ := m.A["token"].([]byte)
 	envBytes, _ := m.A["envelope"].([]byte)
+	// §8.4 recovery evidence (optional): the put of a recovery hand-off
+	// record rides its quorum declaration along (see PublishWithEvidence);
+	// retained — keyed by the envelope's H_record — only if the envelope
+	// itself is kept (accepted or already the winner below).
+	evidence, _ := m.A["evidence"].([]byte)
 	// Write-token defense (§6.3): HMAC over the observed source IP.
 	if !n.tokens.Verify(normIP(raddr.IP), token, 1) {
 		return n.errResp(m, 302, "invalid token")
@@ -856,7 +911,7 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 			poolKept = n.claims.Contains(kClaim, recordHashOrNil(env)) // offered now or already pooled
 		}
 	}
-	accepted, err := n.store.Put(key, env, n.now(), false) // sig already verified
+	accepted, err := n.store.PutWithEvidence(key, env, n.now(), false, evidence) // sig already verified
 	if err != nil {
 		return n.errResp(m, 301, "store error")
 	}
@@ -868,6 +923,7 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 			ih, e1 := inc.RecordHash()
 			ph, e2 := env.RecordHash()
 			if e1 == nil && e2 == nil && bytes.Equal(ih, ph) {
+				n.retainEvidence(env, evidence)      // §8.4: kept (already winner)
 				return n.okResp(m, map[string]any{}) // idempotent: already the winner
 			}
 		}
@@ -876,6 +932,7 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		}
 		return n.errResp(m, 304, "stale record")
 	}
+	n.retainEvidence(env, evidence) // §8.4: kept (accepted as winner)
 	return n.okResp(m, map[string]any{})
 }
 
@@ -1057,12 +1114,12 @@ func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []b
 	// §6.2 advertised address: stamp it on every outbound query so the peer
 	// learns THIS node at the advertised (public) address, not a NAT'd
 	// private observed source. The map is copied, never the caller's.
-	if n.advertise != "" {
+	if adv := n.advertised(); adv != "" {
 		stamped := make(map[string]any, len(args)+1)
 		for k, v := range args {
 			stamped[k] = v
 		}
-		stamped["advertise"] = n.advertise
+		stamped["advertise"] = adv
 		args = stamped
 	}
 	txid := make([]byte, 8)
@@ -1324,7 +1381,7 @@ func (n *Node) Publish(ctx context.Context, env *wire.SignedEnvelope) error {
 	if err != nil {
 		return err
 	}
-	return n.publishKeyed(ctx, key, env)
+	return n.publishKeyed(ctx, key, env, nil)
 }
 
 // PublishClaim publishes the TLD-record envelope carrying an alias claim at
@@ -1355,13 +1412,15 @@ func (n *Node) PublishClaim(ctx context.Context, env *wire.SignedEnvelope) error
 	if err != nil {
 		return err
 	}
-	return n.publishKeyed(ctx, key, env)
+	return n.publishKeyed(ctx, key, env, nil)
 }
 
-// publishKeyed is the shared §6.4 PUT body of Publish and PublishClaim: locate
-// the R closest nodes to key, obtain a write token from each (via get), and
-// issue put. Best-effort — nil iff at least one peer accepted the envelope.
-func (n *Node) publishKeyed(ctx context.Context, key []byte, env *wire.SignedEnvelope) error {
+// publishKeyed is the shared §6.4 PUT body of Publish, PublishClaim and
+// PublishWithEvidence: locate the R closest nodes to key, obtain a write
+// token from each (via get), and issue put (evidence, when non-nil, is the
+// §8.4 recovery blob riding along; see hPut). Best-effort — nil iff at least
+// one peer accepted the envelope.
+func (n *Node) publishKeyed(ctx context.Context, key []byte, env *wire.SignedEnvelope, evidence []byte) error {
 	envBytes, err := env.Bytes()
 	if err != nil {
 		return err
@@ -1372,7 +1431,7 @@ func (n *Node) publishKeyed(ctx context.Context, key []byte, env *wire.SignedEnv
 	}
 	accepted := 0
 	for _, c := range closest {
-		if err := n.putToPeer(ctx, key, envBytes, c); err == nil {
+		if err := n.putToPeer(ctx, key, envBytes, evidence, c); err == nil {
 			accepted++
 		}
 	}
@@ -1505,8 +1564,9 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 // ErrNoPeers signals that Publish had no peers to store to.
 var ErrNoPeers = errors.New("dht: no peers known")
 
-// putToPeer obtains a write token (via get) then issues put to c.
-func (n *Node) putToPeer(ctx context.Context, key, envBytes []byte, c *NodeContact) error {
+// putToPeer obtains a write token (via get) then issues put to c. evidence,
+// when non-nil, is the §8.4 recovery blob riding along as an extra put arg.
+func (n *Node) putToPeer(ctx context.Context, key, envBytes, evidence []byte, c *NodeContact) error {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
 		return err
@@ -1525,11 +1585,15 @@ func (n *Node) putToPeer(ctx context.Context, key, envBytes []byte, c *NodeConta
 		}
 		token, _ = pr.A["token"].([]byte)
 	}
-	putResp, err := n.sendQuery(ctx, addr, c.NodeID, "put", map[string]any{
+	putArgs := map[string]any{
 		"token":    token,
 		"envelope": envBytes,
 		"key":      key, // explicit target (hPut accepts derived or K_claim only)
-	})
+	}
+	if len(evidence) > 0 {
+		putArgs["evidence"] = evidence // §8.4 recovery declaration (see hPut)
+	}
+	putResp, err := n.sendQuery(ctx, addr, c.NodeID, "put", putArgs)
 	if err != nil {
 		return err
 	}

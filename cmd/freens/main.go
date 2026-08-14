@@ -12,9 +12,10 @@
 //
 // Usage:
 //
-//	freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]
-//	       [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]
-//	       [-passive] [-advertise <addr>] [-persist <dir>] [-idna]
+//	freens [-config <path>] [-listen <addr>] [-dns <addr>] [-upstream <csv>]
+//	       [-load <dir>] [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]
+//	       [-peers-file <path>] [-passive] [-advertise <addr>] [-stun <addr>]
+//	       [-persist <dir>] [-metrics <addr>] [-idna]
 //
 // If -config is absent a built-in default config is used (127.0.0.1:53,
 // upstreams 9.9.9.9 / 1.1.1.1, "* = dns-first"). If binding UDP/TCP port 53 is
@@ -45,9 +46,11 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -58,6 +61,7 @@ import (
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/crypto"
 	"github.com/laurent/freens/internal/dht"
+	"github.com/laurent/freens/internal/metrics"
 	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/resolver"
 	"github.com/laurent/freens/internal/wire"
@@ -84,23 +88,36 @@ func main() {
 func run(args []string) error {
 	fs := flag.NewFlagSet("freens", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]")
-		fmt.Fprintln(fs.Output(), "             [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
-		fmt.Fprintln(fs.Output(), "             [-passive] [-advertise <addr>] [-persist <dir>] [-idna]")
+		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-dns <addr>] [-upstream <csv>]")
+		fmt.Fprintln(fs.Output(), "             [-load <dir>] [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
+		fmt.Fprintln(fs.Output(), "             [-peers-file <path>] [-passive] [-advertise <addr>] [-stun <addr>]")
+		fmt.Fprintln(fs.Output(), "             [-persist <dir>] [-metrics <addr>] [-idna]")
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "path to resolver config file (optional; built-in default if absent)")
 	listenAddr := fs.String("listen", "", "override UDP listen address (default from config)")
+	dnsAddr := fs.String("dns", "", "override BOTH the UDP and TCP DNS listen addresses, e.g. 127.0.0.1:5300 "+
+		"(default from config; empty leaves the config addresses untouched)")
 	upstreamCSV := fs.String("upstream", "", "override upstream DNS servers (comma/space separated)")
 	loadDir := fs.String("load", "", "directory of *.cbor envelope files to seed the in-process store on startup")
 	dhtAddr := fs.String("dht", "", "UDP address for the DHT transport (e.g. :15353); empty disables the DHT node")
 	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this node's DHT identity; generated if empty")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as addr#<64-hex-pubkey>")
+	peersFile := fs.String("peers-file", "", "newline-separated peers file (one addr#<64-hex-pubkey> per line; blank lines\n"+
+		"and lines starting with # are skipped), loaded at startup and re-loaded on SIGHUP\n"+
+		"(re-parse + AddPeer each entry, idempotent)")
+	metricsAddr := fs.String("metrics", "", "listen address for the operational HTTP endpoint exposing /metrics\n"+
+		"(Prometheus text format) and /healthz, e.g. :9153; empty disables the endpoint")
 	passive := fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
 	advertiseAddr := fs.String("advertise", "", "address peers should dial to reach this node's DHT transport, host:port "+
 		"(spec §6.2 \"nodes advertise (ip, port, node_pubkey)\") — for NAT/port-forward setups where the observed UDP "+
 		"source is a private address peers cannot dial back; validated at startup, empty = peers learn the observed source "+
 		"(requires -dht)")
+	stunAddr := fs.String("stun", "", "STUN server host:port (RFC 5389 Binding) used to discover this node's "+
+		"server-reflexive public address and advertise it to peers exactly like -advertise (spec §6.2); refreshed "+
+		"every 60s so address changes are picked up. Ignored when -advertise is set (an explicit address always "+
+		"wins over a discovered one). freens ships no TURN relay — for symmetric NAT run an external relay (e.g. "+
+		"coturn) and set -advertise to the relay address (see contrib/README.md) (requires -dht)")
 	persistDir := fs.String("persist", "", "directory to persist the envelope store to (<keyhex>.cbor files) every 60s and at shutdown (requires -dht)")
 	idnaFlag := fs.Bool("idna", false, "accept IDNA2008 U-label aliases (spec §3.2): normalize non-ASCII (raw\n"+
 		"UTF-8) alias/TLD components of query names to punycode A-labels via UTS #46\n"+
@@ -145,6 +162,10 @@ func run(args []string) error {
 	if *listenAddr != "" {
 		cfg.ListenUDP = *listenAddr
 	}
+	if *dnsAddr != "" {
+		cfg.ListenUDP = *dnsAddr
+		cfg.ListenTCP = *dnsAddr
+	}
 	if *upstreamCSV != "" {
 		cfg.UpstreamServers = splitCSV(*upstreamCSV)
 	}
@@ -159,6 +180,19 @@ func run(args []string) error {
 		"load_dir", *loadDir,
 		"idna", naming.IDNANormalizer != nil, // §3.2 U-labels accepted?
 	)
+
+	// -peers-file: validated and parsed AFTER config/flag validation but
+	// BEFORE the DHT node starts; the entries bootstrap alongside -peers.
+	// (Re-read on SIGHUP below.)
+	var filePeers []dht.Peer
+	if *peersFile != "" {
+		data, err := os.ReadFile(*peersFile)
+		if err != nil {
+			return fmt.Errorf("peers-file: %w", err)
+		}
+		filePeers = parsePeersFile(string(data))
+		logger.Info("loaded -peers-file", "file", *peersFile, "peers", len(filePeers))
+	}
 
 	// In-process envelope store: the freens record source. When the DHT
 	// transport is enabled this same store backs both the local resolver lookups
@@ -192,6 +226,7 @@ func run(args []string) error {
 			Logger:     logger,
 			Passive:    *passive,
 			Advertise:  *advertiseAddr,
+			Stun:       *stunAddr,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)
@@ -232,6 +267,10 @@ func run(args []string) error {
 			logger.Info("bootstrapping DHT peers", "count", len(peers))
 			node.Bootstrap(context.Background(), peers)
 		}
+		if len(filePeers) > 0 {
+			logger.Info("bootstrapping -peers-file peers", "count", len(filePeers))
+			node.Bootstrap(context.Background(), filePeers)
+		}
 	}
 
 	// -persist: snapshot the store to disk every 60s (and once at shutdown
@@ -251,8 +290,36 @@ func run(args []string) error {
 	upstream := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
 	res := resolver.New(cfg, freens, upstream)
 
+	// Operational metrics (hardening part 1): the registry always exists —
+	// counters/gauges are near-free when -metrics is off; only the HTTP
+	// endpoint below is optional. Gauges are refreshed by a 15s goroutine;
+	// freens_dns_queries_total is incremented in the DNS server path and the
+	// cache hit/miss counters in ResponseCache.get.
+	reg := metrics.New()
+	processStart := time.Now()
+	uptimeGauge := reg.NewGauge("freens_uptime_seconds", "Seconds since the daemon process started.")
+	dhtPeersGauge := reg.NewGauge("freens_dht_peers", "Entries in this node's Kademlia routing table.")
+	storeEnvGauge := reg.NewGauge("freens_dht_store_envelopes", "Live envelopes in the local DHT envelope store.")
+	histEnvGauge := reg.NewGauge("freens_dht_history_envelopes", "Superseded envelopes retained as §8.3 audit history.")
+	gossipDiffGauge := reg.NewGauge("freens_dht_gossip_difficulty", "Network PoW difficulty in bits: median of peers' advertised witness difficulties (Appendix A.4).")
+	cacheEntriesGauge := reg.NewGauge("freens_resolver_cache_entries", "Entries currently held in the §10.4 response cache.")
+	dnsQueriesCounter := reg.NewCounter("freens_dns_queries_total",
+		"DNS queries answered, by question type and response status (noerror/nxdomain/servfail).", "qtype", "status")
+
+	// The §10.4 response cache: enabled here (it only short-circuits the DNS
+	// server path; direct ResolveQuestion callers are unaffected) so the
+	// cache metrics are live from the first query.
+	cache := resolver.NewResponseCache(0, nil)
+	cache.SetMetrics(reg)
+	res.Cache = cache
+
 	udpSrv := resolver.NewServer(cfg.ListenUDP, "udp", res)
 	tcpSrv := resolver.NewServer(cfg.ListenTCP, "tcp", res)
+	// One shared counter for both transports: the label set is {qtype,status}
+	// (no transport dimension), so a duplicate registration per server would
+	// panic — hence the setter takes the counter, not the registry.
+	udpSrv.SetQueryCounter(dnsQueriesCounter)
+	tcpSrv.SetQueryCounter(dnsQueriesCounter)
 
 	// Start both servers concurrently; both get a chance to bind even if one
 	// fails (spec §9.1: "still attempt"). A bind failure surfaces immediately.
@@ -262,6 +329,72 @@ func run(args []string) error {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Gauge refresh loop: populate immediately, then every 15s. Gauges read
+	// only exported APIs (RoutingTable().Size, EnvelopeStore.Count/
+	// HistoryCount, DHTLookup.NetworkDifficulty — nil-receiver-safe, so the
+	// island case reports PoWDifficultyInit, and ResponseCache.Len).
+	updateGauges := func() {
+		uptimeGauge.With().Set(time.Since(processStart).Seconds())
+		if dhtNode != nil {
+			dhtPeersGauge.With().Set(float64(dhtNode.RoutingTable().Size()))
+		}
+		storeEnvGauge.With().Set(float64(store.Count()))
+		histEnvGauge.With().Set(float64(store.HistoryCount()))
+		gossipDiffGauge.With().Set(float64(dhtLookup.NetworkDifficulty()))
+		cacheEntriesGauge.With().Set(float64(cache.Len()))
+	}
+	updateGauges()
+
+	// bgStop ends the background goroutines (gauge refresh, SIGHUP reload)
+	// during shutdown so no reload ever races the teardown below.
+	bgStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				updateGauges()
+			case <-bgStop:
+				return
+			}
+		}
+	}()
+
+	// SIGHUP: re-read -peers-file and AddPeer each entry (idempotent). With
+	// no -peers-file configured the handler just logs that fact.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		defer signal.Stop(hupCh)
+		for {
+			select {
+			case <-bgStop:
+				return
+			case <-hupCh:
+				reloadPeersFile(dhtNode, *peersFile, logger)
+			}
+		}
+	}()
+
+	// -metrics HTTP endpoint: /metrics (Prometheus text format 0.0.4) and
+	// /healthz, started after the DHT node, stopped with everything else. A
+	// listen failure is logged but does NOT take the resolver down.
+	var metricsSrv *http.Server
+	if *metricsAddr != "" {
+		metricsSrv = &http.Server{
+			Addr:              *metricsAddr,
+			Handler:           newMetricsHandler(reg),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics endpoint failed", "addr", *metricsAddr, "error", err)
+			}
+		}()
+		logger.Info("metrics endpoint listening", "addr", *metricsAddr)
+	}
 
 	var firstErr error
 	select {
@@ -288,6 +421,16 @@ func run(args []string) error {
 	if err := tcpSrv.Shutdown(); err != nil {
 		logger.Error("tcp server shutdown error", "error", err)
 	}
+	// Stop the background goroutines (gauge refresh, SIGHUP reload) and the
+	// metrics endpoint alongside the servers.
+	close(bgStop)
+	if metricsSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := metricsSrv.Shutdown(ctx); err != nil {
+			logger.Error("metrics server shutdown error", "error", err)
+		}
+		cancel()
+	}
 	if dhtNode != nil {
 		if err := dhtNode.Close(); err != nil {
 			logger.Error("dht node shutdown error", "error", err)
@@ -307,6 +450,11 @@ func run(args []string) error {
 			logger.Error("final persist history failed", "error", herr)
 		} else if hc > 0 {
 			logger.Info("persisted audit history at shutdown", "count", hc)
+		}
+		if ec, eerr := store.PersistEvidenceTo(filepath.Join(*persistDir, "evidence")); eerr != nil {
+			logger.Error("final persist evidence failed", "error", eerr)
+		} else if ec > 0 {
+			logger.Info("persisted recovery evidence at shutdown", "count", ec)
 		}
 	}
 	return firstErr
@@ -352,6 +500,11 @@ func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, st
 			} else if hc > 0 {
 				logger.Info("persisted audit history", "dir", filepath.Join(dir, "history"), "count", hc)
 			}
+			if ec, eerr := store.PersistEvidenceTo(filepath.Join(dir, "evidence")); eerr != nil {
+				logger.Error("persist evidence failed", "error", eerr)
+			} else if ec > 0 {
+				logger.Info("persisted recovery evidence", "dir", filepath.Join(dir, "evidence"), "count", ec)
+			}
 		case <-stop:
 			return
 		}
@@ -382,19 +535,93 @@ func loadNodeKey(seedHex string) (*crypto.Keypair, error) {
 func parsePeers(csv string) []dht.Peer {
 	var peers []dht.Peer
 	for _, p := range splitCSV(csv) {
-		idx := strings.Index(p, "#")
-		if idx <= 0 || idx == len(p)-1 {
-			continue
+		if peer, ok := parsePeerEntry(p); ok {
+			peers = append(peers, peer)
 		}
-		addr := p[:idx]
-		pkHex := p[idx+1:]
-		pk, err := hex.DecodeString(pkHex)
-		if err != nil || len(pk) != constants.Ed25519PublicKeyLen {
-			continue
-		}
-		peers = append(peers, dht.Peer{Addr: addr, PublicKey: pk})
 	}
 	return peers
+}
+
+// parsePeerEntry parses a single "addr#<64-hex-pubkey>" peer entry. ok is
+// false for malformed entries (no "#", empty halves, bad hex, wrong length).
+func parsePeerEntry(s string) (dht.Peer, bool) {
+	idx := strings.Index(s, "#")
+	if idx <= 0 || idx == len(s)-1 {
+		return dht.Peer{}, false
+	}
+	addr := s[:idx]
+	pk, err := hex.DecodeString(s[idx+1:])
+	if err != nil || len(pk) != constants.Ed25519PublicKeyLen {
+		return dht.Peer{}, false
+	}
+	return dht.Peer{Addr: addr, PublicKey: pk}, true
+}
+
+// parsePeersFile parses the newline-separated contents of a -peers-file: one
+// "addr#<64-hex-pubkey>" peer per line. Blank lines and lines whose first
+// non-blank character is "#" (comments) are skipped; other malformed lines are
+// skipped silently, matching parsePeers' tolerance.
+func parsePeersFile(content string) []dht.Peer {
+	var peers []dht.Peer
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if peer, ok := parsePeerEntry(line); ok {
+			peers = append(peers, peer)
+		}
+	}
+	return peers
+}
+
+// reloadPeersFile implements the SIGHUP behavior: with no -peers-file
+// configured it just says so; otherwise it re-reads and re-parses the file and
+// AddPeer's every entry into the running DHT node (AddPeer is idempotent).
+// Failures are logged, never fatal.
+func reloadPeersFile(node *dht.Node, path string, logger *slog.Logger) {
+	if path == "" {
+		logger.Info("SIGHUP: no -peers-file configured")
+		return
+	}
+	if node == nil {
+		logger.Warn("SIGHUP: -peers-file reload ignored: no DHT node running (-dht empty)")
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		logger.Error("SIGHUP: read -peers-file failed", "file", path, "error", err)
+		return
+	}
+	peers := parsePeersFile(string(data))
+	added, failed := 0, 0
+	for _, p := range peers {
+		if err := node.AddPeer(p.PublicKey, p.Addr); err != nil {
+			failed++
+			logger.Warn("SIGHUP: AddPeer failed", "addr", p.Addr, "error", err)
+			continue
+		}
+		added++
+	}
+	logger.Info("SIGHUP: reloaded -peers-file",
+		"file", path, "entries", len(peers), "added", added, "failed", failed)
+}
+
+// newMetricsHandler builds the -metrics HTTP endpoint: /metrics (Prometheus
+// text-exposition 0.0.4) and /healthz (liveness). Factored out for tests.
+func newMetricsHandler(reg *metrics.Registry) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if _, err := reg.WriteTo(w); err != nil {
+			slog.Error("metrics: write exposition failed", "error", err)
+		}
+	})
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok"))
+	})
+	return mux
 }
 
 // storeLookup used to be defined locally here; it now lives once in
@@ -421,6 +648,35 @@ func loadConfig(path string) (*resolver.Config, error) {
 // Verification is enabled (verifySignature=true); a malformed file is logged
 // and skipped rather than aborting startup.
 func seedFromDir(store *dht.EnvelopeStore, dir string, logger *slog.Logger) (int, error) {
+	// §8.4 evidence seeding FIRST: <dir>/evidence/*.cbor are recovery
+	// declarations persisted by PersistEvidenceTo, one file per
+	// H_record-named blob. The FILENAME is the hex record hash (the
+	// evidence-table key); each is decode-validated and retained via
+	// PutEvidenceRaw BEFORE any envelope is (re-)Put, so a recovery record
+	// R2 re-seeded from <persist> can displace its incumbent R1 through the
+	// store's §8.4 gate (the gate falls back to this table when the Put
+	// carries no in-band evidence bytes — the restart path).
+	evDir := filepath.Join(dir, "evidence")
+	if eentries, err := os.ReadDir(evDir); err == nil {
+		for _, e := range eentries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".cbor") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(evDir, e.Name()))
+			if err != nil {
+				return 0, err
+			}
+			h, err := hex.DecodeString(strings.TrimSuffix(e.Name(), ".cbor"))
+			if err != nil || len(h) != constants.SHA256Len {
+				logger.Warn("skipping misnamed recovery evidence file", "file", e.Name())
+				continue
+			}
+			if err := store.PutEvidenceRaw(h, data); err != nil {
+				logger.Warn("skipping malformed recovery evidence", "file", e.Name(), "error", err)
+				continue
+			}
+		}
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, err

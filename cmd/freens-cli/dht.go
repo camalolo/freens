@@ -1,7 +1,10 @@
 // Package main (freens-cli) — dht.go implements the live-network subcommands:
 //
 //	publish   §6.4 PUT  — push signed-envelope .cbor files to the R peers
-//	           closest to each record's key.
+//	           closest to each record's key. With -evidence (spec 8.4) the
+//	           single -file is instead carried by the evidence-aware PUT
+//	           (Node.PublishWithEvidence), so the RecoveryEvidence travels
+//	           with the recovered record it proves.
 //	resolve   §6.4 GET  — iterative lookup of a name's terminal record and a
 //	           human-readable display of it (chain verification is NOT
 //	           attempted here; see cmdResolve).
@@ -233,17 +236,35 @@ func readableRdata(rr *wire.RR) string {
 // publish — §6.4 PUT
 // ---------------------------------------------------------------------------
 
+// publishWithEvidence PUTs env with its §8.4 evidence attached via
+// Node.PublishWithEvidence (internal/dht: the evidence rides along on every
+// put so storing peers retain it next to the envelope). It never falls back
+// to a plain Publish: a recovery record that silently lost its proof would
+// be indistinguishable from an unsigned-key takeover (§8.4 step 2's
+// cancellation race exists precisely because acceptance REQUIRES the
+// evidence).
+func publishWithEvidence(ctx context.Context, n *dht.Node, env *wire.SignedEnvelope, evidence []byte) error {
+	return n.PublishWithEvidence(ctx, env, evidence)
+}
+
 // cmdPublish implements `freens-cli publish`: decode each -files envelope,
 // then node.Publish it to the R closest peers (§6.4 PUT — the node obtains a
 // write token from each peer via a prior get, §6.3). One line per file is
 // printed ("name-summary -> accepted/rejected"); the exit is non-zero only
 // when ALL files fail, and a warning is emitted when only some fail.
+//
+// -evidence <path> switches the single -file into §8.4 evidence transport:
+// the RecoveryEvidence CBOR is read, decoded (fail fast), and carried in the
+// PUT via [publishWithEvidence] instead of a plain Publish — the output line
+// then notes the attached signature count. It requires exactly ONE -file
+// (the recovered record R2 the evidence proves).
 func cmdPublish(args []string) error {
 	fs := flag.NewFlagSet("publish", flag.ContinueOnError)
 	filesCSV := fs.String("files", "", "comma-separated paths of signed-envelope .cbor files to PUT onto the DHT (§6.4)")
 	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (required)")
 	listenAddr := fs.String("listen", "", "UDP address for the CLI DHT node (default: ephemeral :0)")
+	evidencePath := fs.String("evidence", "", "path to a RecoveryEvidence CBOR (spec 8.4, freens-cli recover -out): publish the single -file WITH the evidence (Node.PublishWithEvidence) instead of a plain PUT; requires exactly ONE -file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -258,6 +279,25 @@ func cmdPublish(args []string) error {
 	}
 	if len(files) == 0 {
 		return usageErr("publish requires -files <csv of .cbor paths>")
+	}
+	// §8.4 evidence transport: read + decode BEFORE touching the network so a
+	// bad path/bytes is a fast local error, and pin the one-file shape (the
+	// evidence proves exactly one recovered record R2).
+	var evidence []byte
+	var evidenceSigs int
+	if *evidencePath != "" {
+		if len(files) != 1 {
+			return usageErr("publish -evidence requires exactly ONE -file (the spec 8.4 recovered record R2 it proves), got %d", len(files))
+		}
+		data, err := os.ReadFile(*evidencePath)
+		if err != nil {
+			return fmt.Errorf("read %q: %w", *evidencePath, err)
+		}
+		ev, err := wire.DecodeRecoveryEvidence(data)
+		if err != nil {
+			return fmt.Errorf("decode evidence %q: %w", *evidencePath, err)
+		}
+		evidence, evidenceSigs = data, len(ev.Signatures)
 	}
 	peers, err := parsePeerList(*peersCSV)
 	if err != nil {
@@ -289,6 +329,19 @@ func cmdPublish(args []string) error {
 		if !env.VerifySignature() {
 			failed++
 			fmt.Printf("%s: %s -> rejected (envelope signature invalid)\n", path, nameSummary(env.Record.Name))
+			continue
+		}
+		if evidence != nil {
+			// §8.4 path — evidence attached; a failure here is final (no
+			// silent plain-publish fallback, see publishWithEvidence).
+			if err := publishWithEvidence(ctx, node, env, evidence); err != nil {
+				failed++
+				fmt.Printf("%s: %s -> rejected (evidence transport: %v)\n", path, nameSummary(env.Record.Name), err)
+				continue
+			}
+			accepted++
+			fmt.Printf("%s: %s -> accepted (spec 8.4 evidence attached: %s, %d signature(s))\n",
+				path, nameSummary(env.Record.Name), *evidencePath, evidenceSigs)
 			continue
 		}
 		if err := node.Publish(ctx, env); err != nil {

@@ -63,6 +63,11 @@ type entry struct {
 // heap or LRU list bookkeeping is warranted.
 const historyMax = 4096
 
+// evidenceMax bounds the §8.4 recovery-evidence table (evidence.go): like the
+// §8.3 history, a bounded audit side-table next to the single-winner live
+// map, evicting first-inserted-first-out at overflow.
+const evidenceMax = 4096
+
 // EnvelopeStore is the in-process DHT envelope store implementing the §6.4
 // winner rule and the §12 eviction policy. Each 32-byte key retains at most
 // one winning *wire.SignedEnvelope.
@@ -78,6 +83,14 @@ type EnvelopeStore struct {
 	// (not by DHT key): the displaced incumbent on every winning Put, plus
 	// everything dropped by the expired/LRU sweeps. Bounded by historyMax.
 	history map[[constants.SHA256Len]byte]*entry
+
+	// evidence retains §8.4 recovery-declaration evidence (wire.Recovery
+	// Evidence) keyed by the H_record of the envelope it was published WITH
+	// (the recovery record itself, not the recovered predecessor) — the key
+	// the resolver's hand-off walk fetches it by. Bounded by evidenceMax
+	// (FIFO via evidenceOrder). Guarded by mu like every other field.
+	evidence      map[[constants.SHA256Len]byte][]byte
+	evidenceOrder [][constants.SHA256Len]byte // insertion order, oldest first (FIFO eviction)
 }
 
 // NewEnvelopeStore constructs an empty EnvelopeStore. If maxBytes <= 0 it
@@ -99,6 +112,7 @@ func NewEnvelopeStore(maxBytes int, nowFn func() int64) *EnvelopeStore {
 		nowFn:    clock,
 		entries:  make(map[[constants.SHA256Len]byte]*entry),
 		history:  make(map[[constants.SHA256Len]byte]*entry),
+		evidence: make(map[[constants.SHA256Len]byte][]byte),
 	}
 }
 
@@ -124,7 +138,12 @@ func (s *EnvelopeStore) Now() int64 { return s.nowFn() }
 //     newcomer that carries prev_hash (field 9) ASSERTS a chain link, so it is
 //     additionally rejected unless wire.VerifyChainLink(newcomer, incumbent)
 //     holds (§4.4 rule 4 / §8.3: prev_hash == H_record(incumbent) and a
-//     strictly increasing sequence). A newcomer WITHOUT prev_hash is judged by
+//     strictly increasing sequence). A prev_hash-asserting newcomer signed by
+//     a key OTHER than the incumbent's owner is neither an ordinary update
+//     (§8.2: the owner signs) nor a §8.3 transfer (the previous owner signs),
+//     so it is accepted only as a §8.4 recovery hand-off — see
+//     [EnvelopeStore.PutWithEvidence] (plain Put passes nil evidence, i.e.
+//     such a newcomer is rejected). A newcomer WITHOUT prev_hash is judged by
 //     the plain winner rule unchanged (backward compatibility: existing
 //     publishers emit sequence-1 records with no prev_hash). A dead or absent
 //     incumbent means the slot is empty, so the newcomer is accepted
@@ -135,6 +154,28 @@ func (s *EnvelopeStore) Now() int64 { return s.nowFn() }
 //     (a single oversized entry that alone exceeds the cap is retained rather
 //     than evicted in an infinite loop).
 func (s *EnvelopeStore) Put(key []byte, env *wire.SignedEnvelope, now int64, verifySignature bool) (bool, error) {
+	return s.PutWithEvidence(key, env, now, verifySignature, nil)
+}
+
+// PutWithEvidence is [EnvelopeStore.Put] with an OPTIONAL §8.4
+// recovery-evidence blob riding along (nil keeps Put's exact behavior). It
+// governs rule 3's hand-off authorization: when a prev_hash-asserting
+// newcomer displacing an alive incumbent is signed by a key other than the
+// incumbent's owner (not §8.2/§8.3), the newcomer is accepted ONLY as a §8.4
+// recovery — owner = signer = the new primary key, with evidence that
+// decodes, names that same new key (NewOwnerPK), and satisfies a QUORUM of
+// the incumbent's §5.4 policy over H_record(incumbent).
+//
+// The §8.4 timelock is deliberately NOT enforced here: the store verifies
+// with now = evidence.NotBefore so the time gate trivially passes while the
+// quorum is fully enforced. §8.4 step 1 says the declaration is "published
+// like any record (sequence +1)" — retention during the timelock is what
+// makes step 2's cancellation race work (the current primary cancels by
+// publishing a higher-sequence record, which the §6.4 winner rule arbitrates
+// exactly as always). WHEN the recovery takes effect (step 3, "after the
+// timelock elapses") is the RESOLVER's decision, made per query against the
+// caller's clock (wire.VerifyAuthorityChainWithHandoffs).
+func (s *EnvelopeStore) PutWithEvidence(key []byte, env *wire.SignedEnvelope, now int64, verifySignature bool, evidence []byte) (bool, error) {
 	// --- rule 1: key length ----------------------------------------------
 	if len(key) != constants.SHA256Len {
 		return false, fmt.Errorf("dht: key must be %d bytes, got %d", constants.SHA256Len, len(key))
@@ -166,6 +207,15 @@ func (s *EnvelopeStore) Put(key []byte, env *wire.SignedEnvelope, now int64, ver
 		// incumbent (§4.4 rule 4 / §8.3). A nil prev_hash skips this check so
 		// pre-prev_hash publishers keep working (backward compatibility).
 		if len(env.Record.PrevHash) > 0 && !wire.VerifyChainLink(env, cur.env) {
+			return false, nil
+		}
+		// §8.3/§8.4 hand-off authorization: a prev_hash-asserting newcomer
+		// signed by someone OTHER than the incumbent's owner is neither an
+		// ordinary update (§8.2) nor a transfer (§8.3). It is accepted only
+		// as a §8.4 recovery hand-off backed by quorum evidence (see
+		// PutWithEvidence for the timelock rationale).
+		if len(env.Record.PrevHash) > 0 && !bytes.Equal(env.Signer, cur.env.Record.Owner) &&
+			!s.recoveryAcceptableLocked(env, cur.env, evidence) {
 			return false, nil
 		}
 	}

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/laurent/freens/internal/constants"
+	"github.com/laurent/freens/internal/metrics"
 	"github.com/miekg/dns"
 )
 
@@ -69,6 +70,10 @@ type ResponseCache struct {
 	maxEntries int
 	now        func() int64 // wall-clock seconds
 	nextStamp  uint64
+	// hits/misses optionally count get() outcomes; nil (the default, or a
+	// SetMetrics(nil) call) leaves the cache uninstrumented.
+	hits   *metrics.Counter
+	misses *metrics.Counter
 }
 
 // NewResponseCache builds an empty ResponseCache (§10.4). maxEntries <= 0
@@ -97,6 +102,34 @@ func (c *ResponseCache) Len() int {
 	return len(c.entries)
 }
 
+// SetMetrics registers the cache hit/miss counters
+// (freens_resolver_cache_hits_total / freens_resolver_cache_misses_total) on m.
+// It may be called before first use; a nil registry (or no call) disables
+// instrumentation. Call it once per cache on a given registry — the metrics
+// package panics on duplicate registration.
+func (c *ResponseCache) SetMetrics(m *metrics.Registry) {
+	if m == nil {
+		return
+	}
+	c.hits = m.NewCounter("freens_resolver_cache_hits_total",
+		"Response-cache lookups served from a live cache entry (§10.4).")
+	c.misses = m.NewCounter("freens_resolver_cache_misses_total",
+		"Response-cache lookups absent or expired (resolver re-consulted the namespace).")
+}
+
+// countHit/countMiss bump the optional counters (no-op when uninstrumented).
+func (c *ResponseCache) countHit() {
+	if c.hits != nil {
+		c.hits.With().Inc()
+	}
+}
+
+func (c *ResponseCache) countMiss() {
+	if c.misses != nil {
+		c.misses.With().Inc()
+	}
+}
+
 // get returns the cached outcome for key, with every answer RR deep-copied
 // and its TTL decayed to the remaining cache lifetime. ok is false on a miss
 // or an expired entry (which is dropped).
@@ -105,13 +138,16 @@ func (c *ResponseCache) get(key cacheKey) (rrs []dns.RR, rcode int, aa bool, ok 
 	defer c.mu.Unlock()
 	e, hit := c.entries[key]
 	if !hit {
+		c.countMiss()
 		return nil, 0, false, false
 	}
 	now := c.now()
 	if now >= e.expiresAt {
 		delete(c.entries, key)
+		c.countMiss()
 		return nil, 0, false, false
 	}
+	c.countHit()
 	remaining := uint32(e.expiresAt - now)
 	out := make([]dns.RR, len(e.rrs))
 	for i, rr := range e.rrs {

@@ -19,8 +19,16 @@
 //	           evidence: threshold-many recovery keys (validated against the
 //	           previous record's field-10 policy) sign
 //	           wire.RecoverySigningMessage over (prev H_record, new primary
-//	           pk, execute_not_before = now + timelock). Generates evidence
-//	           only; verification/acceptance wiring is future work.
+//	           pk, execute_not_before = now + timelock). -out writes the
+//	           evidence CBOR; -out-envelope ADDITIONALLY writes the §8.4
+//	           recovered record R2 (owner = the new key, sequence = prev+1,
+//	           prev_hash = H(prev), signed by the NEW owner — the opposite
+//	           signer convention of §8.3 transfer) for `publish -files
+//	           <r2.cbor> -evidence <evidence.cbor>`.
+//	verify-recovery §8.4 verifier side — check a RecoveryEvidence against
+//	           the previous record's field-10 policy (pure wire calls, no
+//	           network): quorum count, threshold, and timelock status,
+//	           human-readable.
 //
 // The produced envelopes follow make-record's output conventions
 // (envelope_cbor=<hex> plus wire_name/k_name lines) so they can be piped
@@ -303,15 +311,23 @@ func cmdRotate(args []string) error {
 // field-10 recovery policy, sign wire.RecoverySigningMessage(prev H_record,
 // new owner pk, execute_not_before = now + timelock) with each -recovery-seeds
 // key (validated to be a subset of the policy's keys), and write the
-// RecoveryEvidence CBOR to -out. It GENERATES evidence; it does not verify
-// acceptance (DHT/resolver wiring is future work — during the timelock the
-// current primary key may cancel per §8.4 step 2).
+// RecoveryEvidence CBOR to -out. With -out-envelope it ADDITIONALLY writes the
+// §8.4 recovered record R2 — the make-record-style signed envelope that, once
+// the timelock elapses and the evidence is published alongside it, re-points
+// the name at the new primary key. The recovery POLICY is carried over
+// unchanged (see buildRecoveryEnvelope); operators SHOULD follow up with
+// `freens-cli rotate` after regaining control to rotate the recovery keys
+// (§8.4 step 2: "SHOULD also rotate the recovery keys — this defeats a single
+// stolen recovery key").
 func cmdRecover(args []string) error {
 	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
 	prevPath := fs.String("prev-envelope", "", "path to the previous signed envelope .cbor (whose field-10 recovery policy is used)")
 	newOwnerSeedHex := fs.String("new-owner-seed", "", "hex Ed25519 seed of the fresh primary key that will own the name after recovery")
 	recoverySeedsCSV := fs.String("recovery-seeds", "", "comma-separated hex seeds of the recovery keys (must be a subset of the policy's field-10 keys)")
 	out := fs.String("out", "", "path to write the RecoveryEvidence CBOR")
+	outEnvelope := fs.String("out-envelope", "", "additionally write the spec 8.4 recovered record R2 as a signed envelope .cbor here "+
+		"(owner = the NEW key, sequence = prev+1, prev_hash = H(prev), signed by the NEW owner — the opposite of transfer). "+
+		"The recovery policy is carried over unchanged; after regaining control, follow up with `freens-cli rotate` to rotate the recovery keys (spec 8.4 step 2)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -388,6 +404,9 @@ func cmdRecover(args []string) error {
 	// Self-check: with the assembled quorum the evidence must already verify
 	// once the timelock elapses (or, if fewer than threshold keys signed,
 	// provably not — warn, the caller may still be gathering signatures).
+	// The same check covers the optional R2 envelope below: it pairs R2 with
+	// exactly this evidence, so verifying the evidence at now=NotBefore is
+	// verifying the envelope's acceptance precondition (§8.4 step 3).
 	if ok := wire.VerifyRecovery(policy, ev, prevHash, notBefore); !ok && len(sigs) >= int(policy.Threshold) {
 		return cryptoErr("assembled recovery evidence failed self-verification")
 	}
@@ -397,6 +416,16 @@ func cmdRecover(args []string) error {
 	}
 	if err := os.WriteFile(*out, evBytes, 0o644); err != nil {
 		return fmt.Errorf("write %q: %w", *out, err)
+	}
+
+	// Optional §8.4 recovered record R2 (the envelope `publish -files
+	// <r2.cbor> -evidence <evidence.cbor>` pushes once the timelock elapses).
+	var r2 *wire.SignedEnvelope
+	if *outEnvelope != "" {
+		r2, err = buildRecoveryEnvelope(prev, newKP, now)
+		if err != nil {
+			return err
+		}
 	}
 
 	fmt.Printf("evidence_file=%s\n", *out)
@@ -409,6 +438,222 @@ func cmdRecover(args []string) error {
 	if len(sigs) < int(policy.Threshold) {
 		fmt.Fprintf(os.Stderr, "freens-cli: warning: %d of %d required signatures gathered — the declaration does not verify until the threshold is reached\n", len(sigs), policy.Threshold)
 	}
-	fmt.Println("note: verification-side wiring (DHT/resolver acceptance, spec 8.4 cancellation race) is future work")
+	if r2 != nil {
+		r2Bytes, err := r2.Bytes()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(*outEnvelope, r2Bytes, 0o644); err != nil {
+			return fmt.Errorf("write %q: %w", *outEnvelope, err)
+		}
+		r := r2.Record
+		fmt.Printf("envelope_file=%s\n", *outEnvelope)
+		fmt.Printf("envelope_cbor=%s\n", hex.EncodeToString(r2Bytes))
+		fmt.Printf("wire_name=%s\n", hex.EncodeToString(r.Name))
+		if labels, tldID, derr := naming.DecodeWireName(r.Name); derr == nil && len(labels) == 0 {
+			k, kerr := naming.DHTKeyTld(tldID)
+			if kerr != nil {
+				return kerr
+			}
+			fmt.Printf("k_tld=%s\n", hex.EncodeToString(k))
+		} else {
+			fmt.Printf("k_name=%s\n", hex.EncodeToString(naming.DHTKeyName(r.Name)))
+		}
+		fmt.Printf("name_summary=%s\n", nameSummary(r.Name))
+		fmt.Printf("recovered_owner=%s\n", hex.EncodeToString(r.Owner))
+		fmt.Printf("signer=%s (NEW owner, spec 8.4 — the opposite of transfer)\n", hex.EncodeToString(r2.Signer))
+		fmt.Printf("sequence=%d\n", r.Sequence)
+		fmt.Printf("created=%d\n", r.Created)
+		fmt.Printf("expires=%d (%d seconds remaining, min %d)\n", r.Expires, int64(r.Expires)-int64(now), constants.ResponseTTLCap)
+		fmt.Printf("rrset=%d\n", len(r.RRset))
+		fmt.Printf("recovery_policy=carried over unchanged (threshold %d of %d)\n", r.Recovery.Threshold, len(r.Recovery.Keys))
+		fmt.Printf("wrote=%s\n", *outEnvelope)
+	}
+	fmt.Printf("note: publish the recovered record after the timelock with `freens-cli publish -files <r2.cbor> -evidence %s`; rotate the recovery keys afterwards (spec 8.4 step 2: `freens-cli rotate`)\n", *out)
 	return nil
+}
+
+// buildRecoveryEnvelope builds the §8.4 recovered record R2 from prev (R1).
+// The declaration itself (the quorum's proof) lives in the RecoveryEvidence;
+// R2 is the record that, published WITH that evidence once the timelock
+// elapses, re-points the name:
+//
+//   - Name: carried over verbatim (K_name/K_tld unchanged).
+//   - Owner: the NEW primary key (§8.4 "the new primary key owns the name").
+//   - Sequence: prev.Sequence + 1 (§8.4 "published like any record
+//     (sequence +1 ...)").
+//   - Created/Expires: fresh window — now .. now + (R1's remaining lifetime,
+//     floored at constants.ResponseTTLCap = 3600 s so a nearly-expired or
+//     already-expired R1 still yields a usable R2).
+//   - PrevHash: H_record(R1) (§4.2), chaining R2 to the recovered record the
+//     evidence's signatures name.
+//   - RRset: carried over; an RR without a TTL (0) defaults to 3600.
+//   - Delegation: like a §8.3 hand-off, subtree authority that followed the
+//     previous owner (empty or == prev owner) is re-pointed at the new
+//     owner; a third-party delegation survives unchanged.
+//   - Recovery policy: carried over UNCHANGED (§8.4 step 1's "recovery
+//     fields updated" is the operator's follow-up decision, not the
+//     recovery's: rotating recovery keys requires the regained control this
+//     record establishes — §8.4 step 2 says the owner SHOULD rotate them
+//     right after, i.e. `freens-cli rotate` / make-record -recovery-*).
+//   - Claim: carried over (a TLD-root recovery keeps the alias anchored).
+//     Revoke is NOT carried: a higher-sequence record un-revokes (§8.5).
+//
+// Signer convention — the OPPOSITE of §8.3 transfer: the NEW owner key signs
+// R2. In a transfer the previous owner is available and proves consent by
+// signing; in a recovery the previous key is BY DEFINITION unavailable, so
+// the quorum's evidence (verified against R1's policy and H_record) is the
+// consent proof, and the new key signs the record it will own.
+func buildRecoveryEnvelope(prev *wire.SignedEnvelope, newKP *crypto.Keypair, now uint64) (*wire.SignedEnvelope, error) {
+	if prev == nil || prev.Record == nil {
+		return nil, cryptoErr("previous envelope has no record")
+	}
+	if prev.Record.Recovery == nil {
+		return nil, cryptoErr("%v — there is no policy to carry over into the recovered record", wire.ErrNoRecoveryPolicy)
+	}
+	prevHash, err := prev.RecordHash()
+	if err != nil {
+		return nil, err
+	}
+	// Fresh validity window: carry over R1's remaining lifetime, floored at
+	// one hour (constants.ResponseTTLCap) so R2 is always usable.
+	remaining := int64(prev.Record.Expires) - int64(now)
+	if remaining < int64(constants.ResponseTTLCap) {
+		remaining = int64(constants.ResponseTTLCap)
+	}
+	rec, err := wire.NewRecord(prev.Record.Name, newKP.Public(), prev.Record.Sequence+1, now, uint64(int64(now)+remaining))
+	if err != nil {
+		return nil, err
+	}
+	rec.PrevHash = prevHash
+	if len(prev.Record.RRset) > 0 {
+		rec.RRset = make([]*wire.RR, len(prev.Record.RRset))
+		for i, rr := range prev.Record.RRset {
+			cp := *rr
+			if cp.TTL == 0 {
+				cp.TTL = constants.ResponseTTLCap // "TTLs (default 3600 if absent)"
+			}
+			rec.RRset[i] = &cp
+		}
+	}
+	if len(prev.Record.Delegation) == 0 || bytes.Equal(prev.Record.Delegation, prev.Record.Owner) {
+		// Subtree authority follows the new primary (§8.3-style).
+		rec.Delegation = append([]byte(nil), newKP.Public()...)
+	} else {
+		rec.Delegation = append([]byte(nil), prev.Record.Delegation...)
+	}
+	rec.Recovery = prev.Record.Recovery
+	rec.Claim = prev.Record.Claim
+	env, err := wire.SignRecord(rec, newKP) // §8.4: the NEW owner signs
+	if err != nil {
+		return nil, err
+	}
+	if !env.VerifySignature() {
+		return nil, cryptoErr("recovered record R2 failed its signature self-check")
+	}
+	return env, nil
+}
+
+// ---------------------------------------------------------------------------
+// verify-recovery — §8.4 verifier side (pure wire calls, no network)
+// ---------------------------------------------------------------------------
+
+// cmdVerifyRecovery implements `freens-cli verify-recovery`: decode the
+// previous record and a RecoveryEvidence, and report whether the declaration
+// satisfies R1's field-10 policy at -now (default: the current time) — the
+// same predicate wire.VerifyRecovery applies on the acceptance side, plus a
+// human-readable quorum/threshold/timelock breakdown. A failing verification
+// is a validation failure (exit code 2), not a usage error.
+func cmdVerifyRecovery(args []string) error {
+	fs := flag.NewFlagSet("verify-recovery", flag.ContinueOnError)
+	prevPath := fs.String("prev-envelope", "", "path to the previous signed envelope .cbor (whose field-10 recovery policy and H_record anchor the declaration)")
+	evidencePath := fs.String("evidence", "", "path to the RecoveryEvidence CBOR (freens-cli recover -out)")
+	nowFlag := fs.Int64("now", 0, "verification instant as unix seconds (default: now; spec 8.4 step 3 needs now >= execute_not_before)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return usageErr("verify-recovery takes no positional arguments")
+	}
+	if *prevPath == "" || *evidencePath == "" {
+		return usageErr("verify-recovery requires -prev-envelope and -evidence")
+	}
+	prev, err := loadEnvelope(*prevPath)
+	if err != nil {
+		return err
+	}
+	policy := prev.Record.Recovery
+	if policy == nil {
+		return cryptoErr("%v — the previous record names no recovery quorum", wire.ErrNoRecoveryPolicy)
+	}
+	evData, err := os.ReadFile(*evidencePath)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", *evidencePath, err)
+	}
+	ev, err := wire.DecodeRecoveryEvidence(evData)
+	if err != nil {
+		return fmt.Errorf("decode evidence %q: %w", *evidencePath, err)
+	}
+	prevHash, err := prev.RecordHash()
+	if err != nil {
+		return err
+	}
+	now := uint64(time.Now().Unix())
+	if *nowFlag != 0 {
+		now = uint64(*nowFlag)
+	}
+
+	quorum := countRecoveryQuorum(policy, ev, prevHash)
+	notBefore := time.Unix(int64(ev.NotBefore), 0).UTC().Format(time.RFC3339)
+	nowStr := time.Unix(int64(now), 0).UTC().Format(time.RFC3339)
+
+	fmt.Printf("prev_hash=%s\n", hex.EncodeToString(prevHash))
+	fmt.Printf("new_owner=%s\n", hex.EncodeToString(ev.NewOwnerPK))
+	fmt.Printf("quorum=%d\n", quorum)
+	fmt.Printf("threshold=%d\n", policy.Threshold)
+	fmt.Printf("keys=%d\n", len(policy.Keys))
+	fmt.Printf("timelock_expires=%s (unix %d)\n", notBefore, ev.NotBefore)
+	fmt.Printf("now=%s (unix %d)\n", nowStr, now)
+
+	switch {
+	case quorum < int(policy.Threshold):
+		return cryptoErr("status=quorum %d/%d BELOW THRESHOLD — only %d of the required %d distinct policy keys produced valid signatures",
+			quorum, len(policy.Keys), quorum, policy.Threshold)
+	case now < ev.NotBefore:
+		return cryptoErr("status=quorum %d/%d OK, timelock not elapsed — executable at %s (%d s remaining, spec 8.4 step 3)",
+			quorum, len(policy.Keys), notBefore, int64(ev.NotBefore)-int64(now))
+	default:
+		fmt.Printf("status=quorum %d/%d OK, timelock expires %s\n", quorum, len(policy.Keys), notBefore)
+		return nil
+	}
+}
+
+// countRecoveryQuorum returns the number of DISTINCT policy keys that each
+// produced a valid signature over the §8.4 message — the same counting rule
+// wire.VerifyRecovery applies internally (duplicated here because the wire
+// API exposes only the boolean verdict, and verify-recovery wants the count
+// for its human-readable report).
+func countRecoveryQuorum(policy *wire.RecoveryPolicyWire, ev *wire.RecoveryEvidence, prevHash []byte) int {
+	if policy == nil || ev == nil {
+		return 0
+	}
+	msg, err := wire.RecoverySigningMessage(prevHash, ev.NewOwnerPK, ev.NotBefore)
+	if err != nil {
+		return 0
+	}
+	verified := 0
+	seen := make(map[string]bool, len(policy.Keys))
+	for _, k := range policy.Keys {
+		if len(k) != constants.Ed25519PublicKeyLen || seen[string(k)] {
+			continue
+		}
+		for _, sig := range ev.Signatures {
+			if crypto.Verify(k, sig, msg) {
+				seen[string(k)] = true
+				verified++
+				break
+			}
+		}
+	}
+	return verified
 }

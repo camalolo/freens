@@ -28,8 +28,8 @@ Implemented and fully tested (130 test functions, `go test ./...` green,
 | `internal/claims` | `AliasClaim`, witness attestations, PoW, deterministic §7.4 ordering | §7 |
 | `internal/dht` | XOR metric, 256 k-bucket routing table, rotating HMAC write tokens, envelope store (winner rule + LRU/grace eviction) | §6 |
 | `internal/resolver` | §9.3 INI config parser, per-alias routing, live UDP+TCP DNS server via `miekg/dns`, DNS fallback | §9 |
-| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
-| `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `publish`, `resolve`, `get`, `demo` subcommands | §6.4, §8 |
+| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`, `-stun`, `-dns`, `-metrics`, `-peers-file` + SIGHUP reload): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
+| `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `publish` (incl. `-evidence` for §8.4 recovery transport), `resolve`, `get`, `transfer`/`rotate`/`recover`/`verify-recovery`, `demo` subcommands | §6.4, §8 |
 
 Multi-node operation: with `-dht <addr>` the daemon joins the Kademlia
 network — records seeded locally are served to (and fetched from) peers via
@@ -38,8 +38,13 @@ stored at `K_claim` (pin-first policy: `alias-pins` always win), and due
 records are republished at 80% of lifetime (§6.4). `-advertise <addr>`
 publishes a dialable address (e.g. your public `ip:15353` behind NAT/port
 forwarding) instead of the observed source in peer contact lists (§6.2) —
-see "NAT / port forwarding" in `contrib/README.md`. Without `-dht` the daemon
-is a single-node island (spec §9.4 stage 1).
+see "NAT / port forwarding" in `contrib/README.md`; `-stun <server>`
+discovers that reflexive address automatically. `-dns <addr>` overrides the
+DNS listen without a config file, `-metrics <addr>` exposes metrics +
+`/healthz`, and `-peers-file` + `SIGHUP` hot-reloads the bootstrap set.
+Without `-dht` the daemon is a single-node island (spec §9.4 stage 1).
+`contrib/testnet.sh [N]` spins up an N-node localhost interop testnet and
+asserts DNS convergence on every node (update included).
 
 ## Requirements
 
@@ -99,6 +104,9 @@ go run ./cmd/freens-cli gen-key
 # Run the DNS resolver daemon on a high port (53 needs privileges):
 go run ./cmd/freens -listen 127.0.0.1:5300 -upstream 9.9.9.9,1.1.1.1 \
     -load ./my-records/   # directory of *.cbor signed envelopes to serve
+
+# N-node localhost interop testnet (publish once, dig every node):
+./contrib/testnet.sh 3
 ```
 
 The daemon was validated end-to-end with `dig`: a freens record served from the

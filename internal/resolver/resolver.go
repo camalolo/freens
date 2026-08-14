@@ -89,6 +89,30 @@ type HistoryResolver interface {
 	LookupByHash(ctx context.Context, h []byte) (*wire.SignedEnvelope, error)
 }
 
+// RecoveryEvidenceResolver is the OPTIONAL §8.4 evidence source: it returns
+// the RecoveryEvidence retained for recordHash — the H_record of the recovery
+// hand-off record the evidence accompanies (the new primary's R2, NOT the
+// recovered predecessor) — from this node's evidence table or any peer's, or
+// (nil, nil) if no such evidence is obtainable. §8.4 (lines 691-701): the
+// threshold-of-keys recovery declaration lives OUTSIDE the record (the §4.1
+// schema carries only the §5.4 POLICY, field 10), so proving a recovery hop
+// requires fetching the declaration as a separate hash-addressed object —
+// dht.DHTLookup implements this over its evidence table (local first, then an
+// iterative get asking peers; storing nodes retain the evidence published
+// with the record, exactly like the §8.3 audit history).
+//
+// A RecordLookup MAY implement RecoveryEvidenceResolver (it then usually also
+// implements HistoryResolver — a recovery hop needs BOTH the predecessor
+// envelope and the evidence); the resolver discovers it with a type assertion
+// when the walked chain[0] asserts a hand-off. Trust model: without this
+// source a §8.4 recovery root is unprovable and the name NXDOMAINs — the
+// timelock (now >= evidence.NotBefore) and the quorum are (re-)checked by the
+// wire walker on every query, so the returned evidence is UNTRUSTED input
+// like everything else the source hands over.
+type RecoveryEvidenceResolver interface {
+	RecoveryEvidence(ctx context.Context, recordHash []byte) (*wire.RecoveryEvidence, error)
+}
+
 // DifficultyOracle is the OPTIONAL Appendix A.4 gossip-difficulty source: the
 // claim-PoW floor this node learned from the network. A.4 (lines 1004-1006):
 // "Nodes gossip the current D in witness responses; clients use the median of
@@ -381,55 +405,86 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 }
 
 // verifyAuthorityChain verifies the walked chain per §3.4, additionally
-// accepting a §8.3 whole-TLD transfer record as chain[0] when — and only when
-// — the record source can produce the superseded predecessors by hash.
+// accepting a §8.3 whole-TLD transfer OR a §8.4 recovery hand-off as
+// chain[0] when — and only when — the record source can produce the
+// superseded predecessors by hash (HistoryResolver), and, for recoveries,
+// the §8.4 quorum evidence (RecoveryEvidenceResolver).
 //
-// §8.3 (lines 666-687) defines the hand-off record as: owner = the NEW owner
+// §8.3 (lines 666-687) defines the transfer record as: owner = the NEW owner
 // key, delegation = the same new key ("subtree authority follows"),
 // prev_hash = H_record(previous signed envelope), sequence = prev + 1, and
 // "signature: by ... (current owner key)" — i.e. signed by the PREVIOUS
 // owner, "because the previous owner — whose key the current authority chain
 // names — signed it" (line 681). "For a whole-TLD transfer, the same
 // operation on the TLD record transfers the alias and all undelegated names
-// at once" (lines 686-687). Such a root necessarily fails the plain
-// wire.VerifyAuthorityChain, whose chain[0] rule demands signer == owner of a
-// self-certifying root — correct for every un-transferred TLD and for every
-// sub-name hand-off (those verify via the parent/child authorization rules).
+// at once" (lines 686-687).
 //
-// Dispatch (zero behavior change outside the transferred case):
+// §8.4 (lines 689-707) defines the recovery hand-off dually: the primary key
+// is lost, a threshold of the §5.4 recovery keys signs a declaration handing
+// the name to a new primary, and the resulting record is "published like any
+// record (sequence +1, `recovery` fields updated)" — but signed by the NEW
+// owner (only K2 can sign after K1 was lost), with the PROOF living outside
+// the record as RecoveryEvidence. "After the timelock elapses with no
+// cancellation, the recovery record takes effect and the new primary key
+// owns the name" (lines 700-701): the timelock (now >= NotBefore) and the
+// cancellation race (step 2: the current primary cancels by publishing a
+// higher-sequence record — which the §6.4 winner rule arbitrates before any
+// of this is consulted) are therefore decided per query, at resolve time.
 //
-//   - chain[0].Signer == chain[0].Record.Owner, or no prev_hash assertion:
-//     wire.VerifyAuthorityChain exactly as before (a signer != owner record
-//     without prev_hash is NOT a §8.3 hand-off and still rejects).
-//   - signer != owner AND chain[0].Record.PrevHash non-nil (a §8.3 hand-off):
-//     if r.Freens implements HistoryResolver, verify via
-//     wire.VerifyAuthorityChainWithTransfers, which walks the prev_hash links
-//     through a fetcher over LookupByHash (this node's retained history or
-//     any peer's — storing nodes retain superseded envelopes for audit per
-//     §8.3) back to the original self-certifying root; each hop's prev_hash
-//     must equal the fetched predecessor's H_record, predecessors must be
-//     signature-valid (their own liveness window is NOT required — §8.3 is
-//     an auditable OFFLINE history, and v1 may have expired or been
-//     superseded), and the terminal predecessor must be the self-certifying
-//     root. On false the caller NXDOMAINs as usual. If the source does NOT
-//     implement HistoryResolver the hand-off is unprovable from this vantage
-//     point, so today's behavior stands: reject.
+// Dispatch note (§8.4 vs the plain rules): a recovery hand-off record has
+// Signer == Owner, so it would take the plain-verifier branch below — and
+// FAIL it: the name still carries the ORIGINAL tld_id (crypto.TldID(K2) !=
+// tld_id), so the root is not self-certifying for its new owner. ANY
+// chain[0] with a non-empty prev_hash is therefore routed through the
+// hand-off/transfers walker, which decides per hop whether it links via a
+// §8.3 transfer (signer == predecessor owner) or a §8.4 recovery (signer ==
+// owner != predecessor owner, quorum evidence + caller-clock timelock).
+// signer==owner roots with NO prev_hash keep the byte-identical plain path.
+//
+// Concretely (zero behavior change outside the hand-off cases):
+//
+//   - chain[0].Record.PrevHash empty (or no record): wire.VerifyAuthorityChain
+//     exactly as before — ordinary self-certifying roots, and a signer !=
+//     owner record without prev_hash is NOT a hand-off and still rejects.
+//   - prev_hash non-nil (a §8.3 transfer or a §8.4 recovery root):
+//     if r.Freens implements HistoryResolver, the predecessors are fetched
+//     via LookupByHash (this node's retained history or any peer's — storing
+//     nodes retain superseded envelopes for audit per §8.3) and verification
+//     goes through wire.VerifyAuthorityChainWithHandoffs when the source ALSO
+//     implements RecoveryEvidenceResolver (the evidence fetcher is wired
+//     through, and the resolver's own clock drives the §8.4 timelock gate),
+//     else through wire.VerifyAuthorityChainWithTransfers exactly as today
+//     (a recovery root then still rejects: its hops need evidence a
+//     transfer-only walker cannot check). On false the caller NXDOMAINs as
+//     usual. If the source implements NEITHER, the hand-off is unprovable
+//     from this vantage point, so today's behavior stands: reject.
 func (r *Resolver) verifyAuthorityChain(ctx context.Context, chain []*wire.SignedEnvelope) bool {
 	root := chain[0]
-	if root.Record == nil || bytes.Equal(root.Signer, root.Record.Owner) || len(root.Record.PrevHash) == 0 {
+	if root.Record == nil || len(root.Record.PrevHash) == 0 {
 		// Ordinary (or malformed) root: the §3.4 rules alone apply —
 		// identical to the pre-§8.3 resolver for every input.
 		return wire.VerifyAuthorityChain(chain)
 	}
 	hr, ok := r.Freens.(HistoryResolver)
 	if !ok {
-		// A §8.3 hand-off with no way to fetch predecessors: keep today's
-		// reject (the plain chain rules fail signer != owner).
+		// A hand-off with no way to fetch predecessors: keep today's
+		// reject (the plain chain rules fail signer != owner roots, and a
+		// recovery root fails the self-certification).
 		return wire.VerifyAuthorityChain(chain)
 	}
-	return wire.VerifyAuthorityChainWithTransfers(chain, func(prevHash []byte) (*wire.SignedEnvelope, error) {
+	fetchPredecessor := func(prevHash []byte) (*wire.SignedEnvelope, error) {
 		return hr.LookupByHash(ctx, prevHash)
-	})
+	}
+	if er, ok := r.Freens.(RecoveryEvidenceResolver); ok {
+		fetchEvidence := func(recordHash []byte) (*wire.RecoveryEvidence, error) {
+			return er.RecoveryEvidence(ctx, recordHash)
+		}
+		// §8.4: the caller's (resolver's) clock drives the timelock gate —
+		// pre-timelock recoveries NXDOMAIN here even though the DHT stored
+		// them (the §8.4 step-2 cancellation window).
+		return wire.VerifyAuthorityChainWithHandoffs(chain, fetchPredecessor, fetchEvidence, uint64(r.now()))
+	}
+	return wire.VerifyAuthorityChainWithTransfers(chain, fetchPredecessor)
 }
 
 // resolveAliasClaim implements the network side of §9.2 step 3a (alias →

@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/wire"
@@ -29,9 +30,12 @@ var _ interface {
 } = (*DHTLookup)(nil)
 
 // LookupByHash returns the superseded envelope whose H_record (§4.2) equals
-// h: the local store's §8.3 history first (EnvelopeStore.GetHistory), then —
-// when the lookup has a node — an iterative DHT get on h AS the DHT key,
-// mirroring [DHTLookup.Lookup]'s network path (§6.4 GET; peers serving
+// h: the local store's §8.3 history first (EnvelopeStore.GetHistory), then a
+// live entry stored AT key h (a fetched-by-hash envelope cached under its own
+// H_record — e.g. re-seeded from <persist> at start-up; the hash is verified
+// before returning, so a colliding mis-keyed entry can never masquerade),
+// then — when the lookup has a node — an iterative DHT get on h AS the DHT
+// key, mirroring [DHTLookup.Lookup]'s network path (§6.4 GET; peers serving
 // get-by-hash answer from their own history). A nil node degrades to local
 // only. Returns (nil, nil) when the predecessor is available neither locally
 // nor across the reachable network — an auditable chain that cannot be
@@ -48,6 +52,16 @@ func (l *DHTLookup) LookupByHash(ctx context.Context, h []byte) (*wire.SignedEnv
 	}
 	if env := l.store.GetHistory(h); env != nil {
 		return env, nil
+	}
+	// Hash-keyed live entry (fetch cache / re-seed artifact): the entry's own
+	// H_record must equal the key it is stored under, or it is not the
+	// predecessor being asked for. Get applies the liveness window; a
+	// superseded predecessor retrieved this way is normally well within it,
+	// and an expired one is servable by some peer's history instead.
+	if env, _ := l.store.Get(h, time.Now().Unix()); env != nil {
+		if got, err := env.RecordHash(); err == nil && bytes.Equal(got, h) {
+			return env, nil
+		}
 	}
 	if l.node == nil {
 		return nil, nil // island: local history only.

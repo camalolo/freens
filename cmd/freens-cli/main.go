@@ -8,9 +8,12 @@
 //	gen-key                      Generate an Ed25519 keypair; print seed/public/tld_id.
 //	mine-claim                   Mine an AliasClaim PoW; print nonce/pow_hash/claim CBOR.
 //	make-record                  Build + sign a freens record (A RR); print envelope CBOR + DHT key.
-//	publish                      PUT signed-envelope .cbor files onto the DHT (§6.4 PUT).
+//	publish                      PUT signed-envelope .cbor files onto the DHT (§6.4 PUT);
+//	                             -evidence attaches a §8.4 RecoveryEvidence to the single -file.
 //	resolve                      Fetch + display a name's terminal record (§6.4 GET; no chain walk).
 //	get                          Raw DHT get by 64-hex key (§6.4 GET).
+//	recover                      Assemble §8.4 recovery evidence (+ the recovered record R2 with -out-envelope).
+//	verify-recovery              Check a §8.4 RecoveryEvidence against the previous record's policy (quorum/threshold/timelock).
 //	demo                         Self-contained end-to-end showcase (the headline demo).
 //
 // Exit codes: 0 success, 1 usage/error, 2 crypto/validation failure.
@@ -71,6 +74,8 @@ func main() {
 		err = cmdRotate(args)
 	case "recover":
 		err = cmdRecover(args)
+	case "verify-recovery":
+		err = cmdVerifyRecovery(args)
 	case "publish":
 		err = cmdPublish(args)
 	case "resolve":
@@ -106,8 +111,12 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  make-record           build + sign a freens record (optional -recovery-* embed a spec 5.4 policy; -out writes the .cbor)")
 	fmt.Fprintln(w, "  transfer              hand a name to a new owner key (spec 8.3; -prev-envelope, -new-owner-seed, -signer-seed)")
 	fmt.Fprintln(w, "  rotate                key hygiene: transfer to a fresh key (spec 8.6 = 8.3 hand-off)")
-	fmt.Fprintln(w, "  recover               gather threshold recovery-key signatures (spec 8.4; -prev-envelope, -new-owner-seed, -recovery-seeds)")
-	fmt.Fprintln(w, "  publish               put envelope .cbor files onto the DHT (-files, -peers)")
+	fmt.Fprintln(w, "  recover               gather threshold recovery-key signatures (spec 8.4; -prev-envelope, -new-owner-seed, -recovery-seeds,")
+	fmt.Fprintln(w, "                        -out evidence CBOR; -out-envelope additionally writes the recovered record R2 — signed by the")
+	fmt.Fprintln(w, "                        NEW owner; rotate the recovery keys afterwards: `freens-cli rotate`, spec 8.4 step 2)")
+	fmt.Fprintln(w, "  verify-recovery       check spec 8.4 evidence against the previous record's policy (-prev-envelope, -evidence, [-now])")
+	fmt.Fprintln(w, "  publish               put envelope .cbor files onto the DHT (-files, -peers; -evidence <path> attaches a spec 8.4")
+	fmt.Fprintln(w, "                        RecoveryEvidence to exactly ONE -file, the recovered record R2)")
 	fmt.Fprintln(w, "  resolve               fetch + display a record from the DHT (-name, -tld-id-b32, -peers)")
 	fmt.Fprintln(w, "  get                   raw DHT get by key (-key, -peers)")
 	fmt.Fprintln(w, "  demo                  self-contained end-to-end showcase")

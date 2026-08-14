@@ -10,6 +10,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/laurent/freens/internal/metrics"
 	"github.com/miekg/dns"
 )
 
@@ -19,6 +20,9 @@ type Server struct {
 	dnsSrv   *dns.Server
 	resolver *Resolver
 	network  string
+	// queries optionally counts every answered query by (qtype, status);
+	// nil (the default) disables instrumentation.
+	queries *metrics.Counter
 }
 
 // NewServer builds a Server bound to addr on the given network ("udp"/"tcp").
@@ -29,9 +33,70 @@ type Server struct {
 func NewServer(addr, network string, res *Resolver) *Server {
 	s := &Server{resolver: res, network: network}
 	mux := dns.NewServeMux()
-	mux.HandleFunc(".", res.ServeDNS)
+	mux.HandleFunc(".", s.handleDNS)
 	s.dnsSrv = &dns.Server{Addr: addr, Net: network, Handler: mux}
 	return s
+}
+
+// SetQueryCounter installs a pre-registered counter (expected label layout
+// "qtype", "status") that is incremented once per answered query. Passing nil
+// (or never calling) leaves the server uninstrumented, so existing callers are
+// unaffected. Multiple servers (udp + tcp) may share one counter.
+func (s *Server) SetQueryCounter(c *metrics.Counter) { s.queries = c }
+
+// handleDNS is the mux entry point: it wraps the resolver's ServeDNS with a
+// recording dns.ResponseWriter so the query outcome (rcode) can be counted,
+// then delegates. With no counter installed it is a pure passthrough.
+func (s *Server) handleDNS(w dns.ResponseWriter, m *dns.Msg) {
+	if s.queries == nil {
+		s.resolver.ServeDNS(w, m)
+		return
+	}
+	mw := &metricsWriter{ResponseWriter: w, queries: s.queries, qtype: qtypeLabel(m)}
+	s.resolver.ServeDNS(mw, m)
+}
+
+// metricsWriter is a dns.ResponseWriter that counts the written response's
+// status before delegating. Only WriteMsg is intercepted (it is the sole
+// response path in Resolver.ServeDNS); every other method is inherited.
+type metricsWriter struct {
+	dns.ResponseWriter
+	queries *metrics.Counter
+	qtype   string
+}
+
+// WriteMsg forwards the response and counts it as qtype{noerror|nxdomain|servfail}.
+func (w *metricsWriter) WriteMsg(resp *dns.Msg) error {
+	w.queries.With(w.qtype, statusLabel(resp.Rcode)).Inc()
+	return w.ResponseWriter.WriteMsg(resp)
+}
+
+// statusLabel maps a dns rcode onto the exported status dimension. Only the
+// three statuses the resolver actually emits are distinguished (§9.2):
+// NOERROR, NXDOMAIN, and everything else (SERVFAIL/REFUSED/FORMERR-class) as
+// "servfail".
+func statusLabel(rcode int) string {
+	switch rcode {
+	case dns.RcodeSuccess:
+		return "noerror"
+	case dns.RcodeNameError:
+		return "nxdomain"
+	default:
+		return "servfail"
+	}
+}
+
+// qtypeLabel renders the question's type as the exported qtype dimension
+// ("A", "TXT", …; unknown codes as TYPE<n>; "none" for FORMERR messages
+// carrying no question).
+func qtypeLabel(m *dns.Msg) string {
+	if len(m.Question) == 0 {
+		return "none"
+	}
+	if s, ok := dns.TypeToString[m.Question[0].Qtype]; ok {
+		return s
+	}
+	return fmt.Sprintf("TYPE%d", m.Question[0].Qtype)
 }
 
 // DNSServer returns the underlying miekg/dns Server, so callers (typically
