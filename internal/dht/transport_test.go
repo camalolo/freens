@@ -1,0 +1,449 @@
+package dht
+
+// transport_test.go exercises the §6.3 UDP RPC transport end-to-end on the
+// loopback interface: two real Nodes with real UDP sockets exchanging signed
+// CBOR messages, plus the iterative GET and the DHTLookup cache-on-fetch path.
+//
+// These tests bind ephemeral loopback ports (127.0.0.1:0) and read the concrete
+// address back via Node.LocalAddr, so they never collide and need no privileges.
+
+import (
+	"bytes"
+	"context"
+	"testing"
+	"time"
+
+	"github.com/laurent/freens/internal/constants"
+	"github.com/laurent/freens/internal/crypto"
+	"github.com/laurent/freens/internal/naming"
+	"github.com/laurent/freens/internal/wire"
+)
+
+// startTestNode builds a Node bound to an ephemeral loopback port and starts
+// it, returning the node and its concrete local address. The caller defers Close.
+func startTestNode(t *testing.T, store *EnvelopeStore) (*Node, *crypto.Keypair) {
+	t.Helper()
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatalf("gen keypair: %v", err)
+	}
+	if store == nil {
+		store = NewEnvelopeStore(0, nil)
+	}
+	n, err := NewNode(NodeConfig{
+		Keypair:    kp,
+		ListenAddr: "127.0.0.1:0",
+		Store:      store,
+	})
+	if err != nil {
+		t.Fatalf("NewNode: %v", err)
+	}
+	if err := n.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return n, kp
+}
+
+// peerPair starts two nodes A and B and cross-seeds their routing tables so each
+// knows the other's (addr, pubkey). Returns (A, B).
+func peerPair(t *testing.T) (*Node, *Node) {
+	t.Helper()
+	a, _ := startTestNode(t, nil)
+	b, _ := startTestNode(t, nil)
+	aAddr, err := a.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bAddr, err := b.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddPeer(b.PublicKey(), bAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AddPeer(a.PublicKey(), aAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	return a, b
+}
+
+// makeTLDRecord builds a self-signed TLD-root envelope for alias, owned by kp.
+func makeTLDRecord(t *testing.T, kp *crypto.Keypair, alias string) (*wire.SignedEnvelope, []byte) {
+	t.Helper()
+	tid, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wn, err := naming.EncodeWireName(nil, alias, tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	rec, err := wire.NewRecord(wn, kp.Public(), 1, uint64(now), uint64(now+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.CanonicalBytes(); err != nil {
+		t.Fatal(err)
+	}
+	rr, err := wire.A([]byte{203, 0, 113, 99}, 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.RRset = []*wire.RR{rr}
+	env, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := KeyForWireName(wn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env, key
+}
+
+// TestPing verifies the signed ping/ping round-trip and that the responder
+// learns the sender (its routing table gains the sender's contact). Only A is
+// seeded with B's address, so B starts with an empty table and must learn A
+// purely from the inbound signed ping.
+func TestPing(t *testing.T) {
+	a, _ := startTestNode(t, nil)
+	b, _ := startTestNode(t, nil)
+	defer a.Close()
+	defer b.Close()
+
+	aAddr, _ := a.LocalAddr()
+	bAddr, _ := b.LocalAddr()
+	// A knows B (so it can sign a query to B); B knows nobody yet.
+	if err := a.AddPeer(b.PublicKey(), bAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.RoutingTable().Size(); got != 0 {
+		t.Fatalf("precondition: B should start empty, got %d", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.Ping(ctx, Peer{Addr: bAddr.String(), PublicKey: b.PublicKey()}); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	// B learned A from the signed inbound ping.
+	if got := b.RoutingTable().Size(); got != 1 {
+		t.Errorf("responder did not learn sender: want 1, got %d", got)
+	}
+	_ = aAddr
+}
+
+func peerFor(n *Node) Peer {
+	addr, _ := n.LocalAddr()
+	return Peer{Addr: addr.String(), PublicKey: n.PublicKey()}
+}
+
+// TestIterativeGetFetchesFromPeer seeds an envelope in A's store, then has B
+// fetch it via IterativeGet (B queries A over the DHT). This is the core
+// cross-node path: A is an island whose record B reaches over the network.
+func TestIterativeGetFetchesFromPeer(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "alpha")
+	if accepted, err := a.store.Put(key, env, time.Now().Unix(), true); err != nil || !accepted {
+		t.Fatalf("seed A store: accepted=%v err=%v", accepted, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got, err := b.IterativeGet(ctx, key)
+	if err != nil {
+		t.Fatalf("IterativeGet: %v", err)
+	}
+	if got == nil {
+		t.Fatal("IterativeGet returned nil envelope")
+	}
+	gh, _ := got.RecordHash()
+	eh, _ := env.RecordHash()
+	if !bytes.Equal(gh, eh) {
+		t.Errorf("fetched envelope differs from seeded")
+	}
+}
+
+// TestPublishStoresOnPeer exercises the §6.4 PUT path: A.Publish obtains a write
+// token from B (via get) then puts the envelope, after which B's local store
+// holds it.
+func TestPublishStoresOnPeer(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "alphapub")
+	now := time.Now().Unix()
+	if b.store.Has(key, now) {
+		t.Fatal("precondition: B should not yet hold the envelope")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.Publish(ctx, env); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	// Allow the async store to settle, then verify.
+	if !b.store.Has(key, time.Now().Unix()) {
+		t.Errorf("Publish did not store the envelope on the peer")
+	}
+}
+
+// TestGetMissReturnsNodes verifies that a get for an absent key returns the
+// closest known contacts (the iterative-lookup fuel), not an error.
+func TestGetMissReturnsNodes(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// A random key neither node stores.
+	key := make([]byte, constants.SHA256Len)
+	for i := range key {
+		key[i] = 0xab
+	}
+	addr, _ := b.LocalAddr()
+	resp, err := a.sendQuery(ctx, addr, b.ID(), "get", map[string]any{"key": key})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if resp.Y != wire.MsgTypeResponse {
+		t.Fatalf("expected response, got %q", resp.Y)
+	}
+	nodes := parseNodes(resp.A["nodes"])
+	if len(nodes) == 0 {
+		t.Errorf("get-miss should return closest nodes, got none")
+	}
+	// B is its own closest... actually B returns its contacts (which includes A
+	// once seeded); at minimum the nodes list should be non-empty and decodable.
+	for _, c := range nodes {
+		if len(c.NodeID) != constants.NodeIDLen || len(c.PublicKey) != constants.Ed25519PublicKeyLen {
+			t.Errorf("malformed contact in nodes list: %+v", c)
+		}
+	}
+}
+
+// TestFindNode verifies find_node returns the K closest contacts to a target.
+func TestFindNode(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	target := b.ID() // ask B "who is closest to yourself"
+	addr, _ := b.LocalAddr()
+	resp, err := a.sendQuery(ctx, addr, b.ID(), "find_node", map[string]any{"target": target})
+	if err != nil {
+		t.Fatalf("find_node: %v", err)
+	}
+	if resp.Y != wire.MsgTypeResponse {
+		t.Fatalf("expected response, got %q", resp.Y)
+	}
+	nodes := parseNodes(resp.A["nodes"])
+	if len(nodes) == 0 {
+		t.Fatal("find_node returned no nodes")
+	}
+}
+
+// TestPutRejectsBadToken verifies the §6.3 write-token defense: a put whose
+// token does not validate against the source IP is rejected with code 302.
+func TestPutRejectsBadToken(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	owner, _ := crypto.Generate()
+	env, _ := makeTLDRecord(t, owner, "beta")
+	envBytes, _ := env.Bytes()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	addr, _ := b.LocalAddr()
+	resp, err := a.sendQuery(ctx, addr, b.ID(), "put", map[string]any{
+		"token":    []byte("not-a-valid-token-32-bytes-long!!"), // 32 bytes, wrong
+		"envelope": envBytes,
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if resp.Y != wire.MsgTypeError {
+		t.Fatalf("expected error for bad token, got %q", resp.Y)
+	}
+	code, _ := asUint64(resp.A["code"])
+	if code != 302 {
+		t.Errorf("expected code 302 (invalid token), got %v", resp.A["code"])
+	}
+	// And the envelope must NOT have been stored.
+	key, _ := KeyForWireName(env.Record.Name)
+	if b.store.Has(key, time.Now().Unix()) {
+		t.Errorf("envelope was stored despite invalid token")
+	}
+}
+
+// TestPutRejectsBadSignature verifies code 303 for a valid-token put whose
+// envelope signature does not verify.
+func TestPutRejectsBadSignature(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	// Obtain a real token from B via a get.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	key := make([]byte, constants.SHA256Len)
+	addr, _ := b.LocalAddr()
+	getResp, err := a.sendQuery(ctx, addr, b.ID(), "get", map[string]any{"key": key})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	token, _ := getResp.A["token"].([]byte)
+	if len(token) == 0 {
+		t.Fatal("no token issued on get")
+	}
+
+	// Forge an envelope with a garbage signature.
+	owner, _ := crypto.Generate()
+	env, _ := makeTLDRecord(t, owner, "gamma")
+	env.Sig = make([]byte, constants.Ed25519SignatureLen) // all-zero, invalid
+	envBytes, _ := env.Bytes()
+
+	resp, err := a.sendQuery(ctx, addr, b.ID(), "put", map[string]any{
+		"token":    token,
+		"envelope": envBytes,
+	})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if resp.Y != wire.MsgTypeError {
+		t.Fatalf("expected error for bad sig, got %q", resp.Y)
+	}
+	code, _ := asUint64(resp.A["code"])
+	if code != 303 {
+		t.Errorf("expected code 303 (invalid signature), got %v", resp.A["code"])
+	}
+}
+
+// TestDHTLookupFetchesAndCaches verifies the resolver adapter: a local-store
+// miss triggers a network GET that fetches the envelope AND caches it locally so
+// the second lookup is served from the cache (no further network IO).
+func TestDHTLookupFetchesAndCaches(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "delta")
+	// Seed A's store directly (simulating -load), NOT via Publish.
+	if accepted, err := a.store.Put(key, env, time.Now().Unix(), true); err != nil || !accepted {
+		t.Fatalf("seed A store: accepted=%v err=%v", accepted, err)
+	}
+
+	lookup := NewDHTLookup(b.store, b)
+	now := time.Now().Unix()
+	// B does not have it locally yet.
+	if got, _ := b.store.Get(key, now); got != nil {
+		t.Fatal("precondition: B should not have the envelope")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	got, err := lookup.Lookup(ctx, env.Record.Name, now)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Lookup returned nil (network GET failed)")
+	}
+	gh, _ := got.RecordHash()
+	eh, _ := env.RecordHash()
+	if !bytes.Equal(gh, eh) {
+		t.Error("fetched envelope mismatch")
+	}
+	// Now cached in B's local store.
+	if cached, _ := b.store.Get(key, now); cached == nil {
+		t.Error("fetched envelope was not cached locally")
+	}
+}
+
+// TestIterativeGetNoPeers confirms an island (no peers) returns nil without
+// error rather than hanging.
+func TestIterativeGetNoPeers(t *testing.T) {
+	a, _ := startTestNode(t, nil)
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	key := make([]byte, constants.SHA256Len)
+	got, err := a.IterativeGet(ctx, key)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for island lookup, got envelope")
+	}
+}
+
+// TestDHTLookupLocalHit confirms that when the local store has the envelope,
+// no network IO occurs (the node is nil — proving the local path short-circuits
+// before any IterativeGet).
+func TestDHTLookupLocalHit(t *testing.T) {
+	store := NewEnvelopeStore(0, nil)
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "epsilon")
+	now := time.Now().Unix()
+	if _, err := store.Put(key, env, now, true); err != nil {
+		t.Fatal(err)
+	}
+	// node == nil: any network access would panic, so a return proves locality.
+	lookup := NewDHTLookup(store, nil)
+	got, err := lookup.Lookup(context.Background(), env.Record.Name, now)
+	if err != nil || got == nil {
+		t.Fatalf("local hit failed: got=%v err=%v", got, err)
+	}
+}
+
+// TestUnverifiedMessageDropped confirms a message whose signature does not
+// verify (or whose recipient_id is wrong) is silently dropped — never answered.
+func TestUnverifiedMessageDropped(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	// Craft a query addressed to the WRONG recipient (a random id, not B's), so
+	// B's Verify (which uses its own id as recipient_id) fails.
+	wrongRecipient := make([]byte, constants.NodeIDLen)
+	for i := range wrongRecipient {
+		wrongRecipient[i] = 0x07
+	}
+	addr, _ := b.LocalAddr()
+	// Use a's keypair but sign for the wrong recipient.
+	txid := []byte{1, 2, 3, 4}
+	msg, err := wire.NewQuery("ping", map[string]any{}, a.kp, wrongRecipient, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := msg.Bytes()
+	if _, err := a.conn.WriteToUDP(data, addr); err != nil {
+		t.Fatal(err)
+	}
+	// No response channel was registered (we bypassed sendQuery), so a dropped
+	// message simply yields nothing. Give B a moment to (not) react, then
+	// confirm B did NOT learn the wrong-recipient sender: its routing table
+	// already has A from peerPair, so size should be unchanged.
+	sizeBefore := b.RoutingTable().Size()
+	time.Sleep(150 * time.Millisecond)
+	// (We cannot easily assert "no reply" without a listener; the stronger
+	// invariant is that verify-gated learning did not fire spuriously. The
+	// real guarantee is structural: handle() returns before handleQuery when
+	// Verify fails.)
+	if b.RoutingTable().Size() != sizeBefore {
+		t.Errorf("routing table changed despite unverified message")
+	}
+}

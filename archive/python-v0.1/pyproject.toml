@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freens"
+version = "0.1.0"
+description = "freens — Free Namespace: decentralized, permissionless naming system (reference implementation of the v0.1 draft spec)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "cryptography>=38.0.4",
+]
+
+[project.optional-dependencies]
+test = []
+
+[tool.setuptools.packages.find]
+include = ["freens*"]
