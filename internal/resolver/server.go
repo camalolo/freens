@@ -77,6 +77,24 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 	}
 
 	q := m.Question[0]
+
+	// §10.4: consult the response cache BEFORE resolving so a cached hit
+	// never re-executes the lookup chain. Only freens-sourced outcomes are
+	// ever stored (putFreens ignores aa == false), so DNS-forwarded answers
+	// always reach the upstream.
+	var ck cacheKey
+	caching := r.Cache != nil
+	if caching {
+		ck = cacheKeyFor(q)
+		if rrs, rcode, aa, ok := r.Cache.get(ck); ok {
+			resp.Rcode = rcode
+			resp.Answer = rrs
+			resp.Authoritative = aa
+			_ = w.WriteMsg(resp)
+			return
+		}
+	}
+
 	rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		resp.Rcode = dns.RcodeServerFailure
@@ -91,6 +109,9 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 	// is meaningful for any rcode that an authoritative server would emit
 	// (including NXDOMAIN/NODATA), so we set it verbatim from the resolver.
 	resp.Authoritative = aa
+	if caching {
+		r.Cache.putFreens(ck, rrs, rcode, aa)
+	}
 	_ = w.WriteMsg(resp)
 }
 

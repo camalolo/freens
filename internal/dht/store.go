@@ -24,8 +24,12 @@ package dht
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -93,8 +97,14 @@ func (s *EnvelopeStore) Now() int64 { return s.nowFn() }
 //     argument must still be a structurally valid SignedEnvelope.
 //  3. Incumbent / winner check (§6.4 step 3): if an entry exists for key and
 //     is still alive (now < incumbent.expires + ExpiryGrace), the newcomer is
-//     accepted only when wire.EnvelopeWins(env, incumbent) returns true. A dead
-//     or absent incumbent means the slot is empty, so the newcomer is accepted
+//     accepted only when wire.EnvelopeWins(env, incumbent) returns true. A
+//     newcomer that carries prev_hash (field 9) ASSERTS a chain link, so it is
+//     additionally rejected unless wire.VerifyChainLink(newcomer, incumbent)
+//     holds (§4.4 rule 4 / §8.3: prev_hash == H_record(incumbent) and a
+//     strictly increasing sequence). A newcomer WITHOUT prev_hash is judged by
+//     the plain winner rule unchanged (backward compatibility: existing
+//     publishers emit sequence-1 records with no prev_hash). A dead or absent
+//     incumbent means the slot is empty, so the newcomer is accepted
 //     unconditionally.
 //  4. On acceptance: cache len(env.Bytes()), set lastAccess = now, then run
 //     EvictExpired(now) followed by enforceCap(now, protected=key). The
@@ -127,6 +137,12 @@ func (s *EnvelopeStore) Put(key []byte, env *wire.SignedEnvelope, now int64, ver
 	if cur, ok := s.entries[k]; ok && s.aliveLocked(cur, now) {
 		// Alive incumbent: the newcomer must STRICTLY win.
 		if !wire.EnvelopeWins(env, cur.env) {
+			return false, nil
+		}
+		// The newcomer asserts a prev_hash chain link: enforce it against the
+		// incumbent (§4.4 rule 4 / §8.3). A nil prev_hash skips this check so
+		// pre-prev_hash publishers keep working (backward compatibility).
+		if len(env.Record.PrevHash) > 0 && !wire.VerifyChainLink(env, cur.env) {
 			return false, nil
 		}
 	}
@@ -255,6 +271,81 @@ func (s *EnvelopeStore) Keys() [][]byte {
 		out = append(out, cp)
 	}
 	return out
+}
+
+// StoreEntry is one entry of an Entries snapshot: the 32-byte DHT key and the
+// winning envelope (whose Record carries the Created / Expires timestamps used
+// by the §6.4 step 4 republish scan).
+type StoreEntry struct {
+	Key []byte
+	Env *wire.SignedEnvelope
+}
+
+// Entries returns a snapshot of the ALIVE entries at time now (§6.4 step 4:
+// entries past expires + ExpiryGrace are dead and are excluded, mirroring the
+// lazy eviction of Get). Unlike Keys(), which returns every stored key
+// including not-yet-swept dead ones, Entries yields only live entries, sorted
+// by bytewise-ascending key for deterministic iteration. The envelope pointers
+// are shared with the store (envelopes are never mutated in place); the key
+// slices are fresh copies.
+func (s *EnvelopeStore) Entries(now int64) []StoreEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]StoreEntry, 0, len(s.entries))
+	for k, e := range s.entries {
+		if !s.aliveLocked(e, now) {
+			continue
+		}
+		key := make([]byte, constants.SHA256Len)
+		copy(key, k[:])
+		out = append(out, StoreEntry{Key: key, Env: e.env})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Key, out[j].Key) < 0
+	})
+	return out
+}
+
+// PersistTo writes every ALIVE entry into dir as <keyhex>.cbor, where the file
+// content is the envelope's canonical CBOR (SignedEnvelope.Bytes()) — exactly
+// the format the daemon's -load seeding and freens-cli make-record produce, so
+// a persisted directory can be re-seeded on the next start (the §6.4 winner
+// rule makes re-seeding idempotent). dir is created if missing. Each file is
+// written to a temp file in dir and atomically renamed into place, so a crash
+// mid-write never leaves a torn envelope. Returns the number of envelopes
+// written. An envelope whose encoding fails is skipped (it stays in the
+// in-process store); directory/write errors abort with the count so far.
+func (s *EnvelopeStore) PersistTo(dir string) (int, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, fmt.Errorf("dht: persist mkdir %q: %w", dir, err)
+	}
+	written := 0
+	for _, e := range s.Entries(s.nowFn()) {
+		b, err := e.Env.Bytes()
+		if err != nil {
+			continue
+		}
+		final := filepath.Join(dir, hex.EncodeToString(e.Key)+".cbor")
+		tmp, err := os.CreateTemp(dir, "."+hex.EncodeToString(e.Key)+".tmp-*")
+		if err != nil {
+			return written, fmt.Errorf("dht: persist temp file in %q: %w", dir, err)
+		}
+		if _, err := tmp.Write(b); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist write %q: %w", tmp.Name(), err)
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist close %q: %w", tmp.Name(), err)
+		}
+		if err := os.Rename(tmp.Name(), final); err != nil {
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist rename %q: %w", final, err)
+		}
+		written++
+	}
+	return written, nil
 }
 
 // ----------------------------------------------------------------------

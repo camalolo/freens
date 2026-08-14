@@ -50,6 +50,16 @@ func KeyForWireName(wireName []byte) ([]byte, error) {
 	return naming.DHTKeyName(wireName), nil // K_name
 }
 
+// KeyForClaim derives K_claim = SHA-256(0x03 || "claim:" || alias) (§3.3) —
+// the key under which the §7.4/C.1 claim envelope (the TLD record carrying the
+// AliasClaim in field 11) is stored. It is the thin exported alias of
+// naming.DHTKeyClaim, kept here so the dht package exposes one canonical
+// key-derivation surface (KeyForWireName / KeyForClaim) for Publish /
+// PublishClaim and the put/get handlers.
+func KeyForClaim(alias string) ([]byte, error) {
+	return naming.DHTKeyClaim(alias)
+}
+
 // Lookup returns the winning SignedEnvelope stored for wireName at time now,
 // or (nil, nil) if no live record is stored under the corresponding key.
 //

@@ -447,3 +447,98 @@ func TestUnverifiedMessageDropped(t *testing.T) {
 		t.Errorf("routing table changed despite unverified message")
 	}
 }
+
+// TestIterativeGetEvictsDeadContacts verifies §6.2 failure handling: a contact
+// whose probe times out is evicted from the routing table, and the lookup as a
+// whole terminates well inside the 5s RPC_TIMEOUT (the 2s probe budget).
+func TestIterativeGetEvictsDeadContacts(t *testing.T) {
+	// B is the looker; A holds the record; D is a dead node B has learned.
+	b, _ := startTestNode(t, nil)
+	a, _ := startTestNode(t, nil)
+	d, dkp := startTestNode(t, nil)
+	defer a.Close()
+	defer b.Close()
+
+	aAddr, _ := a.LocalAddr()
+	dAddr, _ := d.LocalAddr()
+	if err := b.AddPeer(a.PublicKey(), aAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AddPeer(d.PublicKey(), dAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	_ = dkp
+
+	// Seed a record on A.
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "evict-test")
+	if ok, err := a.store.Put(key, env, time.Now().Unix(), true); err != nil || !ok {
+		t.Fatalf("seed: %v %v", ok, err)
+	}
+
+	// Kill D AFTER B learned it, so its address is now a black hole.
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := b.RoutingTable().Size(); got != 2 {
+		t.Fatalf("precondition: B should know 2 contacts, got %d", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	start := time.Now()
+	gotEnv, err := b.IterativeGet(ctx, key)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("IterativeGet: %v", err)
+	}
+	if gotEnv == nil {
+		t.Fatal("expected the envelope from A despite the dead contact")
+	}
+	// The dead contact must be gone from B's routing table.
+	if got := b.RoutingTable().Get(d.ID()); got != nil {
+		t.Error("dead contact was not evicted from the routing table")
+	}
+	if got := b.RoutingTable().Size(); got != 1 {
+		t.Errorf("post-lookup table size = %d, want 1 (only A)", got)
+	}
+	// The lookup must not have burned a full RPC_TIMEOUT on the dead probe.
+	if elapsed > 4*time.Second {
+		t.Errorf("lookup took %v despite the 2s probe budget (dead contact slowed it)", elapsed)
+	}
+}
+
+// TestIterativeGetDeadOnlyMissesFast verifies the pure-miss case with only a
+// dead contact: the lookup returns nil promptly and evicts it.
+func TestIterativeGetDeadOnlyMissesFast(t *testing.T) {
+	b, _ := startTestNode(t, nil)
+	d, _ := startTestNode(t, nil)
+	defer b.Close()
+
+	dAddr, _ := d.LocalAddr()
+	if err := b.AddPeer(d.PublicKey(), dAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil { // black-hole the only contact
+		t.Fatal(err)
+	}
+
+	key := make([]byte, constants.SHA256Len)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	start := time.Now()
+	env, err := b.IterativeGet(ctx, key)
+	if err != nil {
+		t.Fatalf("IterativeGet: %v", err)
+	}
+	if env != nil {
+		t.Error("expected nil from a dead-only lookup")
+	}
+	if b.RoutingTable().Size() != 0 {
+		t.Error("dead contact was not evicted")
+	}
+	if el := time.Since(start); el > 4*time.Second {
+		t.Errorf("dead-only miss took %v; want < 4s via probe budget", el)
+	}
+}

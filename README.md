@@ -28,14 +28,15 @@ Implemented and fully tested (130 test functions, `go test ./...` green,
 | `internal/claims` | `AliasClaim`, witness attestations, PoW, deterministic §7.4 ordering | §7 |
 | `internal/dht` | XOR metric, 256 k-bucket routing table, rotating HMAC write tokens, envelope store (winner rule + LRU/grace eviction) | §6 |
 | `internal/resolver` | §9.3 INI config parser, per-alias routing, live UDP+TCP DNS server via `miekg/dns`, DNS fallback | §9 |
-| `cmd/freens` | DNS resolver daemon (single-node stage-1; serves freens records from an in-process store + forwards conventional DNS) | §9.1 |
-| `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `demo` subcommands | §8 |
+| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
+| `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `publish`, `resolve`, `get`, `demo` subcommands | §6.4, §8 |
 
-**Out of scope** (hooks/data structures exist, the live network loop does not):
-the UDP DHT RPC transport (the `Message` type, routing table, token store and
-envelope store are implemented and tested; the iterative-lookup UDP loop is
-not). The daemon uses an in-process `EnvelopeStore` as the freens record source
-(single-node stage-1 operation, as in spec §9.4 stage 1).
+Multi-node operation: with `-dht <addr>` the daemon joins the Kademlia
+network — records seeded locally are served to (and fetched from) peers via
+iterative GET, aliases without a local pin are resolved from claim envelopes
+stored at `K_claim` (pin-first policy: `alias-pins` always win), and due
+records are republished at 80% of lifetime (§6.4). Without `-dht` the daemon
+is a single-node island (spec §9.4 stage 1).
 
 ## Requirements
 
@@ -56,7 +57,7 @@ freens/
 ├── go.mod / go.sum
 ├── cmd/
 │   ├── freens/main.go             # DNS resolver daemon
-│   └── freens-cli/main.go         # gen-key / mine-claim / make-record / demo
+│   └── freens-cli/main.go         # gen-key / mine-claim / make-record / publish / resolve / get / demo
 ├── internal/
 │   ├── constants/                 # Appendix A
 │   ├── naming/                    # §3.2/§3.3 aliases, wire_name, DHT keys

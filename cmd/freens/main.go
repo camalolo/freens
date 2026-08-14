@@ -14,6 +14,7 @@
 //
 //	freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]
 //	       [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]
+//	       [-passive] [-persist <dir>]
 //
 // If -config is absent a built-in default config is used (127.0.0.1:53,
 // upstreams 9.9.9.9 / 1.1.1.1, "* = dns-first"). If binding UDP/TCP port 53 is
@@ -25,6 +26,15 @@
 // only address a peer whose public key it knows, so -peers takes entries of the
 // form "ip:port#<64-hex-pubkey>". The node's own public key (needed by peers) is
 // logged at startup. With -dht empty, the daemon is a single-node island.
+//
+// -passive (spec §6.1 "clients MAY disable participation"): the DHT node still
+// answers ping/find_node/get from its store but refuses put and never
+// republishes others' records.
+//
+// -persist <dir> (requires -dht): snapshots the envelope store to <dir> as
+// <keyhex>.cbor every 60s and once at shutdown, so records fetched over the
+// DHT survive restarts; point -load at the same dir to re-seed them (the §6.4
+// winner rule makes this idempotent).
 package main
 
 import (
@@ -38,6 +48,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/crypto"
@@ -69,6 +80,7 @@ func run(args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-upstream <csv>] [-load <dir>]")
 		fmt.Fprintln(fs.Output(), "             [-dht <addr>] [-node-seed <hex>] [-peers <addr#pk>,...]")
+		fmt.Fprintln(fs.Output(), "             [-passive] [-persist <dir>]")
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "path to resolver config file (optional; built-in default if absent)")
@@ -78,6 +90,8 @@ func run(args []string) error {
 	dhtAddr := fs.String("dht", "", "UDP address for the DHT transport (e.g. :15353); empty disables the DHT node")
 	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this node's DHT identity; generated if empty")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as addr#<64-hex-pubkey>")
+	passive := fs.Bool("passive", false, "passive DHT mode (spec §6.1): answer ping/find_node/get but refuse put and skip republishing (requires -dht)")
+	persistDir := fs.String("persist", "", "directory to persist the envelope store to (<keyhex>.cbor files) every 60s and at shutdown (requires -dht)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -137,6 +151,7 @@ func run(args []string) error {
 			ListenAddr: *dhtAddr,
 			Store:      store,
 			Logger:     logger,
+			Passive:    *passive,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)
@@ -146,14 +161,33 @@ func run(args []string) error {
 		}
 		dhtNode = node
 		freens = dht.NewDHTLookup(store, node)
+		// DHTLookup also implements the resolver's optional ClaimResolver, so
+		// network alias claims (spec §7) resolve automatically from here on —
+		// no further wiring needed; the resolver type-asserts it.
+		logger.Info("claim resolution via DHT enabled (network alias claims, spec §7)")
 		logger.Info("DHT transport started",
 			"listen", *dhtAddr,
 			"node_id", hex.EncodeToString(node.ID()),
 			"node_pk", hex.EncodeToString(node.PublicKey()),
+			"passive", *passive,
 		)
 		if peers := parsePeers(*peersCSV); len(peers) > 0 {
 			logger.Info("bootstrapping DHT peers", "count", len(peers))
 			node.Bootstrap(context.Background(), peers)
+		}
+	}
+
+	// -persist: snapshot the store to disk every 60s (and once at shutdown
+	// below) so records fetched over the DHT survive restarts. Pointing -load
+	// at the same directory re-seeds them on the next start; the §6.4 winner
+	// rule makes the round trip idempotent.
+	var persistStop chan struct{}
+	if *persistDir != "" {
+		if dhtNode == nil {
+			logger.Warn("-persist requires -dht; ignoring", "dir", *persistDir)
+		} else {
+			persistStop = make(chan struct{})
+			go persistLoop(store, *persistDir, persistStop, logger)
 		}
 	}
 
@@ -202,7 +236,38 @@ func run(args []string) error {
 			logger.Error("dht node shutdown error", "error", err)
 		}
 	}
+	// Final persistence AFTER the servers (and the DHT node) have stopped, so
+	// the snapshot reflects every record the resolver cached during shutdown.
+	if persistStop != nil {
+		close(persistStop)
+		if count, err := store.PersistTo(*persistDir); err != nil {
+			logger.Error("final persist failed", "dir", *persistDir, "error", err)
+		} else {
+			logger.Info("persisted envelopes at shutdown", "dir", *persistDir, "count", count)
+		}
+	}
 	return firstErr
+}
+
+// persistLoop snapshots the envelope store into dir every 60s until stop is
+// closed. Errors are logged, never fatal: the next tick (or the final
+// shutdown-time PersistTo) retries.
+func persistLoop(store *dht.EnvelopeStore, dir string, stop <-chan struct{}, logger *slog.Logger) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			count, err := store.PersistTo(dir)
+			if err != nil {
+				logger.Error("persist failed", "dir", dir, "error", err)
+				continue
+			}
+			logger.Info("persisted envelopes", "dir", dir, "count", count)
+		case <-stop:
+			return
+		}
+	}
 }
 
 // loadNodeKey returns the DHT node identity: from seedHex (a 32-byte hex Ed25519

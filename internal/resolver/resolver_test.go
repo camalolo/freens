@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/laurent/freens/internal/claims"
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/crypto"
 	"github.com/laurent/freens/internal/naming"
@@ -1015,5 +1016,845 @@ func TestResolveQuestionFreensExpiredIntermediate(t *testing.T) {
 	}
 	if len(rrs) != 0 {
 		t.Errorf("expected 0 RRs (name unresolvable via stale delegation), got %d: %v", len(rrs), rrs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §8.5 — revocation. A revoked envelope anywhere on the authority chain
+// (terminal OR intermediate) makes the name unresolvable → NXDOMAIN, even
+// though every signature, window, and parent/child binding is otherwise valid.
+// ---------------------------------------------------------------------------
+
+// revokedEnv builds a properly-signed envelope for labels with revoke=true and
+// an EMPTY rrset (§8.5: "revoke = true and empty rrset marks the name
+// deliberately dead").
+func revokedEnv(t *testing.T, w *freensWorld, labels []string, sequence uint64) *wire.SignedEnvelope {
+	t.Helper()
+	wn, err := naming.EncodeWireName(labels, "foo", w.tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := wire.NewRecord(wn, w.tldKP.Public(), sequence,
+		uint64(fixedNow-100), uint64(fixedNow+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := true
+	rec.Revoke = &tr
+	rec.RRset = []*wire.RR{}
+	env, err := wire.SignRecord(rec, w.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !env.IsRevoked() {
+		t.Fatal("fixture: envelope must be revoked")
+	}
+	if !wire.IsBasicValid(env, uint64(fixedNow)) {
+		t.Fatal("fixture: revoked envelope must still be IsBasicValid")
+	}
+	return env
+}
+
+func TestResolveQuestionFREENSRevokedTerminal(t *testing.T) {
+	w := newFreensWorld(t)
+	revokedWWW := revokedEnv(t, w, []string{"www"}, 2)
+	if !wire.VerifyAuthorityChain([]*wire.SignedEnvelope{w.tldEnv, revokedWWW}) {
+		t.Fatal("fixture: chain must verify structurally (revocation is not a signature issue)")
+	}
+
+	lookup := newFakeLookup()
+	lookup.put(w.tldEnv)
+	lookup.put(revokedWWW)
+	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
+
+	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("revoked terminal rcode = %d, want NXDOMAIN (§8.5)", rcode)
+	}
+	if !aa {
+		t.Error("aa = false; freens is authoritative for its own revoked-name NXDOMAIN")
+	}
+	if len(rrs) != 0 {
+		t.Errorf("revoked name returned %d RRs, want 0", len(rrs))
+	}
+}
+
+func TestResolveQuestionFREENSRevokedIntermediate(t *testing.T) {
+	w := newFreensWorld(t)
+	// 3-hop chain: TLD → host.foo (REVOKED delegation) → sub.host.foo (live,
+	// carries the A RR we must NOT receive).
+	revokedHost := revokedEnv(t, w, []string{"host"}, 1)
+
+	subWireName, err := naming.EncodeWireName([]string{"sub", "host"}, "foo", w.tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subRec, err := wire.NewRecord(subWireName, w.tldKP.Public(), 1,
+		uint64(fixedNow-100), uint64(fixedNow+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveA, err := wire.A([]byte{203, 0, 113, 77}, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subRec.RRset = []*wire.RR{liveA}
+	subEnv, err := wire.SignRecord(subRec, w.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chain := []*wire.SignedEnvelope{w.tldEnv, revokedHost, subEnv}
+	if !wire.VerifyAuthorityChain(chain) {
+		t.Fatal("fixture: chain must verify structurally")
+	}
+
+	lookup := newFakeLookup()
+	lookup.put(w.tldEnv)
+	lookup.put(revokedHost)
+	lookup.put(subEnv)
+	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
+
+	q := dns.Question{Name: "sub.host.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("revoked intermediate rcode = %d, want NXDOMAIN (§8.5)", rcode)
+	}
+	if len(rrs) != 0 {
+		t.Errorf("expected 0 RRs through a revoked delegation, got %d: %v", len(rrs), rrs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §4.3 — full RR type mapping (freensRRToDNS table-driven coverage).
+// ---------------------------------------------------------------------------
+
+func TestFreensRRToDNSMappings(t *testing.T) {
+	name := "host.foo."
+	expires := int64(fixedNow + 100)
+	mkRR := func(typ uint64, rdata []byte) *wire.RR {
+		t.Helper()
+		rr, err := wire.NewRR(typ, 600, rdata)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rr
+	}
+
+	// longName is a hostname longer than the 255-octet DNS limit.
+	longName := make([]byte, 300)
+	for i := range longName {
+		longName[i] = 'a'
+	}
+
+	tests := []struct {
+		name  string
+		rr    *wire.RR
+		check func(t *testing.T, got dns.RR)
+	}{
+		{
+			name: "MX",
+			rr:   mkRR(wire.RRTypeMX, append([]byte{0x00, 0x0A}, []byte("mail.example.com.")...)),
+			check: func(t *testing.T, got dns.RR) {
+				mx, ok := got.(*dns.MX)
+				if !ok {
+					t.Fatalf("got %T, want *dns.MX", got)
+				}
+				if mx.Preference != 10 {
+					t.Errorf("MX.Preference = %d, want 10", mx.Preference)
+				}
+				if mx.Mx != "mail.example.com." {
+					t.Errorf("MX.Mx = %q", mx.Mx)
+				}
+			},
+		},
+		{
+			name: "MX non-FQDN target is rooted",
+			rr:   mkRR(wire.RRTypeMX, append([]byte{0x00, 0x14}, []byte("mail2.example.com")...)),
+			check: func(t *testing.T, got dns.RR) {
+				mx, ok := got.(*dns.MX)
+				if !ok {
+					t.Fatalf("got %T, want *dns.MX", got)
+				}
+				if mx.Preference != 20 || mx.Mx != "mail2.example.com." {
+					t.Errorf("MX = %d %q", mx.Preference, mx.Mx)
+				}
+			},
+		},
+		{
+			name: "MX rdata too short (no name)",
+			rr:   mkRR(wire.RRTypeMX, []byte{0x00, 0x0A}),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("short MX rdata = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "MX invalid target name",
+			rr:   mkRR(wire.RRTypeMX, append([]byte{0x00, 0x0A}, []byte("a..b.")...)),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("invalid MX target = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "SRV",
+			rr:   mkRR(wire.RRTypeSRV, append([]byte{0x00, 0x0A, 0x00, 0x14, 0x1F, 0x90}, []byte("srv.example.com.")...)),
+			check: func(t *testing.T, got dns.RR) {
+				srv, ok := got.(*dns.SRV)
+				if !ok {
+					t.Fatalf("got %T, want *dns.SRV", got)
+				}
+				if srv.Priority != 10 || srv.Weight != 20 || srv.Port != 8080 {
+					t.Errorf("SRV = %d/%d/%d", srv.Priority, srv.Weight, srv.Port)
+				}
+				if srv.Target != "srv.example.com." {
+					t.Errorf("SRV.Target = %q", srv.Target)
+				}
+			},
+		},
+		{
+			name: "SRV rdata too short",
+			rr:   mkRR(wire.RRTypeSRV, []byte{0x00, 0x0A, 0x00, 0x14, 0x1F}),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("short SRV rdata = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "SRV empty target",
+			rr:   mkRR(wire.RRTypeSRV, []byte{0x00, 0x0A, 0x00, 0x14, 0x1F, 0x90}),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("SRV with empty target = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "CNAME",
+			rr:   mkRR(wire.RRTypeCNAME, []byte("alias.example.com.")),
+			check: func(t *testing.T, got dns.RR) {
+				cn, ok := got.(*dns.CNAME)
+				if !ok {
+					t.Fatalf("got %T, want *dns.CNAME", got)
+				}
+				if cn.Target != "alias.example.com." {
+					t.Errorf("CNAME.Target = %q", cn.Target)
+				}
+			},
+		},
+		{
+			name: "CNAME oversize name",
+			rr:   mkRR(wire.RRTypeCNAME, longName),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("oversize CNAME target = %T, want nil", got)
+				}
+			},
+		},
+		{
+			name: "NS",
+			rr:   mkRR(wire.RRTypeNS, []byte("ns1.example.com.")),
+			check: func(t *testing.T, got dns.RR) {
+				ns, ok := got.(*dns.NS)
+				if !ok {
+					t.Fatalf("got %T, want *dns.NS", got)
+				}
+				if ns.Ns != "ns1.example.com." {
+					t.Errorf("NS.Ns = %q", ns.Ns)
+				}
+			},
+		},
+		{
+			name: "NS empty rdata",
+			rr:   mkRR(wire.RRTypeNS, nil),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("empty NS rdata = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "SSHFP",
+			rr:   mkRR(wire.RRTypeSSHFP, []byte{0x02, 0x01, 0xAB, 0xCD, 0xEF}),
+			check: func(t *testing.T, got dns.RR) {
+				fp, ok := got.(*dns.SSHFP)
+				if !ok {
+					t.Fatalf("got %T, want *dns.SSHFP", got)
+				}
+				if fp.Algorithm != 2 || fp.Type != 1 {
+					t.Errorf("SSHFP alg/type = %d/%d", fp.Algorithm, fp.Type)
+				}
+				if fp.FingerPrint != "abcdef" {
+					t.Errorf("SSHFP.FingerPrint = %q, want \"abcdef\"", fp.FingerPrint)
+				}
+			},
+		},
+		{
+			name: "SSHFP missing fingerprint",
+			rr:   mkRR(wire.RRTypeSSHFP, []byte{0x02, 0x01}),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("SSHFP without fingerprint = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "TLSA",
+			rr:   mkRR(wire.RRTypeTLSA, []byte{0x03, 0x01, 0x01, 0x9A, 0xBC}),
+			check: func(t *testing.T, got dns.RR) {
+				td, ok := got.(*dns.TLSA)
+				if !ok {
+					t.Fatalf("got %T, want *dns.TLSA", got)
+				}
+				if td.Usage != 3 || td.Selector != 1 || td.MatchingType != 1 {
+					t.Errorf("TLSA = %d/%d/%d", td.Usage, td.Selector, td.MatchingType)
+				}
+				if td.Certificate != "9abc" {
+					t.Errorf("TLSA.Certificate = %q, want \"9abc\"", td.Certificate)
+				}
+			},
+		},
+		{
+			name: "TLSA missing cert data",
+			rr:   mkRR(wire.RRTypeTLSA, []byte{0x03, 0x01, 0x01}),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("TLSA without cert data = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "CAA",
+			rr: mkRR(wire.RRTypeCAA, append(append([]byte{0x00, 0x05},
+				[]byte("issue")...), []byte("letsencrypt.org")...)),
+			check: func(t *testing.T, got dns.RR) {
+				caa, ok := got.(*dns.CAA)
+				if !ok {
+					t.Fatalf("got %T, want *dns.CAA", got)
+				}
+				if caa.Flag != 0 || caa.Tag != "issue" || caa.Value != "letsencrypt.org" {
+					t.Errorf("CAA = %d/%q/%q", caa.Flag, caa.Tag, caa.Value)
+				}
+			},
+		},
+		{
+			name: "CAA critical flag preserved",
+			rr: mkRR(wire.RRTypeCAA, append(append([]byte{0x80, 0x05},
+				[]byte("issue")...), []byte("pki.example.com")...)),
+			check: func(t *testing.T, got dns.RR) {
+				caa, ok := got.(*dns.CAA)
+				if !ok {
+					t.Fatalf("got %T, want *dns.CAA", got)
+				}
+				if caa.Flag != 0x80 {
+					t.Errorf("CAA.Flag = %#x, want 0x80", caa.Flag)
+				}
+			},
+		},
+		{
+			name: "CAA tag length overruns rdata",
+			rr:   mkRR(wire.RRTypeCAA, append([]byte{0x80, 0x40}, []byte("issue")...)), // tagLen=64 > remaining
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("CAA overrun tag = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "CAA empty tag",
+			rr:   mkRR(wire.RRTypeCAA, append([]byte{0x00, 0x00}, []byte("value")...)),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("CAA empty tag = %v, want nil", got)
+				}
+			},
+		},
+		{
+			name: "CAA rdata too short",
+			rr:   mkRR(wire.RRTypeCAA, []byte{0x00}),
+			check: func(t *testing.T, got dns.RR) {
+				if got != nil {
+					t.Errorf("1-byte CAA = %v, want nil", got)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := freensRRToDNS(name, tt.rr, expires, fixedNow)
+			tt.check(t, got)
+			if got != nil {
+				// Every mapped RR must be packable (well-formed for the wire).
+				m := new(dns.Msg)
+				m.SetQuestion(name, got.Header().Rrtype)
+				m.Answer = []dns.RR{got}
+				if _, err := m.Pack(); err != nil {
+					t.Errorf("mapped RR does not pack: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §9.2 step 3a — network alias-claim resolution (§7) via ClaimResolver
+// ---------------------------------------------------------------------------
+
+// withFastPoW lowers claims.PoWDifficultyInit to 8 for the duration of one
+// test (restored on cleanup) so difficulty-8 claims are spec-valid through the
+// default difficulty-inference path (Appendix A.4). These tests are
+// intentionally NOT parallel: the claims difficulty is package state.
+func withFastPoW(t *testing.T) {
+	t.Helper()
+	saved := claims.PoWDifficultyInit
+	claims.PoWDifficultyInit = 8
+	t.Cleanup(func() { claims.PoWDifficultyInit = saved })
+}
+
+// claimedWorld is a complete §7-registered fixture: a mined + W-witnessed
+// alias claim embedded in a self-certifying TLD record, plus a www A record.
+type claimedWorld struct {
+	tldKP   *crypto.Keypair
+	tldID   []byte
+	claim   *claims.AliasClaim
+	tldEnv  *wire.SignedEnvelope // TLD record carrying the claim in field 11
+	wwwEnv  *wire.SignedEnvelope
+	wwwIPv4 net.IP
+}
+
+// newClaimedWorld mines a difficulty-8 claim for alias (with W distinct
+// witnesses, §7.3 quorum), embeds it in the TLD record (field 11), and builds
+// the www.<alias> A record — the state the network would hold at K_claim,
+// K_tld, and K_name after a §7.4/C.1 registration.
+func newClaimedWorld(t *testing.T, alias string) *claimedWorld {
+	t.Helper()
+	withFastPoW(t)
+
+	w := &claimedWorld{wwwIPv4: net.IPv4(203, 0, 113, 77)}
+	tldKP, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.tldKP = tldKP
+	tldID, err := crypto.TldID(tldKP.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.tldID = tldID
+
+	// §7.3: mine the PoW at difficulty 8 (nonce_size 16 pins nonce[0]=8).
+	claim, err := claims.MineAliasClaim(alias, tldKP, uint64(fixedNow-50), 8, 2_000_000, 16)
+	if err != nil {
+		t.Fatalf("MineAliasClaim: %v", err)
+	}
+	// §7.3 witness quorum: W distinct node keypairs co-sign the claim.
+	witnesses := make([]*claims.WitnessAttestation, 0, constants.W)
+	for i := 0; i < constants.W; i++ {
+		wkp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := claims.NewWitnessAttestation(wkp, uint64(fixedNow-50)+uint64(i), alias, tldID, tldKP.Public())
+		if err != nil {
+			t.Fatalf("NewWitnessAttestation: %v", err)
+		}
+		witnesses = append(witnesses, w)
+	}
+	claim.Witnesses = witnesses
+	if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
+		t.Fatal("fixture: claim does not pass VerifyFull")
+	}
+	w.claim = claim
+
+	// TLD record with the claim embedded (§7.4 step 5 / C.1 step 4).
+	tldWire, err := naming.EncodeWireName(nil, alias, tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tldRec, err := wire.NewRecord(tldWire, tldKP.Public(), 1, uint64(fixedNow-100), uint64(fixedNow+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb, err := claim.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tldRec.Claim = cb
+	w.tldEnv, err = wire.SignRecord(tldRec, tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// www.<alias> direct-signed by the TLD key.
+	wwwWire, err := naming.EncodeWireName([]string{"www"}, alias, tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwRec, err := wire.NewRecord(wwwWire, tldKP.Public(), 1, uint64(fixedNow-100), uint64(fixedNow+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aRR, err := wire.A([]byte{203, 0, 113, 77}, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwRec.RRset = []*wire.RR{aRR}
+	w.wwwEnv, err = wire.SignRecord(wwwRec, tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// resignWithClaim returns a fresh TLD-record envelope whose embedded claim is
+// a mutated (decoded → mutate → re-encoded) copy of the world's claim,
+// re-signed by the TLD key so the envelope signature itself stays valid —
+// isolating which CHECKLIST item (not the signature) rejects it.
+func (w *claimedWorld) resignWithClaim(t *testing.T, alias string, mutate func(*claims.AliasClaim)) *wire.SignedEnvelope {
+	t.Helper()
+	claim, err := claims.DecodeAliasClaim(w.tldEnv.Record.Claim)
+	if err != nil {
+		t.Fatalf("decode fixture claim: %v", err)
+	}
+	mutate(claim)
+	cb, err := claim.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := *w.tldEnv.Record // shallow copy: only Claim is replaced
+	rec.Claim = cb
+	env, err := wire.SignRecord(&rec, w.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !env.VerifySignature() {
+		t.Fatal("fixture: re-signed envelope must have a valid signature")
+	}
+	return env
+}
+
+// fakeClaimLookup is a RecordLookup + ClaimResolver backed by maps: records by
+// wire_name (the §3b chain hops) and claim envelopes by alias (the §9.2 step-3a
+// K_claim view). Returning a claim for an alias it was not registered under
+// simulates a claim served under the wrong K_claim.
+type fakeClaimLookup struct {
+	fakeLookup
+	claims map[string]*wire.SignedEnvelope
+}
+
+func newFakeClaimLookup() *fakeClaimLookup {
+	return &fakeClaimLookup{fakeLookup: *newFakeLookup(), claims: map[string]*wire.SignedEnvelope{}}
+}
+
+// putClaim registers the claim envelope for alias and, as the chain[0] hop,
+// its carrier TLD record.
+func (f *fakeClaimLookup) putClaim(alias string, env *wire.SignedEnvelope) {
+	f.claims[alias] = env
+	f.put(env)
+}
+
+func (f *fakeClaimLookup) LookupClaim(_ context.Context, alias string, _ int64) (*wire.SignedEnvelope, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claims[alias], nil
+}
+
+// claimConfig routes "foo" into freens with NO alias pins — the network claim
+// layer (§7) must carry the alias on its own.
+func claimConfig() *Config {
+	cfg, err := ParseConfig("[tld-routes]\n* = dns-first\n")
+	if err != nil {
+		panic(err)
+	}
+	cfg.TLDRoutes["foo"] = RouteFREENS
+	return cfg
+}
+
+// resolveFoo runs www.foo. A through a resolver over the given lookup.
+func resolveFoo(t *testing.T, lookup RecordLookup) ([]dns.RR, int, error) {
+	t.Helper()
+	r := newResolver(claimConfig(), lookup, nil)
+	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
+	return rrs, rcode, err
+}
+
+// TestResolveQuestionFREENSViaNetworkClaim is THE §9.2 step-3a test: with no
+// pin, the resolver pulls the claim envelope from the (fake) K_claim source,
+// runs the full §7 checklist, derives tld_id = SHA-256(claimant_pk), and
+// proceeds with the normal self-certifying chain walk to the A record.
+func TestResolveQuestionFREENSViaNetworkClaim(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", w.tldEnv)
+	lookup.put(w.wwwEnv)
+
+	rrs, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeSuccess {
+		t.Fatalf("rcode = %d, want NOERROR(%d)", rcode, dns.RcodeSuccess)
+	}
+	if len(rrs) != 1 {
+		t.Fatalf("len(rrs) = %d, want 1", len(rrs))
+	}
+	a, ok := rrs[0].(*dns.A)
+	if !ok {
+		t.Fatalf("rrs[0] is %T, want *dns.A", rrs[0])
+	}
+	if !a.A.Equal(w.wwwIPv4) {
+		t.Errorf("A.A = %s, want %s", a.A, w.wwwIPv4)
+	}
+}
+
+// TestResolveQuestionClaimBrokenWitnessSig: one corrupted witness signature
+// drops the quorum to W-1 verified witnesses → the claim fails §7.4 step 2 →
+// the freens branch misses (NXDOMAIN), even though the envelope signature is
+// perfectly valid.
+func TestResolveQuestionClaimBrokenWitnessSig(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	broken := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+		c.Witnesses[0].Sig[0] ^= 0xff
+	})
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", broken)
+	lookup.put(w.wwwEnv)
+
+	rrs, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for a broken witness signature", rcode, dns.RcodeNameError)
+	}
+	if len(rrs) != 0 {
+		t.Errorf("len(rrs) = %d, want 0", len(rrs))
+	}
+}
+
+// TestResolveQuestionClaimBelowQuorum: W-1 (valid) witnesses < W → no quorum
+// → NXDOMAIN.
+func TestResolveQuestionClaimBelowQuorum(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	trimmed := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+		c.Witnesses = c.Witnesses[:constants.W-1]
+	})
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", trimmed)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) below witness quorum", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionClaimAliasMismatch: a claim registered for "bar" but
+// served for "foo" must not resolve "foo" (the claim envelope is otherwise
+// fully valid — the alias-match checklist item is what rejects it).
+func TestResolveQuestionClaimAliasMismatch(t *testing.T) {
+	w := newClaimedWorld(t, "bar")
+	lookup := newFakeClaimLookup()
+	// Serve the bar-claim under foo's lookup AND make the chain hops
+	// resolvable so only the alias check can be failing.
+	lookup.putClaim("foo", w.tldEnv)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for an alias-mismatched claim", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionClaimBadPoW: a tampered pow_hash (envelope re-signed so
+// only the PoW check can fail) → NXDOMAIN.
+func TestResolveQuestionClaimBadPoW(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	bad := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+		c.PowHash[0] ^= 0xff
+	})
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", bad)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for a bad PoW hash", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionClaimClaimantMismatch: claim.TldID pointing at a tld_id
+// that is NOT SHA-256(claimant_pk) (claimant-consistency failure) → NXDOMAIN.
+func TestResolveQuestionClaimClaimantMismatch(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	bad := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+		c.TldID[0] ^= 0xff
+	})
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", bad)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for an inconsistent claimant/tld_id", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionClaimWrongSigner: the claim envelope signed by a key
+// OTHER than the claimant's TLD key fails the claimant-binding checklist item
+// → NXDOMAIN (an attacker cannot carry someone's claim on their own record).
+func TestResolveQuestionClaimWrongSigner(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	other, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := *w.tldEnv.Record
+	env, err := wire.SignRecord(&rec, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", env)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for a non-claimant-signed claim envelope", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionClaimGarbageField11: an envelope whose field 11 is not
+// decodable AliasClaim CBOR is treated as "no claim" → NXDOMAIN (the chain
+// hop for the TLD still exists via the record map, so the decode/checklist
+// path is exercised, not the hop walk).
+func TestResolveQuestionClaimGarbageField11(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	rec := *w.tldEnv.Record
+	rec.Claim = []byte{0x44, 0xde, 0xad, 0xbe, 0xef} // valid CBOR bstr, not an AliasClaim
+	env, err := wire.SignRecord(&rec, w.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", env)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for an undecodable claim", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionClaimExpiredEnvelope: a claim envelope past its expiry
+// fails IsBasicValid at `now` → NXDOMAIN (a claim cannot outlive the record
+// that carries it).
+func TestResolveQuestionClaimExpiredEnvelope(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	tldWire, err := naming.EncodeWireName(nil, "foo", w.tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := wire.NewRecord(tldWire, w.tldKP.Public(), 1, uint64(fixedNow-7200), uint64(fixedNow-10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Claim = w.tldEnv.Record.Claim
+	expired, err := wire.SignRecord(rec, w.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", expired)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) for an expired claim envelope", rcode, dns.RcodeNameError)
+	}
+}
+
+// TestResolveQuestionPinWinsOverClaim: §9.3 — a pin is local policy and
+// ALWAYS beats the claim layer. The pin points at world2 while a fully valid
+// claim points at world1; the answer must come from world2.
+func TestResolveQuestionPinWinsOverClaim(t *testing.T) {
+	w1 := newClaimedWorld(t, "foo")
+	w2 := newClaimedWorld(t, "foo") // second, independent TLD for the same alias
+
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("foo", w1.tldEnv) // network says world1
+	lookup.put(w1.wwwEnv)
+	lookup.put(w2.tldEnv)
+	lookup.put(w2.wwwEnv)
+
+	cfg := claimConfig()
+	cfg.AliasPins = map[string][]byte{"foo": append([]byte(nil), w2.tldID...)} // pin says world2
+	r := newResolver(cfg, lookup, nil)
+	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
+	if err != nil {
+		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeSuccess {
+		t.Fatalf("rcode = %d, want NOERROR(%d)", rcode, dns.RcodeSuccess)
+	}
+	a, ok := rrs[0].(*dns.A)
+	if !ok {
+		t.Fatalf("rrs[0] is %T, want *dns.A", rrs[0])
+	}
+	if !a.A.Equal(w2.wwwIPv4) {
+		t.Errorf("pin did not win: A.A = %s, want world2's %s", a.A, w2.wwwIPv4)
+	}
+}
+
+// TestResolveQuestionNoClaimResolver: a RecordLookup WITHOUT the ClaimResolver
+// extension and no pin keeps the previous pin-only behavior — NXDOMAIN
+// (backward compatibility: the claim path is strictly additive).
+func TestResolveQuestionNoClaimResolver(t *testing.T) {
+	w := newClaimedWorld(t, "foo")
+	lookup := newFakeLookup() // plain RecordLookup
+	lookup.put(w.tldEnv)
+	lookup.put(w.wwwEnv)
+
+	_, rcode, err := resolveFoo(t, lookup)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN(%d) without a claim-capable source", rcode, dns.RcodeNameError)
 	}
 }

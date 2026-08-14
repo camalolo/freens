@@ -8,9 +8,17 @@
 //	gen-key                      Generate an Ed25519 keypair; print seed/public/tld_id.
 //	mine-claim                   Mine an AliasClaim PoW; print nonce/pow_hash/claim CBOR.
 //	make-record                  Build + sign a freens record (A RR); print envelope CBOR + DHT key.
+//	publish                      PUT signed-envelope .cbor files onto the DHT (§6.4 PUT).
+//	resolve                      Fetch + display a name's terminal record (§6.4 GET; no chain walk).
+//	get                          Raw DHT get by 64-hex key (§6.4 GET).
 //	demo                         Self-contained end-to-end showcase (the headline demo).
 //
 // Exit codes: 0 success, 1 usage/error, 2 crypto/validation failure.
+//
+// publish/resolve/get are the live-network subcommands; they take -peers
+// (addr#pk bootstrap peers, same format as the daemon's -peers) and talk real
+// §6.3 UDP RPC. resolve/get DISPLAY the stored record only — cryptographic
+// authority-chain verification (§3.4) is the daemon's job when serving DNS.
 //
 // PoW difficulty: -difficulty defaults to 12 for a quick demo. The network
 // default is constants.PoWDifficultyInit (24, Appendix A); lower it only for
@@ -57,6 +65,12 @@ func main() {
 		err = cmdMineClaim(args)
 	case "make-record":
 		err = cmdMakeRecord(args)
+	case "publish":
+		err = cmdPublish(args)
+	case "resolve":
+		err = cmdResolve(args)
+	case "get":
+		err = cmdGet(args)
 	case "demo":
 		err = cmdDemo(args)
 	case "-h", "--help", "help":
@@ -84,7 +98,12 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  gen-key               generate an Ed25519 keypair")
 	fmt.Fprintln(w, "  mine-claim            mine an AliasClaim PoW")
 	fmt.Fprintln(w, "  make-record           build + sign a freens record")
+	fmt.Fprintln(w, "  publish               put envelope .cbor files onto the DHT (-files, -peers)")
+	fmt.Fprintln(w, "  resolve               fetch + display a record from the DHT (-name, -tld-id-b32, -peers)")
+	fmt.Fprintln(w, "  get                   raw DHT get by key (-key, -peers)")
 	fmt.Fprintln(w, "  demo                  self-contained end-to-end showcase")
+	fmt.Fprintln(w, "resolve/get display the stored record only; authority-chain verification (§3.4)")
+	fmt.Fprintln(w, "is the daemon's job when serving DNS answers.")
 }
 
 // errUsage signals a usage error (exit code 1).
@@ -202,7 +221,7 @@ func cmdMakeRecord(args []string) error {
 	if err != nil {
 		return usageErr("invalid name %q: %v", *name, err)
 	}
-	tldID, err := decodePin(*pin)
+	tldID, err := decodePin(*pin, "-pin")
 	if err != nil {
 		return err
 	}
@@ -270,11 +289,12 @@ func cmdMakeRecord(args []string) error {
 }
 
 // decodePin decodes a base32 tld_id pin (RFC 4648; case-insensitive, padding
-// optional) to exactly 32 bytes, mirroring resolver.decodeBase32TLDID.
-func decodePin(s string) ([]byte, error) {
+// optional) to exactly 32 bytes, mirroring resolver.decodeBase32TLDID. flagName
+// names the calling flag for error messages ("-pin", "-tld-id-b32").
+func decodePin(s, flagName string) ([]byte, error) {
 	s2 := strings.ToUpper(strings.TrimSpace(s))
 	if s2 == "" {
-		return nil, usageErr("empty -pin")
+		return nil, usageErr("empty %s", flagName)
 	}
 	pad := (-len(s2)) % 8
 	if pad < 0 {
@@ -283,10 +303,10 @@ func decodePin(s string) ([]byte, error) {
 	s2 += strings.Repeat("=", pad)
 	decoded, err := base32.StdEncoding.DecodeString(s2)
 	if err != nil {
-		return nil, usageErr("invalid base32 pin %q: %v", s, err)
+		return nil, usageErr("invalid base32 %s %q: %v", flagName, s, err)
 	}
 	if len(decoded) != constants.SHA256Len {
-		return nil, usageErr("decoded pin is %d bytes, expected %d", len(decoded), constants.SHA256Len)
+		return nil, usageErr("decoded %s is %d bytes, expected %d", flagName, len(decoded), constants.SHA256Len)
 	}
 	return decoded, nil
 }

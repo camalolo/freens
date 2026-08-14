@@ -212,6 +212,149 @@ func TestEnvelopeStoreWinnerRuleSameSequenceTieBreak(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// §4.4 rule 4 / §8.3 — prev_hash chain-link enforcement on Put
+// ---------------------------------------------------------------------------
+
+// makeChainedEnv builds a self-certifying TLD envelope (alias "foo") with the
+// given sequence and prev_hash, signed by ownerKP so Put(verifySignature=true)
+// accepts its signature. prevHash may be nil.
+func makeChainedEnv(t *testing.T, sequence uint64, prevHash []byte, ownerKP *crypto.Keypair) *wire.SignedEnvelope {
+	t.Helper()
+	tldID, err := crypto.TldID(ownerKP.Public())
+	if err != nil {
+		t.Fatalf("TldID: %v", err)
+	}
+	name, err := naming.EncodeWireName(nil, "foo", tldID)
+	if err != nil {
+		t.Fatalf("EncodeWireName: %v", err)
+	}
+	rec, err := wire.NewRecord(name, ownerKP.Public(), sequence, 1000, 2000)
+	if err != nil {
+		t.Fatalf("NewRecord: %v", err)
+	}
+	rec.PrevHash = prevHash
+	env, err := wire.SignRecord(rec, ownerKP)
+	if err != nil {
+		t.Fatalf("SignRecord: %v", err)
+	}
+	return env
+}
+
+func TestEnvelopeStoreChainLinkPrevHash(t *testing.T) {
+	kp := mustKeypair(t)
+	key := keyN(11)
+	s := NewEnvelopeStore(0, func() int64 { return 1500 })
+
+	first := makeChainedEnv(t, 1, nil, kp)
+	firstHash, err := first.RecordHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s.Put(key, first, 1500, true); !ok {
+		t.Fatal("Put(first) should be accepted (fresh slot)")
+	}
+
+	wrongHash := append([]byte(nil), firstHash...)
+	wrongHash[0] ^= 0xFF
+
+	// Higher sequence + CORRECT prev_hash → accepted.
+	good := makeChainedEnv(t, 2, firstHash, kp)
+	if ok, _ := s.Put(key, good, 1600, true); !ok {
+		t.Fatal("Put(seq2, correct prev_hash) should be accepted")
+	}
+	goodHash, err := good.RecordHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Higher sequence + WRONG prev_hash → rejected, winner unchanged.
+	bad := makeChainedEnv(t, 3, wrongHash, kp)
+	ok, err := s.Put(key, bad, 1700, true)
+	if err != nil {
+		t.Fatalf("Put(bad prev_hash): %v", err)
+	}
+	if ok {
+		t.Error("Put(seq3, wrong prev_hash) should be rejected (chain link fails)")
+	}
+	got, _ := s.Get(key, 1700)
+	if got == nil || got.Record.Sequence != 2 {
+		t.Fatalf("winner sequence = %v, want 2 (unchanged)", seqOf(got))
+	}
+
+	// Equal sequence with CORRECT prev_hash but a bytewise-GREATER record
+	// hash: EnvelopeWins(newer, older) is true (§6.4 step 3 same-sequence
+	// tie-break), so only the chain-link gate (sequence must strictly
+	// increase, §4.4 rule 4) can reject it. Search for a Created value whose
+	// resulting hash beats the incumbent's so the winner rule alone would
+	// accept.
+	var sneaky *wire.SignedEnvelope
+	for created := uint64(1001); created < 1200; created++ {
+		r2, err := wire.NewRecord(good.Record.Name, good.Record.Owner, 2, created, 2000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r2.PrevHash = goodHash
+		cand, err := wire.SignRecord(r2, kp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, err := cand.RecordHash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Compare(ch, goodHash) > 0 {
+			sneaky = cand
+			break
+		}
+	}
+	if sneaky == nil {
+		t.Fatal("test setup: could not build a same-sequence bigger-hash envelope")
+	}
+	if !wire.EnvelopeWins(sneaky, good) {
+		t.Fatal("test setup: sneaky must strictly win the §6.4 tie-break")
+	}
+	if ok, _ := s.Put(key, sneaky, 1700, true); ok {
+		t.Error("Put(seq2-equal, correct prev_hash, bigger hash) should be rejected: sequence does not strictly increase (§4.4 rule 4)")
+	}
+
+	// prev_hash set but the slot is empty (fresh name) → accepted only if it
+	// strictly wins; VerifyChainLink against a nil predecessor would fail, but
+	// an empty slot has no incumbent to chain to, so the plain winner rule
+	// applies (§6.4 step 4: dead/absent incumbent = empty slot).
+	other := keyN(12)
+	if ok, _ := s.Put(other, makeChainedEnv(t, 5, wrongHash, kp), 1500, true); !ok {
+		t.Error("Put into an EMPTY slot with arbitrary prev_hash should be accepted")
+	}
+}
+
+// Backward compatibility: a nil prev_hash newcomer is judged by the plain
+// winner rule alone (§6.4 step 3); the chain-link gate never fires.
+func TestEnvelopeStoreNilPrevHashBackwardCompat(t *testing.T) {
+	kp := mustKeypair(t)
+	key := keyN(13)
+	s := NewEnvelopeStore(0, func() int64 { return 1500 })
+
+	e1 := makeChainedEnv(t, 1, nil, kp)
+	e4 := makeChainedEnv(t, 4, nil, kp)
+	if ok, _ := s.Put(key, e1, 1500, true); !ok {
+		t.Fatal("Put(seq1) should be accepted")
+	}
+	// seq4 with NO prev_hash (a gap under §8.2's plain winner rule): still
+	// accepted — pre-prev_hash publishers must not break.
+	if ok, _ := s.Put(key, e4, 1600, true); !ok {
+		t.Error("Put(seq4, nil prev_hash) should be accepted (plain winner rule)")
+	}
+	got, _ := s.Get(key, 1600)
+	if seqOf(got) != 4 {
+		t.Errorf("winner sequence = %v, want 4", seqOf(got))
+	}
+	// Older nil-prev_hash newcomer still rejected by the winner rule.
+	if ok, _ := s.Put(key, e1, 1700, true); ok {
+		t.Error("Put(seq1 after seq4) should be rejected (older)")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Signature verification toggle
 // ---------------------------------------------------------------------------
 

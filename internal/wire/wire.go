@@ -586,6 +586,56 @@ func IsBasicValid(env *SignedEnvelope, now uint64) bool {
 	return true
 }
 
+// VerifyChainLink reports whether newer correctly chains to older per §4.4
+// rule 4 (lines 324-338) and §8.3 (lines 666-688).
+//
+// A newcomer that carries prev_hash (field 9) ASSERTS a link to its
+// predecessor, so the assertion is enforced: prev_hash must equal
+// H_record(older) = SHA-256(canonical_cbor(older)) (§4.2, the hash used for
+// prev_hash chaining) AND newer.Sequence must be strictly greater than
+// older.Sequence (§4.4 rule 4; a §8.3 transfer carries sequence = prev + 1).
+// Any mismatch — wrong hash, missing predecessor, non-increasing sequence —
+// yields false.
+//
+// A newcomer with a nil/empty prev_hash asserts nothing: per the spec
+// prev_hash is OPTIONAL on the wire (§8.2 ordinary updates need not carry it;
+// §8.3 requires it only for transfers). Such a newcomer is chain-valid iff
+//
+//   - there is no predecessor (older == nil) and it is a FIRST PUBLICATION
+//     (Sequence == 1, matching §8.2's "sequence resets to 1" for a fresh or
+//     re-created name), or
+//   - a predecessor exists and Sequence still strictly increases (an ordinary
+//     §8.2 update: sequence = old + 1, prev_hash optional).
+//
+// This keeps existing publishers backward compatible: records published
+// without prev_hash (Sequence 1, or Sequence > old with no prev_hash) remain
+// valid, which is exactly the pre-prev_hash behavior of the §6.4 winner rule.
+//
+// Non-raising: any nil envelope/record or hash error yields false.
+func VerifyChainLink(newer, older *SignedEnvelope) bool {
+	if newer == nil || newer.Record == nil {
+		return false
+	}
+	if len(newer.Record.PrevHash) == 0 {
+		// No chain assertion: first publication, or an ordinary update whose
+		// sequence strictly increases (§8.2).
+		if older == nil || older.Record == nil {
+			return newer.Record.Sequence == 1
+		}
+		return newer.Record.Sequence > older.Record.Sequence
+	}
+	// prev_hash is set: it must point at the predecessor's H_record and the
+	// sequence must increase (§8.3).
+	if older == nil || older.Record == nil {
+		return false
+	}
+	h, err := older.RecordHash()
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(newer.Record.PrevHash, h) && newer.Record.Sequence > older.Record.Sequence
+}
+
 // ---------------------------------------------------------------------------
 // §3.4 — authority chain
 // ---------------------------------------------------------------------------

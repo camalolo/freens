@@ -557,6 +557,64 @@ func TestIsRevoked(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// VerifyChainLink (§4.4 rule 4 / §8.3)
+// ---------------------------------------------------------------------------
+
+// chainEnv builds a self-certifying TLD envelope with the given sequence and
+// prev_hash (nil allowed), freshly signed so VerifySignature holds.
+func chainEnv(t *testing.T, kp *crypto.Keypair, sequence uint64, prevHash []byte) *SignedEnvelope {
+	t.Helper()
+	tldID := mustTldID(t, kp.Public())
+	name := mustWireName(t, nil, "foo", tldID)
+	rec := mustRecord(t, name, kp.Public(), sequence, 1000, 2000)
+	rec.PrevHash = prevHash
+	return mustSign(t, rec, kp)
+}
+
+func TestVerifyChainLink(t *testing.T) {
+	kp := mustKeypair(t)
+	first := chainEnv(t, kp, 1, nil)
+	firstHash, err := first.RecordHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongHash := append([]byte(nil), firstHash...)
+	wrongHash[0] ^= 0xFF
+
+	second := chainEnv(t, kp, 2, firstHash)   // correct transfer-style link
+	secondEq := chainEnv(t, kp, 1, firstHash) // correct hash, NON-increasing seq
+	wrongLink := chainEnv(t, kp, 2, wrongHash)
+	plainHigher := chainEnv(t, kp, 2, nil) // ordinary §8.2 update, no prev_hash
+	freshFirst := chainEnv(t, kp, 1, nil)  // first publication of a fresh name
+	freshSecond := chainEnv(t, kp, 2, nil) // gap on a fresh name (no older, no link)
+
+	tests := []struct {
+		name         string
+		newer, older *SignedEnvelope
+		want         bool
+	}{
+		{"nil args", nil, nil, false},
+		{"nil newer", nil, first, false},
+		{"nil newer record", &SignedEnvelope{}, first, false},
+		{"valid transfer link", second, first, true},
+		{"wrong prev_hash", wrongLink, first, false},
+		{"hash ok but seq not increasing", secondEq, first, false},
+		{"prev_hash set but no predecessor", second, nil, false},
+		{"nil prev_hash ordinary update", plainHigher, first, true},
+		{"nil prev_hash seq decreasing", first, second, false},
+		{"nil prev_hash first publication", freshFirst, nil, true},
+		{"nil prev_hash gap on fresh name", freshSecond, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := VerifyChainLink(tt.newer, tt.older); got != tt.want {
+				t.Errorf("VerifyChainLink(%s) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // VerifyAuthorityChain (§3.4)
 // ---------------------------------------------------------------------------
 

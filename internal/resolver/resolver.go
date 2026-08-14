@@ -5,12 +5,17 @@ package resolver
 // conventional upstream DNS, applying the §9.3 routing policy.
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
+	"github.com/laurent/freens/internal/claims"
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/wire"
@@ -28,6 +33,22 @@ type RecordLookup interface {
 	Lookup(ctx context.Context, wireName []byte, now int64) (*wire.SignedEnvelope, error)
 }
 
+// ClaimResolver is the OPTIONAL network alias-claim source for §9.2 step 3a
+// (§7.4 verifier side, §3.2 alias layer): it returns the SignedEnvelope stored
+// at K_claim = SHA-256(0x03 || "claim:" || alias) — the TLD-record envelope
+// whose field 11 carries the AliasClaim — or (nil, nil) if the reachable
+// network has no claim for the alias.
+//
+// A RecordLookup MAY also implement ClaimResolver; the resolver discovers that
+// with a type assertion, so no configuration knob exists or is needed: claim
+// resolution is automatic exactly when the wired record source is
+// claim-capable (e.g. dht.DHTLookup), and a plain store-only lookup keeps the
+// pin-only behavior. The returned envelope is UNTRUSTED input; the resolver
+// runs the full §7 verification checklist on it (see resolveAliasClaim).
+type ClaimResolver interface {
+	LookupClaim(ctx context.Context, alias string, now int64) (*wire.SignedEnvelope, error)
+}
+
 // Upstream forwards a DNS message to conventional recursive resolvers and
 // returns the response. Implementations may do UDP/TCP fallback, DoH, etc.
 type Upstream interface {
@@ -41,6 +62,11 @@ type Resolver struct {
 	Freens   RecordLookup // nil ⇒ freens branch always misses
 	Upstream Upstream     // nil ⇒ DNS branch refused
 	Now      func() int64 // wall-clock seconds; defaults to time.Now().Unix()
+	// Cache optionally caches freens-sourced ResolveQuestion outcomes per
+	// §10.4 (positive: min RR TTL; negative: NegTTL). It is consulted ONLY
+	// on the DNS server path (ServeDNS); direct ResolveQuestion callers
+	// always hit the namespace. nil disables caching.
+	Cache *ResponseCache
 }
 
 // New builds a Resolver with a default clock. Cfg, Freens, and Upstream may be
@@ -155,7 +181,8 @@ func (r *Resolver) ResolveQuestion(ctx context.Context, q dns.Question) (rrs []d
 
 // freensResolve implements the §9.2 step 3 "freens route": resolve the alias to
 // a tld_id, walk the authority chain from the TLD record down to the requested
-// name, verify it, and answer from the terminal record's RRset.
+// name, verify it, and answer from the terminal record's RRset. A revoked
+// envelope at any hop (§8.5) makes the name unresolvable.
 //
 // Returns:
 //   - (rrs, NOERROR, nil)            on a successful answer,
@@ -168,12 +195,18 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 		return nil, dns.RcodeNameError, nil
 	}
 
-	// Step 3a: alias → tld_id. Pin first (local policy, bypasses the claim
-	// race). Without a pin and without a claim source this in-process
-	// implementation cannot resolve the alias → NXDOMAIN for the freens branch.
+	// Step 3a: alias → tld_id. Pin first (§9.3 [alias-pins]: local policy,
+	// bypasses the claim race — a pin ALWAYS wins). Without a pin, consult the
+	// network alias-claim layer (§7): the ClaimResolver returns the envelope
+	// stored at K_claim, which resolveAliasClaim fully verifies (§7.4 step 2
+	// filter) before trusting its tld_id. On no source, no claim, or any
+	// verification failure the freens branch misses → NXDOMAIN.
 	tldID := ResolvePin(r.Cfg, alias)
 	if len(tldID) == 0 {
-		return nil, dns.RcodeNameError, nil
+		tldID = r.resolveAliasClaim(ctx, alias, now)
+		if len(tldID) == 0 {
+			return nil, dns.RcodeNameError, nil
+		}
 	}
 
 	// Step 3b: walk the authority chain TLD → ... → requested name. Each hop's
@@ -211,6 +244,15 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 		if !wire.IsBasicValid(env, uint64(now)) {
 			return nil, dns.RcodeNameError, nil
 		}
+		// §8.5 (lines 708-713): a revoked envelope (revoke = true) marks its
+		// name deliberately dead. Revocation at ANY hop — the terminal record
+		// OR an intermediate delegation — breaks the authority walk, so the
+		// queried name is unresolvable → NXDOMAIN. (The holder may un-revoke
+		// via a newer sequence; until then the chain through this hop is
+		// dead.)
+		if env.IsRevoked() {
+			return nil, dns.RcodeNameError, nil
+		}
 		chain = append(chain, env)
 	}
 
@@ -244,6 +286,92 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	return out, dns.RcodeSuccess, nil
 }
 
+// resolveAliasClaim implements the network side of §9.2 step 3a (alias →
+// tld_id without a local pin): fetch the claim envelope at K_claim from the
+// wired RecordLookup when it is also a [ClaimResolver], then apply the §7
+// verification checklist before returning the claim's tld_id. It returns nil
+// (freens branch miss → NXDOMAIN) on ANY failure — an unresolvable alias and
+// an unprovable one are indistinguishable to the caller by design.
+//
+// The checklist (§7.4 step 2 "Filter: structurally valid, PoW valid, witness
+// quorum valid", plus the record-side bindings):
+//
+//  1. Source: r.Freens implements ClaimResolver, and LookupClaim returns a
+//     non-nil envelope (nil, nil) = "no claim on the network").
+//  2. Envelope: wire.IsBasicValid at `now` — §4.4 structural validity, the
+//     record signature over the canonical CBOR (which covers the embedded
+//     claim as ordinary content, §4.2), and the created <= now < expires
+//     window. A forged or stale carrier record is rejected here.
+//  3. Claim decode: claims.DecodeAliasClaim on Record.Claim (raw canonical
+//     CBOR of field 11) — a decode error is treated as "no claim".
+//  4. Alias match: claim.Alias == the normalized requested alias, so a claim
+//     served under the wrong K_claim cannot redirect a different alias.
+//  5. Claimant binding to the carrier record: the envelope must be signed by
+//     the claimant's TLD key (env.Signer == claim.ClaimantPK) AND be the TLD
+//     record for the claimed tld_id (Record.Name decodes to zero labels with
+//     tld_id == claim.TldID). Together with step 2's signature check this
+//     means the claimant key itself published the claim — the §3.1
+//     self-certification that step 3b's chain walk then re-proves at K_tld.
+//  6. claims.VerifyFull(claim, InferDifficulty, nil, constants.W): claimant
+//     consistency (tld_id == SHA-256(claimant_pk)), recomputed PoW at the
+//     difficulty recorded in nonce[0] (Appendix A.4) or the network default,
+//     and ≥ W = 5 DISTINCT verified witness attestations (each node_pk bound
+//     to its node_id and each signature verifying over the canonical §7.3
+//     witness message). witnessSetIDs is nil — a resolver without a global
+//     routing-table view cannot honestly compute the WITNESS_SET restriction;
+//     distinctness + signature validity still hold (see the deviation note in
+//     the package report).
+//
+// On success the returned tld_id is SHA-256(claimant_pk); resolution then
+// PROCEEDS with the normal §9.2 step 3b chain walk, where the TLD record at
+// K_tld must still verify against that tld_id — self-certification, so a
+// bogus claim cannot manufacture records, only point elsewhere (§3.2, §10.3).
+//
+// Deviation from §7.4's contested-alias procedure (noted, accepted): the spec
+// has verifiers collect ALL competing claims at K_claim and order them by
+// (timestamp, pow_hash, tld_id). This implementation sees the single envelope
+// the §6.4 (sequence, H_record) DHT winner rule serves, which is the claim the
+// storing network converged on. Merging competing claims and applying the §7.5
+// contest window remains future work; §10.4's contested-cache guidance is
+// likewise deferred.
+func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int64) []byte {
+	cr, ok := r.Freens.(ClaimResolver)
+	if !ok {
+		return nil // record source is not claim-capable: pins only
+	}
+	env, err := cr.LookupClaim(ctx, alias, now)
+	if err != nil || env == nil || env.Record == nil {
+		return nil // transient error is a miss here — the freens branch NXDOMAINs
+	}
+	// (2) envelope signature + time window.
+	if !wire.IsBasicValid(env, uint64(now)) {
+		return nil
+	}
+	// (3) claim decode (field 11 raw canonical CBOR).
+	claim, cerr := claims.DecodeAliasClaim(env.Record.Claim)
+	if cerr != nil {
+		return nil
+	}
+	// (4) alias match.
+	aliasN, aerr := naming.ValidateAlias(alias)
+	if aerr != nil || claim.Alias != aliasN {
+		return nil
+	}
+	// (5) claimant binding: the carrier is the claimant's own TLD record.
+	if !bytes.Equal(env.Signer, claim.ClaimantPK) {
+		return nil
+	}
+	labels, nameTldID, derr := naming.DecodeWireName(env.Record.Name)
+	if derr != nil || len(labels) != 0 || !bytes.Equal(nameTldID, claim.TldID) {
+		return nil
+	}
+	// (6) claimant consistency + PoW + ≥ W distinct verified witnesses.
+	if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
+		return nil
+	}
+	return claim.TldID
+}
+
 // forwardDNS implements §9.2 step 4: forward the question verbatim to the
 // configured upstream recursive resolvers. No upstream → REFUSED. A transient
 // forwarder error → SERVFAIL. Otherwise the upstream's answer RRs and rcode are
@@ -267,8 +395,9 @@ func (r *Resolver) forwardDNS(ctx context.Context, q dns.Question) ([]dns.RR, in
 
 // freensRRToDNS maps a freens wire.RR to a dns.RR for the given owner name. TTL
 // is computed per §9.2: min(rr.TTL, expires-now) capped by
-// constants.ResponseTTLCap, clamped to a non-negative uint32. Unsupported RR
-// types return nil (the caller skips them).
+// constants.ResponseTTLCap, clamped to a non-negative uint32. All §4.3 table
+// types are mapped (A, AAAA, NS, CNAME, TXT, MX, SRV, SSHFP, TLSA, CAA);
+// unsupported or malformed rdata returns nil (the caller skips it).
 func freensRRToDNS(name string, rr *wire.RR, expires, now int64) dns.RR {
 	ttl := int64(rr.TTL)
 	if rem := expires - now; rem < ttl {
@@ -301,9 +430,114 @@ func freensRRToDNS(name string, rr *wire.RR, expires, now int64) dns.RR {
 	case wire.RRTypeTXT:
 		hdr.Rrtype = dns.TypeTXT
 		return &dns.TXT{Hdr: hdr, Txt: []string{string(rr.Rdata)}}
+	case wire.RRTypeNS:
+		// §4.3: rdata = wire_name of target (freens) or DNS name (hybrid).
+		// The hybrid form is emitted as-is when it is a valid DNS hostname.
+		target, ok := dnsNameFromRdata(rr.Rdata)
+		if !ok {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeNS
+		return &dns.NS{Hdr: hdr, Ns: target}
+	case wire.RRTypeCNAME:
+		target, ok := dnsNameFromRdata(rr.Rdata)
+		if !ok {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeCNAME
+		return &dns.CNAME{Hdr: hdr, Target: target}
+	case wire.RRTypeMX:
+		// §4.3: uint16 preference (big-endian) || name.
+		if len(rr.Rdata) < 3 { // 2 preference + at least 1 name byte
+			return nil
+		}
+		target, ok := dnsNameFromRdata(rr.Rdata[2:])
+		if !ok {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeMX
+		return &dns.MX{
+			Hdr:        hdr,
+			Preference: binary.BigEndian.Uint16(rr.Rdata[0:2]),
+			Mx:         target,
+		}
+	case wire.RRTypeSRV:
+		// §4.3: uint16 priority, uint16 weight, uint16 port (big-endian),
+		// then the target name.
+		if len(rr.Rdata) < 7 { // 6 fixed + at least 1 name byte
+			return nil
+		}
+		target, ok := dnsNameFromRdata(rr.Rdata[6:])
+		if !ok {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeSRV
+		return &dns.SRV{
+			Hdr:      hdr,
+			Priority: binary.BigEndian.Uint16(rr.Rdata[0:2]),
+			Weight:   binary.BigEndian.Uint16(rr.Rdata[2:4]),
+			Port:     binary.BigEndian.Uint16(rr.Rdata[4:6]),
+			Target:   target,
+		}
+	case wire.RRTypeSSHFP:
+		// §4.3: algorithm byte, fingerprint-type byte, fingerprint (rest).
+		if len(rr.Rdata) < 3 {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeSSHFP
+		return &dns.SSHFP{
+			Hdr:         hdr,
+			Algorithm:   rr.Rdata[0],
+			Type:        rr.Rdata[1],
+			FingerPrint: hex.EncodeToString(rr.Rdata[2:]),
+		}
+	case wire.RRTypeTLSA:
+		// §4.3: usage, selector, matching-type bytes, certificate data (rest).
+		if len(rr.Rdata) < 4 {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeTLSA
+		return &dns.TLSA{
+			Hdr:          hdr,
+			Usage:        rr.Rdata[0],
+			Selector:     rr.Rdata[1],
+			MatchingType: rr.Rdata[2],
+			Certificate:  hex.EncodeToString(rr.Rdata[3:]),
+		}
+	case wire.RRTypeCAA:
+		// §4.3: flags byte, tag (length-prefixed byte string), value (rest).
+		if len(rr.Rdata) < 2 {
+			return nil
+		}
+		tagLen := int(rr.Rdata[1])
+		if tagLen < 1 || 2+tagLen > len(rr.Rdata) {
+			return nil
+		}
+		hdr.Rrtype = dns.TypeCAA
+		return &dns.CAA{
+			Hdr:   hdr,
+			Flag:  rr.Rdata[0],
+			Tag:   string(rr.Rdata[2 : 2+tagLen]),
+			Value: string(rr.Rdata[2+tagLen:]),
+		}
 	default:
-		// Other types (CNAME/MX/NS/SRV/...) are left to a future iteration;
-		// the caller drops nil mappings.
+		// Unknown type codes MUST be preserved verbatim by clients (§4.3,
+		// opaque forwarding) — but this resolver cannot map them to a dns.RR
+		// without full rdata knowledge, so they are skipped (nil) as before.
 		return nil
 	}
+}
+
+// dnsNameFromRdata interprets the name portion of a §4.3 rdata field (NS,
+// CNAME, MX tail, SRV target) in its hybrid DNS-name form: the bytes are the
+// hostname string, trimmed of surrounding whitespace and terminated with the
+// DNS root label (miekg/dns refuses to pack a non-FQDN target). ok is false
+// for an empty or structurally invalid hostname (dns.IsDomainName), in which
+// case the caller drops the RR.
+func dnsNameFromRdata(b []byte) (string, bool) {
+	s := strings.TrimSpace(string(b))
+	if _, ok := dns.IsDomainName(s); !ok {
+		return "", false
+	}
+	return dns.Fqdn(s), true
 }
