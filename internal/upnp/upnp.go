@@ -47,10 +47,17 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
+
+// unsafePointer reinterprets the 8-byte ip_mreq layout for the
+// SetsockoptIPMreq call (avoids importing x/net for one setsockopt).
+func unsafePointer(b *[8]byte) unsafe.Pointer { return unsafe.Pointer(b) }
 
 const (
 	ssdpAddr   = "239.255.255.250:1900"
@@ -87,14 +94,19 @@ type Logger interface {
 	Debug(msg string, args ...any)
 }
 
+// Service returns the WAN connection service URN (diagnostics).
+func (g *Gateway) Service() string { return g.service }
+
+// ControlURL returns the SOAP control endpoint (diagnostics).
+func (g *Gateway) ControlURL() string { return g.control.String() }
+
 // ssdpSearch is the injectable SSDP wave (tests substitute a fake LOCATION).
 var ssdpSearch = func(ctx context.Context) ([]string, error) {
 	return ssdpWave0(ctx)
 }
 
 func ssdpWave0(ctx context.Context) ([]string, error) {
-	laddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	conn, err := net.ListenUDP("udp4", laddr)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return nil, fmt.Errorf("upnp: ssdp socket: %w", err)
 	}
@@ -105,13 +117,40 @@ func ssdpWave0(ctx context.Context) ([]string, error) {
 	}
 	seen := make(map[string]bool)
 	deadline := time.Now().Add(ssdpWave)
-	// One M-SEARCH per target; collect responses until the wave ends.
-	for _, st := range searchTargets {
-		req := fmt.Sprintf("M-SEARCH * HTTP/1.1\r\nHOST: %s\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: %s\r\n\r\n", ssdpAddr, st)
-		if _, err := conn.WriteToUDP([]byte(req), dst); err != nil {
-			return nil, err
+
+	msearch := func(st string) string {
+		return fmt.Sprintf("M-SEARCH * HTTP/1.1\r\nHOST: %s\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: %s\r\n\r\n", ssdpAddr, st)
+	}
+
+	// (1) Multicast, pinned to each candidate LAN interface. A multi-homed
+	// host's default route may point AWAY from the IGD's LAN (a PPPoE WAN
+	// link, a second NIC): the kernel then multicasts out the wrong face
+	// and the router never hears the M-SEARCH. IP_MULTICAST_IF forces each
+	// LAN-shaped interface in turn (best-effort; failures fall through to
+	// the other sends).
+	for _, ip := range lanInterfaceIPs() {
+		setMulticastInterface(conn, ip)
+		for _, st := range searchTargets {
+			// Non-fatal: a VPN/tun interface can hold a private IPv4 yet
+			// fail its multicast send (ENOKEY and friends) — one dead
+			// face must not abort the wave for the healthy ones.
+			_, _ = conn.WriteToUDP([]byte(msearch(st)), dst)
 		}
 	}
+	// (2) Unicast straight at the routing table's default gateway. Some
+	// firmwares ignore multicast M-SEARCH entirely; the gateway is by
+	// definition where the IGD lives. /proc/net/route is Linux (this
+	// daemon's platform); elsewhere the step is skipped and multicast
+	// alone carries the wave.
+	for _, gw := range defaultGateways() {
+		ua := &net.UDPAddr{IP: gw, Port: 1900}
+		for _, st := range searchTargets {
+			if _, err := conn.WriteToUDP([]byte(msearch(st)), ua); err == nil {
+				break // one ST per gateway is enough to elicit a LOCATION
+			}
+		}
+	}
+
 	buf := make([]byte, 4096)
 	for time.Now().Before(deadline) {
 		if err := conn.SetReadDeadline(time.Now().Add(time.Until(deadline))); err != nil {
@@ -121,13 +160,8 @@ func ssdpWave0(ctx context.Context) ([]string, error) {
 		if err != nil {
 			break // deadline: wave over
 		}
-		for _, line := range strings.Split(string(buf[:n]), "\r\n") {
-			if len(line) > 10 && strings.EqualFold(line[:8], "LOCATION:") {
-				loc := strings.TrimSpace(line[9:])
-				if strings.HasPrefix(loc, "http://") {
-					seen[loc] = true // single reader goroutine: no lock needed
-				}
-			}
+		if loc, ok := parseLocation(buf[:n]); ok {
+			seen[loc] = true // single reader goroutine: no lock needed
 		}
 	}
 	out := make([]string, 0, len(seen))
@@ -135,6 +169,127 @@ func ssdpWave0(ctx context.Context) ([]string, error) {
 		out = append(out, loc)
 	}
 	return out, nil
+}
+
+// lanInterfaceIPs lists IPv4 addresses of plausible LAN interfaces: up,
+// non-loopback, private (RFC1918) — the faces an IGD could sit behind.
+func lanInterfaceIPs() []net.IP {
+	var out []net.IP
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipn.IP.To4()
+			if ip4 != nil && ip4.IsPrivate() {
+				out = append(out, ip4)
+			}
+		}
+	}
+	return out
+}
+
+// setMulticastInterface pins the socket's outgoing multicast interface
+// (IP_MULTICAST_IF) to ip — best-effort via the raw fd; errors are ignored
+// (the multicast send then simply follows the routing table as before).
+func setMulticastInterface(conn *net.UDPConn, ip net.IP) {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		var mreq [8]byte // struct ip_mreq_n { imr_multiaddr, imr_address }
+		copy(mreq[4:], ip.To4())
+		_ = syscall.SetsockoptIPMreq(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_IF, (*syscall.IPMreq)(unsafePointer(&mreq)))
+	})
+}
+
+// defaultGateways parses /proc/net/route (Linux) for gateways of default
+// routes, returning their IPs. The kernel writes addresses as little-endian
+// hex per 32-bit word ("0100A8C0" = 192.168.0.1). Missing/unparseable file
+// yields nil.
+func defaultGateways() []net.IP {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return nil
+	}
+	return gatewaysFromRouteTable(data)
+}
+
+// gatewaysFromRouteTable is the pure parser over /proc/net/route content
+// (testable): header line first; per row, Destination (field 2) 00000000
+// means default and Gateway (field 3) carries the gateway.
+func gatewaysFromRouteTable(data []byte) []net.IP {
+	var out []net.IP
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[1] != "00000000" {
+			continue
+		}
+		hexgw := fields[2]
+		if len(hexgw) != 8 {
+			continue
+		}
+		ip := make([]byte, 4)
+		ok := true
+		for b := 0; b < 4; b++ {
+			var v uint64
+			for _, c := range []byte{hexgw[2*(3-b)], hexgw[2*(3-b)+1]} {
+				v <<= 4
+				switch {
+				case c >= '0' && c <= '9':
+					v |= uint64(c - '0')
+				case c >= 'A' && c <= 'F':
+					v |= uint64(c-'A') + 10
+				case c >= 'a' && c <= 'f':
+					v |= uint64(c-'a') + 10
+				default:
+					ok = false
+				}
+			}
+			if !ok || v > 255 {
+				ok = false
+				break
+			}
+			ip[b] = byte(v)
+		}
+		if ok && !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0) {
+			out = append(out, ip) // ppp/point-to-point defaults carry 0.0.0.0
+		}
+	}
+	return out
+}
+
+// parseLocation extracts the LOCATION header value from one SSDP response
+// datagram (case-insensitive header, per HTTP). Only http:// URLs are
+// accepted — everything else (https device descriptions do not exist in
+// UPnP; garbage) is ignored by the caller.
+func parseLocation(resp []byte) (string, bool) {
+	for _, line := range strings.Split(string(resp), "\r\n") {
+		if len(line) >= 9 && strings.EqualFold(line[:9], "LOCATION:") {
+			loc := strings.TrimSpace(line[9:])
+			if strings.HasPrefix(loc, "http://") {
+				return loc, true
+			}
+		}
+	}
+	return "", false
 }
 
 // Discover SSDP-searches the LAN and returns every gateway whose device

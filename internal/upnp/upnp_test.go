@@ -368,3 +368,49 @@ func TestEnsureFreshLostAndUnrecoverable(t *testing.T) {
 		t.Fatalf("EnsureFresh on lost+refused mapping: nm=%v changed=%v err=%v (want nil,false,nil)", nm, changed, err)
 	}
 }
+
+// TestParseLocation — regression for the one-byte bug that shipped v1 of
+// the parser (line[:8] vs "LOCATION:"): real SSDP responses MUST yield
+// their http:// LOCATION regardless of header case, and non-http values
+// must be ignored.
+func TestParseLocation(t *testing.T) {
+	resp := "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: http://192.168.1.1:53671/rootDesc.xml\r\nSERVER: MiniUPnPd/20160421 UPnP/1.1\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:x::urn:y\r\n\r\n"
+	if loc, ok := parseLocation([]byte(resp)); !ok || loc != "http://192.168.1.1:53671/rootDesc.xml" {
+		t.Fatalf("parseLocation = %q %v", loc, ok)
+	}
+	lower := strings.ReplaceAll(resp, "LOCATION:", "location:")
+	if loc, ok := parseLocation([]byte(lower)); !ok || loc != "http://192.168.1.1:53671/rootDesc.xml" {
+		t.Fatalf("parseLocation (lowercase) = %q %v", loc, ok)
+	}
+	if _, ok := parseLocation([]byte("HTTP/1.1 200 OK\r\nLOCATION: https://x/y\r\n\r\n")); ok {
+		t.Fatal("non-http LOCATION accepted")
+	}
+	if _, ok := parseLocation([]byte("HTTP/1.1 200 OK\r\nST: nothing\r\n\r\n")); ok {
+		t.Fatal("response without LOCATION accepted")
+	}
+}
+
+// TestGatewaysFromRouteTable — the /proc/net/route parser: little-endian
+// hex gateways of default routes, non-default rows skipped, ppp-style
+// 0.0.0.0 gateways skipped, garbage tolerated.
+func TestGatewaysFromRouteTable(t *testing.T) {
+	sample := `Iface   Destination Gateway     Flags   RefCnt  Use Metric  Mask        MTU  Window  IRTT
+eno1    00000000    0100A8C0    0003    0       0        1        00000000    0    0       0
+eno1    0001A8C0    00000000    0001    0       0      600        00FFFFFF    0    0       0
+ppp0    00000000    00000000    0001    0       0        0        00000000    0    0       0
+tun0    00000000    0101FEA9    0003    0       0       50        00000000    0    0       0
+`
+	gws := gatewaysFromRouteTable([]byte(sample))
+	if len(gws) != 2 {
+		t.Fatalf("gateways = %v, want 2", gws)
+	}
+	if gws[0].String() != "192.168.0.1" || gws[1].String() != "169.254.1.1" {
+		t.Fatalf("gateways = %v %v", gws[0], gws[1])
+	}
+	if gws := gatewaysFromRouteTable([]byte("garbage\n\n")); len(gws) != 0 {
+		t.Fatalf("garbage yielded %v", gws)
+	}
+	if gws := gatewaysFromRouteTable(nil); len(gws) != 0 {
+		t.Fatalf("empty yielded %v", gws)
+	}
+}
