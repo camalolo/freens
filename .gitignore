@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 build/
 dist/
+freens
+freens-cli
+dist/
