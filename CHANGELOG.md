@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.5 — tombstones re-check fast (un-revoke unstalled, found live)
+- **A §9.5 tombstone's cache window is now 60 s, not 24 h.** The generic
+  freshness rule treated a revoked record's (by-definition empty) RRset
+  as a delegation → day-fresh caching: revocation propagated within the
+  victim's TTL, but an un-revoke could stall behind a day-fresh
+  tombstone for up to 24 h per node. Found live revoking and
+  re-registering `atlantic` on the LAN.
+
 ## v0.3.4 — `freens revoke <name>`: §9.5's tombstone as an easy button
 - **Revocation had every layer except the button**: the wire (field 12),
   the store (winner rule), the resolver (NXDOMAIN at any revoked hop) —

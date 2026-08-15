@@ -2222,10 +2222,20 @@ func NewDHTLookup(store *EnvelopeStore, node *Node) *DHTLookup {
 func (l *DHTLookup) Store() *EnvelopeStore { return l.store }
 
 // cacheFreshness returns the re-validation window for env: the minimum RR TTL
-// across its RRset (a delegation-only record with an empty RRset falls back to
-// RecordDefaultTTL), capped at constants.ResponseTTLCap (1 h) so very long
+// across its RRset (a delegation-only record with an empty RRset falls back
+// to RecordDefaultTTL), capped at constants.ResponseTTLCap (1 h) so very long
 // record TTLs cannot pin a stale cache for the record's whole lifetime.
+//
+// A REVOKED record (§9.5 tombstone) always uses the SHORT window: a
+// tombstone's RRset is empty by definition, so the generic fallback would
+// let nodes serve it un-re-checked for a full day — asymmetrical with
+// revocation itself (which propagates within the victim's TTL) and hostile
+// to un-revokes (found live: an un-revoke stalled behind a day-fresh
+// tombstone cache). 60 s = the resolver's NegTTL.
 func cacheFreshness(env *wire.SignedEnvelope) int64 {
+	if env != nil && env.IsRevoked() {
+		return 60
+	}
 	if env == nil || env.Record == nil || len(env.Record.RRset) == 0 {
 		return int64(constants.RecordDefaultTTL)
 	}
