@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.2 — persistence actually round-trips (found live, fleet-wide)
+- **A restart no longer empties the store.** `-persist` wrote snapshots
+  but nothing reloaded them — records lived only in RAM, so restarting
+  the whole fleet at once lost every record network-wide while the
+  .cbor files sat on disk unread (observed: all stores at 0, names
+  NXDOMAIN, minutes of head-scratching). With `-load` unset the daemon
+  now defaults its seed dir to the persist dir (explicit `-load` still
+  wins); the §6.4 winner rule makes the reload idempotent.
+- **Shutdown persist paths used the flag, not the effective value**:
+  with `persist` set only in the `[dht]` config section, the final
+  snapshot's sidecars (`fetched.json`, `history/`, `evidence/`) went to
+  RELATIVE paths — under a system unit (CWD=/) that is `mkdir /history`,
+  permission denied. All final-persist paths now use the effective dir.
+
 ## v0.3.1 — churn-proof lookups (fixes #1)
 Field-observed 3× on the 7-node LAN: while some nodes are down (reboots,
 crash-looping units), lookups for some names time out or NXDOMAIN for

@@ -193,6 +193,15 @@ func run(args []string) error {
 	// in [dht] turns it off (upnp = true in the file is a no-op).
 	upnpEffective := !(set["upnp"] && !*upnpEnabled) && !dhtCfg.UPnPOff
 
+	// Persistence ROUND TRIP (found live on the 7-node LAN): -persist
+	// writes snapshots, but nothing reloaded them — records lived only in
+	// RAM, so restarting the whole fleet at once emptied every store
+	// simultaneously while the .cbor files sat on disk unread. When -load
+	// is unset, default it to the persist dir so a restart re-seeds the
+	// store from its own snapshots (idempotent under the §6.4 winner rule;
+	// an explicit -load still wins).
+	loadEffective := effectiveLoadDir(*loadDir, persistEffective)
+
 	// Apply CLI overrides.
 	if *listenAddr != "" {
 		cfg.ListenUDP = *listenAddr
@@ -212,7 +221,7 @@ func run(args []string) error {
 		"listen_udp", cfg.ListenUDP,
 		"listen_tcp", cfg.ListenTCP,
 		"upstream", cfg.UpstreamServers,
-		"load_dir", *loadDir,
+		"load_dir", loadEffective,
 		"idna", naming.IDNANormalizer != nil, // §3.2 U-labels accepted?
 	)
 
@@ -234,13 +243,14 @@ func run(args []string) error {
 	// and the get/put RPCs, and caches records fetched from peers (spec §6.4).
 	store := dht.NewEnvelopeStore(0, nil)
 
-	// Seed the store from -load dir, if provided.
-	if *loadDir != "" {
-		count, err := seedFromDir(store, *loadDir, logger)
+	// Seed the store from the load dir: an explicit -load, else the persist
+	// dir (the persistence round trip — snapshots reload on restart).
+	if loadEffective != "" {
+		count, err := seedFromDir(store, loadEffective, logger)
 		if err != nil {
 			return fmt.Errorf("load: %w", err)
 		}
-		logger.Info("seeded envelopes from -load dir", "dir", *loadDir, "count", count)
+		logger.Info("seeded envelopes from store dir", "dir", loadEffective, "count", count)
 	}
 
 	// Wire the freens record source. With the DHT transport off this is the
@@ -338,8 +348,8 @@ func run(args []string) error {
 		// Restore the network-cache metadata (which envelopes were FETCHED,
 		// vs authoritative -load seeds) so a restart does not launder cached
 		// copies into always-fresh local data (§6.4 cache freshness).
-		if *loadDir != "" {
-			if meta, err := os.ReadFile(filepath.Join(*loadDir, fetchMetaFile)); err == nil {
+		if loadEffective != "" {
+			if meta, err := os.ReadFile(filepath.Join(loadEffective, fetchMetaFile)); err == nil {
 				if err := dhtLookup.LoadFetchMetaJSON(meta); err != nil {
 					logger.Warn("could not restore cache metadata", "file", fetchMetaFile, "error", err)
 				} else {
@@ -701,13 +711,13 @@ func run(args []string) error {
 		} else {
 			logger.Info("persisted envelopes at shutdown", "dir", persistEffective, "count", count)
 		}
-		persistFetchMeta(dhtLookup, *persistDir, logger)
-		if hc, herr := store.PersistHistoryTo(filepath.Join(*persistDir, "history")); herr != nil {
+		persistFetchMeta(dhtLookup, persistEffective, logger)
+		if hc, herr := store.PersistHistoryTo(filepath.Join(persistEffective, "history")); herr != nil {
 			logger.Error("final persist history failed", "error", herr)
 		} else if hc > 0 {
 			logger.Info("persisted audit history at shutdown", "count", hc)
 		}
-		if ec, eerr := store.PersistEvidenceTo(filepath.Join(*persistDir, "evidence")); eerr != nil {
+		if ec, eerr := store.PersistEvidenceTo(filepath.Join(persistEffective, "evidence")); eerr != nil {
 			logger.Error("final persist evidence failed", "error", eerr)
 		} else if ec > 0 {
 			logger.Info("persisted recovery evidence at shutdown", "count", ec)
@@ -719,6 +729,17 @@ func run(args []string) error {
 // fetchMetaFile is the sidecar (next to the *.cbor envelopes) recording which
 // persisted envelopes are network caches and when they were fetched.
 const fetchMetaFile = "fetched.json"
+
+// effectiveLoadDir resolves the startup seed directory: an explicit -load
+// always wins; otherwise, when persistence is configured, the persist dir
+// (the snapshots reload on restart — the round trip that was missing until
+// v0.3.1, found live when a fleet-wide restart emptied every store).
+func effectiveLoadDir(loadFlag, persistEffective string) string {
+	if loadFlag != "" {
+		return loadFlag
+	}
+	return persistEffective
+}
 
 // persistFetchMeta best-effort-writes the DHTLookup fetch metadata into dir.
 func persistFetchMeta(l *dht.DHTLookup, dir string, logger *slog.Logger) {
