@@ -14,15 +14,16 @@ It sees no secrets and can forge nothing.
 ## 1. The one-time setup (any Linux box, ~5 minutes)
 
 ```bash
-# as root or with sudo — a server has no user session, so we install a
-# SYSTEM service instead of the desktop `freens setup` path
+# as root or with sudo — the installer handles everything since v0.3.0:
+# config, node key, seeds, AND a systemd SYSTEM unit (boots at power-on,
+# no login needed — right for a headless node)
 curl -L -o freens.tar.gz https://github.com/camalolo/freens/releases/latest/download/freens-linux-amd64.tar.gz
-tar xzf freens.tar.gz && install -m755 freens-linux-amd64/freens /usr/local/bin/freens
+tar xzf freens.tar.gz && sudo install -m755 freens-linux-amd64/freens /usr/local/bin/freens
 
-freens setup          # writes ~/.freens: freens.conf, node key, seeds.conf
-                      # (the systemd --user service step will no-op on a
-                      # headless box; ignore it — step 2 installs the system
-                      # service instead)
+freens setup          # writes ~/.freens + /etc/systemd/system/freens.service
+                       # and enables it (runs as YOU, unprivileged — keys
+                       # stay in your home; sudo is only for the unit file
+                       # and the resolver wiring)
 ```
 
 Then edit `~/.freens/freens.conf`'s `[dht]` section for a public node:
@@ -31,38 +32,19 @@ Then edit `~/.freens/freens.conf`'s `[dht]` section for a public node:
 [dht]
 listen = 0.0.0.0:15353            ; the community port (UDP)
 advertise = YOUR.PUBLIC.IP:15353  ; or a hostname; omit behind UPnP
-persist = /var/lib/freens/store   ; records survive restarts (mkdir -p it)
+persist = ~/.freens/store        ; records survive restarts (setup made it)
 upnp = true                       ; home servers: router maps the port
 ```
 
 Open UDP 15353 in any firewall (`ufw allow 15353/udp`).
 
-## 2. The system service
+## 2. The service
 
-```bash
-sudo mkdir -p /var/lib/freens/store /etc/systemd/system
-sudo tee /etc/systemd/system/freens.service >/dev/null <<EOF
-[Unit]
-Description=freens community node (self-certifying DNS)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/freens daemon -config $HOME/.freens/freens.conf
-Restart=on-failure
-RestartSec=2
-User=YOURUSER
-
-[Install]
-WantedBy=multi-user.target
-EOF
-sudo systemctl daemon-reload && sudo systemctl enable --now freens
-```
-
-> `$HOME` expands when the heredoc is written, so the unit gets the
-> absolute path — check `ExecStart` if your home is elsewhere. The
-> daemon's admin socket stays a 0600 unix socket in `~/.freens` — local
-> CLI only, nothing remote.
+Already done — `freens setup` (step 1) wrote and enabled the systemd
+system unit. If you disabled it, `sudo systemctl enable --now freens`
+brings it back. The daemon runs as the unprivileged user who ran setup;
+the admin socket stays a 0600 unix socket in `~/.freens` — local CLI
+only, nothing remote.
 
 ## 3. Tell the community (and join everyone else)
 

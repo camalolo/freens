@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.0 — system service: the daemon is machine infrastructure
+- **setup installs a systemd SYSTEM unit** (`/etc/systemd/system/
+  freens.service`, `WantedBy=multi-user.target`, `User=` the unprivileged
+  installer). A DNS resolver must come up at power-on — the `--user` model
+  needed `loginctl enable-linger` (which setup never set: fresh machines
+  rebooted into no daemon until first login) and raced the user session.
+  Found live on the 3-box LAN; system units were already what
+  contrib/seed-node.md prescribed for servers. There is exactly one mode
+  now — no flags, no user/system split.
+- **Automatic migration**: setup detects a pre-v0.3.0 `--user` unit,
+  disables + removes it, and installs the system unit in its place
+  (same state dir, same ports, one daemon).
+- Uninstall removes the system unit (and any legacy user unit); the
+  community-node runbook shrank accordingly (`freens setup` does it all).
+
 ## v0.2.1 — OS-resolver wiring that actually works (found live on 3 boxes)
 - **setup: the one true wiring is resolv.conf → 127.0.0.1 + a loopback
   :53 → daemon-port NAT redirect.** The v0.2.0 paths were both broken in

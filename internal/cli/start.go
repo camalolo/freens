@@ -2,7 +2,7 @@
 // the "non-technical user" entry point. In order:
 //
 //	1/3 daemon:   if no daemon answers on the admin socket, run setup
-//	              (idempotent: config, keys, seeds, systemd --user service,
+//	              (idempotent: config, keys, seeds, systemd system service,
 //	              OS resolver wiring — interactive sudo when needed) and
 //	              wait for it to come up
 //	2/3 name:     alias from the argument, else the single keychain alias

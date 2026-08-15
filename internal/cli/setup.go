@@ -7,15 +7,14 @@
 //	      listener + generated node identity (<home>/node.key, 0600) +
 //	      persistent store
 //	(c) <home>/seeds.conf   (if absent)    — the pinned default community seed
-//	(d) systemd --user unit                — ExecStart=<this executable>
-//	      daemon -config <home>/freens.conf, Restart=on-failure; then
-//	      `systemctl --user daemon-reload && enable --now freens.service`
-//	(e) OS resolver wiring (user decision: HIGH PORT + resolv.conf, fully
-//	      automatic where sudo allows): systemd-resolved drop-in
-//	      DNS=127.0.0.1:5300 Domains=~. (+ restart) when systemd-resolved
-//	      runs, else prepend `nameserver 127.0.0.1:5300` to /etc/resolv.conf
-//	      with a .freens.bak backup. When sudo needs a password the EXACT
-//	      commands are printed for the user and setup continues.
+//	(d) systemd SYSTEM unit                — ExecStart=<this executable>
+//	      daemon -config <home>/freens.conf, User=<invoking user>,
+//	      Restart=on-failure, WantedBy=multi-user.target: the resolver is
+//	      machine infrastructure — it boots at power-on with NO login and
+//	      no linger. A pre-v0.3.0 --user unit is migrated away first.
+//	(e) OS resolver wiring (sudo where allowed; exact commands printed
+//	      otherwise): loopback :53 -> daemon-port nft/iptables redirect +
+//	      plain `nameserver 127.0.0.1` resolv.conf.
 //
 // --uninstall reverses (d)/(e) and KEEPS keys + store (says so).
 //
@@ -30,6 +29,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 
@@ -47,10 +47,11 @@ const daemonDNSAddr = "127.0.0.1:5300"
 
 // privileged paths setup/uninstall touch (vars for tests).
 var (
-	pathResolvConf    = "/etc/resolv.conf"
-	pathResolvBackup  = "/etc/resolv.conf.freens.bak"
-	pathResolvedDrop  = "/etc/systemd/resolved.conf.d/freens.conf"
-	pathSystemctlUnit = "" // set in tests to a temp path
+	pathResolvConf     = "/etc/resolv.conf"
+	pathResolvBackup   = "/etc/resolv.conf.freens.bak"
+	pathResolvedDrop   = "/etc/systemd/resolved.conf.d/freens.conf"
+	pathSystemctlUnit  = "" // set in tests to a temp path
+	pathLegacyUserUnit = "" // set in tests to a temp path (pre-v0.3.0 unit)
 )
 
 // sysRun executes a system command; nil error = exit 0. Swapped out by tests.
@@ -192,27 +193,31 @@ func setupInstall() error {
 		written = append(written, seedsPath)
 	}
 
-	// (d) systemd --user service.
+	// (d) systemd SYSTEM service (boots at power-on, no login, no linger).
+	// Migrate any pre-v0.3.0 --user unit away first so exactly one daemon runs.
+	migrateLegacyUserUnit()
 	unitPath, unit, err := systemdUnit()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: warning: no user systemd unit written (%v)\n", ProgName, err)
+		fmt.Fprintf(os.Stderr, "%s: warning: no systemd unit written (%v)\n", ProgName, err)
 	} else {
 		if !sysStatExists(unitPath) {
-			if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
-				return fmt.Errorf("writing unit dir: %w", err)
+			if err := sysWriteEtc(unitPath, []byte(unit), 0o644); err != nil {
+				printManualCommands("system unit", []string{
+					"sudo cp <freens-unit> " + unitPath + "   (unit content below)",
+					"---\n" + unit + "---",
+					"sudo systemctl daemon-reload && sudo systemctl enable --now freens.service",
+				})
+			} else {
+				written = append(written, unitPath)
 			}
-			if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
-				return fmt.Errorf("writing %s: %w", unitPath, err)
-			}
-			written = append(written, unitPath)
 		}
-		fmt.Println("running: systemctl --user daemon-reload")
-		if err := systemctlUser("daemon-reload"); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: warning: systemctl --user daemon-reload failed (%v) — systemd user session missing?\n", ProgName, err)
+		fmt.Println("running: systemctl daemon-reload")
+		if err := sudoRun("reloading systemd", "systemctl", "daemon-reload"); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: systemctl daemon-reload failed (%v)\n", ProgName, err)
 		}
-		fmt.Println("running: systemctl --user enable --now freens.service")
-		if err := systemctlUser("enable", "--now", "freens.service"); err != nil {
-			fmt.Fprintf(os.Stderr, "%s: warning: could not enable freens.service (%v); start it manually:\n    systemctl --user start freens.service\n", ProgName, err)
+		fmt.Println("running: systemctl enable --now freens.service")
+		if err := sudoRun("enabling freens.service (starts the daemon now, at boot, no login needed)", "systemctl", "enable", "--now", "freens.service"); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: could not enable freens.service (%v); start it manually:\n    sudo systemctl start freens.service\n", ProgName, err)
 		}
 	}
 
@@ -343,6 +348,28 @@ func port53ManualCommands(port string) []string {
 	}
 }
 
+// migrateLegacyUserUnit converts a pre-v0.3.0 `--user` install: stop and
+// disable the user unit, remove its file, reload. The system unit
+// installed right after takes over the same ports/state — one daemon.
+func migrateLegacyUserUnit() {
+	legacy := legacyUserUnitPath()
+	if legacy == "" || !sysStatExists(legacy) {
+		return
+	}
+	fmt.Println("migrating: pre-v0.3.0 systemd --user service -> system service")
+	fmt.Println("running: systemctl --user disable --now freens.service")
+	if err := systemctlUser("disable", "--now", "freens.service"); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: warning: could not stop the user service (%v)\n", ProgName, err)
+	}
+	if err := os.Remove(legacy); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: warning: could not remove %s (%v)\n", ProgName, legacy, err)
+	} else {
+		fmt.Printf("removed: %s\n", legacy)
+	}
+	fmt.Println("running: systemctl --user daemon-reload")
+	_ = systemctlUser("daemon-reload")
+}
+
 // printManualCommands is the sudo-needs-a-password path: print exactly what
 // the user should run, keep going.
 func printManualCommands(what string, cmds []string) {
@@ -359,24 +386,30 @@ func printManualCommands(what string, cmds []string) {
 // ---------------------------------------------------------------------------
 
 func setupUninstall() error {
-	// Service off + unit removed.
-	fmt.Println("running: systemctl --user disable --now freens.service")
-	if err := systemctlUser("disable", "--now", "freens.service"); err != nil {
+	// System service off + unit removed.
+	fmt.Println("running: systemctl disable --now freens.service")
+	if err := sudoRun("stopping freens.service", "systemctl", "disable", "--now", "freens.service"); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: disable failed (%v) — service not installed?\n", ProgName, err)
 	}
 	unitPath, _, err := systemdUnit()
-	if err == nil {
-		if sysStatExists(unitPath) {
-			if err := os.Remove(unitPath); err != nil {
-				fmt.Fprintf(os.Stderr, "%s: warning: could not remove %s (%v)\n", ProgName, unitPath, err)
-			} else {
-				fmt.Printf("removed: %s\n", unitPath)
-			}
+	if err == nil && sysStatExists(unitPath) {
+		if err := sudoRun("removing the unit file", "rm", "-f", unitPath); err != nil {
+			printManualCommands("remove unit file", []string{"sudo rm -f " + unitPath})
+		} else {
+			fmt.Printf("removed: %s\n", unitPath)
 		}
 	}
-	fmt.Println("running: systemctl --user daemon-reload")
-	if err := systemctlUser("daemon-reload"); err != nil {
+	fmt.Println("running: systemctl daemon-reload")
+	if err := sudoRun("reloading systemd", "systemctl", "daemon-reload"); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: daemon-reload failed (%v)\n", ProgName, err)
+	}
+	// Any pre-v0.3.0 user unit goes too.
+	if legacy := legacyUserUnitPath(); legacy != "" && sysStatExists(legacy) {
+		_ = systemctlUser("disable", "--now", "freens.service")
+		if err := os.Remove(legacy); err == nil {
+			fmt.Printf("removed: %s (legacy user unit)\n", legacy)
+		}
+		_ = systemctlUser("daemon-reload")
 	}
 
 	// NAT redirect rules: drop our table (iptables variants are per-rule;
@@ -441,16 +474,16 @@ func setupUninstall() error {
 // systemd helpers
 // ---------------------------------------------------------------------------
 
-// systemdUnit returns the user-unit path and the unit file content
-// (ExecStart = the CURRENT executable, abs path, running `daemon -config`).
+// systemdUnit returns the SYSTEM unit path and content. A DNS resolver is
+// machine infrastructure: it must come up at BOOT, before any login — so
+// the unit is system-wide (multi-user.target), running as the UNPRIVILEGED
+// user whose ~/.freens holds the keys (User=; the daemon binds no
+// privileged ports — the nft redirect carries :53). This also removes the
+// linger dependency entirely: no login session is needed, ever.
 func systemdUnit() (path, content string, err error) {
 	dir := pathSystemctlUnit
 	if dir == "" {
-		cfg, err := os.UserConfigDir() // ~/.config (XDG)
-		if err != nil {
-			return "", "", err
-		}
-		dir = filepath.Join(cfg, "systemd", "user", "freens.service")
+		dir = "/etc/systemd/system/freens.service"
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -460,17 +493,35 @@ func systemdUnit() (path, content string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	unit := fmt.Sprintf(setupUnitTemplate, exe, home.ConfPath())
+	u, err := user.Current()
+	if err != nil {
+		return "", "", err
+	}
+	unit := fmt.Sprintf(setupUnitTemplate, exe, home.ConfPath(), u.Username)
 	return dir, unit, nil
 }
 
-// systemctlUser runs a systemctl --user command.
+// legacyUserUnitPath is the pre-v0.3.0 `--user` unit location (~/.config/
+// systemd/user/freens.service; "" when uncomputable). setup migrates it
+// away; uninstall cleans it. Var-gated so tests never touch a real home.
+func legacyUserUnitPath() string {
+	if pathLegacyUserUnit != "" {
+		return pathLegacyUserUnit
+	}
+	cfg, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(cfg, "systemd", "user", "freens.service")
+}
+
+// systemctlUser runs a systemctl --user command (legacy-unit migration only).
 func systemctlUser(args ...string) error {
 	return sysRun("systemctl", append([]string{"--user"}, args...)...)
 }
 
 // systemctlActive reports whether the system unit is active.
-func systemctlActive(unit string) bool {
+var systemctlActive = func(unit string) bool {
 	return sysRun("systemctl", "is-active", "--quiet", unit) == nil
 }
 
@@ -513,12 +564,14 @@ const setupUnitTemplate = `[Unit]
 Description=freens daemon (self-certifying DNS)
 Documentation=https://github.com/camalolo/freens
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=%s daemon -config %s
+User=%s
 Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 `

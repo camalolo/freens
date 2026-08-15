@@ -266,7 +266,7 @@ func runDoctorFixes() {
 		if waitForAdminSocket() {
 			fmt.Println("fix: ✔ daemon is answering on the admin socket")
 		} else {
-			fmt.Println("fix: ✘ daemon still not answering — start it manually: systemctl --user start freens.service")
+			fmt.Println("fix: ✘ daemon still not answering — start it manually: sudo systemctl start freens.service")
 		}
 	}
 	if points, redirect := osResolverPointsAtDaemon(); !points || !redirect {

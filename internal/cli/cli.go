@@ -18,7 +18,7 @@
 //	verify-recovery              Check §8.4 evidence against the previous record's policy.
 //	register                     Claim an alias end-to-end (spec 7): key -> PoW -> W witnesses
 //	                             -> TLD record published at K_tld+K_claim (recovery on by default).
-//	setup                        Install: config, seeds, systemd --user service, OS resolver wiring.
+//	setup                        Install: config, seeds, systemd system service, OS resolver wiring.
 //	start                        The one-command onboarding: setup (if needed) -> register ->
 //	                             plain-language status. Prompts for the name on a TTY.
 //	backup                       Bundle every keychain key into one dated file (RESTORE.txt
@@ -221,7 +221,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "subcommands:")
 	fmt.Fprintln(w, "  start <name>           the one-command onboarding: install if needed, claim <name>, show status")
 	fmt.Fprintln(w, "                         (prompts for the name when interactive; safe to re-run)")
-	fmt.Fprintln(w, "  setup                  install: config, seeds, systemd --user service, OS resolver wiring (--uninstall reverses)")
+	fmt.Fprintln(w, "  setup                  install: config, seeds, system systemd service (boots with the machine), OS resolver wiring (--uninstall reverses)")
 	fmt.Fprintln(w, "  status                 plain-language health: daemon + name -> IP (-v adds raw daemon fields)")
 	fmt.Fprintln(w, "  doctor                 health checks: admin socket, DNS path, aliases, peers, seeds, OS resolver")
 	fmt.Fprintln(w, "                         (--fix repairs: starts the daemon, wires the OS resolver)")

@@ -53,6 +53,7 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 	oldRun, oldWriteEtc := sysRun, sysWriteEtc
 	oldUnit, oldResolv, oldBackup, oldDrop := pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop
 	oldNftTable, oldRedirectProbe := sysStatNftTable, port53RedirectInstalled
+	oldLegacy := pathLegacyUserUnit
 
 	sysRun = func(name string, args ...string) error {
 		argv := append([]string{name}, args...)
@@ -84,11 +85,14 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 	// tests override).
 	sysStatNftTable = func() bool { return false }
 	port53RedirectInstalled = func() bool { return false }
+	// Legacy user-unit detection stays inside the temp sandbox too.
+	pathLegacyUserUnit = filepath.Join(dir, "legacy-user-freens.service")
 
 	t.Cleanup(func() {
 		sysRun, sysWriteEtc = oldRun, oldWriteEtc
 		pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop = oldUnit, oldResolv, oldBackup, oldDrop
 		sysStatNftTable, port53RedirectInstalled = oldNftTable, oldRedirectProbe
+		pathLegacyUserUnit = oldLegacy
 	})
 	return rec
 }
@@ -141,7 +145,7 @@ func TestSetupIdempotent(t *testing.T) {
 	if !strings.Contains(string(seeds1), defaultSeedLine) {
 		t.Errorf("seeds.conf missing the pinned seed:\n%s", seeds1)
 	}
-	// Unit: current executable, daemon -config <home>/freens.conf.
+	// Unit: current executable, daemon -config <home>/freens.conf, unprivileged user.
 	unit := string(unit1)
 	if !strings.Contains(unit, "daemon -config "+home.ConfPath()) {
 		t.Errorf("unit file does not reference the config path:\n%s", unit)
@@ -149,11 +153,14 @@ func TestSetupIdempotent(t *testing.T) {
 	if !strings.Contains(unit, "Restart=on-failure") {
 		t.Errorf("unit file missing Restart=on-failure:\n%s", unit)
 	}
-	// The systemd commands ran.
-	if !rec.ran("systemctl", "--user", "daemon-reload") {
+	if !strings.Contains(unit, "User=") || !strings.Contains(unit, "WantedBy=multi-user.target") {
+		t.Errorf("unit file must be a SYSTEM unit running as the invoking user:\n%s", unit)
+	}
+	// The systemd commands ran (system-level now).
+	if !rec.ran("sudo", "-n", "systemctl", "daemon-reload") {
 		t.Errorf("daemon-reload not run: %v", rec.cmds)
 	}
-	if !rec.ran("systemctl", "--user", "enable", "--now", "freens.service") {
+	if !rec.ran("sudo", "-n", "systemctl", "enable", "--now", "freens.service") {
 		t.Errorf("enable --now not run: %v", rec.cmds)
 	}
 	// OS resolver: resolv.conf replaced with the plain loopback nameserver
@@ -171,8 +178,8 @@ func TestSetupIdempotent(t *testing.T) {
 		"th", "dport", "53", "redirect", "to", ":5300") {
 		t.Errorf("nft redirect rule not installed: %v", rec.cmds)
 	}
-	if len(rec.etcWrites) != 1 {
-		t.Errorf("privileged writes = %d, want 1 (resolv.conf)", len(rec.etcWrites))
+	if len(rec.etcWrites) != 2 {
+		t.Errorf("privileged writes = %d, want 2 (unit + resolv.conf)", len(rec.etcWrites))
 	}
 
 	// Second run: no bytes change anywhere.
@@ -187,8 +194,8 @@ func TestSetupIdempotent(t *testing.T) {
 		t.Error("second setup run changed existing files")
 	}
 	// resolv.conf already pointed at the daemon: no new privileged writes.
-	if len(rec.etcWrites) != 1 {
-		t.Errorf("second run performed %d total privileged writes, want still 1", len(rec.etcWrites))
+	if len(rec.etcWrites) != 2 {
+		t.Errorf("second run performed %d total privileged writes, want still 2", len(rec.etcWrites))
 	}
 }
 
@@ -214,10 +221,10 @@ func TestSetupUninstall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uninstall: %v\n%s", err, out)
 	}
-	if _, err := os.Stat(pathSystemctlUnit); !os.IsNotExist(err) {
-		t.Errorf("unit file still present after uninstall: %v", err)
+	if !rec.ran("sudo", "-n", "rm", "-f", pathSystemctlUnit) {
+		t.Errorf("unit file removal not run: %v", rec.cmds)
 	}
-	if !rec.ran("systemctl", "--user", "disable", "--now", "freens.service") {
+	if !rec.ran("sudo", "-n", "systemctl", "disable", "--now", "freens.service") {
 		t.Errorf("disable --now not run: %v", rec.cmds)
 	}
 	if !rec.ran("sudo", "-n", "cp", pathResolvBackup, pathResolvConf) {
@@ -229,6 +236,35 @@ func TestSetupUninstall(t *testing.T) {
 	}
 	if !strings.Contains(out, "KEPT") {
 		t.Errorf("uninstall output does not say keys/store were kept:\n%s", out)
+	}
+}
+
+// TestSetupMigratesLegacyUserUnit: a pre-v0.3.0 --user install (unit file
+// present at the legacy path) is migrated: the user service is disabled,
+// the legacy file removed, and the SYSTEM unit installed in its place.
+func TestSetupMigratesLegacyUserUnit(t *testing.T) {
+	tempHome(t)
+	rec := stubSysForTest(t)
+	// Simulate the old install: unit file at the legacy path.
+	if err := os.WriteFile(pathLegacyUserUnit, []byte("[Unit]\nDescription=old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdSetup([]string{}) })
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if !rec.ran("systemctl", "--user", "disable", "--now", "freens.service") {
+		t.Errorf("legacy user service not disabled: %v", rec.cmds)
+	}
+	if sysStatExists(pathLegacyUserUnit) {
+		t.Errorf("legacy user unit still present after setup")
+	}
+	if !sysStatExists(pathSystemctlUnit) {
+		t.Errorf("system unit not installed")
+	}
+	if !rec.ran("sudo", "-n", "systemctl", "enable", "--now", "freens.service") {
+		t.Errorf("system service not enabled: %v", rec.cmds)
 	}
 }
 
