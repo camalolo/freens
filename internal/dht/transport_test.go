@@ -10,6 +10,8 @@ package dht
 import (
 	"bytes"
 	"context"
+	"errors"
+	"sort"
 	"testing"
 	"time"
 
@@ -510,10 +512,12 @@ func TestIterativeGetEvictsDeadContacts(t *testing.T) {
 }
 
 // TestIterativeGetDeadOnlyMissesFast verifies the pure-miss case with only a
-// dead contact: the lookup returns nil promptly and evicts it.
+// dead contact: the lookup returns a DEGRADED miss (issue #1: probe failures
+// mean the network could not be interrogated — not that the record is absent)
+// promptly, evicts the contact, and penalizes it.
 func TestIterativeGetDeadOnlyMissesFast(t *testing.T) {
 	b, _ := startTestNode(t, nil)
-	d, _ := startTestNode(t, nil)
+	d, dkp := startTestNode(t, nil)
 	defer b.Close()
 
 	dAddr, _ := d.LocalAddr()
@@ -523,22 +527,198 @@ func TestIterativeGetDeadOnlyMissesFast(t *testing.T) {
 	if err := d.Close(); err != nil { // black-hole the only contact
 		t.Fatal(err)
 	}
+	_ = dkp
 
 	key := make([]byte, constants.SHA256Len)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	start := time.Now()
-	env, err := b.IterativeGet(ctx, key)
-	if err != nil {
-		t.Fatalf("IterativeGet: %v", err)
-	}
+	env, stats, err := b.IterativeGetDetailed(ctx, key)
 	if env != nil {
-		t.Error("expected nil from a dead-only lookup")
+		t.Error("expected nil envelope from a dead-only lookup")
+	}
+	if !errors.Is(err, ErrDegradedMiss) {
+		t.Errorf("dead-only miss = %v, want ErrDegradedMiss", err)
+	}
+	if stats.ProbesFailed == 0 {
+		t.Error("stats report no failed probes for a dead-only walk")
 	}
 	if b.RoutingTable().Size() != 0 {
 		t.Error("dead contact was not evicted")
 	}
 	if el := time.Since(start); el > 4*time.Second {
 		t.Errorf("dead-only miss took %v; want < 4s via probe budget", el)
+	}
+	// The penalty is active: a second walk must skip the corpse entirely
+	// (no probes at all — every unqueried candidate is penalized).
+	_, stats2, err2 := b.IterativeGetDetailed(ctx, key)
+	if err2 != nil {
+		t.Fatalf("second walk: %v", err2)
+	}
+	if stats2.ProbesSent != 0 {
+		t.Errorf("second walk probed %d contact(s); the penalized corpse must be skipped", stats2.ProbesSent)
+	}
+}
+
+// TestIterativeGetCleanMissIsNotDegraded: when every reachable holder
+// ANSWERS "not held" (no probe failures), the miss is clean — (nil, nil),
+// never ErrDegradedMiss — so the resolver may negative-cache it.
+func TestIterativeGetCleanMissIsNotDegraded(t *testing.T) {
+	a, _ := startTestNode(t, nil)
+	b, _ := startTestNode(t, nil)
+	defer a.Close()
+	defer b.Close()
+
+	aAddr, _ := a.LocalAddr()
+	if err := b.AddPeer(a.PublicKey(), aAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, constants.SHA256Len) // nobody stores anything here
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	env, stats, err := b.IterativeGetDetailed(ctx, key)
+	if env != nil || err != nil {
+		t.Fatalf("clean miss = (%v, %v); want (nil, nil)", env, err)
+	}
+	if stats.ProbesFailed != 0 || stats.ProbesSent == 0 {
+		t.Errorf("stats = %+v; want probes sent, none failed", stats)
+	}
+}
+
+// TestIterativeGetPenaltySurvivesReadvertisement (issue #1): a corpse that
+// live peers keep re-advertising (re-learned into the routing table) is NOT
+// re-probed inside the penalty window — the churn loop that burned a 2 s
+// budget per query in the field.
+func TestIterativeGetPenaltySurvivesReadvertisement(t *testing.T) {
+	b, _ := startTestNode(t, nil)
+	a, _ := startTestNode(t, nil) // live holder
+	d, _ := startTestNode(t, nil) // future corpse
+	defer a.Close()
+	defer b.Close()
+
+	aAddr, _ := a.LocalAddr()
+	dAddr, _ := d.LocalAddr()
+	if err := b.AddPeer(a.PublicKey(), aAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AddPeer(d.PublicKey(), dAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "penalty-test")
+	if ok, err := a.store.Put(key, env, time.Now().Unix(), true); err != nil || !ok {
+		t.Fatalf("seed: %v %v", ok, err)
+	}
+	if err := d.Close(); err != nil { // black-hole AFTER B learned it
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if got, _, err := b.IterativeGetDetailed(ctx, key); err != nil || got == nil {
+		t.Fatalf("first walk: env=%v err=%v", got, err)
+	}
+	// Simulate re-advertisement: re-add the dead contact to B's table.
+	if err := b.AddPeer(d.PublicKey(), dAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	// A SECOND walk while the penalty is live must not probe the corpse.
+	_, stats, err := b.IterativeGetDetailed(ctx, key)
+	if err != nil {
+		t.Fatalf("second walk: %v", err)
+	}
+	for _, id := range stats.ProbedNodeIDs {
+		if string(id) == string(d.ID()) {
+			t.Error("the penalized corpse was re-probed inside the penalty window")
+		}
+	}
+}
+
+// TestIterativeGetChurnFindsRecord (issue #1 field repro): with the nodes
+// CLOSEST to the key dead, a walk from a surviving far node still finds the
+// record (stored on every holder at publish time) — and does not classify
+// the found result as degraded.
+func TestIterativeGetChurnFindsRecord(t *testing.T) {
+	if testing.Short() {
+		t.Skip("multi-node timing-sensitive")
+	}
+	nodes := make([]*Node, 0, 6)
+	for i := 0; i < 6; i++ {
+		n, _ := startTestNode(t, nil)
+		nodes = append(nodes, n)
+	}
+	// Full mesh (ring + 0).
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	addrs := make([]string, len(nodes))
+	for i, n := range nodes {
+		la, err := n.LocalAddr()
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs[i] = la.String()
+	}
+	for i := 1; i < len(nodes); i++ {
+		targets := []int{0}
+		if i > 1 {
+			targets = append(targets, i-1)
+		}
+		for _, j := range targets {
+			if err := nodes[i].AddPeer(nodes[j].PublicKey(), addrs[j]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// The record: published from node 1 (peer-PUTs; also teaches node 0
+	// about node 1) AND seeded explicitly into node 0's store so a live
+	// holder exists on the far side regardless of PUT fan-out.
+	owner, _ := crypto.Generate()
+	env, key := makeTLDRecord(t, owner, "churn-test")
+	if ok, err := nodes[0].store.Put(key, env, time.Now().Unix(), true); err != nil || !ok {
+		t.Fatalf("seed node0: %v %v", ok, err)
+	}
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer pubCancel()
+	_ = nodes[1].Publish(pubCtx, env) // best-effort fan-out; node 0 is the guaranteed holder
+
+	// Kill the 3 nodes (among 2..5) closest to the key.
+	type di struct {
+		i    int
+		dist []byte
+	}
+	var order []di
+	for i, n := range nodes {
+		if i <= 1 {
+			continue // keep the publisher + node 0 (both hold the record)
+		}
+		dist, err := XORBytes(key, n.ID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, di{i, dist})
+	}
+	sort.Slice(order, func(a, b int) bool {
+		return bytes.Compare(order[a].dist, order[b].dist) < 0
+	})
+	for _, k := range order[:3] {
+		if err := nodes[k.i].Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The searcher: a surviving node far from the key (the last in order).
+	searcher := nodes[order[len(order)-1].i]
+	start := time.Now()
+	got, stats, err := searcher.IterativeGetDetailed(ctx, key)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("churn walk: %v", err)
+	}
+	if got == nil {
+		t.Fatal("record not found despite live holders (issue #1 regression)")
+	}
+	if elapsed > 6*time.Second {
+		t.Errorf("churn walk took %v (stats %+v); penalty+adaptive batch should reach live holders fast", elapsed, stats)
 	}
 }

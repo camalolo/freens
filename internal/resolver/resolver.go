@@ -17,6 +17,7 @@ import (
 
 	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/wire"
 	"github.com/miekg/dns"
@@ -307,8 +308,17 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	// NXDOMAIN.
 	tldID := ResolvePin(r.Cfg, alias)
 	contested := false
+	degraded := false
 	if len(tldID) == 0 {
-		tldID, contested = r.resolveAliasClaim(ctx, alias, now)
+		tldID, contested, degraded = r.resolveAliasClaim(ctx, alias, now)
+		if degraded {
+			// Issue #1: the claim layer could not be interrogated (probe
+			// failures, nothing local). SERVFAIL — which putFreens never
+			// caches — so the next query retries instead of a 60 s
+			// negative-cached NXDOMAIN for an alias whose claim holders
+			// may be alive.
+			return nil, dns.RcodeServerFailure, nil
+		}
 		if len(tldID) == 0 {
 			return nil, dns.RcodeNameError, nil
 		}
@@ -502,27 +512,33 @@ func (r *Resolver) verifyAuthorityChain(ctx context.Context, chain []*wire.Signe
 //     envelope, so the legacy path keeps its historical behavior (no contest
 //     flag); sources wanting full §7.4 semantics implement ClaimSetResolver.
 //
-// It returns (nil, false) (freens branch miss → NXDOMAIN) on ANY failure — an
-// unresolvable alias and an unprovable one are indistinguishable to the caller
-// by design.
-func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int64) (tldID []byte, contested bool) {
+// It returns (nil, false, false) (freens branch miss → NXDOMAIN) on ANY
+// failure — an unresolvable alias and an unprovable one are
+// indistinguishable to the caller by design — EXCEPT the degraded-miss
+// signal (issue #1): when the claim collection could not interrogate the
+// network (probe failures, nothing local), degraded is true and the caller
+// answers SERVFAIL (retryable, never negative-cached) instead of NXDOMAIN.
+func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int64) (tldID []byte, contested, degraded bool) {
 	if csr, ok := r.Freens.(ClaimSetResolver); ok {
 		return r.resolveClaimSet(ctx, csr, alias, now)
 	}
 	cr, ok := r.Freens.(ClaimResolver)
 	if !ok {
-		return nil, false // record source is not claim-capable: pins only
+		return nil, false, false // record source is not claim-capable: pins only
 	}
 	env, err := cr.LookupClaim(ctx, alias, now)
+	if errors.Is(err, dht.ErrDegradedMiss) {
+		return nil, false, true
+	}
 	if err != nil || env == nil || env.Record == nil {
-		return nil, false // transient error is a miss here — the freens branch NXDOMAINs
+		return nil, false, false // transient error is a miss here — the freens branch NXDOMAINs
 	}
 	oracle, _ := r.Freens.(DifficultyOracle)
 	claim := verifyClaimEnvelope(env, alias, now, oracle)
 	if claim == nil {
-		return nil, false
+		return nil, false, false
 	}
-	return claim.TldID, false
+	return claim.TldID, false, false
 }
 
 // resolveClaimSet implements §7.4 verifier steps 1-4 (spec lines 600-617) on
@@ -560,10 +576,13 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 // while flagging the name as contested in diagnostics"; the flag surfaces
 // here as the contested return value, consumed by freensResolve as the §10.4
 // 60 s TTL cap (a diagnostics channel does not exist in this resolver).
-func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, alias string, now int64) (tldID []byte, contested bool) {
+func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, alias string, now int64) (tldID []byte, contested, degraded bool) {
 	envs, err := csr.CollectClaims(ctx, alias, now)
+	if errors.Is(err, dht.ErrDegradedMiss) {
+		return nil, false, true // issue #1: retryable, not NXDOMAIN
+	}
 	if err != nil || len(envs) == 0 {
-		return nil, false // transient error / no claim anywhere: a miss
+		return nil, false, false // transient error / no claim anywhere: a miss
 	}
 	survivors := make([]*claims.AliasClaim, 0, len(envs))
 	oracle, _ := r.Freens.(DifficultyOracle)
@@ -573,13 +592,13 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 		}
 	}
 	if len(survivors) == 0 {
-		return nil, false // every competing claim failed the §7.4 step-2 filter
+		return nil, false, false // every competing claim failed the §7.4 step-2 filter
 	}
 	winner := claims.SelectWinner(claims.OrderClaims(survivors))
 	if winner == nil {
-		return nil, false // unreachable (survivors passed the same filter)
+		return nil, false, false // unreachable (survivors passed the same filter)
 	}
-	return winner.TldID, now-int64(winner.Timestamp) < int64(constants.ContestWindow)
+	return winner.TldID, now-int64(winner.Timestamp) < int64(constants.ContestWindow), false
 }
 
 // verifyClaimEnvelope applies the per-claim §7.4 step-2 filter ("Filter:

@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.1 — churn-proof lookups (fixes #1)
+Field-observed 3× on the 7-node LAN: while some nodes are down (reboots,
+crash-looping units), lookups for some names time out or NXDOMAIN for
+minutes although surviving nodes hold the records the whole time. Three
+layers fixed:
+- **Walk layer** (`IterativeGet` + the claims walk): probe-failed contacts
+  are PENALIZED for 30 s (eviction alone did not stop re-probing — live
+  peers keep re-advertising corpses in their {nodes} lists); a round in
+  which no probe answered doubles the next round's batch (ALPHA → … ≤ K)
+  so the walk reaches live holders past a cluster of dead closest
+  candidates in one extra round instead of rounds × 2 s of serial
+  timeouts.
+- **Classification**: a miss with probe failures is a DEGRADED miss
+  (`dht.ErrDegradedMiss`), distinct from a clean "every reachable holder
+  answered not-held" miss. `DHTLookup` still serves stale cached copies
+  first (offline resilience unchanged).
+- **Resolver layer**: a degraded miss answers SERVFAIL — which §10.4 never
+  caches — so the next query retries immediately; previously one failed
+  walk during churn negative-cached NXDOMAIN for 60 s, outlasting the
+  outage itself.
+
 ## v0.3.0 — system service: the daemon is machine infrastructure
 - **setup installs a systemd SYSTEM unit** (`/etc/systemd/system/
   freens.service`, `WantedBy=multi-user.target`, `User=` the unprivileged

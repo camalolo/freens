@@ -287,9 +287,61 @@ type Node struct {
 	witnessMu   sync.Mutex
 	witnessLast map[string]witnessSigned
 
+	// deadUntil implements the walk-level dead-peer penalty (issue #1):
+	// node ID → unix time until which the contact is skipped as a LOOKUP
+	// candidate. Set when a lookup probe fails; expires after
+	// deadPenaltyWindow. The routing table's own eviction (§6.2) remains
+	// the source of truth for table membership — the penalty only stops
+	// repeated walks from re-probing corpses that live peers keep
+	// re-advertising in {nodes} lists during churn.
+	penaltyMu sync.Mutex
+	deadUntil map[string]int64
+
 	mu      sync.Mutex
 	pending map[string]chan *wire.Message
 }
+
+// deadPenaltyWindow is how long a probe-failed contact is skipped as a
+// lookup candidate before it may be probed again (it may have come back —
+// reboots, crash loops). Short enough to re-admit recovering nodes within
+// a walk-minute, long enough that a churn window does not burn a 2 s probe
+// budget on the same corpse per query (field-observed: minute-long dig
+// timeouts while 3/7 nodes were down).
+const deadPenaltyWindow = 30 * time.Second
+
+// markDead records the dead-peer penalty for id (now + window).
+func (n *Node) markDead(id []byte, now int64) {
+	n.penaltyMu.Lock()
+	defer n.penaltyMu.Unlock()
+	if n.deadUntil == nil {
+		return
+	}
+	n.deadUntil[string(id)] = now + int64(deadPenaltyWindow/time.Second)
+}
+
+// penalized reports whether id is inside its dead-peer penalty window.
+func (n *Node) penalized(id []byte, now int64) bool {
+	n.penaltyMu.Lock()
+	defer n.penaltyMu.Unlock()
+	until, ok := n.deadUntil[string(id)]
+	return ok && now < until
+}
+
+// LookupStats reports what one iterative lookup did (issue #1
+// observability + the degraded-miss classification).
+type LookupStats struct {
+	ProbesSent    int      // candidate probes issued
+	ProbesFailed  int      // probes that errored (timeout / unreachable / malformed)
+	ProbedNodeIDs [][]byte // IDs probed, in order (penalized contacts excluded)
+}
+
+// ErrDegradedMiss reports a lookup that found nothing while some probes
+// failed: the network could not be interrogated fully, so the miss is NOT
+// authoritative. Callers must treat it as "try again soon" (SERVFAIL /
+// uncached) rather than "does not exist" (NXDOMAIN / negative-cached) —
+// field-churn showed 60 s NXDOMAIN windows for names whose holders were
+// alive the whole time (issue #1).
+var ErrDegradedMiss = errors.New("dht: degraded miss (probe failures; the network could not be fully interrogated)")
 
 // witnessSigned records one witnessed claim for the WITNESS_COOLDOWN check:
 // the SHA-256 of the claim's §7.3 PoW prefix (which binds alias, tld_id,
@@ -398,6 +450,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		evictCh:        make(chan *NodeContact, evictQueueCap),
 		evictPending:   make(map[int]bool),
 		witnessLast:    make(map[string]witnessSigned),
+		deadUntil:      make(map[string]int64),
 		pending:        make(map[string]chan *wire.Message),
 	}, nil
 }
@@ -1432,32 +1485,57 @@ func (n *Node) Bootstrap(ctx context.Context, peers []Peer) {
 //
 // Returns (nil, nil) when no envelope is found anywhere reachable.
 func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelope, error) {
+	env, _, err := n.IterativeGetDetailed(ctx, key)
+	return env, err
+}
+
+// IterativeGetDetailed is IterativeGet with walk telemetry and the
+// degraded-miss classification (issue #1): a nil envelope with
+// ErrDegradedMiss means probes failed — the miss is not authoritative and
+// callers must not negative-cache it; a clean (nil, nil) means every
+// reachable holder answered "not held".
+//
+// Churn behavior (found live on a 7-node LAN): contacts whose probes fail
+// are penalized for deadPenaltyWindow so a later walk skips them instead of
+// re-burning the 2 s probe budget on corpses that live peers keep
+// re-advertising; and a round in which NO probe answered doubles the next
+// round's batch (ALPHA → 2·ALPHA → … ≤ K), so the walk reaches live holders
+// past a cluster of dead closest-candidates in one extra round instead of
+// rounds × 2 s of serial timeouts.
+func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.SignedEnvelope, LookupStats, error) {
+	var stats LookupStats
 	if len(key) != constants.SHA256Len {
-		return nil, fmt.Errorf("dht: key must be %d bytes, got %d", constants.SHA256Len, len(key))
+		return nil, stats, fmt.Errorf("dht: key must be %d bytes, got %d", constants.SHA256Len, len(key))
 	}
 	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
 	if len(shortlist) == 0 {
-		return nil, nil // no peers known: an island.
+		return nil, stats, nil // no peers known: an island.
 	}
 	queried := make(map[string]bool, len(shortlist))
 	var bestEnv *wire.SignedEnvelope
+	batchSize := constants.Alpha
 
 	for round := 0; round < maxLookupRounds; round++ {
 		// Nearest-first so the ALPHA un-queried we pick are the closest.
 		sort.SliceStable(shortlist, func(i, j int) bool {
 			return CompareDistance(key, shortlist[i].NodeID, shortlist[j].NodeID) < 0
 		})
+		now := n.now()
 		var batch []*NodeContact
 		for _, c := range shortlist {
-			if !queried[string(c.NodeID)] {
-				batch = append(batch, c)
-				if len(batch) >= constants.Alpha {
-					break
-				}
+			if queried[string(c.NodeID)] {
+				continue
+			}
+			if n.penalized(c.NodeID, now) {
+				continue // recently-failed corpse: skip as a candidate
+			}
+			batch = append(batch, c)
+			if len(batch) >= batchSize {
+				break
 			}
 		}
 		if len(batch) == 0 {
-			break // every known contact queried: converged.
+			break // every known contact queried or penalized: converged.
 		}
 
 		type res struct {
@@ -1469,6 +1547,8 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 		var wg sync.WaitGroup
 		for i, c := range batch {
 			queried[string(c.NodeID)] = true
+			stats.ProbesSent++
+			stats.ProbedNodeIDs = append(stats.ProbedNodeIDs, c.NodeID)
 			wg.Add(1)
 			go func(i int, c *NodeContact) {
 				defer wg.Done()
@@ -1485,16 +1565,24 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 		}
 		wg.Wait()
 
+		roundAnswered := 0
 		for i, r := range results {
 			// Kademlia failure handling (§6.2): a contact that failed its
 			// probe (timeout / unreachable / malformed address) is evicted
 			// from the routing table so it is neither re-probed by later
 			// lookups on this node nor advertised to others in {nodes} lists.
 			// A parent-context cancellation is NOT a peer failure — never
-			// evict for that.
+			// evict for that. It is ALSO penalized for deadPenaltyWindow:
+			// eviction alone does not stop this walk (and the next) from
+			// re-probing it, because live peers keep re-advertising the
+			// corpse in their {nodes} lists until they probe it themselves.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
+				stats.ProbesFailed++
 				n.rt.Remove(batch[i].NodeID)
+				n.markDead(batch[i].NodeID, n.now())
 				n.log.Debug("dht: evicted unresponsive contact", "addr", batch[i].Addr, "err", r.err)
+			} else if r.err == nil {
+				roundAnswered++
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)
@@ -1510,8 +1598,20 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 				}
 			}
 		}
+		// Adaptive batch: a fully-dead round means the closest candidates
+		// are corpses — widen the next round so the walk reaches live
+		// holders now rather than one dead-batch at a time.
+		if roundAnswered == 0 {
+			batchSize *= 2
+			if batchSize > constants.K {
+				batchSize = constants.K
+			}
+		}
 	}
-	return bestEnv, nil
+	if bestEnv == nil && stats.ProbesFailed > 0 {
+		return nil, stats, ErrDegradedMiss
+	}
+	return bestEnv, stats, nil
 }
 
 // IterativeFindNode performs the §6.2 node lookup: an iterative Kademlia
@@ -2178,21 +2278,35 @@ func (l *DHTLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wi
 	}
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
-	env, err := l.node.IterativeGet(c, key)
-	if err != nil || env == nil {
-		// Fetch failure or a network-wide miss: fall back to the stale cache
-		// (better a still-valid-signature stale record than NXDOMAIN).
+	env, _, gerr := l.node.IterativeGetDetailed(c, key)
+	if env != nil {
+		// Cache the fetched envelope locally (verifySignature=true defensively
+		// re-checks the signature before storing) and stamp its fetch time.
+		_, _ = l.store.Put(key, env, now, true)
+		l.mu.Lock()
+		var k [constants.SHA256Len]byte
+		copy(k[:], key)
+		l.fetchedAt[k] = now
+		l.mu.Unlock()
+		return env, nil
+	}
+	// Miss. A stale cached copy is still served (offline resilience —
+	// better a valid-signature stale record than an error). Only with
+	// NOTHING cached does the miss classification escape:
+	//
+	//   clean miss (every reachable holder answered "not held"):
+	//     (nil, nil) — the resolver's NXDOMAIN, negative-cacheable.
+	//   degraded miss (some probes failed; issue #1): ErrDegradedMiss —
+	//     the resolver maps it to SERVFAIL, which is NEVER cached, so the
+	//     next query retries instead of sitting out a 60 s negative TTL
+	//     for a name whose holders were alive all along.
+	if cached != nil {
 		return cached, nil
 	}
-	// Cache the fetched envelope locally (verifySignature=true defensively
-	// re-checks the signature before storing) and stamp its fetch time.
-	_, _ = l.store.Put(key, env, now, true)
-	l.mu.Lock()
-	var k [constants.SHA256Len]byte
-	copy(k[:], key)
-	l.fetchedAt[k] = now
-	l.mu.Unlock()
-	return env, nil
+	if gerr != nil {
+		return nil, gerr
+	}
+	return nil, nil
 }
 
 // FetchMetaJSON serializes the fetched-keys metadata (key hex → fetchedAt unix

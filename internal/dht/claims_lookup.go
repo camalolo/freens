@@ -106,23 +106,30 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	}
 	queried := make(map[string]bool, len(shortlist))
 	answered := make(map[string]*NodeContact, len(shortlist)) // reachable nodes
+	probesFailed := 0
+	batchSize := constants.Alpha
 
 	for round := 0; round < maxLookupRounds; round++ {
 		// Nearest-first so the ALPHA un-queried we pick are the closest.
 		sort.SliceStable(shortlist, func(i, j int) bool {
 			return CompareDistance(key, shortlist[i].NodeID, shortlist[j].NodeID) < 0
 		})
+		now := n.now()
 		var batch []*NodeContact
 		for _, c := range shortlist {
-			if !queried[string(c.NodeID)] {
-				batch = append(batch, c)
-				if len(batch) >= constants.Alpha {
-					break
-				}
+			if queried[string(c.NodeID)] {
+				continue
+			}
+			if n.penalized(c.NodeID, now) {
+				continue // recently-failed corpse: skip (issue #1 churn)
+			}
+			batch = append(batch, c)
+			if len(batch) >= batchSize {
+				break
 			}
 		}
 		if len(batch) == 0 {
-			break // every known contact queried: converged.
+			break // every known contact queried or penalized: converged.
 		}
 
 		type res struct {
@@ -148,16 +155,21 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 		}
 		wg.Wait()
 
+		roundAnswered := 0
 		for i, r := range results {
 			// §6.2 failure handling, identical to IterativeGet: evict a
-			// contact whose probe failed (unless the caller cancelled).
+			// contact whose probe failed (unless the caller cancelled) and
+			// penalize it for deadPenaltyWindow so later walks skip it.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
+				probesFailed++
 				n.rt.Remove(batch[i].NodeID)
+				n.markDead(batch[i].NodeID, n.now())
 				n.log.Debug("dht: claims lookup evicted unresponsive contact", "addr", batch[i].Addr, "err", r.err)
 				continue
 			}
 			if r.err == nil {
 				answered[string(batch[i].NodeID)] = batch[i]
+				roundAnswered++
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)
@@ -167,6 +179,13 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 			}
 			for _, e := range r.envs {
 				add(e)
+			}
+		}
+		// Adaptive batch, same rationale as IterativeGet (issue #1).
+		if roundAnswered == 0 {
+			batchSize *= 2
+			if batchSize > constants.K {
+				batchSize = constants.K
 			}
 		}
 	}
@@ -206,6 +225,13 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 		}
 	}
 
+	// Degraded-miss classification (issue #1): an EMPTY collected set with
+	// probe failures is not an authoritative "nobody claims this alias" —
+	// the resolver must retry (SERVFAIL) rather than negative-cache an
+	// NXDOMAIN for an alias whose claim holders were alive all along.
+	if len(collected) == 0 && probesFailed > 0 {
+		return nil, ErrDegradedMiss
+	}
 	return sortedByRecordHash(collected), nil
 }
 
@@ -324,11 +350,17 @@ func (l *DHTLookup) CollectClaims(ctx context.Context, alias string, now int64) 
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
 	envs, err := l.node.CollectClaims(c, alias)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrDegradedMiss) {
 		return nil, err
 	}
 	for _, env := range envs {
 		add(env)
+	}
+	// A degraded walk (ErrDegradedMiss) with a LOCAL claim still serves
+	// the local view; only an empty-everywhere degrade propagates the
+	// sentinel (the resolver retries instead of negative-caching).
+	if errors.Is(err, ErrDegradedMiss) && len(collected) == 0 {
+		return nil, err
 	}
 	set := sortedByRecordHash(collected)
 	// §7.4 "storing nodes keep the top 2 by ordering": every collected claim
