@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.1 — OS-resolver wiring that actually works (found live on 3 boxes)
+- **setup: the one true wiring is resolv.conf → 127.0.0.1 + a loopback
+  :53 → daemon-port NAT redirect.** The v0.2.0 paths were both broken in
+  the field: `nameserver 127.0.0.1:5300` is invalid resolv.conf syntax
+  (dig rejects the whole file; glibc silently skips the line), and the
+  systemd-resolved drop-in can never resolve freens names because
+  resolved does not forward single-label queries — and every freens name
+  IS a single-label TLD. setup now installs daddr-scoped nft rules
+  (iptables fallback) and rewrites resolv.conf as a plain file (not
+  through resolved's stub symlink, which restarts would regenerate).
+- **port53-redirect.sh: daddr-scoped rules** — the old uid-exclusion
+  (a) used nft syntax real parsers reject, and (b) excluded EVERY app on
+  single-user machines where apps share the daemon's uid, making the
+  redirect a no-op. Only loopback-destined :53 matches now; the daemon's
+  upstream queries (external addresses) never do.
+- **doctor: checks the real wiring** — resolv.conf at 127.0.0.1 AND the
+  redirect present; warns precisely when only half is wired.
+- **register: the "network too small" error now points at
+  contrib/seed-node.md** (found live: 3 boxes < W=5 witnesses; the
+  honest error, plus how to help).
+- Uninstall removes the NAT table and legacy v0.2.0 artifacts (drop-in,
+  `:5300` resolv.conf lines).
+
 ## v0.2.0 — the friends release
 Everything below plus the "chairs" kit: `contrib/seed-node.md` (run a
 community node on any Linux box in ~5 minutes — a system service, public

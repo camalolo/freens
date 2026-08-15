@@ -251,7 +251,7 @@ func cmdRegister(args []string) error {
 		}
 	}
 	if len(atts) < constants.W {
-		return fmt.Errorf("only %d of %d required witnesses responded — the network is too small from this vantage point; add more -peers and retry (the claim PoW is reusable: rerun with the same -owner-key and -difficulty)", len(atts), constants.W)
+		return fmt.Errorf("only %d of %d required witnesses responded — the network is too small from this vantage point; add more -peers and retry (the claim PoW is reusable: rerun with the same -owner-key and -difficulty). Help the network grow: run a community node (see contrib/seed-node.md) — every always-on node is one more witness", len(atts), constants.W)
 	}
 	claim.Witnesses = atts[:constants.W]
 	if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {

@@ -16,9 +16,9 @@
 #
 # Options (environment variables):
 #   TO_PORT   high port the daemon listens on      (default: 5300)
-#   UID_EXCL  uid whose packets are NOT redirected  (default: your uid).
-#             MUST be the uid the daemon runs as: the daemon's own upstream
-#             forwards to 9.9.9.9:53 etc. must escape the redirect, or they
+#   UID_EXCL  (deprecated, ignored — rules are daddr-scoped now)
+#             Kept for compatibility only.
+#
 #             loop back into the daemon forever.
 #   BACKEND   force "nft" or "ipt"                  (default: auto-detect)
 #
@@ -85,14 +85,16 @@ nft_add() {
 table inet $NFT_TABLE {
     chain output {
         type nat hook output priority -100; policy accept;
-        # Redirect locally-generated DNS to the high-port daemon, except
-        # the daemon's own upstream forwards (sk uid) — those must escape,
-        # or the daemon loops into itself.
-        meta l4proto { tcp, udp } th dport 53 sk uid != $UID_EXCL redirect to :$TO_PORT
+        # Redirect only loopback-destined :53 to the high-port daemon.
+        # daddr-scoping (not uid-exclusion — that breaks single-user
+        # machines where apps share the daemon's uid, found live): the
+        # daemon's own upstream forwards go to EXTERNAL resolver
+        # addresses, so they never match and cannot loop.
+        ip daddr 127.0.0.1 meta l4proto { tcp, udp } th dport 53 redirect to :$TO_PORT
     }
 }
 EOF
-    echo "nft: added redirect :53 -> :$TO_PORT (excluding uid $UID_EXCL)"
+    echo "nft: added redirect 127.0.0.1:53 -> :$TO_PORT"
 }
 
 nft_remove() {
@@ -113,7 +115,7 @@ nft_status() {
 # iptables backend: classic nat OUTPUT REDIRECT rules, check-before-add.
 # ---------------------------------------------------------------------------
 ipt_rule() { # <tcp|udp>
-    echo "-t nat -A OUTPUT -p $1 --dport 53 -m owner ! --uid-owner $UID_EXCL -j REDIRECT --to-ports $TO_PORT"
+    echo "-t nat -A OUTPUT -p $1 -d 127.0.0.1 --dport 53 -j REDIRECT --to-ports $TO_PORT"
 }
 
 ipt_add() {
@@ -123,7 +125,7 @@ ipt_add() {
         else
             # shellcheck disable=SC2046
             iptables $(ipt_rule "$p")
-            echo "iptables: added $p :53 -> :$TO_PORT (excluding uid $UID_EXCL)"
+            echo "iptables: added $p 127.0.0.1:53 -> :$TO_PORT"
         fi
     done
 }

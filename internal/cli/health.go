@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -234,11 +235,13 @@ func cmdDoctor(args []string) error {
 	// 6. seeds.conf parses.
 	check(checkSeeds(), "seeds.conf parses and has at least one seed")
 
-	// 7. OS resolver (warn-only): must name the daemon's configured address.
-	if osResolverPointsAtDaemon() {
-		fmt.Printf("✔ OS resolver points at the daemon\n")
+	// 7. OS resolver + the :53 redirect that makes the wiring complete.
+	if points, redirect := osResolverPointsAtDaemon(); points && redirect {
+		fmt.Printf("✔ OS resolver points at the daemon (127.0.0.1 + :53 -> %s redirect)\n", effectiveDNSAddr())
+	} else if points {
+		warn("resolv.conf points at 127.0.0.1 but the :53 -> %s redirect is MISSING — re-run `freens setup` (or freens doctor --fix)", effectiveDNSAddr())
 	} else {
-		warn("OS resolver does not point at %s yet (setup wires it; DNS still works via the daemon port)", effectiveDNSAddr())
+		warn("OS resolver does not point at the daemon yet (setup wires it; DNS still works via the daemon port)")
 	}
 
 	if failed > 0 {
@@ -266,8 +269,8 @@ func runDoctorFixes() {
 			fmt.Println("fix: ✘ daemon still not answering — start it manually: systemctl --user start freens.service")
 		}
 	}
-	if !osResolverPointsAtDaemon() {
-		fmt.Println("fix: OS resolver not pointing at the daemon — wiring it now")
+	if points, redirect := osResolverPointsAtDaemon(); !points || !redirect {
+		fmt.Println("fix: OS resolver wiring incomplete — wiring it now")
 		fmt.Println(wireOSResolver())
 	}
 }
@@ -311,13 +314,49 @@ func checkSeeds() bool {
 	return len(peers) > 0
 }
 
-// osResolverPointsAtDaemon reports whether /etc/resolv.conf names the
-// daemon's CONFIGURED address (the systemd-resolved drop-in path funnels
-// into resolv.conf's stub too).
-func osResolverPointsAtDaemon() bool {
+// osResolverPointsAtDaemon reports (points, redirectComplete): whether
+// /etc/resolv.conf sends the OS stub to 127.0.0.1 (the working freens
+// wiring — a bare loopback nameserver; the v0.2.0 "127.0.0.1:5300" form was
+// invalid resolv.conf syntax and is treated as legacy) AND whether the
+// port-53 redirect that carries :53 traffic to the daemon's high port is
+// present in the firewall.
+func osResolverPointsAtDaemon() (points, redirect bool) {
 	data, err := os.ReadFile(pathResolvConf)
-	if err != nil {
-		return false
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "nameserver 127.0.0.1" || line == "nameserver 127.0.0.1:5300" {
+				points = true
+				break
+			}
+		}
 	}
-	return strings.Contains(string(data), effectiveDNSAddr())
+	redirect = port53RedirectInstalled()
+	return points, redirect
+}
+
+// port53RedirectInstalled reports whether an active :53 redirect exists
+// (our nft table, an nft ruleset redirect to the daemon port, or iptables
+// REDIRECT rules). Swappable probe for tests.
+var port53RedirectInstalled = func() bool {
+	if out, err := exec.Command("sudo", "-n", "nft", "list", "ruleset").Output(); err == nil {
+		s := string(out)
+		if strings.Contains(s, "redirect to :"+portOfAddr(effectiveDNSAddr())) ||
+			strings.Contains(s, "redirect to 127.0.0.1:"+portOfAddr(effectiveDNSAddr())) ||
+			strings.Contains(s, "chain "+nftTableName) {
+			return true
+		}
+	}
+	if out, err := exec.Command("sudo", "-n", "iptables", "-t", "nat", "-S", "OUTPUT").Output(); err == nil {
+		return strings.Contains(string(out), "--to-ports "+portOfAddr(effectiveDNSAddr()))
+	}
+	return false
+}
+
+// portOfAddr splits "host:port" ("" when malformed).
+func portOfAddr(addr string) string {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		return p
+	}
+	return ""
 }

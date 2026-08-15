@@ -42,9 +42,10 @@ func TestDoctorFixWiresResolverAndTriesDaemon(t *testing.T) {
 	if !strings.Contains(out, "fix: daemon down or install incomplete") {
 		t.Errorf("the daemon fix line is missing:\n%s", out)
 	}
-	// The fix actually wired the stubbed resolv.conf (setup's step (e)).
+	// The fix actually wired the stubbed resolv.conf (bare loopback; the
+	// redirect rides in the firewall, stubbed as sysRun commands).
 	b, rerr := os.ReadFile(pathResolvConf)
-	if rerr != nil || !strings.Contains(string(b), "127.0.0.1:5300") {
+	if rerr != nil || strings.TrimSpace(string(b)) != "nameserver 127.0.0.1" {
 		t.Errorf("resolv.conf not wired by doctor --fix: %v\n%s", rerr, b)
 	}
 }
@@ -64,14 +65,14 @@ func TestDoctorFixWiresResolverWhenDaemonUp(t *testing.T) {
 	}
 
 	out, _ := captureStdout(t, func() error { return cmdDoctor([]string{"-fix"}) })
-	if !strings.Contains(out, "fix: OS resolver not pointing") {
+	if !strings.Contains(out, "fix: OS resolver wiring incomplete") {
 		t.Errorf("the OS-resolver fix line is missing:\n%s", out)
 	}
 	if strings.Contains(out, "running `freens setup`") {
 		t.Errorf("--fix re-ran setup although the daemon was up:\n%s", out)
 	}
 	b, err := os.ReadFile(pathResolvConf)
-	if err != nil || !strings.Contains(string(b), "127.0.0.1:5300") {
+	if err != nil || strings.TrimSpace(string(b)) != "nameserver 127.0.0.1" {
 		t.Errorf("resolv.conf not wired:\n%s", b)
 	}
 }
@@ -83,10 +84,14 @@ func TestDoctorFixNoopWhenHealthy(t *testing.T) {
 	h := tempHome(t)
 	stubSysForTest(t)
 	startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
-	// Pre-wire the resolver so the fix path is not taken.
-	if err := os.WriteFile(pathResolvConf, []byte("nameserver 127.0.0.1:5300\n"), 0o644); err != nil {
+	// Pre-wire the resolver (bare loopback + redirect probe true) so the
+	// fix path is not taken.
+	if err := os.WriteFile(pathResolvConf, []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	oldRedirect := port53RedirectInstalled
+	port53RedirectInstalled = func() bool { return true }
+	t.Cleanup(func() { port53RedirectInstalled = oldRedirect })
 	if err := os.WriteFile(home.ConfPath(), []byte("[listen]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

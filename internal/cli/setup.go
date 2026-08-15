@@ -27,6 +27,7 @@ package cli
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,45 +232,115 @@ func setupInstall() error {
 	return nil
 }
 
-// wireOSResolver points the OS stub resolver at the daemon's high port:
-// a systemd-resolved drop-in when systemd-resolved runs, else a prepended
-// nameserver line in /etc/resolv.conf (backup alongside). Returns the
-// human-readable outcome line for the setup summary.
+// wireOSResolver wires the OS stub to the daemon. There is exactly ONE
+// working model on Linux for freens' names (found live on three boxes):
+//
+//	nft/iptables NAT: 127.0.0.1:53 -> 127.0.0.1:<daemon port>
+//	/etc/resolv.conf: nameserver 127.0.0.1     (bare — resolv.conf has NO
+//	                                             port syntax; a "host:port"
+//	                                             value makes dig reject the
+//	                                             whole file)
+//
+// The daemon (high port, unprivileged) then answers :53 for every app and
+// forwards conventional names upstream (dns-first).
+//
+// Why NOT systemd-resolved's DNS=127.0.0.1:5300 (the v0.2.0 path): resolved
+// NEVER forwards single-label names to upstream resolvers, and every freens
+// name IS a single-label TLD — the stub swallowed "laurent" with NXDOMAIN
+// while the daemon happily answered direct queries. The drop-in branch is
+// gone; resolv.conf is replaced as a PLAIN FILE (not through resolved's
+// stub symlink, which a resolved restart would regenerate).
 func wireOSResolver() string {
-	// Wire the daemon's CONFIGURED address (a user-edited [listen] udp port
-	// must be honored, not the built-in default).
-	addr := effectiveDNSAddr()
-	if systemctlActive("systemd-resolved") {
-		dropIn := "[Resolve]\nDNS=" + addr + "\nDomains=~.\n"
-		if err := sysWriteEtc(pathResolvedDrop, []byte(dropIn), 0o644); err != nil {
-			printManualCommands("systemd-resolved drop-in", []string{
-				"sudo mkdir -p " + filepath.Dir(pathResolvedDrop),
-				"sudo tee " + pathResolvedDrop + " >/dev/null <<'EOF'\n[Resolve]\nDNS=" + addr + "\nDomains=~.\nEOF",
-				"sudo systemctl restart systemd-resolved",
-			})
-			return "OS resolver: MANUAL step printed above (sudo failed) — systemd-resolved drop-in"
-		}
-		if err := sudoRun("restarting systemd-resolved", "systemctl", "restart", "systemd-resolved"); err != nil {
-			printManualCommands("restart systemd-resolved", []string{"sudo systemctl restart systemd-resolved"})
-		}
-		return "OS resolver: systemd-resolved -> " + addr + " (drop-in " + pathResolvedDrop + ")"
+	addr := effectiveDNSAddr() // e.g. 127.0.0.1:5300 (the daemon's configured listener)
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" || port == "53" {
+		port = strings.TrimSuffix(strings.TrimPrefix(addr, "127.0.0.1:"), "")
 	}
-	cur, err := sysReadFile(pathResolvConf)
-	if err == nil && strings.Contains(string(cur), addr) {
-		return "OS resolver: " + pathResolvConf + " already points at " + addr
+	manual := port53ManualCommands(port)
+
+	// 1) The :53 -> port redirect FIRST (never leave resolv.conf pointing
+	//    at a port that nothing answers on).
+	if err := installPort53Redirect(port); err != nil {
+		printManualCommands("port-53 redirect (nft/iptables)", manual[:len(manual)-1])
+		return "OS resolver: MANUAL step printed above (sudo failed) — port-53 redirect to " + addr
 	}
-	backup := "sudo cp " + pathResolvConf + " " + pathResolvBackup
-	prepend := "printf 'nameserver " + addr + "\\n' | sudo tee /tmp/freens-resolv.new >/dev/null && cat " + pathResolvConf + " | sudo tee -a /tmp/freens-resolv.new >/dev/null && sudo cp /tmp/freens-resolv.new " + pathResolvConf
+
+	// 2) resolv.conf -> plain "nameserver 127.0.0.1" (backup alongside).
+	cur, _ := sysReadFile(pathResolvConf)
+	if strings.HasPrefix(string(cur), "nameserver 127.0.0.1\n") {
+		return "OS resolver: already wired (resolv.conf -> 127.0.0.1, :53 -> " + addr + " redirect)"
+	}
 	if err := sudoRun("backing up "+pathResolvConf, "cp", pathResolvConf, pathResolvBackup); err != nil {
-		printManualCommands("resolv.conf backup + prepend", []string{backup, prepend})
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + addr
+		printManualCommands("resolv.conf backup + rewrite", manual[len(manual)-1:])
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
 	}
-	newResolv := "nameserver " + addr + "\n" + string(cur)
-	if err := sysWriteEtc(pathResolvConf, []byte(newResolv), 0o644); err != nil {
-		printManualCommands("resolv.conf prepend", []string{prepend})
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + addr
+	// Replace the file (rm first: through a resolved stub symlink a plain
+	// write would land in /run and be regenerated on the next restart).
+	if err := sudoRun("rewriting "+pathResolvConf, "rm", "-f", pathResolvConf); err != nil {
+		printManualCommands("resolv.conf backup + rewrite", manual[len(manual)-1:])
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
 	}
-	return "OS resolver: " + pathResolvConf + " prepended with nameserver " + addr + " (backup: " + pathResolvBackup + ")"
+	if err := sysWriteEtc(pathResolvConf, []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
+		printManualCommands("resolv.conf rewrite", manual[len(manual)-1:])
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
+	}
+	return "OS resolver: resolv.conf -> 127.0.0.1, :53 -> " + addr + " via nft/iptables redirect (backup: " + pathResolvBackup + "; conventional names go upstream through the daemon)"
+}
+
+// nftTableName is our NAT table for the :53 redirect.
+const nftTableName = "freens_dns"
+
+// installPort53Redirect installs the daddr-scoped NAT rules
+// 127.0.0.1:53 -> :port, idempotently (our table is flushed first). nft is
+// preferred, iptables the fallback. daddr-scoping needs no uid exclusion:
+// only loopback-destined :53 traffic matches, and the daemon's own upstream
+// queries go to external resolvers — the v0.2.0 uid-exclusion design broke
+// single-user machines (every app shares the daemon's uid and escaped the
+// redirect).
+func installPort53Redirect(port string) error {
+	// nft path: (re)create table + chain + rule atomically enough for setup.
+	if sudoRun("installing the port-53 redirect (nft)", "nft", "add", "table", "ip", nftTableName) == nil ||
+		sysStatNftTable() {
+		_ = sudoRun("installing the port-53 redirect (nft)", "nft", "flush", "table", "ip", nftTableName)
+		if sudoRun("installing the port-53 redirect (nft)", "nft", "add", "chain", "ip", nftTableName, "output",
+			"{ type nat hook output priority -100 ; }") == nil {
+			if sudoRun("installing the port-53 redirect (nft)", "nft", "add", "rule", "ip", nftTableName, "output",
+				"ip", "daddr", "127.0.0.1", "meta", "l4proto", "{ tcp, udp }",
+				"th", "dport", "53", "redirect", "to", ":"+port) == nil {
+				return nil
+			}
+		}
+	}
+	// iptables fallback: check-then-add per family.
+	for _, proto := range []string{"udp", "tcp"} {
+		base := []string{"-t", "nat", "-p", proto, "-d", "127.0.0.1", "--dport", "53", "-j", "REDIRECT", "--to-ports", port}
+		chk := append([]string{"-C", "OUTPUT"}, base...)
+		add := append([]string{"-A", "OUTPUT"}, base...)
+		if err := sudoRun("installing the port-53 redirect (iptables)", append([]string{"iptables"}, chk...)...); err != nil {
+			if err := sudoRun("installing the port-53 redirect (iptables)", append([]string{"iptables"}, add...)...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// sysStatNftTable reports whether our nft table exists (swapped in tests).
+var sysStatNftTable = func() bool {
+	c := exec.Command("sudo", "-n", "nft", "list", "table", "ip", nftTableName)
+	return c.Run() == nil
+}
+
+// port53ManualCommands is the copy-paste fallback when sudo is unavailable:
+// the exact nft rules (iptables variant), then the resolv.conf rewrite.
+func port53ManualCommands(port string) []string {
+	return []string{
+		"sudo nft add table ip " + nftTableName,
+		"sudo nft 'add chain ip " + nftTableName + " output { type nat hook output priority -100 ; }'",
+		"sudo nft add rule ip " + nftTableName + " output ip daddr 127.0.0.1 meta l4proto '{ tcp, udp }' th dport 53 redirect to :" + port,
+		"# (no nft? iptables -t nat -A OUTPUT -p udp -d 127.0.0.1 --dport 53 -j REDIRECT --to-ports " + port + "  # and again with -p tcp)",
+		"sudo cp " + pathResolvConf + " " + pathResolvBackup + " && sudo rm -f " + pathResolvConf + " && echo 'nameserver 127.0.0.1' | sudo tee " + pathResolvConf,
+	}
 }
 
 // printManualCommands is the sudo-needs-a-password path: print exactly what
@@ -308,7 +379,18 @@ func setupUninstall() error {
 		fmt.Fprintf(os.Stderr, "%s: warning: daemon-reload failed (%v)\n", ProgName, err)
 	}
 
-	// systemd-resolved drop-in.
+	// NAT redirect rules: drop our table (iptables variants are per-rule;
+	// printed as manual steps if the table path fails).
+	if err := sudoRun("removing the port-53 redirect rules", "nft", "delete", "table", "ip", nftTableName); err != nil {
+		printManualCommands("remove port-53 redirect", []string{
+			"sudo nft delete table ip " + nftTableName,
+			"# iptables variant: sudo iptables -t nat -D OUTPUT -p udp -d 127.0.0.1 --dport 53 -j REDIRECT --to-ports <port>  # and -p tcp",
+		})
+	} else {
+		fmt.Printf("removed: nft table ip %s (:53 redirect)\n", nftTableName)
+	}
+
+	// Legacy v0.2.0 systemd-resolved drop-in (if a previous install left one).
 	if sysStatExists(pathResolvedDrop) {
 		if err := sudoRun("removing the resolved drop-in", "rm", "-f", pathResolvedDrop); err != nil {
 			printManualCommands("remove resolved drop-in", []string{

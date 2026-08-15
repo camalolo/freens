@@ -52,6 +52,7 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 
 	oldRun, oldWriteEtc := sysRun, sysWriteEtc
 	oldUnit, oldResolv, oldBackup, oldDrop := pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop
+	oldNftTable, oldRedirectProbe := sysStatNftTable, port53RedirectInstalled
 
 	sysRun = func(name string, args ...string) error {
 		argv := append([]string{name}, args...)
@@ -78,9 +79,16 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 		t.Fatal(err)
 	}
 
+	// The nft table probe and the doctor redirect probe never hit the real
+	// firewall from tests (redirect presence defaults to false; individual
+	// tests override).
+	sysStatNftTable = func() bool { return false }
+	port53RedirectInstalled = func() bool { return false }
+
 	t.Cleanup(func() {
 		sysRun, sysWriteEtc = oldRun, oldWriteEtc
 		pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop = oldUnit, oldResolv, oldBackup, oldDrop
+		sysStatNftTable, port53RedirectInstalled = oldNftTable, oldRedirectProbe
 	})
 	return rec
 }
@@ -148,10 +156,20 @@ func TestSetupIdempotent(t *testing.T) {
 	if !rec.ran("systemctl", "--user", "enable", "--now", "freens.service") {
 		t.Errorf("enable --now not run: %v", rec.cmds)
 	}
-	// OS resolver: resolv.conf prepended (systemd-resolved inactive in stub).
-	gotResolv := string(readFileOrDie(pathResolvConf))
-	if !strings.HasPrefix(gotResolv, "nameserver 127.0.0.1:5300\n") || !strings.Contains(gotResolv, "nameserver 9.9.9.9") {
-		t.Errorf("resolv.conf not prepended correctly:\n%s", gotResolv)
+	// OS resolver: resolv.conf replaced with the plain loopback nameserver
+	// (the :53 -> daemon-port redirect carries the port; resolv.conf itself
+	// has no port syntax). The nft redirect commands ran via sudo.
+	gotResolv := strings.TrimSpace(string(readFileOrDie(pathResolvConf)))
+	if gotResolv != "nameserver 127.0.0.1" {
+		t.Errorf("resolv.conf = %q, want exactly \"nameserver 127.0.0.1\"", gotResolv)
+	}
+	if !rec.ran("sudo", "-n", "nft", "add", "table", "ip", nftTableName) {
+		t.Errorf("nft redirect table not installed: %v", rec.cmds)
+	}
+	if !rec.ran("sudo", "-n", "nft", "add", "rule", "ip", nftTableName, "output",
+		"ip", "daddr", "127.0.0.1", "meta", "l4proto", "{ tcp, udp }",
+		"th", "dport", "53", "redirect", "to", ":5300") {
+		t.Errorf("nft redirect rule not installed: %v", rec.cmds)
 	}
 	if len(rec.etcWrites) != 1 {
 		t.Errorf("privileged writes = %d, want 1 (resolv.conf)", len(rec.etcWrites))
