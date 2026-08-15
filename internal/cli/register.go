@@ -57,8 +57,17 @@ const (
 )
 
 func cmdRegister(args []string) error {
+	// The README form is positional (`freens register alice`); -alias stays
+	// for scripts and muscle memory. stdlib flag stops at the first
+	// positional, so a LEADING alias is lifted out before Parse and a
+	// TRAILING one is read from fs.Args() — `register alice -ip x` and
+	// `register -ip x alice` both work.
+	var lead string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		lead, args = args[0], args[1:]
+	}
 	fs := flag.NewFlagSet("register", flag.ContinueOnError)
-	alias := fs.String("alias", "", "alias to claim (e.g. alice); becomes the TLD of your namespace")
+	alias := fs.String("alias", "", "alias to claim (e.g. alice); becomes the TLD of your namespace (positional form: register alice)")
 	ip := fs.String("ip", "", "IPv4 address for the apex A record (default: this machine's outbound IPv4)")
 	ttl := fs.Uint64("ttl", 300, "apex A record TTL in seconds")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-node-pk> (standalone mode; default: the running daemon)")
@@ -71,8 +80,22 @@ func cmdRegister(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// The README form is positional (`freens register alice`); -alias stays
+	// for scripts and muscle memory.
+	pos := fs.Args()
+	if lead != "" {
+		pos = append([]string{lead}, pos...)
+	}
+	switch {
+	case len(pos) > 1:
+		return usageErr("register takes one alias (%s register <alias>); got %d arguments", ProgName, len(pos))
+	case len(pos) == 1 && *alias != "" && pos[0] != *alias:
+		return usageErr("alias given twice: %q and -alias %s — pass it once", pos[0], *alias)
+	case *alias == "" && len(pos) == 1:
+		*alias = pos[0]
+	}
 	if *alias == "" {
-		return usageErr("register requires -alias (-ip and -peers default to this machine's outbound IPv4 and the running daemon)")
+		return usageErr("register needs an alias: %s register <alias>  (e.g. %s register alice; -ip and -peers default to this machine's outbound IPv4 and the running daemon)", ProgName, ProgName)
 	}
 	if *difficulty < constants.PoWDifficultyInit {
 		return usageErr("-difficulty must be >= %d (the network default, Appendix A.4)", constants.PoWDifficultyInit)

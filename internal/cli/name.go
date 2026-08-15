@@ -52,7 +52,7 @@ func cmdName(args []string) error {
 	if _, err := os.Stat(keyPath); err != nil {
 		avail := keychainAliases()
 		if len(avail) == 0 {
-			return usageErr("no owner key for alias %q (looked for %s) and the keychain is empty — register an alias first: register -alias <%s>", alias, keyPath, alias)
+			return usageErr("no owner key for alias %q (looked for %s) and the keychain is empty — register an alias first: %s register <%s>", alias, keyPath, ProgName, alias)
 		}
 		return usageErr("no owner key for alias %q (looked for %s); keychain has: %s", alias, keyPath, strings.Join(avail, ", "))
 	}

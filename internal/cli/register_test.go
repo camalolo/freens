@@ -34,7 +34,7 @@ func TestRegisterEndToEnd(t *testing.T) {
 	keyPath := filepath.Join(dir, "alice.key")
 	envPath := filepath.Join(dir, "alice.tld.cbor")
 	err := cmdRegister([]string{
-		"-alias", "alice",
+		"alice", // positional form (the README headline command)
 		"-ip", "203.0.113.5",
 		"-peers", peerArgs[0],
 		"-difficulty", "24",
@@ -108,6 +108,21 @@ func TestRegisterTooFewWitnesses(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "witness") {
 		t.Fatalf("expected witness-shortage error, got: %v", err)
+	}
+}
+
+// TestRegisterAliasForms: the alias may be positional (`register alice`,
+// the README headline form) or -alias; ambiguous input is a usage error
+// that names the right form. These paths exit before any PoW/network work.
+func TestRegisterAliasForms(t *testing.T) {
+	if err := cmdRegister(nil); err == nil || !strings.Contains(err.Error(), "register <alias>") {
+		t.Fatalf("no alias: want usage error naming `register <alias>`, got %v", err)
+	}
+	if err := cmdRegister([]string{"a", "b"}); err == nil || !strings.Contains(err.Error(), "one alias") {
+		t.Fatalf("two positionals: want `one alias` error, got %v", err)
+	}
+	if err := cmdRegister([]string{"-alias", "x", "y"}); err == nil || !strings.Contains(err.Error(), "twice") {
+		t.Fatalf("alias given twice: want `twice` error, got %v", err)
 	}
 }
 

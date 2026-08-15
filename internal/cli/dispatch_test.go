@@ -51,6 +51,38 @@ func TestMainCryptoExitCode(t *testing.T) {
 	}
 }
 
+// TestQuickstartNamesTheBasics: the first-timer card must carry the whole
+// happy path (setup -> register -> name) plus status/doctor/help.
+func TestQuickstartNamesTheBasics(t *testing.T) {
+	var sb strings.Builder
+	quickstart(&sb)
+	got := sb.String()
+	for _, want := range []string{"setup", "register", "name", "status", "doctor", "help"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("quickstart missing %q", want)
+		}
+	}
+}
+
+// TestSuggestSubcommands: typos and stray dashes still land on the right
+// verb; short junk suggests nothing (prefix-only matching).
+func TestSuggestSubcommands(t *testing.T) {
+	for typo, want := range map[string]string{
+		"regsiter": "register",
+		"sttaus":   "status",
+		"-setup":   "setup",
+		"--doctor": "doctor",
+	} {
+		got := strings.Join(suggestSubcommands(typo), ",")
+		if !strings.Contains(got, want) {
+			t.Errorf("suggest(%q) = %q, want it to contain %q", typo, got, want)
+		}
+	}
+	if hits := suggestSubcommands("zz"); len(hits) != 0 {
+		t.Errorf("suggest(\"zz\") = %v, want none", hits)
+	}
+}
+
 // TestUsageListsEverySubcommand: the usage text stays in sync with the
 // dispatch table (no orphan verbs, no undocumented ones).
 func TestUsageListsEverySubcommand(t *testing.T) {

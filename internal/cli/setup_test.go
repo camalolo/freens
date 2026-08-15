@@ -214,8 +214,77 @@ func TestSetupUninstall(t *testing.T) {
 	}
 }
 
+// TestSetupInteractiveSudoFallback: when passwordless sudo fails on a
+// terminal, setup retries the privileged step with a REAL sudo (which can
+// prompt for the password) instead of falling through to manual commands.
+func TestSetupInteractiveSudoFallback(t *testing.T) {
+	tempHome(t)
+	rec := stubSysForTest(t)
+	// sudo -n fails from here on (systemctl still succeeds)…
+	oldRun := sysRun
+	inner := sysRun
+	sysRun = func(name string, args ...string) error {
+		if name == "sudo" {
+			rec.cmds = append(rec.cmds, append([]string{name}, args...))
+			return errStubInactive
+		}
+		return inner(name, args...)
+	}
+	// …we are "on a terminal"…
+	oldTerm := sysIsTerminal
+	sysIsTerminal = func() bool { return true }
+	// …and interactive sudo succeeds.
+	var interactive [][]string
+	oldInter := sysSudoInteractive
+	sysSudoInteractive = func(args ...string) error {
+		interactive = append(interactive, append([]string{"sudo"}, args...))
+		return nil
+	}
+	t.Cleanup(func() { sysRun, sysIsTerminal, sysSudoInteractive = oldRun, oldTerm, oldInter })
+
+	out, err := captureStdout(t, func() error { return cmdSetup([]string{}) })
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if len(interactive) == 0 {
+		t.Fatalf("interactive sudo never attempted:\n%s", out)
+	}
+	// The backup cp ran interactively (the first privileged step of the
+	// resolv.conf branch), and the summary does NOT drop to manual mode.
+	ranBackup := false
+	for _, c := range interactive {
+		if len(c) >= 4 && c[1] == "cp" && c[3] == pathResolvBackup {
+			ranBackup = true
+		}
+	}
+	if !ranBackup {
+		t.Errorf("interactive sudo did not cover the resolv.conf backup: %v", interactive)
+	}
+	if strings.Contains(out, "MANUAL") {
+		t.Errorf("setup fell back to manual commands despite interactive sudo:\n%s", out)
+	}
+	if !strings.Contains(out, "admin password") {
+		t.Errorf("the sudo prompt notice is missing from the output:\n%s", out)
+	}
+}
+
+// TestSudoRunNonTerminalNeverPrompts: with no TTY the interactive attempt
+// is never made — scripts/pipes get the manual-commands path, not a hang.
+func TestSudoRunNonTerminalNeverPrompts(t *testing.T) {
+	oldSudo, oldInter, oldTerm := sysSudo, sysSudoInteractive, sysIsTerminal
+	sysSudo = func(args ...string) error { return errStubInactive }
+	sysSudoInteractive = func(args ...string) error { t.Fatal("interactive sudo without a TTY"); return nil }
+	sysIsTerminal = func() bool { return false }
+	t.Cleanup(func() { sysSudo, sysSudoInteractive, sysIsTerminal = oldSudo, oldInter, oldTerm })
+
+	if err := sudoRun("test step", "true"); err == nil {
+		t.Fatal("sudoRun should report the failure when no TTY is present")
+	}
+}
+
 // TestSetupSudoFallbackPrintsManualCommands: when privileged writes fail
-// (sudo needs a password), setup prints the exact commands and continues.
+// everywhere (no TTY, sudo refused), setup prints the exact commands and
+// continues.
 func TestSetupSudoFallbackPrintsManualCommands(t *testing.T) {
 	tempHome(t)
 	rec := stubSysForTest(t)

@@ -1,12 +1,15 @@
 // health.go — `status` and `doctor`: the "is my freens working" pair.
 //
-//	status  pretty-print the running daemon's admin status + a dig-free
-//	        self-check (admin.Resolve of the user's first keychain alias)
+//	status  plain-language health: daemon up?, each name -> IP, backup
+//	        reminder; the raw daemon fields (node ids, hex) live behind -v
 //	doctor  ✔/✘ health checks; exit 1 when any ✘ fails:
 //	        admin socket, daemon version, DNS fallback path via
 //	        127.0.0.1:5300, each keychain alias's apex, peers > 0,
-//	        seeds.conf parse + first-seen dial, and (warn-only ✱) the OS
-//	        resolver pointing at the daemon.
+//	        seeds.conf parse, and (warn-only ✱) the OS resolver pointing
+//	        at the daemon. --fix repairs what it can BEFORE checking:
+//	        missing daemon -> freens setup (idempotent) + wait, unwired
+//	        OS resolver -> the same wiring setup performs (interactive
+//	        sudo when a password is needed).
 package cli
 
 import (
@@ -16,6 +19,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,6 +28,13 @@ import (
 
 // daemonDNSCheckTimeout bounds the doctor DNS self-check.
 const daemonDNSCheckTimeout = 3 * time.Second
+
+// doctorFixWait bounds how long --fix/start wait for a just-started
+// daemon to answer on the admin socket (vars so tests shrink them).
+var (
+	doctorFixWaitAttempts = 20
+	doctorFixWaitSleep    = 500 * time.Millisecond
+)
 
 // errDaemonNotRunning is status' not-running outcome (exit 1, with the
 // fix-it hint printed to stdout).
@@ -35,6 +46,7 @@ var errDaemonNotRunning = errors.New("daemon not running")
 
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	verbose := fs.Bool("v", false, "also print the daemon's raw status fields (node ids, counters)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -43,7 +55,7 @@ func cmdStatus(args []string) error {
 	}
 	c := maybeAdmin()
 	if c == nil {
-		fmt.Println("daemon not running — freens setup")
+		fmt.Println("daemon not running — start everything with: freens start <name>   (or: freens setup)")
 		return errDaemonNotRunning
 	}
 	ctx, cancel := adminCtx()
@@ -52,36 +64,61 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return fmt.Errorf("daemon status (admin socket %s): %w", home.AdminSock(), err)
 	}
-	fmt.Printf("daemon=running (admin socket %s)\n", home.AdminSock())
-	fmt.Printf("version=%v\n", st.Version)
-	fmt.Printf("node_id=%v\n", st.NodeID)
-	fmt.Printf("node_pk=%v\n", st.NodePK)
-	fmt.Printf("dht_listen=%v\n", st.DHTListen)
-	fmt.Printf("advertise=%v\n", st.Advertise)
-	fmt.Printf("peers=%v\n", st.Peers)
-	fmt.Printf("store_envs=%v\n", st.StoreEnvs)
-	fmt.Printf("history_envs=%v\n", st.HistoryEnvs)
-	fmt.Printf("relay_mode=%v\n", st.RelayMode)
-	fmt.Printf("turn_allocs=%v\n", st.TURNAllocs)
-	fmt.Printf("network_claims=%v\n", st.NetworkClaims)
 
-	// Dig-free self-check: resolve the user's first keychain alias apex.
-	if aliases := keychainAliases(); len(aliases) > 0 {
-		a := aliases[0]
-		r, err := c.Resolve(ctx, a)
-		switch {
-		case err != nil:
-			fmt.Printf("self-check: alias %s: error: %v\n", a, err)
-		case r == nil || !r.Found:
-			fmt.Printf("self-check: alias %s: not found (did `register` finish?)\n", a)
-		default:
-			ip := firstAdminAIP(r.RRset)
-			fmt.Printf("self-check: alias %s: found, sequence=%v apex_a=%s\n", a, r.Sequence, ip)
+	// Plain-language summary first: is it working, and whose names answer.
+	peers := int(st.Peers)
+	net := fmt.Sprintf("%d peers", peers)
+	if peers == 0 {
+		net = "no peers yet (offline island)"
+	}
+	fmt.Printf("daemon: running · version %v · %s\n", st.Version, net)
+
+	aliases := keychainAliases()
+	switch {
+	case len(aliases) == 0:
+		fmt.Printf("names: none yet — claim one with: %s register <name>\n", ProgName)
+	default:
+		for _, a := range aliases {
+			r, err := c.Resolve(ctx, a)
+			switch {
+			case err != nil:
+				fmt.Printf("%s → error: %v\n", a, err)
+			case r == nil || !r.Found:
+				fmt.Printf("%s → not published yet (did `register` finish?)\n", a)
+			default:
+				ip := firstAdminAIP(r.RRset)
+				if ip == "" {
+					ip = "no A record"
+				}
+				fmt.Printf("%s → %s · healthy\n", a, ip)
+			}
 		}
-	} else {
-		fmt.Println("self-check: no keychain aliases yet — register one with `register -alias <you>`")
+		if hasRecoveryKeys(aliases[0]) {
+			fmt.Printf("backup: recovery keys exist — run `%s backup` and store the file off this machine\n", ProgName)
+		}
+	}
+
+	// Raw fields for operators (and doctor debugging).
+	if *verbose {
+		fmt.Printf("admin_socket=%s\n", home.AdminSock())
+		fmt.Printf("node_id=%v\n", st.NodeID)
+		fmt.Printf("node_pk=%v\n", st.NodePK)
+		fmt.Printf("dht_listen=%v\n", st.DHTListen)
+		fmt.Printf("advertise=%v\n", st.Advertise)
+		fmt.Printf("store_envs=%v\n", st.StoreEnvs)
+		fmt.Printf("history_envs=%v\n", st.HistoryEnvs)
+		fmt.Printf("relay_mode=%v\n", st.RelayMode)
+		fmt.Printf("turn_allocs=%v\n", st.TURNAllocs)
+		fmt.Printf("network_claims=%v\n", st.NetworkClaims)
 	}
 	return nil
+}
+
+// hasRecoveryKeys reports whether alias' default register recovery keyfiles
+// exist in the keychain — the "a backup is possible (and wise)" signal.
+func hasRecoveryKeys(alias string) bool {
+	_, err := os.Stat(filepath.Join(home.KeysDir(), alias+".rec1.key"))
+	return err == nil
 }
 
 // ---------------------------------------------------------------------------
@@ -90,12 +127,17 @@ func cmdStatus(args []string) error {
 
 func cmdDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fix := fs.Bool("fix", false, "repair what doctor would flag: start the daemon if down (runs `setup`, idempotent), wire the OS resolver if unwired")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 0 {
 		return usageErr("doctor takes no positional arguments")
 	}
+	if *fix {
+		runDoctorFixes()
+	}
+
 	failed := 0
 	check := func(ok bool, format string, args ...any) {
 		mark := "✔"
@@ -152,8 +194,8 @@ func cmdDoctor(args []string) error {
 		check(peers > 0, "DHT peers connected (%d)", peers)
 	}
 
-	// 6. seeds.conf parses + the first seed answers a dial.
-	check(checkSeeds(), "seeds.conf parses and the first seed is dialable")
+	// 6. seeds.conf parses.
+	check(checkSeeds(), "seeds.conf parses and has at least one seed")
 
 	// 7. OS resolver (warn-only).
 	if osResolverPointsAtDaemon() {
@@ -167,6 +209,42 @@ func cmdDoctor(args []string) error {
 	}
 	fmt.Println("doctor: all checks passed")
 	return nil
+}
+
+// runDoctorFixes is doctor --fix: repair the two things a user can't fix
+// wrong — the daemon not running (re-run setup: idempotent, ends with
+// systemctl enable --now) and the OS resolver not pointing at the daemon
+// (the same wiring setup performs, interactive sudo on a TTY). Everything
+// else doctor checks is network state only time/peers can fix.
+func runDoctorFixes() {
+	c := maybeAdmin()
+	if c == nil || !sysStatExists(home.ConfPath()) || !checkSeeds() {
+		fmt.Println("fix: daemon down or install incomplete — running `freens setup` (safe to re-run)")
+		if err := setupInstall(); err != nil {
+			fmt.Printf("fix: setup failed: %v\n", err)
+		}
+		if waitForAdminSocket() {
+			fmt.Println("fix: ✔ daemon is answering on the admin socket")
+		} else {
+			fmt.Println("fix: ✘ daemon still not answering — start it manually: systemctl --user start freens.service")
+		}
+	}
+	if !osResolverPointsAtDaemon() {
+		fmt.Println("fix: OS resolver not pointing at the daemon — wiring it now")
+		fmt.Println(wireOSResolver())
+	}
+}
+
+// waitForAdminSocket polls for a daemon answer (used after a service
+// start): true once maybeAdmin() returns a client.
+func waitForAdminSocket() bool {
+	for i := 0; i < doctorFixWaitAttempts; i++ {
+		if maybeAdmin() != nil {
+			return true
+		}
+		time.Sleep(doctorFixWaitSleep)
+	}
+	return maybeAdmin() != nil
 }
 
 // checkDNSFallback resolves a known upstream name through the daemon's DNS

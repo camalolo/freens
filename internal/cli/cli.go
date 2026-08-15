@@ -19,8 +19,13 @@
 //	register                     Claim an alias end-to-end (spec 7): key -> PoW -> W witnesses
 //	                             -> TLD record published at K_tld+K_claim (recovery on by default).
 //	setup                        Install: config, seeds, systemd --user service, OS resolver wiring.
-//	status                       Pretty-print the running daemon's admin status.
-//	doctor                       Health checks (admin socket, DNS path, peers, seeds, OS resolver).
+//	start                        The one-command onboarding: setup (if needed) -> register ->
+//	                             plain-language status. Prompts for the name on a TTY.
+//	backup                       Bundle every keychain key into one dated file (RESTORE.txt
+//	                             inside); -restore unpacks it back into the keychain.
+//	status                       Plain-language health (daemon, name -> IP); -v adds raw fields.
+//	doctor                       Health checks (admin socket, DNS path, peers, seeds, OS
+//	                             resolver); --fix repairs daemon/resolver-wiring first.
 //	demo                         Self-contained end-to-end showcase (the headline demo).
 //
 // Exit codes: 0 success, 1 usage/error, 2 crypto/validation failure.
@@ -41,6 +46,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/laurent/freens/internal/crypto"
 )
@@ -73,6 +80,8 @@ var dispatch = map[string]func([]string) error{
 	"verify-recovery": cmdVerifyRecovery,
 	"register":        cmdRegister,
 	"setup":           cmdSetup,
+	"start":           cmdStart,
+	"backup":          cmdBackup,
 	"status":          cmdStatus,
 	"doctor":          cmdDoctor,
 	"demo":            cmdDemo,
@@ -84,7 +93,7 @@ var dispatch = map[string]func([]string) error{
 // crypto/validation), never panicking on bad input.
 func Main(args []string) int {
 	if len(args) == 0 {
-		usage(os.Stderr)
+		quickstart(os.Stderr)
 		return 1
 	}
 	sub, rest := args[0], args[1:]
@@ -96,7 +105,11 @@ func Main(args []string) int {
 	fn, ok := dispatch[sub]
 	if !ok {
 		fmt.Fprintf(os.Stderr, "%s: unknown subcommand %q\n", ProgName, sub)
-		usage(os.Stderr)
+		if hits := suggestSubcommands(sub); len(hits) > 0 {
+			fmt.Fprintf(os.Stderr, "did you mean: %s\n", strings.Join(hits, ", "))
+		}
+		fmt.Fprintln(os.Stderr)
+		quickstart(os.Stderr)
 		return 1
 	}
 	err := fn(rest)
@@ -127,6 +140,78 @@ func cmdVersion(args []string) error {
 	return nil
 }
 
+// quickstart writes the first-timer card: the plain-language path a
+// non-technical user needs, not the full subcommand table. Bare `freens`
+// and unknown verbs print this; `freens help` prints everything.
+func quickstart(w io.Writer) {
+	fmt.Fprintln(w, "freens — free names: a name that is yours by key, no registrar")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "one command does everything (install + claim your name):")
+	fmt.Fprintln(w, "  freens start <name>    e.g.  freens start alice")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "or step by step:")
+	fmt.Fprintln(w, "  freens setup            one-time install on this machine")
+	fmt.Fprintln(w, "  freens register <name>  claim your name, e.g.  freens register alice")
+	fmt.Fprintln(w, "  freens name www.<name>  add a name under it, e.g.  freens name www.alice")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "protect your name:  freens backup     (copy the file it makes off this machine)")
+	fmt.Fprintln(w, "is it working?  freens status    something odd?  freens doctor --fix")
+	fmt.Fprintln(w, "all commands:   freens help")
+}
+
+// suggestSubcommands returns dispatch entries matching want by prefix or
+// within edit distance 2 — the typo net under "unknown subcommand". Short
+// inputs (a prefix like "na") are prefix-only: distance matching would
+// suggest half the table.
+func suggestSubcommands(want string) []string {
+	lw := strings.ToLower(strings.TrimLeft(want, "-"))
+	if lw == "" {
+		return nil
+	}
+	var out []string
+	for name := range dispatch {
+		if strings.HasPrefix(name, lw) {
+			out = append(out, name)
+			continue
+		}
+		if len(lw) >= 4 && editDistance(name, lw) <= 2 {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// editDistance is the classic Levenshtein DP over lowercase inputs.
+func editDistance(a, b string) int {
+	a, b = strings.ToLower(a), strings.ToLower(b)
+	d := make([][]int, len(a)+1)
+	for i := range d {
+		d[i] = make([]int, len(b)+1)
+		d[i][0] = i
+	}
+	for j := 1; j <= len(b); j++ {
+		d[0][j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			m := d[i-1][j] + 1
+			if v := d[i][j-1] + 1; v < m {
+				m = v
+			}
+			if v := d[i-1][j-1] + cost; v < m {
+				m = v
+			}
+			d[i][j] = m
+		}
+	}
+	return d[len(a)][len(b)]
+}
+
 // usageTo writes the subcommand help to any writer (usage(os.Stderr) is the
 // process-level form).
 func usageTo(w io.Writer) { usage(w) }
@@ -134,11 +219,16 @@ func usageTo(w io.Writer) { usage(w) }
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage:", ProgName, "<subcommand> [flags]")
 	fmt.Fprintln(w, "subcommands:")
+	fmt.Fprintln(w, "  start <name>           the one-command onboarding: install if needed, claim <name>, show status")
+	fmt.Fprintln(w, "                         (prompts for the name when interactive; safe to re-run)")
 	fmt.Fprintln(w, "  setup                  install: config, seeds, systemd --user service, OS resolver wiring (--uninstall reverses)")
-	fmt.Fprintln(w, "  status                 daemon status via the admin socket (+ your first alias self-check)")
+	fmt.Fprintln(w, "  status                 plain-language health: daemon + name -> IP (-v adds raw daemon fields)")
 	fmt.Fprintln(w, "  doctor                 health checks: admin socket, DNS path, aliases, peers, seeds, OS resolver")
-	fmt.Fprintln(w, "  register               claim an alias end-to-end (spec 7): key -> PoW -> W live witness")
+	fmt.Fprintln(w, "                         (--fix repairs: starts the daemon, wires the OS resolver)")
+	fmt.Fprintln(w, "  register <alias>       claim an alias end-to-end (spec 7): key -> PoW -> W live witness")
 	fmt.Fprintln(w, "                         co-signatures -> TLD record published at K_tld+K_claim (2-of-3 recovery default)")
+	fmt.Fprintln(w, "  backup                 bundle every key of your name(s) into one dated file (-restore unpacks it)")
+	fmt.Fprintln(w, "                         — the \"never lose your name\" button; store the file off-machine")
 	fmt.Fprintln(w, "  name                   add/update <label>.<alias> (owner key from the keychain; IP inherits the apex A)")
 	fmt.Fprintln(w, "  gen-key                generate an Ed25519 keypair (-out writes a 0600 keyfile)")
 	fmt.Fprintln(w, "  mine-claim             mine an AliasClaim PoW")

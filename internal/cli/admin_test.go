@@ -47,7 +47,7 @@ func startStubAdmin(t *testing.T, sock string, resolve map[string]string) *stubA
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"running":true,"version":"stub-1","node_id":"aa","node_pk":"bb","dht_listen":"0.0.0.0:15353","advertise":"","peers":3,"store_envs":1,"history_envs":0,"relay_mode":false,"turn_allocs":0,"network_claims":0}`)
+		fmt.Fprint(w, `{"running":true,"version":"stub-1","node_id":"aa","node_pk":"bb","dht_listen":"0.0.0.0:15353","advertise":"","peers":3,"store_envs":1,"history_envs":0,"relay_mode":false,"turn_allocs":0,"network_claims":true}`)
 	})
 	mux.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")

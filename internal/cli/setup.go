@@ -60,10 +60,42 @@ var sysRun = func(name string, args ...string) error {
 }
 
 // sysSudo runs a command via NON-INTERACTIVE sudo (sudo -n): it either
-// succeeds without a password prompt or fails fast — the callers print the
-// manual commands on failure.
+// succeeds without a password prompt or fails fast — the callers fall back
+// to sudoRun (interactive) / printManualCommands.
 var sysSudo = func(args ...string) error {
 	return sysRun("sudo", append([]string{"-n"}, args...)...)
+}
+
+// sysSudoInteractive runs sudo WITH terminal IO so it can ask for the
+// admin password itself — used by sudoRun when sudo -n fails on a TTY.
+// Swapped out by tests.
+var sysSudoInteractive = func(args ...string) error {
+	c := exec.Command("sudo", args...)
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return c.Run()
+}
+
+// sysIsTerminal reports whether stdin is an interactive terminal — the gate
+// for password prompts (never prompt into a pipe/script). Swapped by tests.
+var sysIsTerminal = func() bool {
+	st, err := os.Stdin.Stat()
+	return err == nil && st.Mode()&os.ModeCharDevice != 0
+}
+
+// sudoRun is the fix-it path for privileged steps: passwordless sudo
+// first (cached credentials), and when that fails on an interactive
+// terminal, ONE real sudo that asks for the admin password itself. Only
+// when both fail does the caller print the manual commands.
+func sudoRun(why string, args ...string) error {
+	err := sysSudo(args...)
+	if err == nil {
+		return nil
+	}
+	if sysIsTerminal() {
+		fmt.Printf("%s — this needs your admin password (sudo):\n", why)
+		return sysSudoInteractive(args...)
+	}
+	return err
 }
 
 // sysStatExists reports whether path exists (any error = no).
@@ -89,13 +121,13 @@ var sysWriteEtc = func(path string, content []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := sysSudo("mkdir", "-p", filepath.Dir(path)); err != nil {
+	if err := sudoRun("wiring the OS resolver", "mkdir", "-p", filepath.Dir(path)); err != nil {
 		return err
 	}
-	if err := sysSudo("cp", tmpName, path); err != nil {
+	if err := sudoRun("wiring the OS resolver", "cp", tmpName, path); err != nil {
 		return err
 	}
-	return sysSudo("chmod", fmt.Sprintf("%04o", uint32(mode)), path)
+	return sudoRun("wiring the OS resolver", "chmod", fmt.Sprintf("%04o", uint32(mode)), path)
 }
 
 // sysReadFile is os.ReadFile as a var for tests.
@@ -193,8 +225,9 @@ func setupInstall() error {
 		fmt.Printf("    %s\n", w)
 	}
 	fmt.Println(resolverNote)
-	fmt.Printf("next: `freens register -alias <you>` to claim a namespace, then `freens name www.<you>`\n")
-	fmt.Printf("check health any time with `freens doctor`\n")
+	fmt.Printf("next: `freens register <you>` to claim a namespace, then `freens name www.<you>`\n")
+	fmt.Printf("      (or let `freens start <you>` do all of it)\n")
+	fmt.Printf("check health any time with `freens doctor`; protect your keys with `freens backup`\n")
 	return nil
 }
 
@@ -211,9 +244,9 @@ func wireOSResolver() string {
 				"sudo tee " + pathResolvedDrop + " >/dev/null <<'EOF'\n[Resolve]\nDNS=" + daemonDNSAddr + "\nDomains=~.\nEOF",
 				"sudo systemctl restart systemd-resolved",
 			})
-			return "OS resolver: MANUAL step printed above (sudo needed) — systemd-resolved drop-in"
+			return "OS resolver: MANUAL step printed above (sudo failed) — systemd-resolved drop-in"
 		}
-		if err := sysSudo("systemctl", "restart", "systemd-resolved"); err != nil {
+		if err := sudoRun("restarting systemd-resolved", "systemctl", "restart", "systemd-resolved"); err != nil {
 			printManualCommands("restart systemd-resolved", []string{"sudo systemctl restart systemd-resolved"})
 		}
 		return "OS resolver: systemd-resolved -> " + daemonDNSAddr + " (drop-in " + pathResolvedDrop + ")"
@@ -224,14 +257,14 @@ func wireOSResolver() string {
 	}
 	backup := "sudo cp " + pathResolvConf + " " + pathResolvBackup
 	prepend := "printf 'nameserver " + daemonDNSAddr + "\\n' | sudo tee /tmp/freens-resolv.new >/dev/null && cat " + pathResolvConf + " | sudo tee -a /tmp/freens-resolv.new >/dev/null && sudo cp /tmp/freens-resolv.new " + pathResolvConf
-	if err := sysSudo("cp", pathResolvConf, pathResolvBackup); err != nil {
+	if err := sudoRun("backing up "+pathResolvConf, "cp", pathResolvConf, pathResolvBackup); err != nil {
 		printManualCommands("resolv.conf backup + prepend", []string{backup, prepend})
-		return "OS resolver: MANUAL step printed above (sudo needed) — resolv.conf nameserver " + daemonDNSAddr
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + daemonDNSAddr
 	}
 	newResolv := "nameserver " + daemonDNSAddr + "\n" + string(cur)
 	if err := sysWriteEtc(pathResolvConf, []byte(newResolv), 0o644); err != nil {
 		printManualCommands("resolv.conf prepend", []string{prepend})
-		return "OS resolver: MANUAL step printed above (sudo needed) — resolv.conf nameserver " + daemonDNSAddr
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + daemonDNSAddr
 	}
 	return "OS resolver: " + pathResolvConf + " prepended with nameserver " + daemonDNSAddr + " (backup: " + pathResolvBackup + ")"
 }
@@ -274,14 +307,14 @@ func setupUninstall() error {
 
 	// systemd-resolved drop-in.
 	if sysStatExists(pathResolvedDrop) {
-		if err := sysSudo("rm", "-f", pathResolvedDrop); err != nil {
+		if err := sudoRun("removing the resolved drop-in", "rm", "-f", pathResolvedDrop); err != nil {
 			printManualCommands("remove resolved drop-in", []string{
 				"sudo rm -f " + pathResolvedDrop,
 				"sudo systemctl restart systemd-resolved",
 			})
 		} else {
 			fmt.Printf("removed: %s\n", pathResolvedDrop)
-			if err := sysSudo("systemctl", "restart", "systemd-resolved"); err != nil {
+			if err := sudoRun("restarting systemd-resolved", "systemctl", "restart", "systemd-resolved"); err != nil {
 				printManualCommands("restart systemd-resolved", []string{"sudo systemctl restart systemd-resolved"})
 			}
 		}
@@ -289,14 +322,14 @@ func setupUninstall() error {
 
 	// resolv.conf restore.
 	if sysStatExists(pathResolvBackup) {
-		if err := sysSudo("cp", pathResolvBackup, pathResolvConf); err != nil {
+		if err := sudoRun("restoring "+pathResolvConf, "cp", pathResolvBackup, pathResolvConf); err != nil {
 			printManualCommands("restore resolv.conf", []string{
 				"sudo cp " + pathResolvBackup + " " + pathResolvConf,
 				"sudo rm -f " + pathResolvBackup,
 			})
 		} else {
 			fmt.Printf("restored: %s (from %s)\n", pathResolvConf, pathResolvBackup)
-			if err := sysSudo("rm", "-f", pathResolvBackup); err != nil {
+			if err := sudoRun("removing the resolv.conf backup", "rm", "-f", pathResolvBackup); err != nil {
 				printManualCommands("remove resolv.conf backup", []string{"sudo rm -f " + pathResolvBackup})
 			}
 		}

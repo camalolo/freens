@@ -1,14 +1,16 @@
 # freens — Free Namespace (Go reference implementation)
 
-> **New here?** Two commands and you are on the network:
+> **New here?** One command does everything (install + claim your name):
 > ```bash
-> freens setup            # install: config, keys, seeds, systemd service, OS resolver
-> freens register myname  # claim your namespace (key → PoW → W live witnesses → publish)
-> freens name www.myname  # add names; `freens doctor` checks everything
+> freens start alice        # install if needed, claim "alice", show status
+> freens name www.alice     # add names under it
 > ```
-> A single binary; the daemon does the networking (UPnP/STUN/TURN/seeds), the
-> CLI talks to it over a local admin socket — no peer lists, no hex, no unit
-> files. Every low-level subcommand remains available (`freens <verb> -h`).
+> `freens backup` copies your keys somewhere safe (do it!), `freens status`
+> is the plain-language health check, and `freens doctor --fix` repairs a
+> broken install. A single binary; the daemon does the networking
+> (UPnP/STUN/TURN/seeds), the CLI talks to it over a local admin socket —
+> no peer lists, no hex, no unit files. Every low-level subcommand remains
+> available (`freens <verb> -h`).
 
 [![CI](https://github.com/camalolo/freens/actions/workflows/ci.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/ci.yml)
 [![Nightly fuzz](https://github.com/camalolo/freens/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/fuzz.yml)
@@ -30,7 +32,7 @@ resolve collisions on human-readable aliases.
 
 ## Status
 
-Implemented and fully tested (578 test functions + 9 fuzz targets, `go test ./...` green,
+Implemented and fully tested (454 test functions + 9 fuzz targets, `go test ./...` green,
 `go vet` clean, `-race` clean):
 
 | Package | Implements | Spec |
@@ -42,8 +44,9 @@ Implemented and fully tested (578 test functions + 9 fuzz targets, `go test ./..
 | `internal/claims` | `AliasClaim`, witness attestations, PoW, deterministic §7.4 ordering | §7 |
 | `internal/dht` | XOR metric, 256 k-bucket routing table, rotating HMAC write tokens, envelope store (winner rule + LRU/grace eviction) | §6 |
 | `internal/resolver` | §9.3 INI config parser, per-alias routing, live UDP+TCP DNS server via `miekg/dns`, DNS fallback | §9 |
-| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`, `-upnp` (router-requested port mapping, default on), `-stun`, `-turn`, `-turn-relay`, `-dns`, `-metrics`, `-peers-file` + SIGHUP reload): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
-| `cmd/freens-cli` | operator CLI; every seed flag accepts hex or `@keyfile` | `register` (one-command alias claim: key → PoW → W live witnesses → publish), `gen-key` (`-out` writes a 0600 keyfile), `mine-claim`, `make-record`, `publish` (incl. `-evidence` for §8.4 recovery transport), `resolve`, `get`, `transfer`/`rotate`/`recover`/`verify-recovery`, `demo` | §6.4, §7, §8 |
+| `internal/cli` | the user-facing CLI shared by both front-ends: `start` (one-command onboarding: setup → register → summary), `setup` (config, seeds, systemd --user service, OS resolver wiring, interactive sudo), `register <alias>` (positional or `-alias`; cooldown-safe retries), `name`, `status` (plain-language; `-v` raw), `doctor --fix`, `backup`/`-restore` (key bundle + RESTORE.txt), plus the full operator verb set (`gen-key`/`mine-claim`/`make-record`/`publish`/`resolve`/`get`/`transfer`/`rotate`/`recover`/`verify-recovery`/`demo`; every seed flag accepts hex or `@keyfile`); admin-socket transport with standalone `-peers` fallback; first-timer quickstart + typo suggestions | §6.4, §7, §8, §9.4 |
+| `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`, `-upnp` (router-requested port mapping, default on), `-stun`, `-turn`, `-turn-relay`, `-dns`, `-metrics`, `-peers-file` + SIGHUP reload): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7); as the single binary it also fronts every `internal/cli` verb (`freens <verb>`) | §6, §9.1 |
+| `cmd/freens-cli` | compat shim over `internal/cli` (same verbs, `freens-cli` progname) | §6.4, §7, §8 |
 
 Multi-node operation: with `-dht <addr>` the daemon joins the Kademlia
 network — records seeded locally are served to (and fetched from) peers via
@@ -87,8 +90,8 @@ freens/
 ├── specifications.md              # the protocol spec (normative)
 ├── go.mod / go.sum
 ├── cmd/
-│   ├── freens/main.go             # DNS resolver daemon
-│   └── freens-cli/main.go         # gen-key / mine-claim / make-record / publish / resolve / get / demo
+│   ├── freens/main.go             # single binary: DNS resolver daemon + CLI front
+│   └── freens-cli/main.go         # compat shim over internal/cli
 ├── internal/
 │   ├── constants/                 # Appendix A
 │   ├── naming/                    # §3.2/§3.3 aliases, wire_name, DHT keys
@@ -97,6 +100,14 @@ freens/
 │   ├── claims/                    # §7 AliasClaim, witnesses, ordering
 │   ├── dht/                       # §6 ids / tokens / routing / store
 │   ├── resolver/                  # §9 config + miekg/dns server + routing
+│   ├── admin/                     # local admin socket (daemon <-> CLI)
+│   ├── home/                      # ~/.freens state dir: keys, seeds, peerbook
+│   ├── cli/                       # every user-facing verb: start/setup/register/
+│   │                              # name/status/doctor/backup + operator verbs
+│   ├── metrics/                   # /metrics + /healthz
+│   ├── stun/                      # RFC 5389 reflexive-address discovery
+│   ├── turn/                      # RFC 8656 relay client + server
+│   ├── upnp/                      # IGD port mapping (default-on NAT rung)
 │   └── integration/               # end-to-end + golden-vector tests
 ├── contrib/                       # §9.1/§9.4 OS-integration recipes (port-53 redirect, resolv.conf, systemd)
 └── archive/python-v0.1/           # the earlier Python prototype (archived)
@@ -105,7 +116,7 @@ freens/
 ## Running the tests
 
 ```bash
-go test ./...                      # all 578 test functions
+go test ./...                      # all 454 test functions
 go test -race ./...                # race-clean
 go test -v ./internal/integration/ # the end-to-end flow + golden vectors
 ```
@@ -118,6 +129,11 @@ the spec (and the archived Python reference, since both are spec-derived).
 ## Trying it
 
 ```bash
+# As an end user (single binary; install + daemon + claim + status):
+freens start alice        # or step by step: setup, register, name (see the
+                          # top of this README); freens doctor --fix repairs
+                          # a broken install, freens backup saves your keys
+
 # Self-contained end-to-end demo (no daemon needed):
 go run ./cmd/freens-cli demo
 

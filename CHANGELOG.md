@@ -1,6 +1,20 @@
 # Changelog
 
 ## unreleased
+- **Non-technical UX pass** — `freens start <name>` is the whole onboarding
+  as one verb (setup if needed → register → plain summary; prompts for the
+  name interactively; idempotent; positional `register <alias>` accepted
+  too). Bare `freens` now prints a first-timer card instead of the full
+  subcommand dump, and typos get "did you mean" suggestions. `setup`
+  prompts for the admin password itself when sudo needs one on a terminal
+  (never in scripts; manual commands remain the no-TTY fallback).
+  `doctor --fix` repairs what it diagnoses: missing daemon → idempotent
+  setup + wait, unwired OS resolver → the setup wiring. `status` speaks
+  plain language (`alice → 203.0.113.42 · healthy`; raw fields behind
+  `-v`). `freens backup` bundles owner + recovery keys (+ claim state)
+  into one dated file with a RESTORE.txt inside; `backup -restore`
+  unpacks it (bare filenames only — hostile archives are rejected, no
+  clobbering without -force).
 - **Single binary + zero-config UX** — `freens setup` (state dir, config,
   node key, seeds.conf, systemd --user service, OS resolver wiring via
   systemd-resolved drop-in or resolv.conf, `--uninstall`), `freens register`

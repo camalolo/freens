@@ -90,7 +90,11 @@ func main() {
 	// Single-binary front: `freens <verb>` (register, setup, name, doctor,
 	// gen-key, publish, … — the full internal/cli dispatch) runs the CLI;
 	// `freens daemon [flags…]` or bare flags run the resolver daemon
-	// (bare-flag form is the historical one and stays).
+	// (bare-flag form is the historical one and stays). A BARE `freens`
+	// with no arguments at all prints the first-timer quickstart instead
+	// of helplessly trying privileged port 53 (the daemon path stays
+	// reachable via the explicit `daemon` verb, which the systemd unit
+	// uses).
 	if len(os.Args) > 1 {
 		sub := os.Args[1]
 		if sub != "daemon" && sub != "version" && sub != "-version" && sub != "--version" &&
@@ -99,6 +103,10 @@ func main() {
 			cli.Version = version
 			os.Exit(cli.Main(os.Args[1:]))
 		}
+	} else {
+		fmt.Println("to run the resolver daemon itself: freens daemon   (see contrib/ for OS integration)")
+		fmt.Println()
+		os.Exit(cli.Main(nil))
 	}
 	if err := run(daemonArgs(os.Args[1:])); err != nil {
 		fmt.Fprintf(os.Stderr, "freens: %v\n", err)
