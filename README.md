@@ -11,6 +11,14 @@
 > (UPnP/STUN/TURN/seeds), the CLI talks to it over a local admin socket —
 > no peer lists, no hex, no unit files. Every low-level subcommand remains
 > available (`freens <verb> -h`).
+>
+> **What to expect (friends edition):** Linux works best; macOS installs
+> with a manual step or two. Registering a name needs the network to have
+> ~5 live community nodes — until then you will see an honest "network too
+> small" error (help fix it: [run a node](contrib/seed-node.md), it's one
+> cheap VPS or a Raspberry Pi). Keep your daemon running while you want
+> your names alive (records renew automatically while it runs), and back
+> up your keys the day you register.
 
 [![CI](https://github.com/camalolo/freens/actions/workflows/ci.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/ci.yml)
 [![Nightly fuzz](https://github.com/camalolo/freens/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/fuzz.yml)

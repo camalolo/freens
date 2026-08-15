@@ -16,6 +16,10 @@ for the daemon itself).
 Nothing here is executed by the build or tests; these are contributed
 examples — read before running.
 
+> Want to help the network itself, not just your machine? **[Running a
+> community node](seed-node.md)** is the ~5-minute version (VPS or
+> Raspberry Pi; you provide the chairs, the protocol provides the table).
+
 ## 1. High port + port-53 redirect (recommended)
 
 Run the daemon unprivileged on a high port, then redirect the host's outgoing

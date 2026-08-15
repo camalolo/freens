@@ -1,6 +1,16 @@
 # Changelog
 
-## unreleased
+## v0.2.0 — the friends release
+Everything below plus the "chairs" kit: `contrib/seed-node.md` (run a
+community node on any Linux box in ~5 minutes — a system service, public
+DHT listener, persist, and the one-line seed exchange) and a
+friends'-eye "what to expect" note in the README (network needs ~5 live
+nodes; keep the daemon running for renewals; back up keys on day one).
+First release shipping the one-command UX: `freens start`, `backup`,
+`doctor --fix`, plain-language `status`, interactive sudo, cooldown-safe
+witness retries, configured-port awareness.
+
+## v0.1.x (unreleased-to-v0.2.0)
 - **register: cooldown-safe witness retries (fix found live)** — the daemon
   transport passed a fresh timestamp to the witness RPC, so every retry of
   a REUSED claim minted a new prefix hash and §7.3's witness cooldown
