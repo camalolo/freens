@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.6 — §7.4 anti-forgery: claim timestamps are bounded
+- **A forged "ancient" claim could permanently out-order every honest
+  claim** (§7.4 orders earliest-timestamp-first) and steal an alias once
+  cooldowns lapsed — without breaking a single key. Witnesses now refuse
+  claims dated outside [now − WITNESS_COOLDOWN, now + SKEW_TOLERANCE]:
+  the window that covers both mining-time signing and register's
+  cooldown-safe retry re-presentation. The resolver additionally drops
+  future-dated claims at verification (defense in depth). Found
+  auditing what becomes of a revoked alias.
+
 ## v0.3.5 — tombstones re-check fast (un-revoke unstalled, found live)
 - **A §9.5 tombstone's cache window is now 60 s, not 24 h.** The generic
   freshness rule treated a revoked record's (by-definition empty) RRset

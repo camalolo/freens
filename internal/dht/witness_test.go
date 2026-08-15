@@ -121,7 +121,7 @@ func TestWitnessCooldownRefusesDifferentClaim(t *testing.T) {
 	defer b.Close()
 
 	const alias = "coolfoo"
-	id1 := newWitnessIdentity(t, 1_000_000)
+	id1 := newWitnessIdentity(t, uint64(time.Now().Unix()))
 	addr, err := b.LocalAddr()
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +140,7 @@ func TestWitnessCooldownRefusesDifferentClaim(t *testing.T) {
 
 	// A DIFFERENT claim (different claimant ⇒ different prefix hash) for the
 	// SAME alias inside the cooldown: refused with error 301 "cooldown".
-	id2 := newWitnessIdentity(t, 1_000_000)
+	id2 := newWitnessIdentity(t, uint64(time.Now().Unix()))
 	resp, err = a.sendQuery(ctx, addr, b.ID(), "witness", witnessArgs(t, alias, id2))
 	if err != nil {
 		t.Fatalf("witness #2 (competing claim): %v", err)
@@ -180,7 +180,7 @@ func TestWitnessBadPrefixHashRejected(t *testing.T) {
 	defer b.Close()
 
 	const alias = "badhash"
-	id := newWitnessIdentity(t, 2_000_000)
+	id := newWitnessIdentity(t, uint64(time.Now().Unix()))
 	args := witnessArgs(t, alias, id)
 	forged := make([]byte, constants.SHA256Len)
 	for i := range forged {
@@ -204,7 +204,7 @@ func TestWitnessBadPrefixHashRejected(t *testing.T) {
 	// And nothing was signed: the alias has no cooldown entry, so a subsequent
 	// DIFFERENT claim for the same alias must still be accepted (the refused
 	// request did not consume the bucket).
-	idOther := newWitnessIdentity(t, 2_000_000)
+	idOther := newWitnessIdentity(t, uint64(time.Now().Unix()))
 	resp, err = a.sendQuery(ctx, addr, b.ID(), "witness", witnessArgs(t, alias, idOther))
 	if err != nil {
 		t.Fatalf("witness after refusal: %v", err)
@@ -226,7 +226,7 @@ func TestWitnessAttestationContextBinding(t *testing.T) {
 	defer b.Close()
 
 	const alias = "ctxfoo"
-	id := newWitnessIdentity(t, 3_000_000)
+	id := newWitnessIdentity(t, uint64(time.Now().Unix()))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 

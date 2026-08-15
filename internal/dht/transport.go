@@ -1300,6 +1300,24 @@ func (n *Node) hWitness(m *wire.Message, _ *net.UDPAddr) *wire.Message {
 		return n.errResp(m, 305, "bad claim prefix hash")
 	}
 
+	// Claim-timestamp sanity (the §7.4 anti-forgery gate, found auditing
+	// what becomes of a revoked alias): §7.4 orders competing claims
+	// EARLIEST-timestamp-first, so a claim forged with ts≈0 would
+	// permanently out-order every honest claim once its holder's cooldown
+	// lapses — stealing the alias without breaking any key. A legitimate
+	// claim is witnessed at mining time (|ts - now| ≈ seconds) or
+	// re-presented during register's cooldown-safe retries (ts up to
+	// WITNESS_COOLDOWN old). Anything outside [now - cooldown, now + skew]
+	// is refused: not future-dated beyond the live-race skew window, not
+	// older than the cooldown that legitimizes re-presentation.
+	nowTS := n.now()
+	if int64(ts) > nowTS+int64(constants.SkewTolerance) {
+		return n.errResp(m, 305, "claim ts in the future")
+	}
+	if nowTS-int64(ts) > int64(constants.WitnessCooldown) {
+		return n.errResp(m, 305, "claim ts too old")
+	}
+
 	// §7.3 WITNESS_COOLDOWN: one (re-signable) claim per alias per window.
 	now := n.now()
 	n.witnessMu.Lock()

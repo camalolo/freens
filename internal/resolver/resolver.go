@@ -653,6 +653,13 @@ func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64, orac
 	if aerr != nil || claim.Alias != aliasN {
 		return nil
 	}
+	// (3b) claim-timestamp sanity (§7.4 anti-forgery, defense in depth):
+	// ordering is earliest-timestamp-first, so a future-dated claim could
+	// outrank every honest one forever. Witnesses refuse such claims at
+	// signing time; the resolver refuses them at verification time too.
+	if int64(claim.Timestamp) > now+int64(constants.SkewTolerance) {
+		return nil
+	}
 	// (4) claimant binding: the carrier is the claimant's own TLD record.
 	if !bytes.Equal(env.Signer, claim.ClaimantPK) {
 		return nil
