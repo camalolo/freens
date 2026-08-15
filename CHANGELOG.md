@@ -1,6 +1,19 @@
 # Changelog
 
 ## unreleased
+- **register: cooldown-safe witness retries (fix found live)** — the daemon
+  transport passed a fresh timestamp to the witness RPC, so every retry of
+  a REUSED claim minted a new prefix hash and §7.3's witness cooldown
+  refused exactly the nodes that had already helped (observed signer counts
+  degrading 4→2→0). Both transports now present `claim.Timestamp`. On top,
+  witness collection retries on a cold routing table (3 attempts, 10 s
+  pause; each walk warms the table) instead of failing "network too small"
+  on a just-started daemon.
+- **doctor/setup honor a configured DNS port** — the DNS check, the OS
+  resolver wiring, and the uninstall cleanup used the hardcoded
+  127.0.0.1:5300; a user-edited `[listen] udp` port produced false ✔s and
+  wired the OS at a dead port. All paths now read the configured address
+  (fallback to the default when absent/malformed).
 - **Module path matches the repo** — `github.com/camalolo/freens`
   (was `github.com/laurent/freens`; import-path sweep + import re-sorting,
   no behavior change). `go install github.com/camalolo/freens/cmd/freens@…`

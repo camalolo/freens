@@ -236,12 +236,15 @@ func setupInstall() error {
 // nameserver line in /etc/resolv.conf (backup alongside). Returns the
 // human-readable outcome line for the setup summary.
 func wireOSResolver() string {
+	// Wire the daemon's CONFIGURED address (a user-edited [listen] udp port
+	// must be honored, not the built-in default).
+	addr := effectiveDNSAddr()
 	if systemctlActive("systemd-resolved") {
-		dropIn := "[Resolve]\nDNS=" + daemonDNSAddr + "\nDomains=~.\n"
+		dropIn := "[Resolve]\nDNS=" + addr + "\nDomains=~.\n"
 		if err := sysWriteEtc(pathResolvedDrop, []byte(dropIn), 0o644); err != nil {
 			printManualCommands("systemd-resolved drop-in", []string{
 				"sudo mkdir -p " + filepath.Dir(pathResolvedDrop),
-				"sudo tee " + pathResolvedDrop + " >/dev/null <<'EOF'\n[Resolve]\nDNS=" + daemonDNSAddr + "\nDomains=~.\nEOF",
+				"sudo tee " + pathResolvedDrop + " >/dev/null <<'EOF'\n[Resolve]\nDNS=" + addr + "\nDomains=~.\nEOF",
 				"sudo systemctl restart systemd-resolved",
 			})
 			return "OS resolver: MANUAL step printed above (sudo failed) — systemd-resolved drop-in"
@@ -249,24 +252,24 @@ func wireOSResolver() string {
 		if err := sudoRun("restarting systemd-resolved", "systemctl", "restart", "systemd-resolved"); err != nil {
 			printManualCommands("restart systemd-resolved", []string{"sudo systemctl restart systemd-resolved"})
 		}
-		return "OS resolver: systemd-resolved -> " + daemonDNSAddr + " (drop-in " + pathResolvedDrop + ")"
+		return "OS resolver: systemd-resolved -> " + addr + " (drop-in " + pathResolvedDrop + ")"
 	}
 	cur, err := sysReadFile(pathResolvConf)
-	if err == nil && strings.Contains(string(cur), daemonDNSAddr) {
-		return "OS resolver: " + pathResolvConf + " already points at " + daemonDNSAddr
+	if err == nil && strings.Contains(string(cur), addr) {
+		return "OS resolver: " + pathResolvConf + " already points at " + addr
 	}
 	backup := "sudo cp " + pathResolvConf + " " + pathResolvBackup
-	prepend := "printf 'nameserver " + daemonDNSAddr + "\\n' | sudo tee /tmp/freens-resolv.new >/dev/null && cat " + pathResolvConf + " | sudo tee -a /tmp/freens-resolv.new >/dev/null && sudo cp /tmp/freens-resolv.new " + pathResolvConf
+	prepend := "printf 'nameserver " + addr + "\\n' | sudo tee /tmp/freens-resolv.new >/dev/null && cat " + pathResolvConf + " | sudo tee -a /tmp/freens-resolv.new >/dev/null && sudo cp /tmp/freens-resolv.new " + pathResolvConf
 	if err := sudoRun("backing up "+pathResolvConf, "cp", pathResolvConf, pathResolvBackup); err != nil {
 		printManualCommands("resolv.conf backup + prepend", []string{backup, prepend})
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + daemonDNSAddr
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + addr
 	}
-	newResolv := "nameserver " + daemonDNSAddr + "\n" + string(cur)
+	newResolv := "nameserver " + addr + "\n" + string(cur)
 	if err := sysWriteEtc(pathResolvConf, []byte(newResolv), 0o644); err != nil {
 		printManualCommands("resolv.conf prepend", []string{prepend})
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + daemonDNSAddr
+		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver " + addr
 	}
-	return "OS resolver: " + pathResolvConf + " prepended with nameserver " + daemonDNSAddr + " (backup: " + pathResolvBackup + ")"
+	return "OS resolver: " + pathResolvConf + " prepended with nameserver " + addr + " (backup: " + pathResolvBackup + ")"
 }
 
 // printManualCommands is the sudo-needs-a-password path: print exactly what
@@ -333,10 +336,16 @@ func setupUninstall() error {
 				printManualCommands("remove resolv.conf backup", []string{"sudo rm -f " + pathResolvBackup})
 			}
 		}
-	} else if cur, err := sysReadFile(pathResolvConf); err == nil && strings.Contains(string(cur), daemonDNSAddr) {
-		printManualCommands("remove freens from resolv.conf", []string{
-			"sudo sed -i '/" + daemonDNSAddr + "/d' " + pathResolvConf,
-		})
+	} else if cur, err := sysReadFile(pathResolvConf); err == nil && (strings.Contains(string(cur), daemonDNSAddr) || strings.Contains(string(cur), effectiveDNSAddr())) {
+		// Remove every freens address that might have been wired over the
+		// install's lifetime (the config port may have changed since).
+		var cmds []string
+		for _, addr := range []string{daemonDNSAddr, effectiveDNSAddr()} {
+			if strings.Contains(string(cur), addr) {
+				cmds = append(cmds, "sudo sed -i '/"+addr+"/d' "+pathResolvConf)
+			}
+		}
+		printManualCommands("remove freens from resolv.conf", cmds)
 	}
 
 	fmt.Println()

@@ -205,6 +205,12 @@ func cmdRegister(args []string) error {
 	}
 
 	// --- witness collection (§7.3) -------------------------------------------
+	// Both paths pass claim.Timestamp — NOT a fresh now — so every retry
+	// presents the SAME claim prefix hash. §7.3's cooldown lets a witness
+	// re-sign an identical claim inside the window but REFUSES a different
+	// one; a per-run ts on a reused claim would mint a new prefix each
+	// attempt and cooldown-lock out exactly the witnesses that already
+	// helped (observed live: attempts degrading 4→2→0 signers).
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -212,7 +218,9 @@ func cmdRegister(args []string) error {
 	var node *dht.Node
 	if tr.daemon() {
 		fmt.Printf("witnesses: collecting %d co-signatures via the running daemon (admin socket)\n", constants.W)
-		atts, err = collectWitnessesViaAdmin(ctx, tr.client, *alias, tldID, kp.Public(), ts)
+		atts, err = collectWitnessesRetried(constants.W, func(int) ([]*claims.WitnessAttestation, error) {
+			return collectWitnessesViaAdmin(ctx, tr.client, *alias, tldID, kp.Public(), claim.Timestamp)
+		})
 		if err != nil {
 			return err
 		}
@@ -227,15 +235,19 @@ func cmdRegister(args []string) error {
 		if err != nil {
 			return err
 		}
-		// §6.2 walk toward K_claim: bootstrap peers alone would cap the witness
-		// candidates at the -peers list; the WITNESS_SET is defined over the W
-		// closest nodes to K_claim, so fill the routing table first.
-		found := node.IterativeFindNode(ctx, kClaim, constants.WitnessSet)
-		fmt.Printf("witness candidates (closest to K_claim): %d\n", len(found))
-
-		atts, err = node.CollectWitnesses(ctx, *alias, tldID, kp.Public(), claim.Timestamp, constants.WitnessSet)
+		atts, err = collectWitnessesRetried(constants.W, func(int) ([]*claims.WitnessAttestation, error) {
+			// §6.2 walk toward K_claim: bootstrap peers alone would cap the
+			// witness candidates at the -peers list; the WITNESS_SET is
+			// defined over the W closest nodes to K_claim, so fill the
+			// routing table first. Each attempt's walk also WARMS the
+			// table (responses seed it), which is what makes retries
+			// converge on a cold node.
+			found := node.IterativeFindNode(ctx, kClaim, constants.WitnessSet)
+			fmt.Printf("witness candidates (closest to K_claim): %d\n", len(found))
+			return node.CollectWitnesses(ctx, *alias, tldID, kp.Public(), claim.Timestamp, constants.WitnessSet)
+		})
 		if err != nil {
-			return fmt.Errorf("witness collection: %w", err)
+			return err
 		}
 	}
 	if len(atts) < constants.W {
@@ -374,6 +386,44 @@ func recoveryPlan(noRecovery bool, keysDir, alias string) ([]string, *wire.Recov
 		return nil, nil, err
 	}
 	return paths, pol, nil
+}
+
+// witnessRetryAttempts / witnessRetrySleep are the cold-routing-table
+// self-heal knobs (vars so tests shrink them): a freshly started daemon or
+// one-shot node may reach too few witnesses on the FIRST walk even on a
+// healthy network; each walk warms the table, so pause + retry converges.
+var (
+	witnessRetryAttempts = 3
+	witnessRetrySleep    = 10 * time.Second
+)
+
+// collectWitnessesRetried wraps one witness-collection attempt (a closure
+// that returns the verified, de-duplicated attestations it gathered) with
+// the cold-table self-heal: keep the best haul across attempts, pausing
+// between them so the routing table fills. Returns the last error only
+// when the attempt itself failed (transport errors are not wait-fixable);
+// a short haul is returned to the caller, whose W-quorum check produces
+// the actionable "network too small" message.
+func collectWitnessesRetried(needed int, collect func(attempt int) ([]*claims.WitnessAttestation, error)) ([]*claims.WitnessAttestation, error) {
+	var best []*claims.WitnessAttestation
+	for attempt := 1; attempt <= witnessRetryAttempts; attempt++ {
+		atts, err := collect(attempt)
+		if err != nil {
+			return nil, err
+		}
+		if len(atts) > len(best) {
+			best = atts
+		}
+		if len(best) >= needed {
+			return best, nil
+		}
+		if attempt < witnessRetryAttempts {
+			fmt.Printf("  only %d of %d witnesses so far — waiting %s for the routing table to warm up (retry %d/%d)…\n",
+				len(best), needed, witnessRetrySleep, attempt+1, witnessRetryAttempts)
+			time.Sleep(witnessRetrySleep)
+		}
+	}
+	return best, nil
 }
 
 // collectWitnessesViaAdmin asks the running daemon to collect the witness

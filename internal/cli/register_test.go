@@ -15,8 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/camalolo/freens/internal/admin"
+	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // TestRegisterEndToEnd: the full flow against 7 live in-process nodes — key
@@ -125,6 +128,84 @@ func TestRegisterAliasForms(t *testing.T) {
 		t.Fatalf("alias given twice: want `twice` error, got %v", err)
 	}
 }
+
+// TestRegisterDaemonPathCooldownSafe: the daemon transport (admin socket)
+// must present the SAME claim prefix hash on every retry — register passes
+// claim.Timestamp, not a fresh now, so §7.3's witness cooldown treats
+// retries as idempotent re-signs instead of refusing them. Serves a REAL
+// admin socket from the witness net's bootstrap node; run 1 is a full
+// register through it, then the SAME claim identity is re-witnessed
+// directly (the retry path) and must again gather the full quorum.
+// Regression: the pre-fix code passed time.Now(), degrading the signer
+// count on each retry (observed 4→2→0 live).
+func TestRegisterDaemonPathCooldownSafe(t *testing.T) {
+	if testing.Short() {
+		t.Skip("mines real PoW")
+	}
+	tempHome(t)
+	boot, _ := startWitnessNet(t, 7)
+
+	srv := admin.New(boot, nil, "test", testAdminLogger{})
+	sock := home.AdminSock()
+	_ = os.Remove(sock)
+	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe(sock) }()
+	for i := 0; i < 100 && !admin.Alive(sock); i++ {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !admin.Alive(sock) {
+		t.Fatalf("admin server never came up: %v", <-errCh)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	dir := t.TempDir()
+	if err := cmdRegister([]string{
+		"alice", "-ip", "203.0.113.9", "-difficulty", "24",
+		"-out-key", filepath.Join(dir, "alice.key"), "-out-dir", dir,
+	}); err != nil {
+		t.Fatalf("register run 1 (daemon transport): %v", err)
+	}
+
+	// The retry: same owner key, same persisted claim (same Timestamp =>
+	// same prefix hash), re-witnessed through the daemon transport inside
+	// the 3600 s cooldown window. The witnesses signed this alias already;
+	// they must re-sign the IDENTICAL claim, not refuse it.
+	kp, err := seedKeypair("@"+filepath.Join(dir, "alice.key"), "-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := loadReusableClaim("alice", kp, 24)
+	if claim == nil {
+		t.Fatal("persisted claim not reusable after run 1")
+	}
+	c := maybeAdmin()
+	if c == nil {
+		t.Fatal("admin client gone")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	atts, err := collectWitnessesViaAdmin(ctx, c, "alice", tldID, kp.Public(), claim.Timestamp)
+	if err != nil {
+		t.Fatalf("re-witness (daemon transport): %v", err)
+	}
+	if len(atts) < constants.W {
+		t.Fatalf("cooldown-locked: only %d of %d witnesses re-signed the identical claim", len(atts), constants.W)
+	}
+}
+
+// testAdminLogger sinks admin-server logs (keep test output clean).
+type testAdminLogger struct{}
+
+func (testAdminLogger) Info(string, ...any)  {}
+func (testAdminLogger) Warn(string, ...any)  {}
+func (testAdminLogger) Debug(string, ...any) {}
 
 // TestSeedSpecKeyfile: the @file form loads from disk; plain hex still
 // works; a missing file is a usage error, not a panic.

@@ -36,6 +36,41 @@ var (
 	doctorFixWaitSleep    = 500 * time.Millisecond
 )
 
+// effectiveDNSAddr returns the DNS address the daemon actually listens on:
+// the EXPLICIT [listen] "udp =" value from freens.conf, else the
+// 127.0.0.1:5300 default setup writes. doctor and the OS-resolver wiring
+// must use THIS address — checking the built-in default against a
+// user-configured port produces false ✔s (or wires the OS at a dead port).
+// The resolver package's parser cannot be used here: it defaults
+// ListenUDP to 127.0.0.1:53, which would make "no explicit udp" (setup's
+// own 5300 layout, or a malformed file) look like a :53 config.
+func effectiveDNSAddr() string {
+	b, err := os.ReadFile(home.ConfPath())
+	if err != nil {
+		return daemonDNSAddr
+	}
+	inListen := false
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inListen = line == "[listen]"
+			continue
+		}
+		if !inListen {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "udp" {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+	}
+	return daemonDNSAddr
+}
+
 // errDaemonNotRunning is status' not-running outcome (exit 1, with the
 // fix-it hint printed to stdout).
 var errDaemonNotRunning = errors.New("daemon not running")
@@ -173,8 +208,10 @@ func cmdDoctor(args []string) error {
 	}
 
 	// 3. DNS path through the daemon: a known upstream name resolves via
-	//    127.0.0.1:5300 — exercising the conventional-DNS fallback.
-	check(checkDNSFallback(), "DNS: example.com resolves via %s (fallback path)", daemonDNSAddr)
+	//    the daemon's CONFIGURED listen address — exercising the
+	//    conventional-DNS fallback.
+	dnsAddr := effectiveDNSAddr()
+	check(checkDNSFallback(dnsAddr), "DNS: example.com resolves via %s (fallback path)", dnsAddr)
 
 	// 4. freens path: each keychain alias's apex resolves via the daemon.
 	aliases := keychainAliases()
@@ -197,11 +234,11 @@ func cmdDoctor(args []string) error {
 	// 6. seeds.conf parses.
 	check(checkSeeds(), "seeds.conf parses and has at least one seed")
 
-	// 7. OS resolver (warn-only).
+	// 7. OS resolver (warn-only): must name the daemon's configured address.
 	if osResolverPointsAtDaemon() {
 		fmt.Printf("✔ OS resolver points at the daemon\n")
 	} else {
-		warn("OS resolver does not point at %s yet (setup wires it; DNS still works via the daemon port)", daemonDNSAddr)
+		warn("OS resolver does not point at %s yet (setup wires it; DNS still works via the daemon port)", effectiveDNSAddr())
 	}
 
 	if failed > 0 {
@@ -248,13 +285,13 @@ func waitForAdminSocket() bool {
 }
 
 // checkDNSFallback resolves a known upstream name through the daemon's DNS
-// listener (127.0.0.1:5300) with a Go net.Resolver pinned to that address.
-func checkDNSFallback() bool {
+// listener (its configured address) with a Go net.Resolver pinned to it.
+func checkDNSFallback(addr string) bool {
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: daemonDNSCheckTimeout}
-			return d.DialContext(ctx, "udp", daemonDNSAddr)
+			return d.DialContext(ctx, "udp", addr)
 		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), daemonDNSCheckTimeout)
@@ -274,12 +311,13 @@ func checkSeeds() bool {
 	return len(peers) > 0
 }
 
-// osResolverPointsAtDaemon reports whether /etc/resolv.conf names the daemon
-// (the systemd-resolved drop-in path funnels into resolv.conf's stub too).
+// osResolverPointsAtDaemon reports whether /etc/resolv.conf names the
+// daemon's CONFIGURED address (the systemd-resolved drop-in path funnels
+// into resolv.conf's stub too).
 func osResolverPointsAtDaemon() bool {
 	data, err := os.ReadFile(pathResolvConf)
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(data), daemonDNSAddr)
+	return strings.Contains(string(data), effectiveDNSAddr())
 }

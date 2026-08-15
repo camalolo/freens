@@ -8,6 +8,7 @@ package cli
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/home"
 )
 
@@ -282,6 +284,109 @@ func TestStartEndToEnd(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home.KeysDir(), "alice.key")); err != nil {
 		t.Errorf("owner key not in keychain after start: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// witness-collection retry (cold routing table self-heal)
+// ---------------------------------------------------------------------------
+
+// TestCollectWitnessesRetried: a first short haul pauses and retries; the
+// quorum is reached as soon as an attempt delivers it; transport errors
+// abort immediately (waiting cannot fix them).
+func TestCollectWitnessesRetried(t *testing.T) {
+	oldA, oldS := witnessRetryAttempts, witnessRetrySleep
+	witnessRetryAttempts, witnessRetrySleep = 3, time.Millisecond
+	t.Cleanup(func() { witnessRetryAttempts, witnessRetrySleep = oldA, oldS })
+
+	calls := 0
+	atts, err := collectWitnessesRetried(5, func(attempt int) ([]*claims.WitnessAttestation, error) {
+		calls++
+		if attempt < 3 {
+			return make([]*claims.WitnessAttestation, attempt), nil // 1, then 2
+		}
+		return make([]*claims.WitnessAttestation, 5), nil
+	})
+	if err != nil || len(atts) != 5 {
+		t.Fatalf("want 5 atts after 3 calls, got %d (err %v), calls=%d", len(atts), err, calls)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+
+	calls = 0
+	atts, err = collectWitnessesRetried(5, func(int) ([]*claims.WitnessAttestation, error) {
+		calls++
+		return make([]*claims.WitnessAttestation, 5), nil
+	})
+	if err != nil || len(atts) != 5 || calls != 1 {
+		t.Fatalf("quorum on first try should not retry: atts=%d err=%v calls=%d", len(atts), err, calls)
+	}
+
+	calls = 0
+	if _, err := collectWitnessesRetried(5, func(int) ([]*claims.WitnessAttestation, error) {
+		calls++
+		return nil, errors.New("admin socket gone")
+	}); err == nil || calls != 1 {
+		t.Fatalf("transport error should abort at once: err=%v calls=%d", err, calls)
+	}
+
+	// Exhaustion returns the BEST haul (the caller reports the shortage).
+	calls = 0
+	atts, err = collectWitnessesRetried(5, func(int) ([]*claims.WitnessAttestation, error) {
+		calls++
+		if calls == 2 {
+			return make([]*claims.WitnessAttestation, 4), nil
+		}
+		return make([]*claims.WitnessAttestation, 2), nil
+	})
+	if err != nil || len(atts) != 4 || calls != 3 {
+		t.Fatalf("exhaustion should return best haul: atts=%d err=%v calls=%d", len(atts), err, calls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// effectiveDNSAddr (doctor/setup must honor a user-configured port)
+// ---------------------------------------------------------------------------
+
+// TestEffectiveDNSAddr: absent conf -> the setup default; a configured
+// [listen] udp -> that address; unparseable conf -> the default.
+func TestEffectiveDNSAddr(t *testing.T) {
+	tempHome(t)
+	if got := effectiveDNSAddr(); got != daemonDNSAddr {
+		t.Fatalf("no conf: %q, want default %q", got, daemonDNSAddr)
+	}
+	conf := "[listen]\nudp = 127.0.0.1:5301\ntcp = 127.0.0.1:5301\n[tld-routes]\n* = dns-first\n"
+	if err := os.WriteFile(home.ConfPath(), []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveDNSAddr(); got != "127.0.0.1:5301" {
+		t.Fatalf("configured: %q, want 127.0.0.1:5301", got)
+	}
+	if err := os.WriteFile(home.ConfPath(), []byte(";;; not a config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveDNSAddr(); got != daemonDNSAddr {
+		t.Fatalf("garbage conf: %q, want default", got)
+	}
+}
+
+// TestDoctorChecksConfiguredPort: with a custom [listen] port in the conf,
+// doctor's DNS check names THAT port (not the built-in 5300), proving it
+// probes the configured address.
+func TestDoctorChecksConfiguredPort(t *testing.T) {
+	tempHome(t)
+	stubSysForTest(t)
+	conf := "[listen]\nudp = 127.0.0.1:59999\ntcp = 127.0.0.1:59999\n"
+	if err := os.WriteFile(home.ConfPath(), []byte(conf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := captureStdout(t, func() error { return cmdDoctor(nil) })
+	if !strings.Contains(out, "127.0.0.1:59999") {
+		t.Errorf("doctor did not check the configured port:\n%s", out)
+	}
+	if strings.Contains(out, "127.0.0.1:5300") {
+		t.Errorf("doctor still names the default port:\n%s", out)
 	}
 }
 
