@@ -199,8 +199,11 @@ func run(args []string) error {
 	// simultaneously while the .cbor files sat on disk unread. When -load
 	// is unset, default it to the persist dir so a restart re-seeds the
 	// store from its own snapshots (idempotent under the §6.4 winner rule;
-	// an explicit -load still wins).
-	loadEffective := effectiveLoadDir(*loadDir, persistEffective)
+	// an explicit -load still wins). A defaulted load on a NOT-YET-EXISTING
+	// dir (fresh install: the first persist tick creates it) is skipped —
+	// only an EXPLICIT -load errors on a missing dir (found live on the
+	// cross-internet test node: first boot with persist=/fresh/path).
+	loadEffective := resolveLoadForBoot(*loadDir, persistEffective)
 
 	// Apply CLI overrides.
 	if *listenAddr != "" {
@@ -739,6 +742,20 @@ func effectiveLoadDir(loadFlag, persistEffective string) string {
 		return loadFlag
 	}
 	return persistEffective
+}
+
+// resolveLoadForBoot is effectiveLoadDir plus the fresh-install tolerance:
+// a DEFAULTED load dir that does not exist yet (first boot — the first
+// persist tick creates it) is dropped so startup proceeds; an explicit
+// -load is returned verbatim (a missing explicit dir is a loud error).
+func resolveLoadForBoot(loadFlag, persistEffective string) string {
+	dir := effectiveLoadDir(loadFlag, persistEffective)
+	if loadFlag == "" && dir != "" {
+		if _, err := os.Stat(dir); err != nil {
+			return "" // nothing to reload yet: fine
+		}
+	}
+	return dir
 }
 
 // persistFetchMeta best-effort-writes the DHTLookup fetch metadata into dir.

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.3 — fresh-install fix (found on the cross-internet test node)
+- **First boot with a fresh `persist` dir no longer fails.** The v0.3.2
+  load→persist defaulting errored on a not-yet-existing store dir
+  (`load: open …/store: no such file or directory`) — every LAN box had a
+  store already, so it only surfaced on a genuinely fresh remote node. A
+  defaulted load on a missing dir is now skipped (the first persist tick
+  creates it); an explicit `-load` still errors loudly.
+
 ## v0.3.2 — persistence actually round-trips (found live, fleet-wide)
 - **A restart no longer empties the store.** `-persist` wrote snapshots
   but nothing reloaded them — records lived only in RAM, so restarting
