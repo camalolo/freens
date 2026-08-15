@@ -58,6 +58,10 @@ func main() {
 		usage(os.Stderr)
 		os.Exit(1)
 	}
+	if len(os.Args) > 1 && (os.Args[1] == "version" || os.Args[1] == "-version" || os.Args[1] == "--version") {
+		fmt.Println("freens-cli", cliVersion)
+		return
+	}
 	sub := os.Args[1]
 	args := os.Args[2:]
 	var err error
@@ -105,6 +109,9 @@ func main() {
 	}
 }
 
+// cliVersion is stamped at build time; "dev" marks a local build.
+var cliVersion = "dev"
+
 func usage(w *os.File) {
 	fmt.Fprintln(w, "usage: freens-cli <subcommand> [flags]")
 	fmt.Fprintln(w, "subcommands:")
@@ -124,6 +131,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  resolve               fetch + display a record from the DHT (-name, -tld-id-b32, -peers)")
 	fmt.Fprintln(w, "  get                   raw DHT get by key (-key, -peers)")
 	fmt.Fprintln(w, "  demo                  self-contained end-to-end showcase")
+	fmt.Fprintln(w, "  version               print the binary version")
 	fmt.Fprintln(w, "resolve/get display the stored record only; authority-chain verification (§3.4)")
 	fmt.Fprintln(w, "is the daemon's job when serving DNS answers.")
 }

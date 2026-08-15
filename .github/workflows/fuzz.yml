@@ -1,0 +1,100 @@
+name: fuzz
+
+# Go native fuzzing (go.dev/security/fuzz) for the hostile-input decode paths.
+#
+# smoke  — every push / PR plus a weekly schedule tick: 20 s per target.
+#          The regular ci.yml `go test ./...` already executes every Fuzz
+#          function's seed corpus + committed testdata corpus as ordinary
+#          unit tests (each target's seeds run in well under 2 s), so this
+#          job adds only the coverage-guided mutation phase.
+#
+# nightly — daily schedule tick (manual dispatch supported): 2 m per target.
+#          continue-on-error so a fresh fuzz finding never blocks the repo;
+#          any crasher Go writes to <pkg>/testdata/fuzz/<FuzzName>/ is
+#          uploaded as an artifact for triage.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly smoke: Monday 06:00 UTC
+    - cron: "30 3 * * *" # nightly deep fuzz: daily 03:30 UTC
+  workflow_dispatch:
+
+env:
+  GOFLAGS: -trimpath
+
+jobs:
+  smoke:
+    if: github.event_name != 'schedule' || github.event.schedule == '0 6 * * 1'
+    name: smoke (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: ./internal/wire, name: FuzzDecodeEnvelope }
+          - { pkg: ./internal/wire, name: FuzzDecodeRecoveryEvidence }
+          - { pkg: ./internal/claims, name: FuzzDecodeAliasClaim }
+          - { pkg: ./internal/claims, name: FuzzDecodeWitnessAttestation }
+          - { pkg: ./internal/stun, name: FuzzParseBindingResponse }
+          - { pkg: ./internal/turn, name: FuzzParseMessage }
+          - { pkg: ./internal/turn, name: FuzzDecodeXORAddr }
+          - { pkg: ./internal/resolver, name: FuzzUnescapeName }
+          - { pkg: ./internal/naming, name: FuzzDecodeWireName }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+      - name: fuzz ${{ matrix.name }} (20s)
+        run: |
+          go test ${{ matrix.pkg }} -run '^Fuzz' -fuzz '^Fuzz${{ matrix.name }}$' -fuzztime 20s
+      - name: upload crashers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-crashers-${{ matrix.name }}
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+          retention-days: 30
+
+  nightly:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '30 3 * * *')
+    name: nightly (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true # flaky/network-independent fuzz findings must not block
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pkg: ./internal/wire, name: FuzzDecodeEnvelope }
+          - { pkg: ./internal/wire, name: FuzzDecodeRecoveryEvidence }
+          - { pkg: ./internal/claims, name: FuzzDecodeAliasClaim }
+          - { pkg: ./internal/claims, name: FuzzDecodeWitnessAttestation }
+          - { pkg: ./internal/stun, name: FuzzParseBindingResponse }
+          - { pkg: ./internal/turn, name: FuzzParseMessage }
+          - { pkg: ./internal/turn, name: FuzzDecodeXORAddr }
+          - { pkg: ./internal/resolver, name: FuzzUnescapeName }
+          - { pkg: ./internal/naming, name: FuzzDecodeWireName }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+      - name: fuzz ${{ matrix.name }} (2m)
+        continue-on-error: true
+        run: |
+          go test ${{ matrix.pkg }} -run '^Fuzz' -fuzz '^Fuzz${{ matrix.name }}$' -fuzztime 2m
+      - name: upload crashers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-crashers-${{ matrix.name }}
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+          retention-days: 90

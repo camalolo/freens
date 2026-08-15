@@ -48,8 +48,9 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens ./cmd/freens
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens-cli ./cmd/freens-cli
+          VER="${GITHUB_SHA::12}"
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/laurent/freens/cmd/freens.version=$VER -X github.com/laurent/freens/cmd/freens-cli.cliVersion=$VER" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens ./cmd/freens
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/laurent/freens/cmd/freens.version=$VER -X github.com/laurent/freens/cmd/freens-cli.cliVersion=$VER" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens-cli ./cmd/freens-cli
       - uses: actions/upload-artifact@v4
         with:
           name: freens-${{ matrix.goos }}-${{ matrix.goarch }}

@@ -340,17 +340,19 @@ func (s *Server) handleAllocate(m *message, raddr *net.UDPAddr) {
 
 // relayIP picks the local IP for a relayed socket serving client raddr: the
 // main socket's own local IP when it is concrete (a non-wildcard ListenAddr
-// like "192.0.2.7:3478"), else the source IP the OS would route toward
-// raddr (a connected throwaway UDP socket reveals it without sending), nil
-// when even that fails (the bind degrades to wildcard — logged by the
-// caller's allocation of a useless address, never a crash).
+// like "192.0.2.7:3478" or "[2001:db8::7]:3478"), else the source IP the OS
+// would route toward raddr (a connected throwaway UDP socket reveals it
+// without sending — same address family as the client), nil when even that
+// fails (the bind degrades to wildcard — logged by the caller's allocation
+// of a useless address, never a crash).
 func (s *Server) relayIP(raddr *net.UDPAddr) net.IP {
 	if la, err := net.ResolveUDPAddr("udp", s.conn.LocalAddr().String()); err == nil && la.IP != nil && !la.IP.IsUnspecified() {
 		return la.IP
 	}
 	fam := "udp4"
 	if raddr.IP.To4() == nil {
-		fam = "udp6"
+		fam = "udp6" // IPv6 clients relay on a v6 face; a v4-mapped face
+		// would hand out a v4 address the v6 peer cannot dial.
 	}
 	c, err := net.DialUDP(fam, nil, raddr)
 	if err != nil {

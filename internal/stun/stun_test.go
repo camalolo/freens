@@ -400,3 +400,33 @@ func TestServerIgnoresNonBindingTraffic(t *testing.T) {
 		t.Fatalf("reflexive address %v != socket local address %v", got, local)
 	}
 }
+
+// TestServerClientRoundTripIPv6 — the codec and sockets are family-agnostic
+// (§15.2 XOR covers IPv6 with cookie||txid); pin the loopback v6 path end
+// to end. Skipped where [::1] is unavailable.
+func TestServerClientRoundTripIPv6(t *testing.T) {
+	c, err := net.Dial("udp6", "[::1]:1")
+	if err != nil {
+		t.Skip("no IPv6 loopback")
+	}
+	_ = c.Close()
+	srv, err := Listen("[::1]:0")
+	if err != nil {
+		t.Fatalf("Listen v6: %v", err)
+	}
+	defer srv.Close()
+	sa, err := srv.Addr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sa.IP.To4() != nil {
+		t.Fatalf("bound %v, want v6", sa)
+	}
+	got, err := (&Client{Server: sa.String()}).Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover over v6: %v", err)
+	}
+	if got == nil || got.IP == nil || got.IP.To4() != nil || got.Port == 0 {
+		t.Fatalf("reflexive address %v, want IPv6 with a port", got)
+	}
+}

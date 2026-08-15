@@ -321,6 +321,33 @@ Quick operational knobs that override/extend the config file (all optional):
   Useful when the bootstrap set is managed by config management and must not
   touch the long-lived `-node-seed` identity or the persisted store.
 
+## 6b. Daemon `[dht]` config section
+
+The `-config` file carries the whole daemon, not just the resolver. The
+`[dht]` section holds the network side — same keys as the flags:
+
+```ini
+[tld-routes]
+mytld = freens
+
+[dht]
+listen = 0.0.0.0:15353
+node-seed = /etc/freens/node.key   ; or 64-hex
+peers = 192.0.2.10:15353#<64-hex-node-pk>
+peers-file = /etc/freens/peers.txt
+advertise = 203.0.113.7:15353      ; or stun = ... / turn-relay = ...
+turn = :3478                       ; optional community relay
+persist = /var/lib/freens
+; passive = true
+; upnp = false                     ; only the off switch exists in-file
+```
+
+Precedence per setting: an explicitly-passed flag wins over the config,
+which wins over the default (same rule as `-listen`/`-upstream`).
+`node-seed` accepts a bare path or `@path` keyfile form (hex otherwise);
+full-line `;`/`#` comments only. `freens version` / `freens-cli version`
+print the build (CI builds stamp the commit / tag).
+
 ## Files
 
 - `testnet.sh` — N-node localhost interop testnet, `direct` or `relay`

@@ -400,3 +400,56 @@ func TestXORAddressIPv6RoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %v ≠ %v", got, a)
 	}
 }
+
+// TestServerClientEndToEndIPv6 — allocation, tunneled WriteTo (peer sees the
+// v6 RELAYED source), and ReadFrom reply, all over [::1]. Skipped where v6
+// loopback is unavailable.
+func TestServerClientEndToEndIPv6(t *testing.T) {
+	if c, err := net.Dial("udp6", "[::1]:1"); err != nil {
+		t.Skip("no IPv6 loopback")
+	} else {
+		_ = c.Close()
+	}
+	srv := newTestServer(t, func(c *ServerConfig) { c.ListenAddr = "[::1]:0" })
+	a, err := srv.Addr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp, _ := crypto.Generate()
+	cl, err := (&Client{Server: a.String(), NodeKey: kp}).Dial(context.Background())
+	if err != nil {
+		t.Fatalf("Dial over v6: %v", err)
+	}
+	t.Cleanup(func() { _ = cl.Close() })
+	relayed := cl.RelayedAddr()
+	if relayed == nil || relayed.IP == nil || relayed.IP.To4() != nil {
+		t.Fatalf("relayed address %v, want IPv6", relayed)
+	}
+	// v6 "peer" socket.
+	pconn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("::1")})
+	if err != nil {
+		t.Skipf("v6 peer socket: %v", err)
+	}
+	t.Cleanup(func() { _ = pconn.Close() })
+	peerAddr, _ := net.ResolveUDPAddr("udp", pconn.LocalAddr().String())
+
+	if _, err := cl.WriteTo([]byte("v6knock"), peerAddr); err != nil {
+		t.Fatalf("WriteTo over v6: %v", err)
+	}
+	_ = pconn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 256)
+	n, from, err := pconn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("peer never received: %v", err)
+	}
+	if !bytes.Equal(buf[:n], []byte("v6knock")) || from.String() != relayed.String() {
+		t.Fatalf("peer got %q from %v (want relayed %v)", buf[:n], from, relayed)
+	}
+	if _, err := pconn.WriteToUDP([]byte("v6back"), relayed); err != nil {
+		t.Fatal(err)
+	}
+	_ = cl.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, src, err := cl.ReadFrom(make([]byte, 128)); err != nil || src.String() != peerAddr.String() {
+		t.Fatalf("ReadFrom over v6: %v %v", src, err)
+	}
+}

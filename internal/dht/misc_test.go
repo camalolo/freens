@@ -300,3 +300,69 @@ func TestUpdateAdvertise(t *testing.T) {
 		t.Fatalf("empty address did not clear: %q", got)
 	}
 }
+
+// TestIPv6LoopbackEndToEnd — the transport is family-agnostic ("udp" binds
+// dual-stack; addresses ride *net.UDPAddr of either family), and this pins
+// it: two nodes over [::1] ping, publish, and IterativeGet. Skipped on
+// hosts without IPv6 loopback (some containers/CI).
+func TestIPv6LoopbackEndToEnd(t *testing.T) {
+	if !hasIPv6Loopback(t) {
+		t.Skip("no IPv6 loopback on this host")
+	}
+	a, err := NewNode(NodeConfig{Keypair: mustKeypair(t), ListenAddr: "[::1]:0", Store: NewEnvelopeStore(0, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := NewNode(NodeConfig{Keypair: mustKeypair(t), ListenAddr: "[::1]:0", Store: NewEnvelopeStore(0, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	la, err := a.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if la.IP.To4() != nil {
+		t.Fatalf("bound %v, want IPv6", la)
+	}
+	if err := b.AddPeer(a.PublicKey(), la.String()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := b.Ping(ctx, Peer{Addr: la.String(), PublicKey: a.PublicKey()}); err != nil {
+		t.Fatalf("ping over IPv6: %v", err)
+	}
+	owner := mustKeypair(t)
+	env, key := makeTLDRecord(t, owner, "v6test")
+	if acc, err := a.store.Put(key, env, time.Now().Unix(), true); err != nil || !acc {
+		t.Fatalf("seed on a: %v %v", acc, err)
+	}
+	got, err := b.IterativeGet(ctx, key)
+	if err != nil || got == nil {
+		t.Fatalf("IterativeGet over IPv6: %v %v", got, err)
+	}
+	eh, _ := env.RecordHash()
+	gh, _ := got.RecordHash()
+	if !bytes.Equal(eh, gh) {
+		t.Fatal("different envelope returned over IPv6")
+	}
+}
+
+func hasIPv6Loopback(t *testing.T) bool {
+	t.Helper()
+	c, err := net.Dial("udp6", "[::1]:1")
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}

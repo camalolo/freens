@@ -90,7 +90,15 @@ func main() {
 	}
 }
 
+// version is stamped at build time (-ldflags "-X ...cmd/freens.version=vX.Y.Z");
+// "dev" marks a locally built binary.
+var version = "dev"
+
 func run(args []string) error {
+	if len(args) > 0 && (args[0] == "version" || args[0] == "-version" || args[0] == "--version") {
+		fmt.Println("freens", version)
+		return nil
+	}
 	fs := flag.NewFlagSet("freens", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: freens [-config <path>] [-listen <addr>] [-dns <addr>] [-upstream <csv>]")
@@ -109,15 +117,11 @@ func run(args []string) error {
 	turnAddr, turnRelayAddr, persistDir, idnaFlag := f.turnAddr, f.turnRelayAddr, f.persistDir, f.idna
 	upnpEnabled := f.upnpEnabled
 
-	// -idna override semantics (mirroring -listen/-upstream): an explicitly
-	// passed flag wins; otherwise the config file's [options] idna decides;
-	// otherwise IDNA stays off.
-	idnaFlagSet := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "idna" {
-			idnaFlagSet = true
-		}
-	})
+	// Per-setting precedence everywhere below: an explicitly-passed flag
+	// wins; otherwise the -config file ([dht] section for the network side,
+	// [options]/[tld-routes] for the resolver side); otherwise the default.
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(logger)
@@ -133,9 +137,28 @@ func run(args []string) error {
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	if !idnaFlagSet && cfg.EnableIDNA {
+	if !set["idna"] && cfg.EnableIDNA {
 		naming.EnableIDNA()
 	}
+	// [dht] section: the network side of the same file (flag > config >
+	// default, per setting — see dhtconfig.go).
+	dhtCfg, err := loadDHTConfig(*configPath)
+	if err != nil {
+		return fmt.Errorf("config [dht]: %w", err)
+	}
+	dhtEffective := pickString(set["dht"], *dhtAddr, dhtCfg.Listen, "")
+	nodeSeedEffective := pickString(set["node-seed"], *nodeSeedHex, dhtCfg.NodeSeed, "")
+	peersCSVEffective := pickString(set["peers"], *peersCSV, dhtCfg.Peers, "")
+	peersFileEffective := pickString(set["peers-file"], *peersFile, dhtCfg.PeersFile, "")
+	advertiseEffective := pickString(set["advertise"], *advertiseAddr, dhtCfg.Advertise, "")
+	stunEffective := pickString(set["stun"], *stunAddr, dhtCfg.Stun, "")
+	turnEffective := pickString(set["turn"], *turnAddr, dhtCfg.Turn, "")
+	turnRelayEffective := pickString(set["turn-relay"], *turnRelayAddr, dhtCfg.TurnRelay, "")
+	persistEffective := pickString(set["persist"], *persistDir, dhtCfg.Persist, "")
+	passiveEffective := pickBool(set["passive"], *passive, dhtCfg.Passive, false)
+	// -upnp defaults ON; only an explicit -upnp=false flag or upnp = false
+	// in [dht] turns it off (upnp = true in the file is a no-op).
+	upnpEffective := !(set["upnp"] && !*upnpEnabled) && !dhtCfg.UPnPOff
 
 	// Apply CLI overrides.
 	if *listenAddr != "" {
@@ -164,13 +187,13 @@ func run(args []string) error {
 	// BEFORE the DHT node starts; the entries bootstrap alongside -peers.
 	// (Re-read on SIGHUP below.)
 	var filePeers []dht.Peer
-	if *peersFile != "" {
-		data, err := os.ReadFile(*peersFile)
+	if peersFileEffective != "" {
+		data, err := os.ReadFile(peersFileEffective)
 		if err != nil {
 			return fmt.Errorf("peers-file: %w", err)
 		}
 		filePeers = parsePeersFile(string(data))
-		logger.Info("loaded -peers-file", "file", *peersFile, "peers", len(filePeers))
+		logger.Info("loaded -peers-file", "file", peersFileEffective, "peers", len(filePeers))
 	}
 
 	// In-process envelope store: the freens record source. When the DHT
@@ -201,16 +224,16 @@ func run(args []string) error {
 	// -turn / -turn-relay both require the DHT transport; warn-and-ignore
 	// mirrors -persist (a relay server without a node serves no one; a node
 	// without the DHT transport has no peer UDP to tunnel).
-	if *dhtAddr == "" {
-		if *turnAddr != "" {
-			logger.Warn("-turn requires -dht; ignoring", "turn", *turnAddr)
+	if dhtEffective == "" {
+		if turnEffective != "" {
+			logger.Warn("-turn requires -dht; ignoring", "turn", turnEffective)
 		}
-		if *turnRelayAddr != "" {
-			logger.Warn("-turn-relay requires -dht; ignoring", "turn-relay", *turnRelayAddr)
+		if turnRelayEffective != "" {
+			logger.Warn("-turn-relay requires -dht; ignoring", "turn-relay", turnRelayEffective)
 		}
 	}
-	if *dhtAddr != "" {
-		nodeKP, err := loadNodeKey(*nodeSeedHex)
+	if dhtEffective != "" {
+		nodeKP, err := loadNodeKey(nodeSeedEffective)
 		if err != nil {
 			return fmt.Errorf("node key: %w", err)
 		}
@@ -220,9 +243,9 @@ func run(args []string) error {
 		// -advertise would. Skipped when a better rung is already set; any
 		// failure falls to the rest of the ladder (-stun, observed source)
 		// with at most a Debug line.
-		advertise := *advertiseAddr
-		if *upnpEnabled && advertise == "" && *turnRelayAddr == "" {
-			port := dhtPort(*dhtAddr)
+		advertise := advertiseEffective
+		if upnpEffective && advertise == "" && turnRelayEffective == "" {
+			port := dhtPort(dhtEffective)
 			mctx, mcancel := context.WithTimeout(context.Background(), 6*time.Second)
 			m, merr := upnp.Map(mctx, port, "freens", logger)
 			mcancel()
@@ -244,18 +267,18 @@ func run(args []string) error {
 		// (MaxAllocsPerIP, DefaultLifetime/MaxLifetime, MaxPermissions —
 		// see the flag help).
 		var turnSrvCfg *turn.ServerConfig
-		if *turnAddr != "" {
-			turnSrvCfg = &turn.ServerConfig{ListenAddr: *turnAddr, Log: logger}
+		if turnEffective != "" {
+			turnSrvCfg = &turn.ServerConfig{ListenAddr: turnEffective, Log: logger}
 		}
 		node, err := dht.NewNode(dht.NodeConfig{
 			Keypair:    nodeKP,
-			ListenAddr: *dhtAddr,
+			ListenAddr: dhtEffective,
 			Store:      store,
 			Logger:     logger,
-			Passive:    *passive,
+			Passive:    passiveEffective,
 			Advertise:  advertise,
-			Stun:       *stunAddr,
-			TurnRelay:  *turnRelayAddr,
+			Stun:       stunEffective,
+			TurnRelay:  turnRelayEffective,
 			TurnServer: turnSrvCfg,
 		})
 		if err != nil {
@@ -284,7 +307,7 @@ func run(args []string) error {
 		// no further wiring needed; the resolver type-asserts it.
 		logger.Info("claim resolution via DHT enabled (network alias claims, spec §7)")
 		logger.Info("DHT transport started",
-			"listen", *dhtAddr,
+			"listen", dhtEffective,
 			"node_id", hex.EncodeToString(node.ID()),
 			"node_pk", hex.EncodeToString(node.PublicKey()),
 			"passive", *passive,
@@ -292,8 +315,8 @@ func run(args []string) error {
 			// or empty (peers learn the observed source; Node.Start logs a
 			// warning if a passed address could not be honored).
 			"advertise", advertise,
-			"turn_server", *turnAddr,
-			"turn_relay", *turnRelayAddr,
+			"turn_server", turnEffective,
+			"turn_relay", turnRelayEffective,
 		)
 		// TURN startup verdicts, mirroring the -advertise/-stun style logs:
 		// the relay outcome is known right after Start (the allocation dials
@@ -312,7 +335,7 @@ func run(args []string) error {
 					"addr", a.String())
 			}
 		}
-		if peers := parsePeers(*peersCSV); len(peers) > 0 {
+		if peers := parsePeers(peersCSVEffective); len(peers) > 0 {
 			logger.Info("bootstrapping DHT peers", "count", len(peers))
 			node.Bootstrap(context.Background(), peers)
 		}
@@ -327,12 +350,12 @@ func run(args []string) error {
 	// at the same directory re-seeds them on the next start; the §6.4 winner
 	// rule makes the round trip idempotent.
 	var persistStop chan struct{}
-	if *persistDir != "" {
+	if persistEffective != "" {
 		if dhtNode == nil {
-			logger.Warn("-persist requires -dht; ignoring", "dir", *persistDir)
+			logger.Warn("-persist requires -dht; ignoring", "dir", persistEffective)
 		} else {
 			persistStop = make(chan struct{})
-			go persistLoop(store, dhtLookup, *persistDir, persistStop, logger)
+			go persistLoop(store, dhtLookup, persistEffective, persistStop, logger)
 		}
 	}
 
@@ -480,7 +503,7 @@ func run(args []string) error {
 			case <-bgStop:
 				return
 			case <-hupCh:
-				reloadPeersFile(dhtNode, *peersFile, logger)
+				reloadPeersFile(dhtNode, peersFileEffective, logger)
 			}
 		}
 	}()
@@ -560,10 +583,10 @@ func run(args []string) error {
 	// the snapshot reflects every record the resolver cached during shutdown.
 	if persistStop != nil {
 		close(persistStop)
-		if count, err := store.PersistTo(*persistDir); err != nil {
-			logger.Error("final persist failed", "dir", *persistDir, "error", err)
+		if count, err := store.PersistTo(persistEffective); err != nil {
+			logger.Error("final persist failed", "dir", persistEffective, "error", err)
 		} else {
-			logger.Info("persisted envelopes at shutdown", "dir", *persistDir, "count", count)
+			logger.Info("persisted envelopes at shutdown", "dir", persistEffective, "count", count)
 		}
 		persistFetchMeta(dhtLookup, *persistDir, logger)
 		if hc, herr := store.PersistHistoryTo(filepath.Join(*persistDir, "history")); herr != nil {
