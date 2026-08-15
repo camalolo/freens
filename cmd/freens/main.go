@@ -61,9 +61,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/laurent/freens/internal/admin"
+	"github.com/laurent/freens/internal/cli"
 	"github.com/laurent/freens/internal/constants"
 	"github.com/laurent/freens/internal/crypto"
 	"github.com/laurent/freens/internal/dht"
+	"github.com/laurent/freens/internal/home"
 	"github.com/laurent/freens/internal/metrics"
 	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/resolver"
@@ -84,13 +87,35 @@ servers = 9.9.9.9, 1.1.1.1
 `
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	// Single-binary front: `freens <verb>` (register, setup, name, doctor,
+	// gen-key, publish, … — the full internal/cli dispatch) runs the CLI;
+	// `freens daemon [flags…]` or bare flags run the resolver daemon
+	// (bare-flag form is the historical one and stays).
+	if len(os.Args) > 1 {
+		sub := os.Args[1]
+		if sub != "daemon" && sub != "version" && sub != "-version" && sub != "--version" &&
+			!strings.HasPrefix(sub, "-") {
+			cli.ProgName = "freens"
+			cli.Version = version
+			os.Exit(cli.Main(os.Args[1:]))
+		}
+	}
+	if err := run(daemonArgs(os.Args[1:])); err != nil {
 		fmt.Fprintf(os.Stderr, "freens: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// version is stamped at build time (-ldflags "-X ...cmd/freens.version=vX.Y.Z");
+// daemonArgs strips the optional literal "daemon" subcommand so both
+// `freens daemon -dht :15353` and `freens -dht :15353` parse identically.
+func daemonArgs(args []string) []string {
+	if len(args) > 0 && args[0] == "daemon" {
+		return args[1:]
+	}
+	return args
+}
+
+// version is stamped at build time (-ldflags "-X main.version=vX.Y.Z");
 // "dev" marks a locally built binary.
 var version = "dev"
 
@@ -215,6 +240,7 @@ func run(args []string) error {
 	// store first and falls back to an iterative network GET on a miss.
 	var dhtNode *dht.Node
 	var dhtLookup *dht.DHTLookup
+	var adminSrv *admin.Server
 	// upnpMapping is the live router port mapping (released at shutdown);
 	// the renewal goroutine may replace it, and the metrics ticker reads it,
 	// so access goes through upnpMu.
@@ -289,6 +315,17 @@ func run(args []string) error {
 		}
 		dhtNode = node
 		dhtLookup = dht.NewDHTLookup(store, node)
+		// Local control socket (internal/admin): the single-binary CLI's
+		// admin-aware commands (publish/resolve/register/name/…) talk to
+		// THIS daemon through it instead of spinning their own DHT nodes —
+		// the "no -peers needed" path. Node-less daemons still serve
+		// status-only.
+		adminSrv = admin.New(node, dhtLookup, version, logger)
+		go func() {
+			if err := adminSrv.ListenAndServe(home.AdminSock()); err != nil {
+				logger.Warn("admin socket failed", "sock", home.AdminSock(), "error", err)
+			}
+		}()
 		freens = dhtLookup
 		// Restore the network-cache metadata (which envelopes were FETCHED,
 		// vs authoritative -load seeds) so a restart does not launder cached
@@ -335,6 +372,15 @@ func run(args []string) error {
 					"addr", a.String())
 			}
 		}
+		// Hostname-shaped -advertise (e.g. a DDNS-fronted seed): Start
+		// resolved it once; the monitor re-resolves the ORIGINAL hostname
+		// every 5 minutes and UpdateAdvertise's peers onto a fresh IP
+		// after a PPPoE/dynDNS drift (internal/dht/advertise_resolve.go).
+		// No-op for IP literals (the common case) and for UPnP-derived
+		// addresses (those are literals too; the renewal loop owns them).
+		if advertise != "" {
+			node.StartAdvertiseResolve(advertise)
+		}
 		if peers := parsePeers(peersCSVEffective); len(peers) > 0 {
 			logger.Info("bootstrapping DHT peers", "count", len(peers))
 			node.Bootstrap(context.Background(), peers)
@@ -342,6 +388,39 @@ func run(args []string) error {
 		if len(filePeers) > 0 {
 			logger.Info("bootstrapping -peers-file peers", "count", len(filePeers))
 			node.Bootstrap(context.Background(), filePeers)
+		}
+		// Zero-config bootstrap (home state directory): when NO peers were
+		// provided at all — neither -peers nor -peers-file, flag or [dht]
+		// config — fall back to <home>/seeds.conf (written with the pinned
+		// seed on first boot below, operator-editable) plus the learned
+		// peerbook (<home>/peers/book.json, refreshed every 60s by the
+		// loop under "Learned-peerbook persistence"). The book always
+		// lives in home.Dir() ($FREENS_HOME, default ~/.freens) even when
+		// -config points elsewhere: it is learned state, not config.
+		if peersCSVEffective == "" && peersFileEffective == "" {
+			if err := home.EnsureSeeds(); err != nil {
+				logger.Debug("could not ensure seeds.conf in home dir", "error", err)
+			}
+			seeds := home.ParseSeeds(home.SeedsPath())
+			book := home.LoadPeerbook()
+			peers := peersFromSources(nil, nil, seeds, book)
+			switch {
+			case len(seeds) > 0 && len(book) > 0:
+				logger.Info("bootstrapping from seeds.conf + peerbook (no -peers given)",
+					"seeds", len(seeds), "peerbook", len(book), "peers", len(peers))
+			case len(seeds) > 0:
+				logger.Info("bootstrapping from seeds.conf (no -peers given)",
+					"seeds", len(seeds), "peers", len(peers))
+			case len(book) > 0:
+				logger.Info("bootstrapping from peerbook (no -peers given)",
+					"peerbook", len(book), "peers", len(peers))
+			default:
+				logger.Info("no peers configured — using seeds.conf/peerbook when available; " +
+					"this node is an island until peered (-peers, seeds.conf, or UPnP-discovered contacts)")
+			}
+			if len(peers) > 0 {
+				node.Bootstrap(context.Background(), peers)
+			}
 		}
 	}
 
@@ -357,6 +436,20 @@ func run(args []string) error {
 			persistStop = make(chan struct{})
 			go persistLoop(store, dhtLookup, persistEffective, persistStop, logger)
 		}
+	}
+
+	// Learned-peerbook persistence (home): every 60s save the routing
+	// table's contacts (cap 32) to <home>/peers/book.json so the NEXT boot
+	// does not depend on seeds being reachable — the zero-config
+	// bootstrap above re-reads it. Runs alongside the -persist loop with
+	// the same stop-channel pattern (a final snapshot happens at
+	// shutdown, after the DHT node stopped, so the book reflects every
+	// contact learned during shutdown handshakes). Best-effort like the
+	// book itself: errors are logged, never fatal.
+	var bookStop chan struct{}
+	if dhtNode != nil {
+		bookStop = make(chan struct{})
+		go peerbookLoop(dhtNode, bookStop, logger)
 	}
 
 	upstream := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
@@ -561,6 +654,11 @@ func run(args []string) error {
 		}
 		cancel()
 	}
+	if adminSrv != nil {
+		if err := adminSrv.Close(); err != nil {
+			logger.Error("admin socket shutdown error", "error", err)
+		}
+	}
 	if dhtNode != nil {
 		if err := dhtNode.Close(); err != nil {
 			logger.Error("dht node shutdown error", "error", err)
@@ -578,6 +676,13 @@ func run(args []string) error {
 		} else {
 			logger.Info("upnp: port mapping released")
 		}
+	}
+	// Final peerbook snapshot AFTER the DHT node stopped (mirrors the
+	// final -persist below): the book reflects every contact learned
+	// during shutdown handshakes, then the loop is retired.
+	if bookStop != nil {
+		close(bookStop)
+		savePeerbook(dhtNode, logger)
 	}
 	// Final persistence AFTER the servers (and the DHT node) have stopped, so
 	// the snapshot reflects every record the resolver cached during shutdown.
@@ -652,6 +757,73 @@ func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, st
 			return
 		}
 	}
+}
+
+// peersFromSources selects and merges the bootstrap-peer sources in
+// precedence order, deduplicating by (addr, public key): the explicit
+// sources (-peers CSV, then -peers-file) when EITHER provided an entry,
+// otherwise the zero-config home sources (seeds.conf, then the learned
+// peerbook). Later duplicates of an earlier (addr, pk) pair are dropped.
+// Pure — unit-tested without a daemon (the run() caller passes nil explicit
+// sources precisely when neither flag nor [dht] config provided peers).
+func peersFromSources(flagPeers, filePeers, seeds, book []dht.Peer) []dht.Peer {
+	var out []dht.Peer
+	seen := make(map[string]bool)
+	add := func(ps []dht.Peer) {
+		for _, p := range ps {
+			key := p.Addr + "#" + hex.EncodeToString(p.PublicKey)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, p)
+		}
+	}
+	if len(flagPeers) > 0 || len(filePeers) > 0 {
+		add(flagPeers)
+		add(filePeers)
+		return out
+	}
+	add(seeds)
+	add(book)
+	return out
+}
+
+// peerbookLoop snapshots the node's routing-table contacts to
+// <home>/peers/book.json every 60s until stop is closed (same pattern as
+// persistLoop). Errors are logged, never fatal: the book is an
+// optimization, not state.
+func peerbookLoop(node *dht.Node, stop <-chan struct{}, logger *slog.Logger) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			savePeerbook(node, logger)
+		case <-stop:
+			return
+		}
+	}
+}
+
+// savePeerbook persists the node's current routing-table contacts (the
+// best dialable peers this node knows — AllContacts order, capped at 32 by
+// home.SavePeerbook) as one best-effort atomic write. No-op without a node
+// or without contacts (an empty book would erase nothing but also teach
+// nothing; keeping the last non-empty book is strictly better).
+func savePeerbook(node *dht.Node, logger *slog.Logger) {
+	if node == nil {
+		return
+	}
+	peers := home.ContactsToPeers(node.RoutingTable().AllContacts())
+	if len(peers) == 0 {
+		return
+	}
+	if err := home.SavePeerbook(peers, time.Now().Unix()); err != nil {
+		logger.Debug("peerbook save failed", "error", err)
+		return
+	}
+	logger.Info("peerbook saved", "peers", len(peers))
 }
 
 // loadNodeKey returns the DHT node identity: from seedHex (a 32-byte hex Ed25519

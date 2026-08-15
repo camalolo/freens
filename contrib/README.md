@@ -348,6 +348,19 @@ which wins over the default (same rule as `-listen`/`-upstream`).
 full-line `;`/`#` comments only. `freens version` / `freens-cli version`
 print the build (CI builds stamp the commit / tag).
 
+## 10. Seed node: hostname advertise
+
+A node with a stable public address seeds the network: point a DNS name
+at it (e.g. `freens.example.com`), open the DHT port (15353/udp) and the
+public resolver port if desired, and run the daemon with
+`-advertise freens.example.com:15353`. Hostnames are resolved at startup
+and re-resolved every 5 minutes at runtime (`Node.StartAdvertiseResolve`)
+— peers learn the current address from the advertise stamp on every
+outbound query, so DNS-side changes propagate without daemon restarts.
+New nodes bootstrap from the seed via `~/.freens/seeds.conf`
+(`freens setup` writes the default pin; edit the file to point at any
+seed you prefer — or your own).
+
 ## Files
 
 - `testnet.sh` — N-node localhost interop testnet, `direct` or `relay`
@@ -355,6 +368,13 @@ print the build (CI builds stamp the commit / tag).
   an update, `dig` every node again (kills everything on exit; needs `go`
   + `dig`; relay mode additionally runs `-turn`/`-turn-relay` through
   node 1, see §7).
+- `ddns-cloudflare.sh` — Cloudflare DDNS keep-A-record-current for
+  dynamic-IP seed nodes (§10): WAN IP from the interface, PATCH on drift,
+  `--check` dry-run, token from env or certbot's `cloudflare.ini` (never
+  printed; needs `curl` + `jq` + iproute2; validated with `bash -n` only).
+- `systemd/freens-ddns.service` + `systemd/freens-ddns.timer` — system
+  units driving the script every 5 minutes (`Persistent=true`; install
+  instructions in the unit headers; validated with `bash -n`/`systemd-analyze verify` only).
 - `port53-redirect.sh` — iptables/nftables REDIRECT :53 → :5300 (UDP+TCP),
   idempotent, with `remove`/`status` actions (needs root to *run*; validated
   with `bash -n` only).

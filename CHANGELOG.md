@@ -1,6 +1,22 @@
 # Changelog
 
 ## unreleased
+- **Single binary + zero-config UX** — `freens setup` (state dir, config,
+  node key, seeds.conf, systemd --user service, OS resolver wiring via
+  systemd-resolved drop-in or resolv.conf, `--uninstall`), `freens register`
+  (defaults: outbound IP, running daemon via the admin socket, default-on
+  2-of-3 recovery keyfiles, cooldown-safe claim REUSE across retries),
+  `freens name`, `freens status`, `freens doctor`. `~/.freens` state dir
+  (FREENS_HOME); learned peerbook persists across restarts; pinned default
+  seed (freens.camalolo.com) with hostname re-resolve every 5 min. The
+  local admin socket (unix, 0600) exposes publish/get/resolve/witness/
+  peers/status to the CLI; `freens-cli` is now a thin compat shim (all
+  subcommands moved to `internal/cli`, admin-aware, standalone fallback).
+- **Fixes found live**: IterativeFindNode early-break starved walks on
+  tables with stale contacts; register now reuses the owner key AND mined
+  claim on retry (witness-cooldown cascade); setup template wrote a
+  freens-only route (NXDOMAINing the internet) — now dns-first; doctor's
+  seed check TCP-dialed a UDP protocol.
 - **`freens-cli register`** — one-command alias onboarding (§7): owner key
   (generated to a 0600 keyfile) → claim PoW → W live witness co-signatures
   from the DHT → TLD record published at K_tld + K_claim. Every seed flag

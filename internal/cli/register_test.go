@@ -1,13 +1,14 @@
-package main
-
 // register_test.go pins the register flow against a real in-process DHT
 // network: enough nodes that W=5 DISTINCT live witnesses exist beyond the
 // single bootstrap peer (the IterativeFindNode walk must discover them), the
 // owner keyfile lifecycle (generated, 0600, @file reload), and the
-// @keyfile seed spec shared by every seed flag.
+// @keyfile seed spec shared by every seed flag. (Moved from cmd/freens-cli;
+// runs against FREENS_HOME temp dirs.)
+package cli
 
 import (
 	"context"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,87 +17,7 @@ import (
 
 	"github.com/laurent/freens/internal/crypto"
 	"github.com/laurent/freens/internal/dht"
-	"github.com/laurent/freens/internal/naming"
 )
-
-// startWitnessNet boots n witness-capable nodes on an in-process network:
-// node 0 is the bootstrap entry the CLI is told about; the others are
-// discovered via find_node (proving the routing-table walk). Nodes peer in
-// a ring + to node 0 so their tables interconnect.
-func startWitnessNet(t *testing.T, n int) (*dht.Node, []string) {
-	t.Helper()
-	nodes := make([]*dht.Node, n)
-	pks := make([]string, n)
-	addrs := make([]string, n)
-	for i := range nodes {
-		store := dht.NewEnvelopeStore(0, nil)
-		node, err := dht.NewNode(dht.NodeConfig{
-			Keypair:    mustTestKeypair(t),
-			ListenAddr: "127.0.0.1:0",
-			Store:      store,
-			// Keep witness cooldown etc. live but skip refresh/republish
-			// chatter — irrelevant to a short test.
-			BucketRefreshInterval: -1,
-			RepublishInterval:     -1,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := node.Start(); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = node.Close() })
-		nodes[i] = node
-		la, err := node.LocalAddr()
-		if err != nil {
-			t.Fatal(err)
-		}
-		addrs[i] = la.String()
-		pks[i] = hexPK(node.PublicKey())
-	}
-	// Interconnect: everyone pings node 0 and its ring neighbors.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for i := 1; i < n; i++ {
-		targets := []int{0}
-		if i > 1 {
-			targets = append(targets, i-1)
-		}
-		for _, j := range targets {
-			if err := nodes[i].AddPeer(nodes[j].PublicKey(), addrs[j]); err != nil {
-				t.Fatal(err)
-			}
-			c, cc := context.WithTimeout(ctx, 2*time.Second)
-			if err := nodes[i].Ping(c, dht.Peer{Addr: addrs[j], PublicKey: nodes[j].PublicKey()}); err != nil {
-				// A ring ping failing is survivable; node 0 is the one that
-				// must be reachable.
-				if j == 0 {
-					t.Fatalf("bootstrap node ping: %v", err)
-				}
-			}
-			cc()
-		}
-	}
-	return nodes[0], []string{addrs[0] + "#" + pks[0]}
-}
-
-func mustTestKeypair(t *testing.T) *crypto.Keypair {
-	t.Helper()
-	kp, err := crypto.Generate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return kp
-}
-
-func hexPK(pk []byte) string {
-	const hexd = "0123456789abcdef"
-	out := make([]byte, len(pk)*2)
-	for i, c := range pk {
-		out[2*i], out[2*i+1] = hexd[c>>4], hexd[c&15]
-	}
-	return string(out)
-}
 
 // TestRegisterEndToEnd: the full flow against 7 live in-process nodes — key
 // generated to a 0600 file, PoW at floor difficulty (12 would be faster but
@@ -106,6 +27,7 @@ func TestRegisterEndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mines real PoW")
 	}
+	tempHome(t) // recovery keyfiles + admin socket paths land in a temp home
 	boot, peerArgs := startWitnessNet(t, 7)
 	dir := t.TempDir()
 
@@ -155,6 +77,13 @@ func TestRegisterEndToEnd(t *testing.T) {
 	if len(env.Record.Claim) == 0 {
 		t.Fatal("record carries no embedded claim")
 	}
+	// Default-on recovery (spec 5.4): register embeds a 2-of-3 policy.
+	if env.Record.Recovery == nil ||
+		env.Record.Recovery.Threshold != recoveryThreshold ||
+		len(env.Record.Recovery.Keys) != recoveryKeyfileCount ||
+		env.Record.Recovery.Timelock != 259200 {
+		t.Fatalf("apex recovery policy = %+v, want 2-of-3 timelock 259200", env.Record.Recovery)
+	}
 	if _, err := os.Stat(envPath); err != nil {
 		t.Fatalf("envelope artifact: %v", err)
 	}
@@ -166,6 +95,7 @@ func TestRegisterTooFewWitnesses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mines real PoW")
 	}
+	tempHome(t)
 	boot, peerArgs := startWitnessNet(t, 2) // bootstrap + 1: < W=5
 	_ = boot
 	err := cmdRegister([]string{
@@ -201,13 +131,5 @@ func TestSeedSpecKeyfile(t *testing.T) {
 	if _, err := seedKeypair("@"+filepath.Join(dir, "nope"), "-x"); err == nil {
 		t.Fatal("missing keyfile accepted")
 	}
-}
-
-func mustWireName(t *testing.T, alias string, tldID []byte) []byte {
-	t.Helper()
-	wn, err := naming.EncodeWireName(nil, alias, tldID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return wn
+	_ = hex.EncodeToString
 }

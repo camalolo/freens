@@ -1,5 +1,4 @@
-// Package main (freens-cli) — lifecycle.go implements the §8 ownership
-// lifecycle subcommands:
+// lifecycle.go — the §8 ownership lifecycle subcommands:
 //
 //	transfer   §8.3 (lines 666-688) — re-point a name's authority to a new
 //	           owner key. The hand-off record keeps the name, sets
@@ -33,7 +32,7 @@
 // The produced envelopes follow make-record's output conventions
 // (envelope_cbor=<hex> plus wire_name/k_name lines) so they can be piped
 // around, and -out additionally writes the raw .cbor file that
-// `freens-cli publish -files` consumes.
+// `publish -files` consumes.
 //
 // Resolver interaction (documented, NOT changed here): wire.VerifyAuthorityChain
 // requires the TLD-root signer == owner and tld_id == SHA-256(owner), so a
@@ -45,7 +44,7 @@
 // (the parent's owner/delegation still names the old child key that signed
 // the hand-off), but descendants of a transferred name must re-sign with the
 // new key once the delegation follows it.
-package main
+package cli
 
 import (
 	"bytes"
@@ -286,7 +285,7 @@ func buildHandoffEnvelope(prev *wire.SignedEnvelope, newOwnerPK []byte, signerKP
 // transfer — §8.3
 // ---------------------------------------------------------------------------
 
-// cmdTransfer implements `freens-cli transfer`: build the §8.3 hand-off
+// cmdTransfer implements `transfer`: build the §8.3 hand-off
 // envelope from -prev-envelope, signed by the current owner (-signer-seed),
 // re-pointing the name to -new-owner-seed's public key.
 func cmdTransfer(args []string) error {
@@ -301,7 +300,7 @@ func cmdTransfer(args []string) error {
 // rotate — §8.6
 // ---------------------------------------------------------------------------
 
-// cmdRotate implements `freens-cli rotate`. §8.6 (lines 714-720): "Rotation =
+// cmdRotate implements `rotate`. §8.6 (lines 714-720): "Rotation =
 // transfer to a fresh key (Section 8.3), optionally in the same record as a
 // normal update." — rotation is exactly transfer semantics with the fresh
 // hygiene key as the new owner, so this is a thin variant of cmdTransfer
@@ -318,7 +317,7 @@ func cmdRotate(args []string) error {
 // recover — §8.4 evidence assembly
 // ---------------------------------------------------------------------------
 
-// cmdRecover implements `freens-cli recover`: read the previous record's
+// cmdRecover implements `recover`: read the previous record's
 // field-10 recovery policy, sign wire.RecoverySigningMessage(prev H_record,
 // new owner pk, execute_not_before = now + timelock) with each -recovery-seeds
 // key (validated to be a subset of the policy's keys), and write the
@@ -327,7 +326,7 @@ func cmdRotate(args []string) error {
 // the timelock elapses and the evidence is published alongside it, re-points
 // the name at the new primary key. The recovery POLICY is carried over
 // unchanged (see buildRecoveryEnvelope); operators SHOULD follow up with
-// `freens-cli rotate` after regaining control to rotate the recovery keys
+// `rotate` after regaining control to rotate the recovery keys
 // (§8.4 step 2: "SHOULD also rotate the recovery keys — this defeats a single
 // stolen recovery key").
 func cmdRecover(args []string) error {
@@ -338,7 +337,7 @@ func cmdRecover(args []string) error {
 	out := fs.String("out", "", "path to write the RecoveryEvidence CBOR")
 	outEnvelope := fs.String("out-envelope", "", "additionally write the spec 8.4 recovered record R2 as a signed envelope .cbor here "+
 		"(owner = the NEW key, sequence = prev+1, prev_hash = H(prev), signed by the NEW owner — the opposite of transfer). "+
-		"The recovery policy is carried over unchanged; after regaining control, follow up with `freens-cli rotate` to rotate the recovery keys (spec 8.4 step 2)")
+		"The recovery policy is carried over unchanged; after regaining control, follow up with `rotate` to rotate the recovery keys (spec 8.4 step 2)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -447,7 +446,7 @@ func cmdRecover(args []string) error {
 	fmt.Printf("timelock=%d seconds (spec 8.4 default 72 h)\n", policy.Timelock)
 	fmt.Printf("execute_not_before=%d (%s)\n", notBefore, time.Unix(int64(notBefore), 0).UTC().Format(time.RFC3339))
 	if len(sigs) < int(policy.Threshold) {
-		fmt.Fprintf(os.Stderr, "freens-cli: warning: %d of %d required signatures gathered — the declaration does not verify until the threshold is reached\n", len(sigs), policy.Threshold)
+		fmt.Fprintf(os.Stderr, "%s: warning: %d of %d required signatures gathered — the declaration does not verify until the threshold is reached\n", ProgName, len(sigs), policy.Threshold)
 	}
 	if r2 != nil {
 		r2Bytes, err := r2.Bytes()
@@ -480,7 +479,7 @@ func cmdRecover(args []string) error {
 		fmt.Printf("recovery_policy=carried over unchanged (threshold %d of %d)\n", r.Recovery.Threshold, len(r.Recovery.Keys))
 		fmt.Printf("wrote=%s\n", *outEnvelope)
 	}
-	fmt.Printf("note: publish the recovered record after the timelock with `freens-cli publish -files <r2.cbor> -evidence %s`; rotate the recovery keys afterwards (spec 8.4 step 2: `freens-cli rotate`)\n", *out)
+	fmt.Printf("note: publish the recovered record after the timelock with `publish -files <r2.cbor> -evidence %s`; rotate the recovery keys afterwards (spec 8.4 step 2: `rotate`)\n", *out)
 	return nil
 }
 
@@ -506,7 +505,7 @@ func cmdRecover(args []string) error {
 //     fields updated" is the operator's follow-up decision, not the
 //     recovery's: rotating recovery keys requires the regained control this
 //     record establishes — §8.4 step 2 says the owner SHOULD rotate them
-//     right after, i.e. `freens-cli rotate` / make-record -recovery-*).
+//     right after, i.e. `rotate` / make-record -recovery-*).
 //   - Claim: carried over (a TLD-root recovery keeps the alias anchored).
 //     Revoke is NOT carried: a higher-sequence record un-revokes (§8.5).
 //
@@ -569,7 +568,7 @@ func buildRecoveryEnvelope(prev *wire.SignedEnvelope, newKP *crypto.Keypair, now
 // verify-recovery — §8.4 verifier side (pure wire calls, no network)
 // ---------------------------------------------------------------------------
 
-// cmdVerifyRecovery implements `freens-cli verify-recovery`: decode the
+// cmdVerifyRecovery implements `verify-recovery`: decode the
 // previous record and a RecoveryEvidence, and report whether the declaration
 // satisfies R1's field-10 policy at -now (default: the current time) — the
 // same predicate wire.VerifyRecovery applies on the acceptance side, plus a
@@ -578,7 +577,7 @@ func buildRecoveryEnvelope(prev *wire.SignedEnvelope, newKP *crypto.Keypair, now
 func cmdVerifyRecovery(args []string) error {
 	fs := flag.NewFlagSet("verify-recovery", flag.ContinueOnError)
 	prevPath := fs.String("prev-envelope", "", "path to the previous signed envelope .cbor (whose field-10 recovery policy and H_record anchor the declaration)")
-	evidencePath := fs.String("evidence", "", "path to the RecoveryEvidence CBOR (freens-cli recover -out)")
+	evidencePath := fs.String("evidence", "", "path to the RecoveryEvidence CBOR (recover -out)")
 	nowFlag := fs.Int64("now", 0, "verification instant as unix seconds (default: now; spec 8.4 step 3 needs now >= execute_not_before)")
 	if err := fs.Parse(args); err != nil {
 		return err

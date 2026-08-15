@@ -1,4 +1,7 @@
-package main
+// lifecycle_test.go — transfer (§8.3) / rotate (§8.6) / recover (§8.4)
+// end-to-end through the real CLI builders + DHT store. (Moved from
+// cmd/freens-cli, unchanged semantics.)
+package cli
 
 import (
 	"bytes"
@@ -15,79 +18,6 @@ import (
 	"github.com/laurent/freens/internal/naming"
 	"github.com/laurent/freens/internal/wire"
 )
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-// lifecycleKeypair returns a deterministic keypair from a single-byte seed.
-func lifecycleKeypair(t *testing.T, seed byte) *crypto.Keypair {
-	t.Helper()
-	kp, err := crypto.FromSeed(bytes.Repeat([]byte{seed}, constants.Ed25519PrivateKeyLen))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return kp
-}
-
-// captureStdout runs fn with os.Stdout redirected to a pipe and returns what
-// it printed (keeps the CLI subcommand tests' output clean).
-func captureStdout(t *testing.T, fn func() error) (string, error) {
-	t.Helper()
-	saved := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stdout = w
-	fnErr := fn()
-	w.Close()
-	os.Stdout = saved
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		t.Fatal(err)
-	}
-	return buf.String(), fnErr
-}
-
-// writeEnvelope signs rec with kp, writes the canonical .cbor to dir, and
-// returns the envelope plus its path (the make-record/publish file format).
-func writeEnvelope(t *testing.T, dir string, name string, rec *wire.Record, kp *crypto.Keypair) (*wire.SignedEnvelope, string) {
-	t.Helper()
-	env, err := wire.SignRecord(rec, kp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := env.Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, name+".cbor")
-	if err := os.WriteFile(path, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return env, path
-}
-
-// newSubNameRecord builds a §4.1 record for labels under the "foo" alias of
-// tldOwner with an A RR, in the fresh validity window around now.
-func newSubNameRecord(t *testing.T, labels []string, owner *crypto.Keypair, tldID []byte, seq uint64, now int64) *wire.Record {
-	t.Helper()
-	wireName, err := naming.EncodeWireName(labels, "foo", tldID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec, err := wire.NewRecord(wireName, owner.Public(), seq, uint64(now), uint64(now+constants.RecordDefaultTTL))
-	if err != nil {
-		t.Fatal(err)
-	}
-	aRR, err := wire.A([]byte{203, 0, 113, 42}, 300)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec.RRset = []*wire.RR{aRR}
-	return rec
-}
 
 // ---------------------------------------------------------------------------
 // transfer (§8.3) — end to end through the real CLI + DHT store
@@ -346,7 +276,10 @@ func TestRecoverEndToEnd(t *testing.T) {
 	r1 := lifecycleKeypair(t, 0x51)
 	r2 := lifecycleKeypair(t, 0x52)
 	r3 := lifecycleKeypair(t, 0x53)
-	tldID, _ := crypto.TldID(owner.Public())
+	tldID, err := crypto.TldID(owner.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Previous record with a 2-of-3 recovery policy (field 10).
 	rec := newSubNameRecord(t, []string{"www"}, owner, tldID, 1, now)
@@ -441,13 +374,4 @@ func TestRecoverEndToEnd(t *testing.T) {
 	}); err == nil {
 		t.Error("recover against a record with no field-10 policy must fail")
 	}
-}
-
-func mustRead(t *testing.T, path string) []byte {
-	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
 }

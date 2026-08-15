@@ -1,20 +1,19 @@
-// Package main (freens-cli) — dht.go implements the live-network subcommands:
+// dht.go — the live-network subcommands, now admin-aware:
 //
-//	publish   §6.4 PUT  — push signed-envelope .cbor files to the R peers
-//	           closest to each record's key. With -evidence (spec 8.4) the
-//	           single -file is instead carried by the evidence-aware PUT
-//	           (Node.PublishWithEvidence), so the RecoveryEvidence travels
-//	           with the recovered record it proves.
-//	resolve   §6.4 GET  — iterative lookup of a name's terminal record and a
-//	           human-readable display of it (chain verification is NOT
-//	           attempted here; see cmdResolve).
+//	publish   §6.4 PUT — push signed-envelope .cbor files to the R peers
+//	          closest to each record's key. With -evidence (spec 8.4) the
+//	          single -file is instead carried by the evidence-aware PUT
+//	          (Node.PublishWithEvidence). Via the daemon (admin socket) when
+//	          no -peers is given.
+//	resolve   §6.4 GET — iterative lookup of a name's terminal record and a
+//	          human-readable display of it (chain verification is NOT
+//	          attempted here; the daemon does it when serving DNS).
 //	get       raw §6.4 GET by 32-byte key — the debugging escape hatch.
 //
-// They share two helpers: parsePeerList/startCLINode (build a one-shot DHT
-// node from the -peers/-node-seed/-listen flags and verify reachability with
-// a synchronous bootstrap ping round) and printEnvelope (the record
-// pretty-printer shared by resolve and get).
-package main
+// They share the -peers/startCLINode plumbing (a one-shot DHT node with a
+// synchronous bootstrap ping round), printEnvelope (the record
+// pretty-printer), and pickTransport (admin.go's daemon-vs-standalone rule).
+package cli
 
 import (
 	"context"
@@ -123,10 +122,10 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 			return fail(err)
 		}
 		c, cancel := context.WithTimeout(ctx, time.Duration(constants.RPCTimeoutSec)*time.Second)
-		err := node.Ping(c, p)
+		err = node.Ping(c, p)
 		cancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "freens-cli: warning: peer %s unreachable (%v)\n", p.Addr, err)
+			fmt.Fprintf(os.Stderr, "%s: warning: peer %s unreachable (%v)\n", ProgName, p.Addr, err)
 			continue
 		}
 		reachable++
@@ -241,24 +240,26 @@ func publishWithEvidence(ctx context.Context, n *dht.Node, env *wire.SignedEnvel
 	return n.PublishWithEvidence(ctx, env, evidence)
 }
 
-// cmdPublish implements `freens-cli publish`: decode each -files envelope,
-// then node.Publish it to the R closest peers (§6.4 PUT — the node obtains a
-// write token from each peer via a prior get, §6.3). One line per file is
-// printed ("name-summary -> accepted/rejected"); the exit is non-zero only
-// when ALL files fail, and a warning is emitted when only some fail.
+// cmdPublish implements `publish`: decode each -files envelope, then PUT it
+// to the R closest peers (§6.4 PUT — the node obtains a write token from
+// each peer via a prior get, §6.3) or hand it to the running daemon (no
+// -peers). One line per file is printed ("name-summary -> accepted/
+// rejected"); the exit is non-zero only when ALL files fail, and a warning
+// is emitted when only some fail.
 //
 // -evidence <path> switches the single -file into §8.4 evidence transport:
 // the RecoveryEvidence CBOR is read, decoded (fail fast), and carried in the
 // PUT via [publishWithEvidence] instead of a plain Publish — the output line
 // then notes the attached signature count. It requires exactly ONE -file
-// (the recovered record R2 the evidence proves).
+// (the recovered record R2 the evidence proves). Evidence transport is
+// standalone-only: the admin socket does not carry recovery evidence.
 func cmdPublish(args []string) error {
 	fs := flag.NewFlagSet("publish", flag.ContinueOnError)
 	filesCSV := fs.String("files", "", "comma-separated paths of signed-envelope .cbor files to PUT onto the DHT (§6.4)")
-	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty")
-	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (required)")
-	listenAddr := fs.String("listen", "", "UDP address for the CLI DHT node (default: ephemeral :0)")
-	evidencePath := fs.String("evidence", "", "path to a RecoveryEvidence CBOR (spec 8.4, freens-cli recover -out): publish the single -file WITH the evidence (Node.PublishWithEvidence) instead of a plain PUT; requires exactly ONE -file")
+	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty (standalone mode only)")
+	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (standalone mode; default: the running daemon)")
+	listenAddr := fs.String("listen", "", "UDP address for the CLI DHT node (default: ephemeral :0; standalone mode only)")
+	evidencePath := fs.String("evidence", "", "path to a RecoveryEvidence CBOR (spec 8.4, recover -out): publish the single -file WITH the evidence (Node.PublishWithEvidence) instead of a plain PUT; requires exactly ONE -file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -293,18 +294,24 @@ func cmdPublish(args []string) error {
 		}
 		evidence, evidenceSigs = data, len(ev.Signatures)
 	}
-	peers, err := parsePeerList(*peersCSV)
+	tr, err := pickTransport(*peersCSV)
 	if err != nil {
 		return err
+	}
+	if evidence != nil && tr.daemon() {
+		return usageErr("publish -evidence requires standalone mode: pass -peers (the admin socket does not carry spec 8.4 recovery evidence)")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
 	defer cancel()
-	node, err := startCLINode(ctx, *nodeSeedHex, *listenAddr, peers)
-	if err != nil {
-		return err
+	var node *dht.Node
+	if !tr.daemon() {
+		node, err = startCLINode(ctx, *nodeSeedHex, *listenAddr, tr.peers)
+		if err != nil {
+			return err
+		}
+		defer node.Close()
 	}
-	defer node.Close()
 
 	accepted, failed := 0, 0
 	for _, path := range files {
@@ -338,19 +345,29 @@ func cmdPublish(args []string) error {
 				path, nameSummary(env.Record.Name), *evidencePath, evidenceSigs)
 			continue
 		}
-		if err := node.Publish(ctx, env); err != nil {
+		stored := 0
+		if tr.daemon() {
+			stored, err = tr.client.Publish(ctx, env)
+		} else {
+			err = node.Publish(ctx, env)
+		}
+		if err != nil {
 			failed++
 			fmt.Printf("%s: %s -> rejected (%v)\n", path, nameSummary(env.Record.Name), err)
 			continue
 		}
 		accepted++
-		fmt.Printf("%s: %s -> accepted\n", path, nameSummary(env.Record.Name))
+		if tr.daemon() && stored > 0 {
+			fmt.Printf("%s: %s -> accepted (daemon, %d storing peers)\n", path, nameSummary(env.Record.Name), stored)
+		} else {
+			fmt.Printf("%s: %s -> accepted\n", path, nameSummary(env.Record.Name))
+		}
 	}
 	switch {
 	case accepted == 0:
 		return fmt.Errorf("publish: all %d file(s) failed", failed)
 	case failed > 0:
-		fmt.Fprintf(os.Stderr, "freens-cli: warning: %d of %d file(s) failed\n", failed, accepted+failed)
+		fmt.Fprintf(os.Stderr, "%s: warning: %d of %d file(s) failed\n", ProgName, failed, accepted+failed)
 	}
 	return nil
 }
@@ -359,18 +376,18 @@ func cmdPublish(args []string) error {
 // resolve — §6.4 GET by name
 // ---------------------------------------------------------------------------
 
-// cmdResolve implements `freens-cli resolve`: derive the wire_name from
-// -name + -tld-id-b32, look it up with an iterative §6.4 GET, and display the
-// terminal record. Only the TERMINAL record is displayed: cryptographic
-// authority-chain verification (§3.4) is the daemon's job when serving DNS
-// answers — this subcommand is a fetch/display/debug tool, not a validating
-// resolver.
+// cmdResolve implements `resolve`: derive the wire_name from -name +
+// -tld-id-b32, look it up with an iterative §6.4 GET (or via the daemon when
+// no -peers is given), and display the terminal record. Only the TERMINAL
+// record is displayed: cryptographic authority-chain verification (§3.4) is
+// the daemon's job when serving DNS answers — this subcommand is a
+// fetch/display/debug tool, not a validating resolver.
 func cmdResolve(args []string) error {
 	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
 	name := fs.String("name", "", "display name to fetch (labels.alias, e.g. www.alice.foo; bare alias = TLD root). Chain verification is NOT performed — the daemon does it when serving DNS.")
 	tldIDB32 := fs.String("tld-id-b32", "", "base32 tld_id pin of the TLD (gen-key's tld_id_b32; RFC 4648, padding optional)")
-	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty")
-	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (required)")
+	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty (standalone mode only)")
+	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (standalone mode; default: the running daemon)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -388,7 +405,7 @@ func cmdResolve(args []string) error {
 	if err != nil {
 		return usageErr("invalid name %q: %v", *name, err)
 	}
-	peers, err := parsePeerList(*peersCSV)
+	tr, err := pickTransport(*peersCSV)
 	if err != nil {
 		return err
 	}
@@ -396,14 +413,29 @@ func cmdResolve(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	if tr.daemon() {
+		ctx, cancel := adminCtx()
+		defer cancel()
+		r, err := tr.client.Resolve(ctx, *name)
+		if err != nil {
+			return err
+		}
+		if r == nil || !r.Found {
+			fmt.Println("not found")
+			return nil
+		}
+		printResolved(r, alias)
+		return nil
+	}
+
 	key, err := dht.KeyForWireName(wireName)
 	if err != nil {
 		return err
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
 	defer cancel()
-	node, err := startCLINode(ctx, *nodeSeedHex, "", peers)
+	node, err := startCLINode(ctx, *nodeSeedHex, "", tr.peers)
 	if err != nil {
 		return err
 	}
@@ -424,18 +456,40 @@ func cmdResolve(args []string) error {
 	return nil
 }
 
+// printResolved pretty-prints an admin.Resolve answer in the same spirit as
+// printEnvelope (the daemon has already chain-verified what it serves).
+// RR.Rdata arrives base64-encoded ("rdata_b64"), with a human rendering in
+// Text ("rdata_text") when one exists.
+func printResolved(r *adminResolved, alias string) {
+	fmt.Println("found")
+	fmt.Printf("alias=%s\n", alias)
+	fmt.Printf("name=%s\n", r.Name)
+	fmt.Printf("tld_id_b32=%s\n", r.TldIDB32)
+	fmt.Printf("owner=%s\n", r.Owner)
+	fmt.Printf("sequence=%d\n", r.Sequence)
+	fmt.Printf("rrset=%d\n", len(r.RRset))
+	for i, rr := range r.RRset {
+		line := fmt.Sprintf("  [%d] type=%d ttl=%d rdata_b64=%s", i, rr.Type, rr.TTL, rr.Rdata)
+		if rr.Text != "" {
+			line += "  " + rr.Text
+		}
+		fmt.Println(line)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // get — raw §6.4 GET by key
 // ---------------------------------------------------------------------------
 
-// cmdGet implements `freens-cli get`: a raw iterative GET of an arbitrary
-// 32-byte DHT key (K_tld, K_name, or K_claim — whatever produced the key),
-// printing the envelope's H_record plus the record summary, or "not found".
+// cmdGet implements `get`: a raw iterative GET of an arbitrary 32-byte DHT
+// key (K_tld, K_name, or K_claim — whatever produced the key), printing the
+// envelope's H_record plus the record summary, or "not found". Daemon-backed
+// when no -peers is given.
 func cmdGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ContinueOnError)
 	keyHex := fs.String("key", "", "32-byte DHT key as 64 hex chars")
-	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty")
-	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (required)")
+	nodeSeedHex := fs.String("node-seed", "", "hex Ed25519 seed (32 bytes) for this CLI node's DHT identity; random if empty (standalone mode only)")
+	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (standalone mode; default: the running daemon)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -452,14 +506,31 @@ func cmdGet(args []string) error {
 	if len(key) != constants.SHA256Len {
 		return usageErr("key must be %d bytes (%d hex chars), got %d bytes", constants.SHA256Len, 2*constants.SHA256Len, len(key))
 	}
-	peers, err := parsePeerList(*peersCSV)
+	tr, err := pickTransport(*peersCSV)
 	if err != nil {
 		return err
 	}
 
+	if tr.daemon() {
+		ctx, cancel := adminCtx()
+		defer cancel()
+		env, err := tr.client.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if env == nil {
+			fmt.Println("not found")
+			return nil
+		}
+		fmt.Println("found")
+		fmt.Printf("key=%s\n", hex.EncodeToString(key))
+		printEnvelope(env, time.Now().Unix())
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
 	defer cancel()
-	node, err := startCLINode(ctx, *nodeSeedHex, "", peers)
+	node, err := startCLINode(ctx, *nodeSeedHex, "", tr.peers)
 	if err != nil {
 		return err
 	}

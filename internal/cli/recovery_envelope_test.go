@@ -1,11 +1,10 @@
-package main
-
 // recovery_envelope_test.go exercises the §8.4 recovered-record side of the
 // CLI: `recover -out-envelope` (the R2 signed envelope the NEW owner signs —
 // the opposite of §8.3's transfer signer), `verify-recovery` (the pure-wire
 // quorum/threshold/timelock report), and `publish -evidence`'s flag/decode
 // validation plus the no-silent-fallback guarantee of the evidence
-// transport helper.
+// transport helper. (Moved from cmd/freens-cli, unchanged semantics.)
+package cli
 
 import (
 	"bytes"
@@ -336,9 +335,10 @@ func TestVerifyRecoveryStatuses(t *testing.T) {
 }
 
 // TestPublishEvidenceFlagValidation: -evidence requires exactly ONE -file,
-// and the evidence bytes are read + decoded BEFORE the CLI node starts (a
-// typo'd path or garbage file is a fast local error, not a network one).
+// and the evidence bytes are read + decoded BEFORE the transport is chosen
+// (a typo'd path or garbage file is a fast local error, not a network one).
 func TestPublishEvidenceFlagValidation(t *testing.T) {
+	tempHome(t) // publish consults the admin socket via pickTransport
 	dir := t.TempDir()
 	owner := lifecycleKeypair(t, 0xa1)
 	f1 := filepath.Join(dir, "a.cbor")
@@ -355,8 +355,8 @@ func TestPublishEvidenceFlagValidation(t *testing.T) {
 		t.Errorf("two-file -evidence verdict = %v, want the one-file usage error", err)
 	}
 
-	// Missing evidence path: fails on the read, before -peers is even parsed
-	// (the error names the evidence file, not the peers).
+	// Missing evidence path: fails on the read, before the transport is even
+	// chosen (the error names the evidence file, not the peers/daemon).
 	_, err = captureStdout(t, func() error {
 		return cmdPublish([]string{"-files", f1, "-evidence", filepath.Join(dir, "missing.cbor")})
 	})
@@ -374,6 +374,22 @@ func TestPublishEvidenceFlagValidation(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "decode evidence") {
 		t.Errorf("garbage evidence verdict = %v, want a decode error", err)
+	}
+}
+
+// TestPublishNoPeersNoDaemon: neither -peers nor a daemon — the standing
+// product error telling the user to run setup.
+func TestPublishNoPeersNoDaemon(t *testing.T) {
+	tempHome(t)
+	dir := t.TempDir()
+	owner := lifecycleKeypair(t, 0xa1)
+	f1 := filepath.Join(dir, "a.cbor")
+	runMakeRecord(t, makeRecordArgs(t, "t.example", owner, "-out", f1))
+	_, err := captureStdout(t, func() error {
+		return cmdPublish([]string{"-files", f1})
+	})
+	if err == nil || err.Error() != errNoDaemon.Error() {
+		t.Errorf("publish without peers/daemon verdict = %v, want %v", err, errNoDaemon)
 	}
 }
 

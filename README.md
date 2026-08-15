@@ -1,5 +1,15 @@
 # freens — Free Namespace (Go reference implementation)
 
+> **New here?** Two commands and you are on the network:
+> ```bash
+> freens setup            # install: config, keys, seeds, systemd service, OS resolver
+> freens register myname  # claim your namespace (key → PoW → W live witnesses → publish)
+> freens name www.myname  # add names; `freens doctor` checks everything
+> ```
+> A single binary; the daemon does the networking (UPnP/STUN/TURN/seeds), the
+> CLI talks to it over a local admin socket — no peer lists, no hex, no unit
+> files. Every low-level subcommand remains available (`freens <verb> -h`).
+
 [![CI](https://github.com/camalolo/freens/actions/workflows/ci.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/ci.yml)
 [![Nightly fuzz](https://github.com/camalolo/freens/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/fuzz.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

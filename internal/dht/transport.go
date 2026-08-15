@@ -480,6 +480,12 @@ func (n *Node) UpdateAdvertise(addr string) error {
 	return nil
 }
 
+// Advertised returns the current §6.2 advertised address ("" ⇒ observed
+// source) — the exported, race-safe view for daemons, orchestrators, and
+// tests (the hostname re-resolve monitor of advertise_resolve.go is
+// observed through it).
+func (n *Node) Advertised() string { return n.advertised() }
+
 // Start binds the UDP socket and launches the read loop and the background
 // maintenance loops (§6.2 bucket refresh; §6.4 step 4 republish timer unless
 // Passive). In relay mode (NodeConfig.TurnRelay set, Advertise empty) it
@@ -1570,10 +1576,14 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 				}
 			}
 		}
-		if len(shortlist) >= want {
-			// Enough discovered; one more sorted cut below returns the best.
-			break
-		}
+		// NO shortlist-size early break: the shortlist can already hold
+		// want+ STALE/dead contacts at round 0 (garbage from past sessions),
+		// and stopping then would starve the walk of the live nodes deeper
+		// in the list — IterativeGet (which runs to convergence) has no such
+		// break for exactly this reason. The loop naturally ends when every
+		// candidate has been queried; dead probes evict their contacts, so
+		// each round makes progress. maxLookupRounds (256) × ALPHA bounds
+		// the worst case.
 	}
 	sort.SliceStable(shortlist, func(i, j int) bool {
 		return CompareDistance(target, shortlist[i].NodeID, shortlist[j].NodeID) < 0
@@ -2106,6 +2116,10 @@ type DHTLookup struct {
 func NewDHTLookup(store *EnvelopeStore, node *Node) *DHTLookup {
 	return &DHTLookup{store: store, node: node, fetchedAt: make(map[[constants.SHA256Len]byte]int64)}
 }
+
+// Store returns the lookup's local envelope store (the admin socket's
+// status gauges read it; nil never happens for NewDHTLookup values).
+func (l *DHTLookup) Store() *EnvelopeStore { return l.store }
 
 // cacheFreshness returns the re-validation window for env: the minimum RR TTL
 // across its RRset (a delegation-only record with an empty RRset falls back to

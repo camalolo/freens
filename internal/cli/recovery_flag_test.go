@@ -1,9 +1,8 @@
-package main
-
 // recovery_flag_test.go exercises make-record's -recovery-* flags (spec 5.4,
 // lines 373-394): the CLI-side construction of the field-10 recovery policy
-// that `freens-cli recover` (§8.4) later consumes. Until these flags existed
-// the §8.4 flow was only reachable programmatically (see lifecycle_test.go).
+// that `recover` (§8.4) later consumes. (Moved from cmd/freens-cli,
+// unchanged semantics.)
+package cli
 
 import (
 	"encoding/base32"

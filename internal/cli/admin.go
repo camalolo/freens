@@ -1,0 +1,166 @@
+// admin.go — the admin-awareness core: every live-network subcommand picks
+// one of two transports.
+//
+//	-peers given                 -> standalone one-shot DHT node (classic mode)
+//	no -peers, daemon alive      -> the user's running daemon via its admin
+//	                                socket (internal/admin): publish/resolve/
+//	                                get/register's witnesses all ride the
+//	                                daemon's already-connected routing table
+//	neither                      -> errNoDaemon, which tells the user exactly
+//	                                what to run
+package cli
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/laurent/freens/internal/admin"
+	"github.com/laurent/freens/internal/dht"
+	"github.com/laurent/freens/internal/home"
+	"github.com/laurent/freens/internal/wire"
+)
+
+// adminTimeout bounds every admin-socket round trip from the CLI side.
+const adminTimeout = 15 * time.Second
+
+// errNoDaemon is the standing error when neither a -peers list nor a living
+// daemon exists. The wording is the product decision: setup is the fix.
+var errNoDaemon = errors.New("no -peers given and no running freens daemon found (start one with: freens setup)")
+
+// maybeAdmin returns a client for the user's running daemon when one answers
+// on the admin socket, else nil. This is THE helper that makes the CLI
+// admin-aware: callers treat a nil result as "standalone mode required".
+func maybeAdmin() *admin.Client {
+	sock := home.AdminSock()
+	if admin.Alive(sock) {
+		return &admin.Client{Sock: sock, Timeout: adminTimeout}
+	}
+	return nil
+}
+
+// adminCtx is the per-call context for admin round trips.
+func adminCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), adminTimeout)
+}
+
+// adminResolved aliases admin.Resolved (resolved-name answer) for the
+// pretty-printer in dht.go.
+type adminResolved = admin.Resolved
+
+// adminRR aliases admin.RR (one resolved resource record).
+type adminRR = admin.RR
+
+// transport is the resolved network access mode of a live-network
+// subcommand: exactly one of client (daemon) or peers (standalone) is set.
+type transport struct {
+	client *admin.Client // non-nil: use the running daemon
+	peers  []dht.Peer    // non-empty: standalone mode with these bootstraps
+}
+
+// pickTransport implements the admin-awareness rule shared by publish /
+// resolve / get / register / name:
+//
+//	-peers non-empty -> standalone (parse + fail on typos, as today)
+//	daemon alive     -> daemon
+//	neither          -> errNoDaemon
+func pickTransport(peersCSV string) (*transport, error) {
+	if strings.TrimSpace(peersCSV) != "" {
+		peers, err := parsePeerList(peersCSV)
+		if err != nil {
+			return nil, err
+		}
+		return &transport{peers: peers}, nil
+	}
+	if c := maybeAdmin(); c != nil {
+		return &transport{client: c}, nil
+	}
+	return nil, errNoDaemon
+}
+
+// daemon reports whether the transport is the running daemon.
+func (t *transport) daemon() bool { return t != nil && t.client != nil }
+
+// publishEnv PUTs env via whichever transport was picked. The daemon path
+// returns the number of storing peers the daemon reports; the standalone
+// path returns 0 (the one-shot node's Publish already walked to the R
+// closest storers, same as the classic CLI).
+func (t *transport) publishEnv(ctx context.Context, env *wire.SignedEnvelope) (int, error) {
+	if t.daemon() {
+		return t.client.Publish(ctx, env)
+	}
+	node, err := startCLINode(ctx, "", "", t.peers)
+	if err != nil {
+		return 0, err
+	}
+	defer node.Close()
+	if err := node.Publish(ctx, env); err != nil {
+		return 0, err
+	}
+	return 0, nil
+}
+
+// firstAdminAIP extracts the first A-record address from an admin Resolved
+// RRset — the apex-IP inheritance rule of `name`. The daemon renders A
+// records' dotted quad in RR.Text ("rdata_text"); when absent the base64
+// rdata ("rdata_b64") is decoded and its length checked (an A record is
+// exactly 4 opaque bytes).
+func firstAdminAIP(rrs []admin.RR) string {
+	for _, rr := range rrs {
+		if rr.Text != "" {
+			if ip := net.ParseIP(rr.Text); ip != nil && ip.To4() != nil {
+				return ip.To4().String()
+			}
+		}
+		d, err := base64.StdEncoding.DecodeString(rr.Rdata)
+		if err != nil || len(d) != net.IPv4len {
+			continue
+		}
+		if ip := net.IP(d).To4(); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// keychain helpers
+// ---------------------------------------------------------------------------
+
+// keyFileRe matches an owner keyfile name: <alias>.key. Recovery keyfiles
+// (<alias>.rec1.key etc.) never match because the stem must be a plain
+// valid alias.
+var keyFileRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.key$`)
+
+// keychainAliases lists the aliases that have an owner key in the freens
+// keychain (home.KeysDir(), sorted) — the "which namespaces can I manage"
+// answer used by name/status/doctor.
+func keychainAliases() []string {
+	entries, err := os.ReadDir(home.KeysDir())
+	if err != nil {
+		return nil
+	}
+	var aliases []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if m := keyFileRe.FindStringSubmatch(e.Name()); m != nil {
+			aliases = append(aliases, m[1])
+		}
+	}
+	sort.Strings(aliases)
+	return aliases
+}
+
+// ownerKeyPath is the keychain location of alias' owner key.
+func ownerKeyPath(alias string) string {
+	return filepath.Join(home.KeysDir(), alias+".key")
+}
