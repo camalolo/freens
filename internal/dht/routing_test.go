@@ -194,8 +194,11 @@ func TestKBucketFillRefreshOverflow(t *testing.T) {
 		t.Fatalf("bucket order wrong: %v", b.Nodes)
 	}
 
-	// Refresh c1: it should move to the tail (most-recently-seen).
+	// Refresh c1 as a DIRECT exchange (ConfirmedAt set): it moves to the
+	// tail (most-recently-seen). A mere advertisement (ConfirmedAt 0)
+	// keeps the entry's position and LastSeen (issue #2 anti-laundering).
 	c1Refreshed := makeNode(t, 0x01, "5.5.5.5:99", 100)
+	c1Refreshed.ConfirmedAt = 100
 	if r := b.AddOrRefresh(c1Refreshed); r != nil {
 		t.Fatalf("AddOrRefresh(refresh) want nil, got %v", r)
 	}

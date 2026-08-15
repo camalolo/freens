@@ -87,7 +87,7 @@ func cmdName(args []string) error {
 		}
 		if apexIP == "" {
 			if r, err := tr.client.Resolve(ctx, alias); err == nil && r != nil {
-				apexIP = firstAdminAIP(r.RRset)
+				apexIP = firstAdminIP(r.RRset) // A first, AAAA fallback
 			}
 		}
 	} else {
@@ -124,21 +124,24 @@ func cmdName(args []string) error {
 						apexIP = net.IP(rr.Rdata).To4().String()
 						break
 					}
+					if rr.Type == wire.RRTypeAAAA && len(rr.Rdata) == net.IPv6len && apexIP == "" {
+						apexIP = net.IP(rr.Rdata).To16().String()
+					}
 				}
 			}
 		}
 	}
 	if apexIP == "" {
-		return usageErr("no -ip given and the apex %s has no current A record to inherit — pass -ip", alias)
-	}
-	ip4 := net.ParseIP(apexIP).To4()
-	if ip4 == nil {
-		return usageErr("invalid IPv4 address %q", apexIP)
+		return usageErr("no -ip given and the apex %s has no current A/AAAA record to inherit — pass -ip", alias)
 	}
 
 	// --- build + sign (the same builder make-record uses) -------------------
 	expires := uint64(time.Now().Unix()) + uint64(constants.RecordDefaultTTL)
-	rec, wireName, err := buildARecord(displayName, tldID, ownerKP.Public(), ip4, seq, *ttl, expires)
+	ipRR, rrErr := addrRR(apexIP, *ttl)
+	if rrErr != nil {
+		return usageErr("%v", rrErr)
+	}
+	rec, wireName, err := buildRRRecord(displayName, tldID, ownerKP.Public(), ipRR, seq, expires)
 	if err != nil {
 		return err
 	}

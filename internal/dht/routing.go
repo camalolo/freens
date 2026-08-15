@@ -30,12 +30,17 @@ const numBuckets = 256
 // NodeID (= SHA-256(PublicKey)); the public key is stored alongside so that
 // signatures on incoming RPCs can be verified without a separate lookup.
 // Addr is the "ip:port" form. LastSeen is a unix timestamp updated on
-// add/refresh.
+// add/refresh. ConfirmedAt is the last time THIS node exchanged directly
+// with the contact (a verified inbound message, or a successful RPC round
+// trip): advertisement alone ({nodes} lists) never advances it — that is
+// the anti-ghost invariant (issue #2): a dead contact re-taught by peers
+// must not look alive.
 type NodeContact struct {
-	NodeID    []byte // 32 bytes (SHA-256(PublicKey))
-	PublicKey []byte // 32 bytes (Ed25519 verifying key)
-	Addr      string // "ip:port"
-	LastSeen  int64  // unix seconds
+	NodeID      []byte // 32 bytes (SHA-256(PublicKey))
+	PublicKey   []byte // 32 bytes (Ed25519 verifying key)
+	Addr        string // "ip:port"
+	LastSeen    int64  // unix seconds
+	ConfirmedAt int64  // unix seconds; 0 = never directly confirmed
 }
 
 // NewNodeContact validates and constructs a NodeContact. nodeID and publicKey
@@ -71,10 +76,11 @@ func (c *NodeContact) clone() *NodeContact {
 		return nil
 	}
 	return &NodeContact{
-		NodeID:    append([]byte(nil), c.NodeID...),
-		PublicKey: append([]byte(nil), c.PublicKey...),
-		Addr:      c.Addr,
-		LastSeen:  c.LastSeen,
+		NodeID:      append([]byte(nil), c.NodeID...),
+		PublicKey:   append([]byte(nil), c.PublicKey...),
+		Addr:        c.Addr,
+		LastSeen:    c.LastSeen,
+		ConfirmedAt: c.ConfirmedAt,
 	}
 }
 
@@ -117,9 +123,13 @@ func (b *KBucket) Remove(nodeID []byte) bool {
 // AddOrRefresh performs the Kademlia bucket update and returns the eviction
 // candidate (or nil):
 //
-//   - If the contact's NodeID is already present: its PublicKey/Addr/LastSeen
-//     are updated in place and it is moved to the tail (most-recently-seen).
-//     Returns nil.
+//   - If the contact's NodeID is already present: PublicKey/Addr update in
+//     place. A DIRECT confirmation (c.ConfirmedAt > 0) also refreshes
+//     LastSeen/ConfirmedAt and moves the contact to the tail
+//     (most-recently-seen). A mere ADVERTISEMENT (c.ConfirmedAt == 0) of an
+//     entry this node has never confirmed keeps the stored LastSeen and
+//     bucket position — re-teaching must not launder a dead contact into
+//     liveness (issue #2).
 //   - If absent and the bucket is not full: the contact is appended at the
 //     tail. Returns nil.
 //   - If absent and the bucket is FULL: does NOT insert; returns the head
@@ -128,13 +138,18 @@ func (b *KBucket) AddOrRefresh(c *NodeContact) *NodeContact {
 	for i, cur := range b.Nodes {
 		if bytes.Equal(cur.NodeID, c.NodeID) {
 			// Refresh the stored contact's fields in place so other holders
-			// of the same *NodeContact reference observe the update, then
-			// move it to the tail.
+			// of the same *NodeContact reference observe the update.
 			cur.PublicKey = c.PublicKey
 			cur.Addr = c.Addr
-			cur.LastSeen = c.LastSeen
-			b.Nodes = append(b.Nodes[:i], b.Nodes[i+1:]...)
-			b.Nodes = append(b.Nodes, cur)
+			if c.ConfirmedAt > cur.ConfirmedAt {
+				cur.ConfirmedAt = c.ConfirmedAt
+			}
+			if c.ConfirmedAt > 0 {
+				// A direct exchange: full recency refresh + move to tail.
+				cur.LastSeen = c.LastSeen
+				b.Nodes = append(b.Nodes[:i], b.Nodes[i+1:]...)
+				b.Nodes = append(b.Nodes, cur)
+			}
 			return nil
 		}
 	}

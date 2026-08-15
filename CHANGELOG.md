@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5.0 — ghost contacts, IPv6 names, clock doctor, chair alerting
+- **Issue #2 fixed — advertisement can no longer launder dead contacts.**
+  A contact's liveness now requires DIRECT exchange: `ConfirmedAt` is
+  advanced only by verified inbound messages / successful RPCs; {nodes}
+  re-teaching keeps the original LastSeen and bucket position (an
+  advertised ghost never looks fresh), a 1-minute idle sweep (default
+  TTL 1 h, `NodeConfig.ContactIdleTTL`) evicts unconfirmed- and
+  silent-ages contacts no matter how enthusiastically peers re-advertise
+  them, and the peerbook persists ONLY directly-confirmed contacts.
+  Found live: a day of one-shot CLI probes left ~10 ephemeral-port
+  ghosts per table; witness collection degraded to 2/5.
+- **IPv6 names: `-ip` accepts v6 in `register` and `name`** (IPv6
+  literal → AAAA record; dotted quad → A as before). `name`'s apex
+  inheritance falls back A → AAAA.
+- **doctor checks the clock** (warn-only): freens crypto is wall-clock
+  dependent (validity windows, §7.4 ordering, witness ts bounds);
+  skew measured against HTTP Date headers, NTP-fix advice at 2 min/1 h
+  thresholds, offline = skip not fail.
+- **Chair alerting**: `contrib/systemd/freens-health.{service,timer}` —
+  doctor every 15 min, failures in the journal, `OnFailure=` hook for
+  your notifier; plus an acceptable-use section for node operators in
+  the runbook.
+
 ## v0.4.0 — passphrase-protected keyfiles
 - **Owner and recovery keys can now be encrypted at rest.** At
   registration a passphrase is prompted: Enter twice = the plaintext

@@ -873,14 +873,16 @@ func peerbookLoop(node *dht.Node, stop <-chan struct{}, logger *slog.Logger) {
 
 // savePeerbook persists the node's current routing-table contacts (the
 // best dialable peers this node knows — AllContacts order, capped at 32 by
-// home.SavePeerbook) as one best-effort atomic write. No-op without a node
+// home.SavePeerbook) as one best-effort atomic write. Only DIRECTLY
+// CONFIRMED contacts are persisted (issue #2: advertisement-learned
+// ephemeral-port ghosts must not survive a restart). No-op without a node
 // or without contacts (an empty book would erase nothing but also teach
 // nothing; keeping the last non-empty book is strictly better).
 func savePeerbook(node *dht.Node, logger *slog.Logger) {
 	if node == nil {
 		return
 	}
-	peers := home.ContactsToPeers(node.RoutingTable().AllContacts())
+	peers := confirmedPeers(node.RoutingTable().AllContacts(), time.Now().Unix())
 	if len(peers) == 0 {
 		return
 	}
@@ -889,6 +891,20 @@ func savePeerbook(node *dht.Node, logger *slog.Logger) {
 		return
 	}
 	logger.Info("peerbook saved", "peers", len(peers))
+}
+
+// confirmedPeers filters contacts to those with at least one DIRECT
+// exchange (ConfirmedAt > 0 — the routing table's anti-ghost invariant) and
+// converts them to the persistence form. Exported shape: pure function.
+func confirmedPeers(contacts []*dht.NodeContact, now int64) []dht.Peer {
+	var out []dht.Peer
+	for _, c := range contacts {
+		if c.ConfirmedAt <= 0 {
+			continue // never directly confirmed: do not persist
+		}
+		out = append(out, dht.Peer{Addr: c.Addr, PublicKey: c.PublicKey})
+	}
+	return out
 }
 
 // renewLoop keeps the user's own names alive: every 10 minutes it scans the

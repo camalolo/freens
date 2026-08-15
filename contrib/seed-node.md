@@ -73,3 +73,22 @@ so symmetric-NAT users can join; expose `-metrics` locally.
 A node is kilobytes of signed records and occasional witness signatures —
 the smallest VPS or a Pi is far more than enough. Disk use is bounded by
 the record store; `persist` can be dropped if you prefer memory-only.
+
+## Staying awake (alerting)
+
+A dead chair shrinks the witness pool silently. `contrib/systemd/`
+ships a `freens-health.timer` + service pair: `freens doctor` every
+15 minutes, failures in the journal under `freens-health.service` —
+wire `OnFailure=` to whatever notifies you (mail, ntfy, your pager).
+
+## Acceptable use
+
+Your node stores and serves whatever correctly-signed records the
+network publishes — you cannot see or pre-approve content (it is
+end-to-end signed, not encrypted). As an operator you retain the
+ultimate control: stopping the daemon, or firewalling specific
+records' keys is impractical, but shutting the node down is always one
+command. If your jurisdiction or hosting provider has rules about
+carrying third-party content, factor them in before joining; the
+network has no builtin takedown path (by design — only a record's
+owner key can revoke it).

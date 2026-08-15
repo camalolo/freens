@@ -112,9 +112,8 @@ func cmdRegister(args []string) error {
 		apexIP = out.String()
 		fmt.Printf("ip=%s (this machine's outbound IPv4; override with -ip)\n", apexIP)
 	}
-	ip4 := netIP(apexIP)
-	if ip4 == nil {
-		return usageErr("invalid -ip %q (want dotted quad)", apexIP)
+	if ip := net.ParseIP(apexIP); ip == nil || (ip.To4() == nil && !strings.Contains(apexIP, ":")) {
+		return usageErr("invalid -ip %q (want an IPv4 dotted quad or an IPv6 literal)", apexIP)
 	}
 
 	// --- owner key ---------------------------------------------------------
@@ -303,7 +302,7 @@ func cmdRegister(args []string) error {
 	if err != nil {
 		return err
 	}
-	a, err := wire.A(ip4, *ttl)
+	a, err := addrRR(apexIP, *ttl)
 	if err != nil {
 		return usageErr("invalid -ip: %v", err)
 	}

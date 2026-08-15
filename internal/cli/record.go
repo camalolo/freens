@@ -52,6 +52,26 @@ func buildARecord(displayName string, tldID, ownerPK []byte, ip4 net.IP, seq, tt
 	return rec, wireName, nil
 }
 
+// buildRRRecord is buildARecord for ANY pre-built address RR (A or AAAA —
+// the IPv6 path of `name`; see addrRR).
+func buildRRRecord(displayName string, tldID, ownerPK []byte, rr *wire.RR, seq, expires uint64) (*wire.Record, []byte, error) {
+	labels, alias, err := naming.DecomposeName(displayName)
+	if err != nil {
+		return nil, nil, usageErr("invalid name %q: %v", displayName, err)
+	}
+	wireName, err := naming.EncodeWireName(labels, alias, tldID)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := uint64(time.Now().Unix())
+	rec, err := wire.NewRecord(wireName, ownerPK, seq, now, expires)
+	if err != nil {
+		return nil, nil, err
+	}
+	rec.RRset = []*wire.RR{rr}
+	return rec, wireName, nil
+}
+
 // ---------------------------------------------------------------------------
 // make-record
 // ---------------------------------------------------------------------------

@@ -107,6 +107,30 @@ func (t *transport) publishEnv(ctx context.Context, env *wire.SignedEnvelope) (i
 	return 0, nil
 }
 
+// firstAdminIP extracts the first A-record address from an admin Resolved
+// RRset — falling back to AAAA (16-byte rdata) when no A exists — the
+// apex-IP inheritance rule of `name` (v4 preferred, v6 capable).
+func firstAdminIP(rrs []admin.RR) string {
+	if ip := firstAdminAIP(rrs); ip != "" {
+		return ip
+	}
+	for _, rr := range rrs {
+		if rr.Text != "" {
+			if ip := net.ParseIP(rr.Text); ip != nil && ip.To4() == nil && ip.To16() != nil {
+				return ip.To16().String()
+			}
+		}
+		d, err := base64.StdEncoding.DecodeString(rr.Rdata)
+		if err != nil || len(d) != net.IPv6len {
+			continue
+		}
+		if ip := net.IP(d); ip.To4() == nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
 // firstAdminAIP extracts the first A-record address from an admin Resolved
 // RRset — the apex-IP inheritance rule of `name`. The daemon renders A
 // records' dotted quad in RR.Text ("rdata_text"); when absent the base64

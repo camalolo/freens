@@ -1,0 +1,22 @@
+# freens chair monitoring: a systemd timer running `freens doctor` on a
+# schedule. Failures land in the journal with the unit's name — pair with
+# any log-alerting you already run (journalctl -u freens-health, or your
+# host's email/pager bridge on OnFailure=).
+#
+# Install (as root):
+#   install -m644 freens-health.service freens-health.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now freens-health.timer
+#
+# The service runs as the SAME USER that ran `freens setup` (the one owning
+# ~/.freens and the daemon's admin socket). Replace YOURUSER if needed.
+
+[Unit]
+Description=freens health check (doctor)
+
+[Service]
+Type=oneshot
+User=YOURUSER
+ExecStart=/usr/local/bin/freens doctor
+# doctor exits non-zero when any check fails — OnFailure fires the alert
+# path below. Uncomment and point at your notifier (mail, ntfy, pager):
+#OnFailure=notify-email@.service

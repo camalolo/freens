@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -244,6 +245,24 @@ func cmdDoctor(args []string) error {
 		warn("OS resolver does not point at the daemon yet (setup wires it; DNS still works via the daemon port)")
 	}
 
+	// 8. Clock sanity (warn-only): freens cryptography is wall-clock
+	//    dependent (record validity windows, §7.4 claim ordering, witness
+	//    timestamp bounds) — a badly skewed clock registers badly and
+	//    resolves badly. Measured against an HTTP Date header; offline or
+	//    unreachable is a skip, not a failure.
+	if skew, ok := clockSkew(); ok {
+		switch {
+		case skew < 2*time.Minute:
+			fmt.Printf("✔ clock sane (skew %s against internet time)\n", skew.Round(time.Second))
+		case skew < 1*time.Hour:
+			warn("clock is %s off internet time — fix NTP (records/claims misbehave under skew)", skew.Round(time.Second))
+		default:
+			warn("clock is %s off internet time — registrations from this machine will misbehave; fix NTP NOW", skew.Round(time.Minute))
+		}
+	} else {
+		warn("could not check clock skew (no internet time source reachable)")
+	}
+
 	if failed > 0 {
 		return fmt.Errorf("doctor: %d check(s) failed", failed)
 	}
@@ -285,6 +304,37 @@ func waitForAdminSocket() bool {
 		time.Sleep(doctorFixWaitSleep)
 	}
 	return maybeAdmin() != nil
+}
+
+// clockSkew measures |local clock − internet time| via HTTP Date headers
+// (second-granularity, plenty for the minutes-level sanity we need).
+// ok=false means "could not measure" (offline / filtered), never an error.
+// The endpoint set is swapped in tests.
+var clockSkewProbes = []string{"https://1.1.1.1/", "https://www.google.com/"}
+
+func clockSkew() (time.Duration, bool) {
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, url := range clockSkewProbes {
+		resp, err := client.Head(url)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		d := resp.Header.Get("Date")
+		if d == "" {
+			continue
+		}
+		remote, err := http.ParseTime(d)
+		if err != nil {
+			continue
+		}
+		skew := time.Since(remote)
+		if skew < 0 {
+			skew = -skew
+		}
+		return skew, true
+	}
+	return 0, false
 }
 
 // checkDNSFallback resolves a known upstream name through the daemon's DNS

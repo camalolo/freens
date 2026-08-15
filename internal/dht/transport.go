@@ -92,6 +92,14 @@ const lookupProbeTimeout = 2 * time.Second
 // due (past RefreshFraction = 80% of its lifetime, checked on every scan).
 const defaultRepublishInterval = 60 * time.Second
 
+// defaultContactIdleTTL is the anti-ghost sweep horizon (issue #2): a
+// contact with no DIRECT exchange for this long is evicted, no matter how
+// enthusiastically peers re-advertise it. One-shot CLI nodes (ephemeral
+// ports), crashed daemons and stale port-forwards all converge to evicted
+// within one TTL; healthy meshes confirm constantly (republish traffic,
+// bucket refreshes) and never approach it.
+const defaultContactIdleTTL = time.Hour
+
 // Default per-source-IP get/find_node throttle (§12 line 914). 50 req/s with a
 // burst of 100 is ~2 orders of magnitude above honest lookup traffic (an
 // iterative GET issues one get per round-trip per ALPHA=3 candidate) while
@@ -150,6 +158,10 @@ type NodeConfig struct {
 	// the refresh loop. The refresh runs regardless of Passive (even a passive
 	// node needs a healthy routing table for its own iterative GETs).
 	BucketRefreshInterval time.Duration
+	// ContactIdleTTL bounds how long a contact survives without a DIRECT
+	// exchange (advertisement re-teaching does not count — issue #2).
+	// Zero ⇒ the default (1 h); negative ⇒ the idle sweep is disabled.
+	ContactIdleTTL time.Duration
 	// RepublishInterval overrides the scan period of the §6.4 step 4 republish
 	// timer (spec lines 471-473: records are republished once past
 	// RefreshFraction = 80% of their lifetime). Zero ⇒ 60s. Negative disables
@@ -230,6 +242,7 @@ type Node struct {
 	passive        bool
 	refreshEvery   time.Duration // resolved: >0 = run refresh loop
 	republishEvery time.Duration // resolved: >0 = run republish loop
+	contactIdleTTL time.Duration // resolved: >0 = run the idle sweep
 	pingTimeout    time.Duration // resolved: §6.2 eviction-ping deadline
 	bgCancel       context.CancelFunc
 	bgOnce         sync.Once
@@ -414,6 +427,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	} else if republishEvery < 0 {
 		republishEvery = 0
 	}
+	contactIdleTTL := cfg.ContactIdleTTL
+	if contactIdleTTL == 0 {
+		contactIdleTTL = defaultContactIdleTTL
+	}
 	// Per-source-IP read throttle (§12 line 914): negative rate ⇒ disabled.
 	var getLim *rateLimiter
 	if cfg.GetRateLimit >= 0 {
@@ -434,6 +451,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		passive:        cfg.Passive,
 		refreshEvery:   refreshEvery,
 		republishEvery: republishEvery,
+		contactIdleTTL: contactIdleTTL,
 		pingTimeout:    pingTimeout,
 		store:          cfg.Store,
 		rt:             rt,
@@ -815,6 +833,7 @@ func (n *Node) learnPeer(pk []byte, raddr *net.UDPAddr, advertised string) {
 	if err != nil {
 		return
 	}
+	c.ConfirmedAt = n.now() // a verified inbound message: direct confirmation
 	n.learn(c)
 }
 
@@ -1772,14 +1791,41 @@ func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*
 }
 
 // learnContact refreshes/inserts a contact discovered via find_node/get (a
-// parsed node list, so LastSeen is stamped here). A full bucket schedules the
-// async §6.2 eviction check (see learn).
+// parsed node list, so LastSeen is stamped here). ConfirmedAt stays 0 for
+// new entries — advertisement is not evidence of life (issue #2) — and is
+// never advanced by re-teaching; only a direct exchange (learnPeer) does
+// that. A full bucket schedules the async §6.2 eviction check (see learn).
 func (n *Node) learnContact(c *NodeContact) {
 	if c == nil || bytes.Equal(c.NodeID, n.id) {
 		return
 	}
 	c.LastSeen = n.now()
+	// c.ConfirmedAt is left as the caller set it (0 from {nodes} parsing);
+	// AddOrRefresh keeps the stored entry's confirmation untouched.
 	n.learn(c)
+}
+
+// sweepIdleContacts evicts contacts whose last DIRECT confirmation (or, for
+// never-confirmed advertised contacts, their original learn time) is older
+// than the idle TTL (issue #2: one-shot CLI nodes and other ghosts leave
+// ephemeral-address contacts behind; peers re-advertise them, so only a
+// confirmation-age sweep converges). Called from the maintenance loop.
+func (n *Node) sweepIdleContacts(now int64) {
+	if n.contactIdleTTL <= 0 {
+		return // disabled
+	}
+	ttl := int64(n.contactIdleTTL / time.Second)
+	for _, c := range n.rt.AllContacts() {
+		effective := c.ConfirmedAt
+		if effective == 0 {
+			effective = c.LastSeen // never confirmed: probation from learn time
+		}
+		if now-effective > ttl {
+			n.rt.Remove(c.NodeID)
+			n.log.Debug("dht: evicted idle contact", "addr", c.Addr,
+				"confirmed_at", c.ConfirmedAt, "ttl", n.contactIdleTTL.String())
+		}
+	}
 }
 
 // Publish stores env on the R closest nodes to its key (§6.4 PUT), obtaining a
@@ -2061,6 +2107,26 @@ func (n *Node) startBackground() {
 	if !n.passive && n.republishEvery > 0 {
 		n.bgWg.Add(1)
 		go n.republishLoop(ctx)
+	}
+	if n.contactIdleTTL > 0 {
+		n.bgWg.Add(1)
+		go n.idleSweepLoop(ctx)
+	}
+}
+
+// idleSweepLoop runs sweepIdleContacts on a 1-minute cadence (issue #2).
+func (n *Node) idleSweepLoop(ctx context.Context) {
+	defer n.bgWg.Done()
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	n.sweepIdleContacts(n.now()) // also at startup: reload hygiene
+	for {
+		select {
+		case <-t.C:
+			n.sweepIdleContacts(n.now())
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
