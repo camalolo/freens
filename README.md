@@ -1,4 +1,8 @@
-# freens — Free Namespace (Go reference implementation, v0.1 draft)
+# freens — Free Namespace (Go reference implementation)
+
+[![CI](https://github.com/camalolo/freens/actions/workflows/ci.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/ci.yml)
+[![Nightly fuzz](https://github.com/camalolo/freens/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/fuzz.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 freens is a decentralized, permissionless naming system that maps
 human-readable names to signed resource records (IP addresses, TXT, etc.)
@@ -16,7 +20,7 @@ resolve collisions on human-readable aliases.
 
 ## Status
 
-Implemented and fully tested (130 test functions, `go test ./...` green,
+Implemented and fully tested (578 test functions + 9 fuzz targets, `go test ./...` green,
 `go vet` clean, `-race` clean):
 
 | Package | Implements | Spec |
@@ -91,7 +95,7 @@ freens/
 ## Running the tests
 
 ```bash
-go test ./...                      # all 130 test functions
+go test ./...                      # all 578 test functions
 go test -race ./...                # race-clean
 go test -v ./internal/integration/ # the end-to-end flow + golden vectors
 ```
@@ -176,3 +180,8 @@ signing key produces identical signatures in either implementation.
 - Protocol spec: `specifications.md` (v0.1 draft)
 - RFC 8032 (Ed25519), RFC 8949 §4.2 (deterministic CBOR), FIPS 180-4 (SHA-256),
   RFC 2119/8174 (requirements language), RFC 4648 (base32)
+
+## License
+
+MIT — see [LICENSE](LICENSE). `specifications.md` is the normative protocol
+specification and lives in this repository.
