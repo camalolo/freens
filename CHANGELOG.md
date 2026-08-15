@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.3.4 — `freens revoke <name>`: §9.5's tombstone as an easy button
+- **Revocation had every layer except the button**: the wire (field 12),
+  the store (winner rule), the resolver (NXDOMAIN at any revoked hop) —
+  but no CLI could create one. `freens revoke <name>` builds the §9.5
+  tombstone from live state (owner key from the keychain, sequence =
+  current+1 fetched from the network, empty RRset, revoke=true) and
+  publishes it; confirmation prompt on a TTY (-yes skips). Un-revoke =
+  publish a newer sequence.
+- **register is now sequence-aware**: it hardcoded sequence 1, so
+  re-registering a revoked apex (the natural un-revoke path) would have
+  LOST the §6.4 winner rule and been silently ignored. It now fetches
+  the current sequence like `name` does.
+
 ## v0.3.3 — fresh-install fix (found on the cross-internet test node)
 - **First boot with a fresh `persist` dir no longer fails.** The v0.3.2
   load→persist defaulting errored on a not-yet-existing store dir

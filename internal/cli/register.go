@@ -267,7 +267,27 @@ func cmdRegister(args []string) error {
 		return err
 	}
 	now := uint64(time.Now().Unix())
-	rec, err := wire.NewRecord(name, kp.Public(), 1, now, now+86400)
+	// Sequence: the network's current + 1 when the name exists (a RETRY
+	// after a revocation, or any prior publication, must out-sequence it —
+	// §6.4 winner rule — or the re-publish is silently ignored); 1 for a
+	// genuinely fresh name.
+	seq := uint64(1)
+	if tr.daemon() {
+		sctx, scancel := adminCtx()
+		if r, rerr := tr.client.Resolve(sctx, *alias); rerr == nil && r != nil && r.Found {
+			seq = uint64(r.Sequence) + 1
+		}
+		scancel()
+	} else {
+		kTld, kerr := dht.KeyForWireName(name)
+		if kerr != nil {
+			return kerr
+		}
+		if cur, cerr := node.IterativeGet(ctx, kTld); cerr == nil && cur != nil {
+			seq = cur.Record.Sequence + 1
+		}
+	}
+	rec, err := wire.NewRecord(name, kp.Public(), seq, now, now+86400)
 	if err != nil {
 		return err
 	}

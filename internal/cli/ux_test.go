@@ -395,6 +395,56 @@ func TestDoctorChecksConfiguredPort(t *testing.T) {
 	}
 }
 
+// TestRevokePublishesTombstone: revoke builds the §9.5 tombstone from live
+// state — owner key from the keychain, sequence = current+1 (the stub says
+// 4), empty RRset, revoke=true — and publishes it via the daemon transport.
+func TestRevokePublishesTombstone(t *testing.T) {
+	h := tempHome(t)
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), map[string]string{
+		"alice": resolvedJSON("alice", 4, "203.0.113.42"),
+	})
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), mustTestKeypair(t)); err != nil {
+		t.Fatal(err)
+	}
+	oldTerm := sysIsTerminal
+	sysIsTerminal = func() bool { return false } // no prompt in tests
+	t.Cleanup(func() { sysIsTerminal = oldTerm })
+
+	out, err := captureStdout(t, func() error { return cmdRevoke([]string{"alice", "-yes"}) })
+	if err != nil {
+		t.Fatalf("revoke: %v\n%s", err, out)
+	}
+	if len(stub.published) == 0 {
+		t.Fatal("nothing published")
+	}
+	env := stub.published[len(stub.published)-1]
+	if !env.IsRevoked() {
+		t.Error("published envelope is not revoked")
+	}
+	if env.Record.Sequence != 5 {
+		t.Errorf("tombstone sequence = %d, want 5 (current 4 + 1)", env.Record.Sequence)
+	}
+	if len(env.Record.RRset) != 0 {
+		t.Errorf("tombstone RRset = %d entries, want 0 (spec 9.5)", len(env.Record.RRset))
+	}
+	if !strings.Contains(out, "REVOKED") {
+		t.Errorf("output missing the REVOKED line:\n%s", out)
+	}
+}
+
+// TestRevokeUnknownAlias: revoking a name whose alias has no keychain key
+// is a plain usage error (only the owner can revoke), listing what exists.
+func TestRevokeUnknownAlias(t *testing.T) {
+	tempHome(t)
+	oldTerm := sysIsTerminal
+	sysIsTerminal = func() bool { return false }
+	t.Cleanup(func() { sysIsTerminal = oldTerm })
+	_, err := captureStdout(t, func() error { return cmdRevoke([]string{"alice", "-yes"}) })
+	if err == nil || !strings.Contains(err.Error(), "only the owner can revoke") {
+		t.Fatalf("want owner-only error, got: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // backup / restore
 // ---------------------------------------------------------------------------

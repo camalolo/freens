@@ -79,6 +79,7 @@ var dispatch = map[string]func([]string) error{
 	"recover":         cmdRecover,
 	"verify-recovery": cmdVerifyRecovery,
 	"register":        cmdRegister,
+	"revoke":          cmdRevoke,
 	"setup":           cmdSetup,
 	"start":           cmdStart,
 	"backup":          cmdBackup,
@@ -227,6 +228,8 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "                         (--fix repairs: starts the daemon, wires the OS resolver)")
 	fmt.Fprintln(w, "  register <alias>       claim an alias end-to-end (spec 7): key -> PoW -> W live witness")
 	fmt.Fprintln(w, "                         co-signatures -> TLD record published at K_tld+K_claim (2-of-3 recovery default)")
+	fmt.Fprintln(w, "  revoke <name>          tombstone a name you own (spec 9.5): stops resolving everywhere;")
+	fmt.Fprintln(w, "                         un-revoke = publish again (`register`/`name` at a newer sequence)")
 	fmt.Fprintln(w, "  backup                 bundle every key of your name(s) into one dated file (-restore unpacks it)")
 	fmt.Fprintln(w, "                         — the \"never lose your name\" button; store the file off-machine")
 	fmt.Fprintln(w, "  name                   add/update <label>.<alias> (owner key from the keychain; IP inherits the apex A)")
