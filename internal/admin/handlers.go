@@ -297,6 +297,13 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "publish failed: "+err.Error())
 		return
 	}
+	// Local-first consistency: also install the envelope in the DAEMON'S
+	// OWN store (§6.4 winner rule makes it harmless — a better incumbent
+	// is kept, a winning newcomer replaces it). Without this the owner's
+	// resolver keeps serving the stale copy from its cache/local store
+	// until freshness lapses (found live: post-renewal the publishing box
+	// itself still answered sequence N-1 while peers served N).
+	s.storeLocally(env)
 	accepted := 1
 	if claimErr == nil {
 		// §7.4/C.1: the same envelope also lives at K_claim. Best-effort —
@@ -309,6 +316,23 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"accepted": accepted})
+}
+
+// storeLocally installs env at every legitimate key (dht.StorageKeys) in the
+// daemon's own store, best-effort (the network publication already
+// happened; the local slot is an optimization for the local resolver).
+func (s *Server) storeLocally(env *wire.SignedEnvelope) {
+	if s.lookup == nil {
+		return
+	}
+	keys, err := dht.StorageKeys(env)
+	if err != nil {
+		return
+	}
+	now := s.lookup.Store().Now()
+	for _, k := range keys {
+		_, _ = s.lookup.Store().Put(k, env, now, false) // signature verified above
+	}
 }
 
 // ---------------------------------------------------------------------------
