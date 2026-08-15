@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.7 — names stay alive: renewal + the community seed is back
+- **`freens renew [name…]`** — the lease-extension button: re-signs at
+  sequence+1 with a fresh 24 h window (owner-only, no PoW, no witnesses,
+  milliseconds). No arguments renews every keychain alias; fresh records
+  are skipped unless -force; revoked records are refused (deliberate
+  death). New `internal/renewal` package carries the semantics.
+- **The daemon auto-renews keychain names every 10 minutes** (store scan:
+  every envelope signed by a keychain key inside the final-20% window is
+  re-signed and republished at all its legitimate keys — K_tld/K_name +
+  K_claim). "Keep the daemon running and your names stay alive" is now
+  literally true; the §6.4 republish loop alone cannot extend an expiry
+  baked into a signature. Passive nodes and relay-only boxes (empty
+  keychain) skip it.
+- **Community seed promoted**: the shipped `defaultSeedLine` pointed at
+  the morning's uninstalled production node (right hostname, dead key —
+  every fresh install bootstrapped against nothing). Now pinned to the
+  current fleet identity on freens.camalolo.com (that machine holds its
+  public IP directly on ppp0 — no NAT in the path).
+- `dht.Node.PublishKeyedAt`: publish an envelope at an explicit key set
+  (the auto-renew path; same best-effort semantics as Publish).
+
 ## v0.3.6 — §7.4 anti-forgery: claim timestamps are bounded
 - **A forged "ancient" claim could permanently out-order every honest
   claim** (§7.4 orders earliest-timestamp-first) and steal an alias once

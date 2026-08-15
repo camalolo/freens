@@ -38,8 +38,10 @@ import (
 )
 
 // defaultSeedLine is the pinned community bootstrap seed written to
-// seeds.conf (host:port#node-pubkey-hex).
-const defaultSeedLine = "freens.camalolo.com:15353#780494a338d831d94b371c9a1d9351885753df071ba4e60e23283282d33fe2c7"
+// seeds.conf (host:port#node-pubkey-hex). Updated v0.3.7: the promoted
+// community node on freens.camalolo.com (the machine holds its public IP
+// directly — no NAT between it and the internet).
+const defaultSeedLine = "freens.camalolo.com:15353#38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6"
 
 // daemonDNSAddr is the high port the daemon's resolver listens on (53 needs
 // privileges; the OS is pointed here instead).

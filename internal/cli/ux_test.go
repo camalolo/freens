@@ -17,7 +17,11 @@ import (
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // ---------------------------------------------------------------------------
@@ -442,6 +446,91 @@ func TestRevokeUnknownAlias(t *testing.T) {
 	_, err := captureStdout(t, func() error { return cmdRevoke([]string{"alice", "-yes"}) })
 	if err == nil || !strings.Contains(err.Error(), "only the owner can revoke") {
 		t.Fatalf("want owner-only error, got: %v", err)
+	}
+}
+
+// TestRenewExtendsLease: renew fetches the current envelope (seq 4, expiring
+// soon), re-signs at seq 5 with a fresh 24 h window, and publishes.
+func TestRenewExtendsLease(t *testing.T) {
+	h := tempHome(t)
+	kp := mustTestKeypair(t)
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireName, err := naming.EncodeWireName(nil, "alice", tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := uint64(time.Now().Unix())
+	rec, err := wire.NewRecord(wireName, kp.Public(), 4, now-80000, now+2000) // inside the 20% window
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := wire.A([]byte{203, 0, 113, 42}, 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.RRset = []*wire.RR{a}
+	prev, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The stub /get serves the current envelope under its K_tld.
+	key, err := dht.KeyForWireName(wireName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
+	stub.getKey = key
+	stub.getEnv = prev
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+
+	out, errOut := captureStdout(t, func() error { return cmdRenew([]string{"alice"}) })
+	if errOut != nil {
+		t.Fatalf("renew: %v\n%s", errOut, out)
+	}
+	if len(stub.published) == 0 {
+		t.Fatal("nothing published")
+	}
+	env := stub.published[len(stub.published)-1]
+	if env.Record.Sequence != 5 {
+		t.Errorf("renewed sequence = %d, want 5", env.Record.Sequence)
+	}
+	if env.Record.Expires <= now+86000 {
+		t.Errorf("renewed expires = %d, want a fresh ~24h window", env.Record.Expires)
+	}
+	if !strings.Contains(out, "RENEWED") {
+		t.Errorf("output missing RENEWED:\n%s", out)
+	}
+}
+
+// TestRenewSkipsFresh: a comfortably-fresh record is skipped without -force.
+func TestRenewSkipsFresh(t *testing.T) {
+	h := tempHome(t)
+	kp := mustTestKeypair(t)
+	tldID, _ := crypto.TldID(kp.Public())
+	wireName, _ := naming.EncodeWireName(nil, "alice", tldID)
+	now := uint64(time.Now().Unix())
+	rec, _ := wire.NewRecord(wireName, kp.Public(), 1, now-100, now+80000)
+	prev, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := dht.KeyForWireName(wireName)
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
+	stub.getKey = key
+	stub.getEnv = prev
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+
+	out, _ := captureStdout(t, func() error { return cmdRenew([]string{"alice"}) })
+	if !strings.Contains(out, "fresh") || !strings.Contains(out, "skipping") {
+		t.Errorf("fresh record not skipped:\n%s", out)
 	}
 }
 

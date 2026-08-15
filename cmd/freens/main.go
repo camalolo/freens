@@ -69,6 +69,7 @@ import (
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/metrics"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/renewal"
 	"github.com/camalolo/freens/internal/resolver"
 	"github.com/camalolo/freens/internal/turn"
 	"github.com/camalolo/freens/internal/upnp"
@@ -473,6 +474,21 @@ func run(args []string) error {
 		go peerbookLoop(dhtNode, bookStop, logger)
 	}
 
+	// Auto-renewal (the lease half of "ownership = liveness"): every 10
+	// minutes, scan the store for envelopes signed by a KEYCHAIN key (the
+	// user's own names — apexes, sub-names, claim copies) whose remaining
+	// lifetime is inside the renewal threshold, and re-sign + republish
+	// them at sequence+1 with a fresh window. This is what makes "keep
+	// the daemon running and your names stay alive" literally true: the
+	// §6.4 republish loop alone cannot extend an expiry baked into a
+	// signature. Skipped in passive mode (§6.1: no put) and when no
+	// keychain keys exist (a pure relay/witness node owns nothing).
+	var renewStop chan struct{}
+	if dhtNode != nil && !passiveEffective {
+		renewStop = make(chan struct{})
+		go renewLoop(dhtNode, store, logger, renewStop)
+	}
+
 	upstream := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
 	res := resolver.New(cfg, freens, upstream)
 
@@ -703,7 +719,9 @@ func run(args []string) error {
 	// during shutdown handshakes, then the loop is retired.
 	if bookStop != nil {
 		close(bookStop)
-		savePeerbook(dhtNode, logger)
+	}
+	if renewStop != nil {
+		close(renewStop)
 	}
 	// Final persistence AFTER the servers (and the DHT node) have stopped, so
 	// the snapshot reflects every record the resolver cached during shutdown.
@@ -870,6 +888,105 @@ func savePeerbook(node *dht.Node, logger *slog.Logger) {
 		return
 	}
 	logger.Info("peerbook saved", "peers", len(peers))
+}
+
+// renewLoop keeps the user's own names alive: every 10 minutes it scans the
+// store for envelopes SIGNED BY A KEYCHAIN KEY whose remaining lifetime is
+// inside renewal.ShouldRenew, re-signs them (sequence+1, fresh 24 h window)
+// and republishes at every legitimate key (dht.StorageKeys: K_tld/K_name
+// plus K_claim for claim-carrying records). Owner-private keys live in
+// ~/.freens/keys (0600, same user as the daemon) — the loop reads them to
+// sign, exactly like the CLI would, and never exposes them further.
+//
+// Two conservatisms: a record that is REVOKED is never renewed (deliberate
+// death), and a renewal that fails to publish anywhere is retried on the
+// next tick (leases have a full day of slack).
+func renewLoop(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, stop <-chan struct{}) {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			renewOnce(node, store, logger)
+		case <-stop:
+			return
+		}
+	}
+}
+
+// renewOnce is one auto-renewal pass (split out so a future -renew-now flag
+// or admin RPC can trigger it on demand).
+func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
+	// The keychain map: owner public key -> keypair (skip .recN recovery
+	// keyfiles — they recover, they do not renew).
+	entries, err := os.ReadDir(home.KeysDir())
+	if err != nil {
+		return // no keychain: a relay node, nothing to renew
+	}
+	owners := make(map[string]*crypto.Keypair)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".key") || strings.Contains(name, ".rec") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(home.KeysDir(), name))
+		if err != nil {
+			continue
+		}
+		seed, err := hex.DecodeString(strings.TrimSpace(string(b)))
+		if err != nil {
+			logger.Debug("auto-renew: keyfile is not hex", "file", name)
+			continue
+		}
+		kp, err := crypto.FromSeed(seed)
+		if err != nil {
+			logger.Debug("auto-renew: unparseable keyfile", "file", name)
+			continue
+		}
+		owners[hex.EncodeToString(kp.Public())] = kp
+	}
+	if len(owners) == 0 {
+		return
+	}
+
+	now := store.Now()
+	renewed := 0
+	for _, ent := range store.Entries(now) {
+		env := ent.Env
+		if env == nil || env.Record == nil || env.IsRevoked() {
+			continue
+		}
+		signerHex := hex.EncodeToString(env.Signer)
+		kp, mine := owners[signerHex]
+		if !mine {
+			continue // not ours: cached/relayed records are their owners' business
+		}
+		if !renewal.ShouldRenew(now, int64(env.Record.Expires)) {
+			continue
+		}
+		fresh, err := renewal.RenewEnvelope(env, kp, now)
+		if err != nil {
+			logger.Warn("auto-renew: re-sign failed", "error", err)
+			continue
+		}
+		keys, err := dht.StorageKeys(fresh)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = node.PublishKeyedAt(ctx, keys, fresh)
+		cancel()
+		if err != nil {
+			logger.Warn("auto-renew: publish failed (retry next tick)", "error", err)
+			continue
+		}
+		renewed++
+		logger.Info("auto-renewed record", "sequence", fresh.Record.Sequence,
+			"expires", fresh.Record.Expires)
+	}
+	if renewed > 0 {
+		logger.Info("auto-renew pass complete", "renewed", renewed)
+	}
 }
 
 // loadNodeKey returns the DHT node identity: from seedHex (a 32-byte hex Ed25519

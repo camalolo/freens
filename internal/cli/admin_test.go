@@ -32,6 +32,8 @@ type stubAdmin struct {
 	published      []*wire.SignedEnvelope
 	publishedClaim []*wire.SignedEnvelope
 	rawPublish     [][]byte
+	getKey         []byte               // when set, /get serves getEnv (base64)
+	getEnv         *wire.SignedEnvelope // when getKey matches
 }
 
 // startStubAdmin listens on sock (the admin socket path of a temp home).
@@ -88,6 +90,22 @@ func startStubAdmin(t *testing.T, sock string, resolve map[string]string) *stubA
 	})
 	mux.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `[]`)
+	})
+	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+		var gj struct {
+			Key string `json:"key"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gj)
+		want := hex.EncodeToString(s.getKey)
+		if s.getKey != nil && gj.Key == want && s.getEnv != nil {
+			if eb, err := s.getEnv.Bytes(); err == nil {
+				fmt.Fprintf(w, `{"envelope":%q}`, base64.StdEncoding.EncodeToString(eb))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":"not found"}`)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// lenient catch-all: anything unknown answers success-shaped JSON so

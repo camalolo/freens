@@ -1832,6 +1832,24 @@ func (n *Node) PublishClaim(ctx context.Context, env *wire.SignedEnvelope) error
 	return n.publishKeyed(ctx, key, env, nil)
 }
 
+// PublishKeyedAt publishes env at the EXPLICIT keys (the dht.StorageKeys
+// set: K_tld/K_name plus K_claim for claim-carrying records). Exported for
+// the daemon's auto-renew loop, which re-publishes a re-signed envelope at
+// every key its predecessor legitimately lived at. Best-effort like Publish:
+// nil when at least one target accepted.
+func (n *Node) PublishKeyedAt(ctx context.Context, keys [][]byte, env *wire.SignedEnvelope) error {
+	published := false
+	for _, k := range keys {
+		if err := n.publishKeyed(ctx, k, env, nil); err == nil {
+			published = true
+		}
+	}
+	if !published {
+		return ErrNoPeers
+	}
+	return nil
+}
+
 // publishKeyed is the shared §6.4 PUT body of Publish, PublishClaim and
 // PublishWithEvidence: locate the R closest nodes to key, obtain a write
 // token from each (via get), and issue put (evidence, when non-nil, is the
