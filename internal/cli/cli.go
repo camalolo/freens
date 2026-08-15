@@ -49,7 +49,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // Version is the cli package's own version, printed by the `version`

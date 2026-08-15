@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // startThrottleNode starts a node bound to a specific loopback address with a

@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/wire"
 	"github.com/miekg/dns"
 )
 

@@ -36,7 +36,7 @@ package wire
 import (
 	"bytes"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // VerifyAuthorityChainWithHandoffs verifies chain[0] authority when it is a

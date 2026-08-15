@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // poolOffered checks that env is pooled under key at position pos (0=best).

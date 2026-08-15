@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // minRootSecretLen is the minimum acceptable root-secret length. The Python

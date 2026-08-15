@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/home"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // TestRegisterRecoveryPlanDefaults: the default plan generates exactly 3

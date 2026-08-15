@@ -26,8 +26,8 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/camalolo/freens/internal/crypto"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/laurent/freens/internal/crypto"
 )
 
 // fuzzMinedClaim mines one difficulty-8 claim (fast; Appendix C.1 shape) and

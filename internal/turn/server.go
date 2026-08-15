@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // ServerConfig configures a TURN server. Zero values select the defaults

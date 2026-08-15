@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/home"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // ---------------------------------------------------------------------------

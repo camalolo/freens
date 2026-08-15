@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
 )
 
 // withDifficulty lowers PoWDifficultyInit for the duration of fn, restoring it

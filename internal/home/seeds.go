@@ -21,8 +21,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/dht"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/dht"
 )
 
 // DefaultSeeds is the pinned seeds.conf content written by EnsureSeeds on

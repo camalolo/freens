@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // gossipStateNode builds an UNSTARTED node (no socket, no loops) whose

@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // newBGNode builds and starts a Node with its own store, applying mutate to

@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/stun"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/stun"
 )
 
 // newTestServer starts a TURN server on an ephemeral loopback port.

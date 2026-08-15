@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // newTestTokenStore builds a TokenStore whose clock reads `initial` seconds,

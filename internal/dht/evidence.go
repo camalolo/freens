@@ -26,8 +26,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // evidenceLookup pins the §8.4 fetch shape DHTLookup exposes.

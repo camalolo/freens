@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/turn"
+	"github.com/camalolo/freens/internal/turn"
 )
 
 // startTurnServerNode starts a plain DHT node that ALSO runs a TURN server

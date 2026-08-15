@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/stun"
+	"github.com/camalolo/freens/internal/stun"
 )
 
 // startSTUNNode builds and starts a Node with the given Stun/Advertise

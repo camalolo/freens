@@ -5,10 +5,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // TestStoreLookup builds a TLD-root record and a descendant `www.foo` A record,

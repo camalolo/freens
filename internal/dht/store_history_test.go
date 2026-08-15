@@ -14,10 +14,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // histHash returns H_record(env) or fails the test.

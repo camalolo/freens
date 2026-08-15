@@ -31,9 +31,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
 )
 
 // RecoverySigningTag is the canonical domain-separation tag for §8.4 recovery

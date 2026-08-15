@@ -9,7 +9,7 @@ package main
 import (
 	"testing"
 
-	"github.com/laurent/freens/internal/dht"
+	"github.com/camalolo/freens/internal/dht"
 )
 
 // mkPeer builds a bootstrap peer whose 32-byte key is the repeated key

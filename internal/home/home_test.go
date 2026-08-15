@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/dht"
+	"github.com/camalolo/freens/internal/dht"
 )
 
 // testPK returns a deterministic 32-byte public key for index i (hex chars

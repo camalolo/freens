@@ -57,12 +57,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/laurent/freens/internal/claims"
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
-	"github.com/laurent/freens/internal/turn"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/claims"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/turn"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // ErrTimeout is returned when an RPC receives no response within

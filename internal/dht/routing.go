@@ -19,7 +19,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // numBuckets is the number of k-buckets — one per bit prefix length of a

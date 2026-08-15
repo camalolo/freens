@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/laurent/freens/internal/dht"
-	"github.com/laurent/freens/internal/metrics"
+	"github.com/camalolo/freens/internal/dht"
+	"github.com/camalolo/freens/internal/metrics"
 )
 
 // pkHex builds a valid 64-hex-char Ed25519 public key string (64 chars of a

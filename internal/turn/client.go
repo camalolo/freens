@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 const (

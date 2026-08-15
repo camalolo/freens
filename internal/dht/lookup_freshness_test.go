@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // TestDHTLookupFreshnessRevalidates: B fetches v1 from A; A publishes v2

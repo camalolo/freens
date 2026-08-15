@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/laurent/freens/internal/home"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // backupEntryRe matches the only filenames a backup (or a restore) may

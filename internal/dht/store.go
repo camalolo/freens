@@ -44,8 +44,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // entry is the per-key store record: the single winning envelope plus the

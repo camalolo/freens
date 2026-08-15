@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // makeNode derives a deterministic NodeContact from a single seed byte. The

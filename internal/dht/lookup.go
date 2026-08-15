@@ -25,8 +25,8 @@ package dht
 import (
 	"context"
 
-	"github.com/laurent/freens/internal/naming"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // StoreLookup adapts an *EnvelopeStore to the resolver.RecordLookup interface

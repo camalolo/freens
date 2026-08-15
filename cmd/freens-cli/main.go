@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/laurent/freens/internal/cli"
+	"github.com/camalolo/freens/internal/cli"
 )
 
 // cliVersion is stamped at build time (-X main.cliVersion=...); "dev" marks

@@ -20,7 +20,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // ErrCrypto is returned for unrecoverable crypto failures (e.g. PoW exhaustion).

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/laurent/freens/internal/home"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // sysRecorder captures every stubbed system interaction.

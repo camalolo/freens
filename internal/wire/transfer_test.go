@@ -12,7 +12,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // transferHop builds the §8.3 successor envelope over prev: same wire_name,

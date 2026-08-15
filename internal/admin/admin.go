@@ -51,7 +51,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/laurent/freens/internal/dht"
+	"github.com/camalolo/freens/internal/dht"
 )
 
 // Logger is the minimal logging surface the admin server needs. It is

@@ -22,7 +22,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/laurent/freens/internal/naming"
+	"github.com/camalolo/freens/internal/naming"
 )
 
 func cmdStart(args []string) error {

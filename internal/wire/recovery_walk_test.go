@@ -14,8 +14,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // recoveryWalkKeys builds the 2-of-3 §5.4 policy kit used by most tests:

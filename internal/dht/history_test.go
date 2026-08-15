@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // TestLookupByHashLocalOnly: with a nil node the lookup degrades to the

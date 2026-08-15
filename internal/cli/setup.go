@@ -32,8 +32,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/home"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // defaultSeedLine is the pinned community bootstrap seed written to
@@ -420,7 +420,7 @@ const setupSeedsTemplate = `# freens seed nodes — one per line: <host:port>#<6
 
 const setupUnitTemplate = `[Unit]
 Description=freens daemon (self-certifying DNS)
-Documentation=https://github.com/laurent/freens
+Documentation=https://github.com/camalolo/freens
 After=network-online.target
 
 [Service]

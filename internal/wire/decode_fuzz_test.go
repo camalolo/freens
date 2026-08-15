@@ -27,9 +27,9 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
 )
 
 // fuzzSignedEnvelopeBytes builds one fully-populated, signed envelope (every

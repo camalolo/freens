@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // stubAdmin is a tiny HTTP-over-unix admin server for tests.

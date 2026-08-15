@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 	"golang.org/x/net/idna"
 )
 

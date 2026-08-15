@@ -31,7 +31,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // difficultyRingSize caps the observed-difficulty ring at the WITNESS_SET

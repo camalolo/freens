@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // makeRecordArgs assembles a make-record flag slice for name owned by owner

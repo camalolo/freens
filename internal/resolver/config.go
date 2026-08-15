@@ -16,8 +16,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/naming"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/naming"
 )
 
 // Route is a per-alias routing policy (spec §9.3 lines 770-786). Each constant's

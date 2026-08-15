@@ -23,7 +23,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // FuzzParseMessage: no panic; on success encode() must succeed and re-parse

@@ -19,8 +19,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // hashLookup pins the LookupByHash shape other packages type-assert

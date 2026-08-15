@@ -33,9 +33,9 @@ import (
 	"bytes"
 	"sync"
 
-	"github.com/laurent/freens/internal/claims"
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/claims"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // ClaimPool is the §7.4 "storing nodes keep the top 2 by ordering" store: for

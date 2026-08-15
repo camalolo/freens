@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
 )
 
 // startCfgNode starts a real node with an explicit NodeConfig (background

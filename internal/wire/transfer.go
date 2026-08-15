@@ -22,9 +22,9 @@ package wire
 import (
 	"bytes"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
 )
 
 // transferMaxDepth caps how many prev_hash links VerifyAuthorityChainWithTransfers

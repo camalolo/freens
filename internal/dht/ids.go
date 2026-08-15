@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/laurent/freens/internal/constants"
+	"github.com/camalolo/freens/internal/constants"
 )
 
 // IDLen is the length of a freens node ID in bytes (32; 256 bits). It mirrors

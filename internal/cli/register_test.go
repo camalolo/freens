@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/dht"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/dht"
 )
 
 // TestRegisterEndToEnd: the full flow against 7 live in-process nodes — key

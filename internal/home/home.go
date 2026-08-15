@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/laurent/freens/internal/dht"
+	"github.com/camalolo/freens/internal/dht"
 )
 
 // Dir returns the state directory root: $FREENS_HOME, else ~/.freens.

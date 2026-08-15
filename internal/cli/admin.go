@@ -22,10 +22,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/laurent/freens/internal/admin"
-	"github.com/laurent/freens/internal/dht"
-	"github.com/laurent/freens/internal/home"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/admin"
+	"github.com/camalolo/freens/internal/dht"
+	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // adminTimeout bounds every admin-socket round trip from the CLI side.

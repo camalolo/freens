@@ -13,7 +13,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/laurent/freens/internal/metrics"
+	"github.com/camalolo/freens/internal/metrics"
 	"github.com/miekg/dns"
 )
 

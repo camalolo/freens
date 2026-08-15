@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/laurent/freens/internal/home"
+	"github.com/camalolo/freens/internal/home"
 )
 
 // daemonDNSCheckTimeout bounds the doctor DNS self-check.

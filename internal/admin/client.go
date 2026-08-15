@@ -26,8 +26,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/laurent/freens/internal/dht"
-	"github.com/laurent/freens/internal/wire"
+	"github.com/camalolo/freens/internal/dht"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // defaultTimeout bounds one client request when Client.Timeout is unset.

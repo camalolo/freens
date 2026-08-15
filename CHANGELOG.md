@@ -1,6 +1,10 @@
 # Changelog
 
 ## unreleased
+- **Module path matches the repo** — `github.com/camalolo/freens`
+  (was `github.com/laurent/freens`; import-path sweep + import re-sorting,
+  no behavior change). `go install github.com/camalolo/freens/cmd/freens@…`
+  now works.
 - **Non-technical UX pass** — `freens start <name>` is the whole onboarding
   as one verb (setup if needed → register → plain summary; prompts for the
   name interactively; idempotent; positional `register <alias>` accepted

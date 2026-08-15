@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/home"
-	"github.com/laurent/freens/internal/naming"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/naming"
 )
 
 func TestNameViaStubAdmin(t *testing.T) {

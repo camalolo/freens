@@ -29,10 +29,10 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/crypto"
-	"github.com/laurent/freens/internal/naming"
 )
 
 // canonicalEM is the RFC 8949 §4.2 "Core Deterministic" encoding mode used for

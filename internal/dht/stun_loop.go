@@ -31,7 +31,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/laurent/freens/internal/stun"
+	"github.com/camalolo/freens/internal/stun"
 )
 
 // stunRefreshInterval is the period between STUN reflexive-address

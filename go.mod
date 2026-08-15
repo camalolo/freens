@@ -1,4 +1,4 @@
-module github.com/laurent/freens
+module github.com/camalolo/freens
 
 go 1.25.0
 

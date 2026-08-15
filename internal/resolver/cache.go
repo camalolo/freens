@@ -28,8 +28,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/laurent/freens/internal/constants"
-	"github.com/laurent/freens/internal/metrics"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/metrics"
 	"github.com/miekg/dns"
 )
 
