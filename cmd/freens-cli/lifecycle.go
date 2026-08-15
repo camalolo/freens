@@ -82,9 +82,20 @@ func loadEnvelope(path string) (*wire.SignedEnvelope, error) {
 	return env, nil
 }
 
-// seedKeypair decodes a 32-byte hex Ed25519 seed into a Keypair; flagName
-// names the calling flag for error messages.
-func seedKeypair(seedHex, flagName string) (*crypto.Keypair, error) {
+// seedKeypair resolves a seed SPEC into a Keypair; flagName names the
+// calling flag for error messages. A spec is either 64 hex characters or
+// "@/path/to/keyfile" — a file containing the hex seed (as written by
+// gen-key -out / register). The @file form keeps raw seeds off command
+// lines (ps, shell history) and is the ergonomic companion to keyfiles.
+func seedKeypair(spec, flagName string) (*crypto.Keypair, error) {
+	seedHex := spec
+	if strings.HasPrefix(spec, "@") {
+		b, err := os.ReadFile(strings.TrimPrefix(spec, "@"))
+		if err != nil {
+			return nil, usageErr("read %s keyfile %q: %v", flagName, spec, err)
+		}
+		seedHex = strings.TrimSpace(string(b))
+	}
 	seed, err := hex.DecodeString(strings.TrimSpace(seedHex))
 	if err != nil {
 		return nil, usageErr("invalid %s hex: %v", flagName, err)

@@ -635,11 +635,20 @@ func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, st
 // seed) when provided, or freshly generated otherwise. A stable identity across
 // restarts (a pinned -node-seed) keeps a node's Node ID / routing-table entry
 // stable for its peers.
-func loadNodeKey(seedHex string) (*crypto.Keypair, error) {
-	if seedHex == "" {
+func loadNodeKey(seedSpec string) (*crypto.Keypair, error) {
+	if seedSpec == "" {
 		return crypto.Generate()
 	}
-	seed, err := hex.DecodeString(seedHex)
+	// "@/path/to/keyfile": keep raw node seeds off unit files and command
+	// lines (same convention as freens-cli's @keyfile specs).
+	if strings.HasPrefix(seedSpec, "@") {
+		b, err := os.ReadFile(strings.TrimPrefix(seedSpec, "@"))
+		if err != nil {
+			return nil, fmt.Errorf("read node keyfile: %w", err)
+		}
+		seedSpec = strings.TrimSpace(string(b))
+	}
+	seed, err := hex.DecodeString(seedSpec)
 	if err != nil {
 		return nil, fmt.Errorf("decode hex: %w", err)
 	}

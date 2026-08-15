@@ -1508,6 +1508,99 @@ func (n *Node) IterativeGet(ctx context.Context, key []byte) (*wire.SignedEnvelo
 	return bestEnv, nil
 }
 
+// IterativeFindNode performs the §6.2 node lookup: an iterative Kademlia
+// walk toward target (ALPHA contacts per round, closer contacts learned into
+// the routing table as it goes), returning up to want contacts closest to
+// target by XOR distance. It is the table-population step a registration
+// client runs before CollectWitnesses — the §7.3 WITNESS_SET are "the W
+// nodes whose IDs are closest to K_claim", and a freshly-bootstrapped node
+// knows only its bootstrap peers until it walks. Errors of individual
+// candidates evict them (same §6.2 rule as IterativeGet); the walk itself
+// never fails, it just returns what it could reach.
+func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) []*NodeContact {
+	if len(target) != constants.SHA256Len || want <= 0 {
+		return nil
+	}
+	shortlist := append([]*NodeContact(nil), n.rt.Closest(target, constants.K)...)
+	if len(shortlist) == 0 {
+		return nil // island
+	}
+	queried := make(map[string]bool, len(shortlist))
+	for round := 0; round < maxLookupRounds; round++ {
+		sort.SliceStable(shortlist, func(i, j int) bool {
+			return CompareDistance(target, shortlist[i].NodeID, shortlist[j].NodeID) < 0
+		})
+		var batch []*NodeContact
+		for _, c := range shortlist {
+			if !queried[string(c.NodeID)] {
+				batch = append(batch, c)
+				if len(batch) >= constants.Alpha {
+					break
+				}
+			}
+		}
+		if len(batch) == 0 {
+			break
+		}
+		type res struct {
+			nodes []*NodeContact
+			err   error
+		}
+		results := make([]res, len(batch))
+		var wg sync.WaitGroup
+		for i, c := range batch {
+			queried[string(c.NodeID)] = true
+			wg.Add(1)
+			go func(i int, c *NodeContact) {
+				defer wg.Done()
+				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
+				defer cancel()
+				results[i].nodes, results[i].err = n.findNodeRound(pctx, target, c)
+			}(i, c)
+		}
+		wg.Wait()
+		for i, r := range results {
+			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
+				n.rt.Remove(batch[i].NodeID)
+			}
+			for _, nc := range r.nodes {
+				n.learnContact(nc)
+				if !contactIn(shortlist, nc.NodeID) {
+					shortlist = append(shortlist, nc)
+				}
+			}
+		}
+		if len(shortlist) >= want {
+			// Enough discovered; one more sorted cut below returns the best.
+			break
+		}
+	}
+	sort.SliceStable(shortlist, func(i, j int) bool {
+		return CompareDistance(target, shortlist[i].NodeID, shortlist[j].NodeID) < 0
+	})
+	if len(shortlist) > want {
+		shortlist = shortlist[:want]
+	}
+	return shortlist
+}
+
+// findNodeRound issues one find_node(target) RPC to c and returns the
+// offered closer contacts (an error signals probe failure → eviction).
+func (n *Node) findNodeRound(ctx context.Context, target []byte, c *NodeContact) ([]*NodeContact, error) {
+	addr, err := net.ResolveUDPAddr("udp", c.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve: %w", err)
+	}
+	resp, err := n.sendQuery(ctx, addr, c.NodeID, "find_node", map[string]any{"target": target})
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil || resp.Y == wire.MsgTypeError {
+		return nil, nil
+	}
+	return parseNodes(resp.A["nodes"]), nil
+}
+
 // getFromPeer issues a single get(key) RPC to c and parses the response into
 // the envelopes offered by the peer and/or the closer-contacts list. The
 // offers are, best-first: the §7.4 `envelopes` extension (top-2 claim pool,

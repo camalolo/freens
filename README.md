@@ -29,7 +29,7 @@ Implemented and fully tested (130 test functions, `go test ./...` green,
 | `internal/dht` | XOR metric, 256 k-bucket routing table, rotating HMAC write tokens, envelope store (winner rule + LRU/grace eviction) | §6 |
 | `internal/resolver` | §9.3 INI config parser, per-alias routing, live UDP+TCP DNS server via `miekg/dns`, DNS fallback | §9 |
 | `cmd/freens` | DNS resolver daemon; optional full DHT node (`-dht`, `-peers`, `-node-seed`, `-passive`, `-persist`, `-advertise`, `-upnp` (router-requested port mapping, default on), `-stun`, `-turn`, `-turn-relay`, `-dns`, `-metrics`, `-peers-file` + SIGHUP reload): serves/republishes records, answers `ping`/`find_node`/`get`/`put`/`witness` RPCs, resolves aliases from network claims (§7) | §6, §9.1 |
-| `cmd/freens-cli` | `gen-key`, `mine-claim`, `make-record`, `publish` (incl. `-evidence` for §8.4 recovery transport), `resolve`, `get`, `transfer`/`rotate`/`recover`/`verify-recovery`, `demo` subcommands | §6.4, §8 |
+| `cmd/freens-cli` | operator CLI; every seed flag accepts hex or `@keyfile` | `register` (one-command alias claim: key → PoW → W live witnesses → publish), `gen-key` (`-out` writes a 0600 keyfile), `mine-claim`, `make-record`, `publish` (incl. `-evidence` for §8.4 recovery transport), `resolve`, `get`, `transfer`/`rotate`/`recover`/`verify-recovery`, `demo` | §6.4, §7, §8 |
 
 Multi-node operation: with `-dht <addr>` the daemon joins the Kademlia
 network — records seeded locally are served to (and fetched from) peers via

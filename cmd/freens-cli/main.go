@@ -62,6 +62,8 @@ func main() {
 	args := os.Args[2:]
 	var err error
 	switch sub {
+	case "register":
+		err = cmdRegister(args)
 	case "gen-key":
 		err = cmdGenKey(args)
 	case "mine-claim":
@@ -106,7 +108,9 @@ func main() {
 func usage(w *os.File) {
 	fmt.Fprintln(w, "usage: freens-cli <subcommand> [flags]")
 	fmt.Fprintln(w, "subcommands:")
-	fmt.Fprintln(w, "  gen-key               generate an Ed25519 keypair")
+	fmt.Fprintln(w, "  gen-key               generate an Ed25519 keypair (-out writes a 0600 keyfile)")
+	fmt.Fprintln(w, "  register              claim an alias end-to-end (spec 7): key -> PoW -> W live witness")
+	fmt.Fprintln(w, "                        co-signatures -> TLD record published at K_tld+K_claim")
 	fmt.Fprintln(w, "  mine-claim            mine an AliasClaim PoW")
 	fmt.Fprintln(w, "  make-record           build + sign a freens record (optional -recovery-* embed a spec 5.4 policy; -out writes the .cbor)")
 	fmt.Fprintln(w, "  transfer              hand a name to a new owner key (spec 8.3; -prev-envelope, -new-owner-seed, -signer-seed)")
@@ -144,6 +148,7 @@ func cryptoErr(format string, args ...any) error {
 
 func cmdGenKey(args []string) error {
 	fs := flag.NewFlagSet("gen-key", flag.ContinueOnError)
+	out := fs.String("out", "", "write the seed as a 0600 keyfile (64 hex chars + newline) for use as -owner-key @<path> etc.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -162,6 +167,12 @@ func cmdGenKey(args []string) error {
 	fmt.Printf("public=%s\n", hex.EncodeToString(kp.Public()))
 	fmt.Printf("tld_id=%s\n", hex.EncodeToString(tldID))
 	fmt.Printf("tld_id_b32=%s\n", base32.StdEncoding.EncodeToString(tldID))
+	if *out != "" {
+		if err := writeKeyFile(*out, kp); err != nil {
+			return fmt.Errorf("writing keyfile: %w", err)
+		}
+		fmt.Printf("keyfile=%s (0600; use as -owner-key @%s on other subcommands)\n", *out, *out)
+	}
 	return nil
 }
 
@@ -182,11 +193,8 @@ func cmdMineClaim(args []string) error {
 	if *alias == "" || *seedHex == "" {
 		return usageErr("mine-claim requires -alias and -seed")
 	}
-	seed, err := hex.DecodeString(strings.TrimSpace(*seedHex))
-	if err != nil {
-		return usageErr("invalid seed hex: %v", err)
-	}
-	kp, err := crypto.FromSeed(seed)
+	// -seed accepts hex or @keyfile (seedKeypair).
+	kp, err := seedKeypair(*seedHex, "-seed")
 	if err != nil {
 		return err
 	}
@@ -247,21 +255,14 @@ func cmdMakeRecord(args []string) error {
 	if err != nil {
 		return err
 	}
-	ownerSeed, err := hex.DecodeString(strings.TrimSpace(*ownerSeedHex))
-	if err != nil {
-		return usageErr("invalid owner seed hex: %v", err)
-	}
-	ownerKP, err := crypto.FromSeed(ownerSeed)
+	// -owner-seed / -signer-seed accept hex or @keyfile (seedKeypair).
+	ownerKP, err := seedKeypair(*ownerSeedHex, "-owner-seed")
 	if err != nil {
 		return err
 	}
 	signerKP := ownerKP
 	if *signerSeedHex != "" {
-		sseed, err := hex.DecodeString(strings.TrimSpace(*signerSeedHex))
-		if err != nil {
-			return usageErr("invalid signer seed hex: %v", err)
-		}
-		signerKP, err = crypto.FromSeed(sseed)
+		signerKP, err = seedKeypair(*signerSeedHex, "-signer-seed")
 		if err != nil {
 			return err
 		}

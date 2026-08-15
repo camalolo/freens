@@ -140,18 +140,12 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 // nodeKeypair returns the CLI node's identity: from seedHex (a 32-byte hex
 // Ed25519 seed) when provided, or freshly generated otherwise. Mirrors the
 // daemon's loadNodeKey.
-func nodeKeypair(seedHex string) (*crypto.Keypair, error) {
-	if seedHex == "" {
+func nodeKeypair(seedSpec string) (*crypto.Keypair, error) {
+	if seedSpec == "" {
 		return crypto.Generate()
 	}
-	seed, err := hex.DecodeString(strings.TrimSpace(seedHex))
-	if err != nil {
-		return nil, fmt.Errorf("decode hex: %w", err)
-	}
-	if len(seed) != constants.Ed25519PrivateKeyLen {
-		return nil, fmt.Errorf("seed must be %d bytes, got %d", constants.Ed25519PrivateKeyLen, len(seed))
-	}
-	return crypto.FromSeed(seed)
+	// hex or @keyfile (seedKeypair does the parsing).
+	return seedKeypair(seedSpec, "-node-seed")
 }
 
 // ---------------------------------------------------------------------------
