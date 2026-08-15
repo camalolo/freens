@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.4.0 — passphrase-protected keyfiles
+- **Owner and recovery keys can now be encrypted at rest.** At
+  registration a passphrase is prompted: Enter twice = the plaintext
+  legacy form (fully compatible), anything else typed twice = a
+  scrypt(N=2¹⁵)+AES-256-GCM envelope (`FREENSK1` magic). Unlocking
+  prompts on a terminal or reads `FREENS_PASSPHRASE` (scripts/services).
+  Detection is by magic; plaintext files load unchanged. Hostile scrypt
+  parameters in a planted keyfile are refused. New `internal/securekey`
+  (+ `golang.org/x/crypto`, `x/term`).
+- **Honest auto-renew trade-off, stated up front**: the daemon cannot
+  prompt, so passphrase-protected names are skipped by the auto-renew
+  loop (logged with the `freens renew` / `FREENS_PASSPHRASE hints) and
+  register warns at generation time.
+- `freens backup` inherits the protection automatically (files copied
+  verbatim); RESTORE.txt documents both forms.
+
+## v0.3.8 — publisher-local store on admin publish
+- **The publishing box's own resolver now serves the new sequence
+  immediately.** The admin `/publish` path published to peers only; the
+  daemon's own store kept the previous sequence and DHTLookup served it
+  until freshness lapsed (found live verifying v0.3.7: post-renewal the
+  publishing box answered sequence N−1 while peers served N). Publish
+  now also installs the envelope at every `dht.StorageKeys` slot locally
+  (the §6.4 winner rule makes it harmless).
+
 ## v0.3.7 — names stay alive: renewal + the community seed is back
 - **`freens renew [name…]`** — the lease-extension button: re-signs at
   sequence+1 with a fresh 24 h window (owner-only, no PoW, no witnesses,

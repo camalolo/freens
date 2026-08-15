@@ -21,6 +21,7 @@ import (
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/securekey"
 	"github.com/camalolo/freens/internal/wire"
 )
 
@@ -531,6 +532,57 @@ func TestRenewSkipsFresh(t *testing.T) {
 	out, _ := captureStdout(t, func() error { return cmdRenew([]string{"alice"}) })
 	if !strings.Contains(out, "fresh") || !strings.Contains(out, "skipping") {
 		t.Errorf("fresh record not skipped:\n%s", out)
+	}
+}
+
+// TestPassphraseKeyfiles: register's encryption path end to end (without
+// the network): encrypted files carry the FREENSK1 magic, unlock works via
+// the env var, wrong passphrase and no-terminal-no-env both fail cleanly,
+// and legacy plaintext keeps loading.
+func TestPassphraseKeyfiles(t *testing.T) {
+	tempHome(t)
+	if err := home.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	kp := mustTestKeypair(t)
+	p := filepath.Join(home.KeysDir(), "alice.key")
+
+	// Encrypted write + magic.
+	if err := writeKeyFileEnc(p, kp, "s3cret pass"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if !securekey.IsEncrypted(b) {
+		t.Fatal("writeKeyFileEnc did not write a FREENSK1 envelope")
+	}
+
+	// Unlock with the right passphrase (via env; no TTY in tests).
+	t.Setenv(EnvPassphrase, "s3cret pass")
+	got, err := seedKeypair("@"+p, "-owner")
+	if err != nil || string(got.Public()) != string(kp.Public()) {
+		t.Fatalf("encrypted load: %v", err)
+	}
+
+	// Wrong passphrase: clean error naming the passphrase.
+	t.Setenv(EnvPassphrase, "wrong")
+	if _, err := seedKeypair("@"+p, "-owner"); err == nil || !strings.Contains(err.Error(), "passphrase") {
+		t.Fatalf("wrong passphrase = %v, want a passphrase error", err)
+	}
+
+	// Encrypted file, no env, no TTY: actionable usage error.
+	os.Unsetenv(EnvPassphrase)
+	if _, err := seedKeypair("@"+p, "-owner"); err == nil || !strings.Contains(err.Error(), EnvPassphrase) {
+		t.Fatalf("no-terminal unlock = %v, want guidance naming %s", err, EnvPassphrase)
+	}
+
+	// Legacy plaintext still loads.
+	plain := filepath.Join(home.KeysDir(), "legacy.key")
+	if err := writeKeyFile(plain, kp); err != nil {
+		t.Fatal(err)
+	}
+	got2, err := seedKeypair("@"+plain, "-owner")
+	if err != nil || string(got2.Public()) != string(kp.Public()) {
+		t.Fatalf("legacy plaintext load: %v", err)
 	}
 }
 

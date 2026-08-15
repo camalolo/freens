@@ -60,6 +60,7 @@ import (
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/securekey"
 	"github.com/camalolo/freens/internal/wire"
 )
 
@@ -84,18 +85,34 @@ func loadEnvelope(path string) (*wire.SignedEnvelope, error) {
 // seedKeypair resolves a seed SPEC into a Keypair; flagName names the
 // calling flag for error messages. A spec is either 64 hex characters or
 // "@/path/to/keyfile" — a file containing the hex seed (as written by
-// gen-key -out / register). The @file form keeps raw seeds off command
-// lines (ps, shell history) and is the ergonomic companion to keyfiles.
+// gen-key -out / register) or a passphrase-encrypted envelope (the
+// FREENSK1 format; unlocked via prompt or FREENS_PASSPHRASE). The @file
+// form keeps raw seeds off command lines (ps, shell history).
 func seedKeypair(spec, flagName string) (*crypto.Keypair, error) {
-	seedHex := spec
+	raw := spec
 	if strings.HasPrefix(spec, "@") {
 		b, err := os.ReadFile(strings.TrimPrefix(spec, "@"))
 		if err != nil {
 			return nil, usageErr("read %s keyfile %q: %v", flagName, spec, err)
 		}
-		seedHex = strings.TrimSpace(string(b))
+		if securekey.IsEncrypted(b) {
+			pass, perr := passphraseForUnlock()
+			if perr != nil {
+				return nil, perr
+			}
+			seed, derr := securekey.DecryptSeed(b, pass)
+			if derr != nil {
+				return nil, usageErr("unlock %s keyfile: %v", flagName, derr)
+			}
+			kp, kerr := crypto.FromSeed(seed)
+			if kerr != nil {
+				return nil, usageErr("%s: %v", flagName, kerr)
+			}
+			return kp, nil
+		}
+		raw = strings.TrimSpace(string(b))
 	}
-	seed, err := hex.DecodeString(strings.TrimSpace(seedHex))
+	seed, err := hex.DecodeString(strings.TrimSpace(raw))
 	if err != nil {
 		return nil, usageErr("invalid %s hex: %v", flagName, err)
 	}

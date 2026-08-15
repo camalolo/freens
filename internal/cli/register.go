@@ -44,6 +44,7 @@ import (
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/securekey"
 	"github.com/camalolo/freens/internal/wire"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -118,6 +119,7 @@ func cmdRegister(args []string) error {
 
 	// --- owner key ---------------------------------------------------------
 	var kp *crypto.Keypair
+	keyPassphrase := ""
 	keyPath := ""
 	if *ownerKey != "" {
 		var err error
@@ -148,10 +150,20 @@ func cmdRegister(args []string) error {
 		if keyPath == "" {
 			keyPath = ownerKeyPath(*alias) // <home>/keys/<alias>.key
 		}
-		if err := writeKeyFile(keyPath, kp); err != nil {
+		// Passphrase policy (interactive default: ask; empty twice or a
+		// non-terminal = plaintext legacy form). One passphrase covers the
+		// owner key AND the recovery keyfiles below.
+		keyPassphrase = promptNewPassphrase()
+		if err := writeKeyFileEnc(keyPath, kp, keyPassphrase); err != nil {
 			return fmt.Errorf("writing owner key: %w", err)
 		}
-		fmt.Printf("owner key generated and saved (0600): %s  — BACK THIS UP; losing it without a recovery policy loses the name\n", keyPath)
+		if keyPassphrase != "" {
+			fmt.Printf("owner key generated and saved (0600, passphrase-encrypted): %s\n", keyPath)
+			fmt.Printf("*** the daemon CANNOT auto-renew passphrase-protected names (it cannot prompt) — renew manually (`%s renew %s`) or provide %s to the service\n", ProgName, *alias, EnvPassphrase)
+			fmt.Println("BACK THIS UP; losing it without a recovery policy loses the name")
+		} else {
+			fmt.Printf("owner key generated and saved (0600): %s  — BACK THIS UP; losing it without a recovery policy loses the name\n", keyPath)
+		}
 	}
 	tldID, err := crypto.TldID(kp.Public())
 	if err != nil {
@@ -161,7 +173,7 @@ func cmdRegister(args []string) error {
 	fmt.Printf("alias=%s tld_id_b32=%s\n", *alias, pin)
 
 	// --- default-on recovery (spec 5.4; user decision) ---------------------
-	recPaths, recPolicy, err := recoveryPlan(*noRecovery, home.KeysDir(), *alias)
+	recPaths, recPolicy, err := recoveryPlan(*noRecovery, home.KeysDir(), *alias, keyPassphrase)
 	if err != nil {
 		return err
 	}
@@ -383,7 +395,7 @@ func outboundIPv4() (net.IP, error) {
 //	                 (72 h) timelock, ready to embed in the apex record
 //
 // Split out so the defaults are unit-testable without a live network.
-func recoveryPlan(noRecovery bool, keysDir, alias string) ([]string, *wire.RecoveryPolicyWire, error) {
+func recoveryPlan(noRecovery bool, keysDir, alias, passphrase string) ([]string, *wire.RecoveryPolicyWire, error) {
 	if noRecovery {
 		return nil, nil, nil
 	}
@@ -395,7 +407,7 @@ func recoveryPlan(noRecovery bool, keysDir, alias string) ([]string, *wire.Recov
 			return nil, nil, err
 		}
 		p := filepath.Join(keysDir, fmt.Sprintf("%s.rec%d.key", alias, i))
-		if err := writeKeyFile(p, rkp); err != nil {
+		if err := writeKeyFileEnc(p, rkp, passphrase); err != nil {
 			return nil, nil, fmt.Errorf("writing recovery keyfile: %w", err)
 		}
 		paths = append(paths, p)
@@ -481,12 +493,30 @@ type adminWitnesser interface {
 	Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) ([][]byte, error)
 }
 
-// writeKeyFile persists a hex seed at path with 0600 (mkdir -p the parent).
+// writeKeyFile persists a hex seed at path with 0600 (mkdir -p the parent)
+// — the legacy PLAINTEXT form (compatible with every existing tooling).
 func writeKeyFile(path string, kp *crypto.Keypair) error {
+	return writeKeyFileOpt(path, kp, "")
+}
+
+// writeKeyFileEnc persists the seed passphrase-encrypted (FREENSK1) with
+// 0600; "" writes the legacy plaintext form.
+func writeKeyFileEnc(path string, kp *crypto.Keypair, passphrase string) error {
+	return writeKeyFileOpt(path, kp, passphrase)
+}
+
+func writeKeyFileOpt(path string, kp *crypto.Keypair, passphrase string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(hex.EncodeToString(kp.Seed())+"\n"), 0o600)
+	if passphrase == "" {
+		return os.WriteFile(path, []byte(hex.EncodeToString(kp.Seed())+"\n"), 0o600)
+	}
+	enc, err := securekey.EncryptSeed(kp.Seed(), passphrase)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, enc, 0o600)
 }
 
 // netIP parses a dotted-quad IPv4 (the CLI's A-record convention); nil on

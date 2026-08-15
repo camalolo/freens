@@ -71,6 +71,7 @@ import (
 	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/renewal"
 	"github.com/camalolo/freens/internal/resolver"
+	"github.com/camalolo/freens/internal/securekey"
 	"github.com/camalolo/freens/internal/turn"
 	"github.com/camalolo/freens/internal/upnp"
 	"github.com/camalolo/freens/internal/wire"
@@ -924,6 +925,8 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		return // no keychain: a relay node, nothing to renew
 	}
 	owners := make(map[string]*crypto.Keypair)
+	encrypted := 0
+	envPass, envOK := os.LookupEnv("FREENS_PASSPHRASE")
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".key") || strings.Contains(name, ".rec") {
@@ -933,10 +936,23 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		if err != nil {
 			continue
 		}
-		seed, err := hex.DecodeString(strings.TrimSpace(string(b)))
-		if err != nil {
-			logger.Debug("auto-renew: keyfile is not hex", "file", name)
-			continue
+		var seed []byte
+		if securekey.IsEncrypted(b) {
+			if !envOK {
+				encrypted++
+				continue // cannot prompt from a service; renew manually
+			}
+			seed, err = securekey.DecryptSeed(b, envPass)
+			if err != nil {
+				logger.Warn("auto-renew: wrong passphrase for keyfile (check FREENS_PASSPHRASE)", "file", name)
+				continue
+			}
+		} else {
+			seed, err = hex.DecodeString(strings.TrimSpace(string(b)))
+			if err != nil {
+				logger.Debug("auto-renew: keyfile is not hex", "file", name)
+				continue
+			}
 		}
 		kp, err := crypto.FromSeed(seed)
 		if err != nil {
@@ -944,6 +960,11 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			continue
 		}
 		owners[hex.EncodeToString(kp.Public())] = kp
+	}
+	if encrypted > 0 {
+		logger.Info("auto-renew: skipping passphrase-protected key(s) (the daemon cannot prompt)",
+			"count", encrypted,
+			"hint", "renew manually or set FREENS_PASSPHRASE for the service")
 	}
 	if len(owners) == 0 {
 		return
