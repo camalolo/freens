@@ -10,3 +10,6 @@ dist/
 
 # register artifacts (written to cwd by default)
 *.tld.cbor
+
+# agent working notes (private host details)
+AGENTS.md
