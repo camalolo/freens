@@ -1,4 +1,4 @@
-// handlers.go — the admin socket's HTTP surface: route table, the six
+// handlers.go — the admin socket's HTTP surface: route table, the
 // endpoints, and the JSON wire types consumed verbatim by the CLI
 // (cmd/freens-cli). Every endpoint is a thin, defensive translation between
 // JSON and the daemon's already-running *dht.Node; no endpoint mutates node
@@ -62,6 +62,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /resolve", s.handleResolve)
 	mux.HandleFunc("POST /witness", s.handleWitness)
 	mux.HandleFunc("GET /peers", s.handlePeers)
+	mux.HandleFunc("GET /store", s.handleStore)
+	mux.HandleFunc("GET /difficulty", s.handleDifficulty)
 	return s.logRequests(mux)
 }
 
@@ -692,8 +694,9 @@ type peersResponse struct {
 // node public key (required — recipient_id is inside every §6.3 signature,
 // so a node can only address a peer whose key it knows).
 type peerJSON struct {
-	Addr string `json:"addr"`
-	PK   string `json:"pk"`
+	Addr      string `json:"addr"`
+	PK        string `json:"pk"`
+	Confirmed int64  `json:"confirmed,omitempty"` // unix seconds of last DIRECT exchange (issue #2)
 }
 
 // handlePeers returns every routing-table contact. Deliberately not capped:
@@ -707,8 +710,9 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 	out := peersResponse{}
 	for _, c := range s.node.RoutingTable().AllContacts() {
 		out.Peers = append(out.Peers, peerJSON{
-			Addr: c.Addr,
-			PK:   hex.EncodeToString(c.PublicKey),
+			Addr:      c.Addr,
+			PK:        hex.EncodeToString(c.PublicKey),
+			Confirmed: c.ConfirmedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

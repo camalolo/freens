@@ -283,3 +283,22 @@ func (c *Client) Peers(ctx context.Context) ([]dht.Peer, error) {
 	}
 	return peers, nil
 }
+
+// Store fetches the daemon's live envelope store (GET /store) — the web
+// UI's Store page and any tooling that wants the full listing.
+func (c *Client) Store(ctx context.Context) (*StoreResponse, error) {
+	var out StoreResponse
+	if _, err := c.do(ctx, http.MethodGet, "/store", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Difficulty fetches the A.4 difficulty oracle (GET /difficulty).
+func (c *Client) Difficulty(ctx context.Context) (*Difficulty, error) {
+	var out Difficulty
+	if _, err := c.do(ctx, http.MethodGet, "/difficulty", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
