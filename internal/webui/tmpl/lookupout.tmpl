@@ -1,0 +1,13 @@
+{{define "lookupout"}}
+{{if .Error}}<div class="alert error">{{.Error}}</div>{{else}}
+<div class="card">
+  <div class="spread"><strong class="mono">{{.Name}}</strong>
+  {{if .Revoked}}<span class="badge bad">revoked (freens)</span>
+  {{else if .Found}}<span class="badge ok">{{.Source}}</span>
+  {{else}}<span class="badge dim">{{.Source}}</span>{{end}}</div>
+  {{if .RRs}}<table class="mt"><tr><th>record</th></tr>
+    {{range .RRs}}<tr><td class="mono">{{.}}</td></tr>{{end}}
+  </table>{{else if not .Revoked}}<div class="muted mt">no records</div>{{end}}
+</div>
+{{end}}
+{{end}}

@@ -1,0 +1,35 @@
+{{define "content"}}
+<div class="page-head">
+  <div><h1>Names</h1><div class="subtitle">aliases owned by this machine's keychain</div></div>
+  <a class="btn primary" href="/register">{{template "icon-plus"}} Register a name</a>
+</div>
+{{if .Names}}
+<div class="grid cols-2">
+  {{range .Names}}
+  <div class="card">
+    <div class="spread">
+      <h2 style="margin:0"><a href="/names/{{.Alias}}">{{.Alias}}</a></h2>
+      {{if .Revoked}}<span class="badge bad">revoked</span>
+      {{else if .Healthy}}<span class="badge ok">live</span>
+      {{else}}<span class="badge warn">no record</span>{{end}}
+    </div>
+    <dl class="kv mt">
+      <dt>tld_id</dt><dd class="cell-mono">{{printf "%.20s…" .TldIDB32}}</dd>
+      <dt>address</dt><dd>{{.IP}}</dd>
+      <dt>lease</dt><dd>{{.ExpiryText}}</dd>
+      <dt>owner key</dt><dd>{{if .Encrypted}}🔒 encrypted{{else}}plaintext{{end}}</dd>
+    </dl>
+    <div class="row mt">
+      {{if not .Revoked}}
+      <button class="btn small" hx-post="/api/renew" hx-vals='{"name":"{{.Alias}}"}'
+              hx-target="#toast-anchor-{{.Alias}}" hx-swap="none" data-toast="renewal sent">Renew</button>
+      {{end}}
+    </div>
+    <div id="toast-anchor-{{.Alias}}"></div>
+  </div>
+  {{end}}
+</div>
+{{else}}
+<div class="card muted">No names yet — <a href="/register">register your first</a>.</div>
+{{end}}
+{{end}}

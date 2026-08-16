@@ -1,0 +1,51 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · freens</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/htmx.min.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar">
+    <div class="brand"><span class="dot"></span>freens</div>
+    {{$page := .Page}}
+    <a class="nav-link {{if eq $page "dashboard"}}active{{end}}" href="/">
+      {{template "icon-gauge"}} Dashboard</a>
+    <a class="nav-link {{if eq $page "names"}}active{{end}}" href="/names">
+      {{template "icon-globe"}} Names</a>
+    <a class="nav-link {{if eq $page "register"}}active{{end}}" href="/register">
+      {{template "icon-plus"}} Register</a>
+    <a class="nav-link {{if eq $page "store"}}active{{end}}" href="/store">
+      {{template "icon-database"}} Store</a>
+    <a class="nav-link {{if eq $page "lookup"}}active{{end}}" href="/lookup">
+      {{template "icon-search"}} Lookup</a>
+    <a class="nav-link {{if eq $page "network"}}active{{end}}" href="/network">
+      {{template "icon-share"}} Network</a>
+    <a class="nav-link {{if eq $page "keys"}}active{{end}}" href="/keys">
+      {{template "icon-key"}} Keys</a>
+    <div class="spacer"></div>
+    <div class="row">
+      <button class="btn small" onclick="toggleTheme()" title="toggle theme">◐</button>
+      <a class="btn small" href="/logout">Sign out</a>
+    </div>
+    <div class="foot">freens-web<br>v{{.Version}}</div>
+  </nav>
+  <main>
+    {{template "content" .}}
+  </main>
+</div>
+<div id="toasts"></div>
+</body>
+</html>{{end}}
+
+{{define "icon-gauge"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M5 7l3 3M19 7l-3 3"/><circle cx="12" cy="14" r="6"/></svg>{{end}}
+{{define "icon-globe"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20"/></svg>{{end}}
+{{define "icon-plus"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>{{end}}
+{{define "icon-database"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg>{{end}}
+{{define "icon-search"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>{{end}}
+{{define "icon-share"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4"/></svg>{{end}}
+{{define "icon-key"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zm0 0L15 8m5-1 2-2m-4 6 2-2"/></svg>{{end}}

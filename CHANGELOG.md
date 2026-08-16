@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.6.0 — freens-web: the LAN management UI; un-revoke fixed
+- **freens-web** — a web UI for the whole system, served on the LAN:
+  dashboard (daemon, peers, store, difficulty, your names' health), names
+  (records, expiry, address changes, sub-names), full register flow with
+  LIVE progress (PoW mining → witness collection → publish, as an async
+  job), renew, revoke (typed confirmation), the DHT store browser, a DNS
+  lookup playground, the network page (peers + confirmation state), and
+  keys with one-click backup download. Server-rendered Go (html/template
+  + htmx, everything embedded — no CDN, no build step), dark/light, a
+  separate optional systemd unit (`contrib/systemd/freens-web.service`)
+  so the daemon never depends on it. Security: binds 0.0.0.0 but serves
+  ONLY the machine's private subnets (auto-detected allowlist — a WAN
+  address like ppp0 gets 403, verified live), first-visit password
+  bootstrap (bcrypt, 0600), 24 h HttpOnly sessions, per-IP login lockout,
+  CSRF header on mutations, typed-alias confirm for revocation.
+  Encrypted owner keys prompt per operation; passphrases never persist.
+- **Un-revoke fixed (found by the web UI's integration tests):** sequence
+  discovery used /resolve, which reports a revoked name as found:false
+  with NO sequence — so publishing after a revocation (the documented
+  un-revoke: `freens name <alias>`, or re-`register`) reset the sequence
+  to 1 and SILENTLY LOST the §6.4 winner race against the tombstone (0
+  peer acceptances). register/name/revoke (daemon mode) now fetch the
+  envelope by key — tombstones included — before computing sequence+1.
+- **internal/keychain**: the keyfile/alias/backup/recovery/claim-parking
+  logic extracted from the CLI into one library shared with the web UI
+  (no behavior change; CLI delegates). Sentinels ErrNeedsPassphrase /
+  ErrWrongPassphrase let UIs ask precisely.
+- **Admin socket: GET /store and GET /difficulty** (read-only, like every
+  admin endpoint): the live envelope listing (decoded names, RRsets,
+  lease state, claim keys flagged) and the A.4 difficulty oracle.
+- **`freens backup` output unchanged** but the bundle builder now lives
+  in keychain.BuildBackup (one implementation for CLI + web).
+
 ## v0.5.2 — hot-path performance; throttled gets stop negative-caching
 - **44× faster cold resolves (1.6 ms → 37 µs on the test N200).** Profiling
   the live paths (new loopback benchmark suite: resolve cold/cached/network,

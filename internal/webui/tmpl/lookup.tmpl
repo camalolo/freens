@@ -1,0 +1,12 @@
+{{define "content"}}
+<div class="page-head"><div><h1>Lookup</h1>
+<div class="subtitle">ask this daemon like a DNS client would</div></div></div>
+<div class="card">
+  <form class="stack" hx-get="/api/dns" hx-target="#lookupout" hx-swap="innerHTML">
+    <div class="field"><label>Name</label>
+      <input type="text" name="name" placeholder="www.alice or example.com" required autocomplete="off"></div>
+    <button class="btn primary" type="submit">Resolve</button>
+  </form>
+</div>
+<div id="lookupout" class="mt"></div>
+{{end}}

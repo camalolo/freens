@@ -1,0 +1,26 @@
+# freens-web.service — the LAN management web UI (optional companion to the
+# freens daemon; the daemon never depends on it). Install as a SYSTEM unit
+# running as the SAME user as the daemon (it reads ~/.freens: keys + admin
+# socket):
+#
+#   sudo cp freens-web.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now freens-web
+#
+# First visit from a LAN browser bootstraps the admin password. The default
+# listener is 0.0.0.0:8090 gated to the machine's private subnets (see
+# freens.conf's [webui] section: listen / allow).
+
+[Unit]
+Description=freens web UI (LAN management)
+Documentation=https://github.com/camalolo/freens
+After=network-online.target freens.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/freens-web -config %h/.freens/freens.conf
+User=REPLACE_WITH_THE_FREENS_USER
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

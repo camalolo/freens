@@ -1,0 +1,29 @@
+{{define "content"}}
+<div class="page-head"><div><h1>DHT store</h1>
+<div class="subtitle">{{.Count}} live envelopes this node serves</div></div>
+<input type="text" id="storeq" placeholder="filter…" oninput="filterStore(this.value)" style="max-width:220px">
+</div>
+<div class="table-wrap"><table id="storetable">
+<tr><th>Name / alias</th><th>Key</th><th>Seq</th><th>Records</th><th>Expires</th><th>State</th></tr>
+{{range .Entries}}
+<tr data-name="{{.Alias}} {{.DisplayName}}">
+  <td>{{if .ClaimKey}}<span class="badge info">claim</span> {{end}}{{if .Alias}}{{.Alias}}{{else}}<span class="faint">(sub-name)</span>{{end}}
+    {{if .DisplayName}}<div class="faint mono" style="font-size:.78rem">{{.DisplayName}}</div>{{end}}</td>
+  <td class="mono"><a href="/api/store/{{.Key}}" hx-get="/api/store/{{.Key}}" hx-target="#storedetail">{{printf "%.10s…" .Key}}</a></td>
+  <td class="mono">{{.Sequence}}</td>
+  <td>{{range .RRs}}<span class="mono">{{.Text}}</span> {{end}}{{if not .RRs}}<span class="faint">—</span>{{end}}</td>
+  <td class="mono">{{.ExpiryText}}</td>
+  <td>{{if .Revoked}}<span class="badge bad">revoked</span>{{else if .Lapsed}}<span class="badge warn">lapsed</span>{{else}}<span class="badge ok">live</span>{{end}}</td>
+</tr>
+{{end}}
+</table></div>
+<div class="card mt" id="storedetail" style="display:none"></div>
+<script>
+function filterStore(q){
+  q = q.toLowerCase();
+  document.querySelectorAll('#storetable tr[data-name]').forEach(function(tr){
+    tr.style.display = tr.dataset.name.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+</script>
+{{end}}

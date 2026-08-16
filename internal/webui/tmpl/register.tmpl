@@ -1,0 +1,48 @@
+{{define "content"}}
+<div class="page-head"><div><h1>Register a name</h1>
+<div class="subtitle">claim → PoW → {{.WitnessQuorum}} witnesses → publish (takes ~a minute)</div></div></div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <div class="card-title">New alias</div>
+    <form class="stack" id="regform" hx-post="/api/register" hx-swap="none">
+      <div class="field"><label>Alias</label>
+        <input type="text" name="alias" placeholder="alice" required pattern="[a-z0-9][a-z0-9-]{0,62}" autocomplete="off">
+        <div class="hint">lowercase letters, digits, hyphens; the name IS the identity</div></div>
+      <div class="field"><label>Address</label>
+        <input type="text" name="ip" placeholder="{{.DefaultIP}} (this machine)" autocomplete="off">
+        <div class="hint">empty = this machine's outbound address; IPv6 becomes an AAAA record</div></div>
+      <div class="field"><label>TTL (seconds)</label>
+        <input type="number" name="ttl" value="300" min="60"></div>
+      <div class="field"><label>Key passphrase (optional)</label>
+        <input type="password" name="passphrase" autocomplete="new-password">
+        <div class="hint">encrypts the owner + recovery keys at rest; needed for every future update</div></div>
+      <label class="row"><input type="checkbox" name="recovery" checked style="width:auto">
+        <span>generate recovery keys <span class="faint">(3 keys, 2 needed — recommended)</span></span></label>
+      <button class="btn primary" type="submit" id="regbtn">Claim name</button>
+    </form>
+  </div>
+
+  <div class="card" id="jobcard" {{if not .JobID}}style="display:none"{{end}}>
+    <div class="card-title">Job</div>
+    <div id="jobbody">
+      {{if .JobID}}{{template "jobfragment" .}}{{end}}
+    </div>
+  </div>
+</div>
+
+<div class="alert info mt">
+  A name is yours by key, not by lease — but records expire after 24 h by design
+  (ownership = liveness). Renew from the Names page; the daemon does it
+  automatically for plaintext keys.
+</div>
+
+<script>
+document.getElementById('regform').addEventListener('htmx:afterRequest', function(ev){
+  if (ev.detail.successful) {
+    document.getElementById('jobcard').style.display = '';
+    document.getElementById('regbtn').disabled = true;
+  }
+});
+</script>
+{{end}}

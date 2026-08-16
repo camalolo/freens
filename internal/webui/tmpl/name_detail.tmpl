@@ -1,0 +1,81 @@
+{{define "content"}}
+<div class="page-head">
+  <div><h1>{{.Alias}}</h1>
+    <div class="subtitle mono">{{.TldIDB32}}</div></div>
+  {{if .Revoked}}<span class="badge bad">revoked</span>{{else if .Found}}<span class="badge ok">live</span>{{else}}<span class="badge warn">no record</span>{{end}}
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <div class="card-title">Current record</div>
+    {{if .Found}}
+    <dl class="kv">
+      <dt>sequence</dt><dd>{{.Sequence}}</dd>
+      <dt>owner</dt><dd class="cell-mono">{{printf "%.16s…" .Owner}}</dd>
+      <dt>expires</dt><dd>{{.ExpiryText}}</dd>
+      <dt>ttl left</dt><dd>{{.TTLText}}</dd>
+    </dl>
+    {{if .RRs}}<table class="mt"><tr><th>type</th><th>value</th><th>ttl</th></tr>
+      {{range .RRs}}<tr><td>{{.Type}}</td><td class="mono">{{.Text}}</td><td class="mono">{{.TTL}}</td></tr>
+    {{end}}</table>{{end}}
+    {{else if .Revoked}}
+    <div class="muted">This name is deliberately dead (§9.5 tombstone). Un-revoke by publishing a newer record below.</div>
+    {{else}}
+    <div class="muted">No live record found for this alias.</div>
+    {{end}}
+  </div>
+
+  <div class="card">
+    <div class="card-title">Change address (apex or sub-name)</div>
+    <form class="stack" hx-post="/api/name" hx-swap="none">
+      <input type="hidden" name="name" value="{{.Alias}}">
+      <div class="field"><label>Name</label>
+        <select name="target">
+          <option value="{{.Alias}}">{{.Alias}} (apex)</option>
+          {{range .SubNames}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select></div>
+      <div class="field"><label>Address (empty = inherit apex)</label>
+        <input type="text" name="ip" placeholder="{{.IP}}" autocomplete="off"></div>
+      <div class="field"><label>Passphrase (only if the owner key is encrypted)</label>
+        <input type="password" name="passphrase" autocomplete="new-password"></div>
+      <button class="btn primary" type="submit">Publish</button>
+    </form>
+
+    <div class="card-title mt">Add a sub-name</div>
+    <form class="stack" hx-post="/api/name" hx-swap="none">
+      <input type="hidden" name="name" value="{{.Alias}}">
+      <div class="field"><label>Full name</label>
+        <input type="text" name="target" placeholder="www.{{.Alias}}" autocomplete="off"></div>
+      <div class="field"><label>Address</label>
+        <input type="text" name="ip" placeholder="{{.IP}}" autocomplete="off"></div>
+      <div class="field"><label>Passphrase (if encrypted)</label>
+        <input type="password" name="passphrase" autocomplete="new-password"></div>
+      <button class="btn primary" type="submit">Publish</button>
+    </form>
+  </div>
+</div>
+
+<div class="card mt">
+  <div class="card-title" style="color:var(--danger)">Danger zone</div>
+  <div class="spread">
+    <div class="muted">Revoking publishes a §9.5 tombstone: the name stops resolving network-wide
+      within its TTL, everywhere. Un-revoke = publish a newer record.</div>
+    <form hx-post="/api/revoke" hx-swap="none" onsubmit="return confirmRevoke(this)">
+      <input type="hidden" name="name" value="{{.Alias}}">
+      <input type="hidden" name="confirm" value="">
+      <div class="field"><label>Passphrase (if encrypted)</label>
+        <input type="password" name="passphrase" autocomplete="new-password"></div>
+      <button class="btn danger" type="submit">Revoke {{.Alias}}</button>
+    </form>
+  </div>
+</div>
+<script>
+function confirmRevoke(f){
+  const alias = f.querySelector('[name=name]').value;
+  const want = prompt('Type the name to revoke it permanently:\n' + alias);
+  if (want !== alias) { window.freensToast && freensToast('typed name did not match — aborted', 'error'); return false; }
+  f.confirm.value = alias;
+  return true;
+}
+</script>
+{{end}}

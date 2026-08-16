@@ -1,0 +1,13 @@
+{{define "storeentry"}}
+<div class="spread"><h2 style="margin:0">Envelope detail</h2><span class="badge dim mono">{{.Key}}</span></div>
+<dl class="kv mt">
+  <dt>sequence</dt><dd>{{.Sequence}}</dd>
+  <dt>alias</dt><dd>{{if .Alias}}{{.Alias}}{{else}}<span class="faint">—</span>{{end}}</dd>
+  <dt>tld_id</dt><dd class="cell-mono">{{.TldIDB32}}</dd>
+  <dt>owner</dt><dd class="cell-mono">{{.Owner}}</dd>
+  <dt>size</dt><dd>{{.Bytes}} B</dd>
+  <dt>expires</dt><dd>{{.Expires}} ({{.ExpiresIn}}s)</dd>
+</dl>
+{{if .Claim}}<div class="mt"><span class="badge info">carries a §7.4 claim</span></div>{{end}}
+{{if .Revoked}}<div class="mt"><span class="badge bad">revoked</span></div>{{end}}
+{{end}}

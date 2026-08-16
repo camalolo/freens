@@ -1,0 +1,15 @@
+{{define "jobfragment"}}
+<div class="spread"><strong>{{.JobLabel}}</strong>
+  {{if .JobDone}}{{if .JobError}}<span class="badge bad">failed</span>{{else}}<span class="badge ok">done</span>{{end}}
+  {{else}}<span class="badge info">running</span>{{end}}</div>
+<div class="progress mt"><div style="width:{{.JobPct}}%"></div></div>
+<div class="steps">
+  {{range .JobSteps}}<span class="{{.Class}}">{{.Text}}</span>{{end}}
+</div>
+{{if .JobError}}<div class="alert error mt">{{.JobError}}</div>{{end}}
+{{if .JobDone}}{{if .JobResult}}
+  <div class="alert ok mt">Registered <strong>{{.JobResult.Alias}}</strong> → {{.JobResult.IP}}
+    (sequence {{.JobResult.Sequence}}, {{.JobResult.Witnesses}} witnesses)</div>
+{{end}}{{end}}
+{{if not .JobDone}}<div hx-get="/api/job/{{.JobID}}" hx-trigger="every 600ms" hx-target="#jobbody" hx-swap="innerHTML"></div>{{end}}
+{{end}}

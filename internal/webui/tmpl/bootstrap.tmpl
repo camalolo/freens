@@ -1,0 +1,19 @@
+{{define "content"}}
+<div style="max-width:480px;margin:8vh auto">
+  <div class="brand" style="justify-content:center"><span class="dot"></span>freens</div>
+  <div class="card">
+    <div class="card-title">Welcome — set the admin password</div>
+    <div class="muted" style="margin-bottom:1rem">First visit to this freens-web instance.
+      This password guards name management for the whole LAN. Losing it means deleting
+      <code class="pill">{{.AuthPath}}</code> on the box (shell required) and setting a new one.</div>
+    {{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}
+    <form class="stack" method="post" action="/bootstrap">
+      <div class="field"><label>Password (min 8 chars)</label>
+        <input type="password" name="password" required minlength="8" autofocus autocomplete="new-password"></div>
+      <div class="field"><label>Repeat</label>
+        <input type="password" name="password2" required minlength="8" autocomplete="new-password"></div>
+      <button class="btn primary" type="submit">Set password & sign in</button>
+    </form>
+  </div>
+</div>
+{{end}}

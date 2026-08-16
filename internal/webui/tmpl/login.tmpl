@@ -1,0 +1,14 @@
+{{define "content"}}
+<div style="max-width:420px;margin:8vh auto">
+  <div class="brand" style="justify-content:center"><span class="dot"></span>freens</div>
+  <div class="card">
+    <div class="card-title">Sign in</div>
+    {{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}
+    <form class="stack" method="post" action="/login">
+      <div class="field"><label>Password</label>
+        <input type="password" name="password" required autofocus autocomplete="current-password"></div>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form>
+  </div>
+</div>
+{{end}}

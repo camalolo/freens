@@ -1,0 +1,28 @@
+{{define "content"}}
+<div class="page-head"><div><h1>Keys</h1>
+<div class="subtitle">the keychain at {{.KeysDir}}</div></div>
+<a class="btn primary" href="/api/backup" download>Download backup (.tar.gz)</a></div>
+
+{{if .Inventory}}
+<div class="table-wrap"><table>
+<tr><th>Alias</th><th>Kind</th><th>File</th><th>At rest</th><th>Size</th><th>Modified</th></tr>
+{{range .Inventory}}
+<tr>
+  <td>{{.Alias}}</td>
+  <td>{{if eq .Kind "owner"}}<span class="badge ok">owner</span>{{else}}<span class="badge dim">recovery</span>{{end}}</td>
+  <td class="mono">{{.Name}}</td>
+  <td>{{if .Encrypted}}<span class="badge info">🔒 encrypted</span>{{else}}<span class="badge warn">plaintext</span>{{end}}</td>
+  <td class="mono">{{.Size}} B</td>
+  <td class="mono">{{.ModTime}}</td>
+</tr>
+{{end}}
+</table></div>
+{{else}}
+<div class="card muted">No keys on this machine yet.</div>
+{{end}}
+
+<div class="alert info mt">
+  The backup bundles every key of every name into one file — it IS ownership.
+  Store it OFF this machine; anyone holding it can take over the names.
+</div>
+{{end}}

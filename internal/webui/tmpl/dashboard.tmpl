@@ -1,0 +1,68 @@
+{{define "content"}}
+<div class="page-head">
+  <div>
+    <h1>Dashboard</h1>
+    <div class="subtitle">{{.Host}} · {{.Home}}</div>
+  </div>
+  <div class="row">
+    {{if .DaemonUp}}<span class="badge ok">daemon {{.DaemonVersion}}</span>{{else}}<span class="badge bad">daemon down</span>{{end}}
+    {{if .PeersOK}}<span class="badge ok">{{.Peers}} peers</span>{{else}}<span class="badge warn">{{.Peers}} peers</span>{{end}}
+  </div>
+</div>
+
+<div class="grid cols-3">
+  <div class="card">
+    <div class="card-title">Node</div>
+    <div class="big">{{.Peers}}</div>
+    <div class="muted">peers in the routing table</div>
+    <div class="mt muted mono" style="font-size:.75rem">{{if .NodeID}}{{printf "%.12s…" .NodeID}}{{else}}—{{end}}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Store</div>
+    <div class="big">{{.StoreEnvs}}</div>
+    <div class="muted">live envelopes ({{.HistoryEnvs}} history)</div>
+    <div class="mt"><span class="badge {{if .RelayMode}}warn{{else}}dim{{end}}">{{if .RelayMode}}relay mode{{else}}direct{{end}}</span></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Network difficulty</div>
+    <div class="big">{{.Difficulty}}</div>
+    <div class="muted">bits (PoW); quorum {{.WitnessQuorum}} witnesses</div>
+    <div class="mt"><span class="badge {{if .NetworkClaims}}ok{{else}}dim{{end}}">{{if .NetworkClaims}}co-signs claims{{else}}not co-signing{{end}}</span></div>
+  </div>
+</div>
+
+<h2 class="mt">Your names</h2>
+{{if .Names}}
+<div class="table-wrap"><table>
+  <tr><th>Name</th><th>Address</th><th>State</th><th>Lease</th></tr>
+  {{range .Names}}
+  <tr>
+    <td><a href="/names/{{.Alias}}">{{.Alias}}</a></td>
+    <td class="mono">{{.IP}}</td>
+    <td>{{if .Revoked}}<span class="badge bad">revoked</span>{{else if .Healthy}}<span class="badge ok">healthy</span>{{else}}<span class="badge warn">no record</span>{{end}}</td>
+    <td class="mono muted">{{.ExpiryText}}</td>
+  </tr>
+  {{end}}
+</table></div>
+{{else}}
+<div class="card muted">No names on this machine yet — <a href="/register">register one</a>.</div>
+{{end}}
+
+<h2 class="mt">Health</h2>
+<div class="grid cols-2">
+  <div class="card">
+    <div class="card-title">Checks</div>
+    <div class="steps">
+      <span class="{{if .DaemonUp}}done{{else}}current{{end}}">{{if .DaemonUp}}✓{{else}}✗{{end}} daemon answering on the admin socket</span>
+      <span class="{{if .DNSOK}}done{{else}}current{{end}}">{{if .DNSOK}}✓{{else}}✗{{end}} resolver answers a freens name</span>
+      <span class="{{if .PeersOK}}done{{else}}current{{end}}">{{if .PeersOK}}✓{{else}}✗{{end}} at least one peer</span>
+      <span class="{{if .ClockOK}}done{{else}}current{{end}}">{{if .ClockOK}}✓{{else}}?{{end}} clock sane</span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Recent actions</div>
+    {{if .RecentJobs}}<div class="steps">{{range .RecentJobs}}<span>{{.When}} — {{.Label}}: {{.State}}</span>{{end}}</div>
+    {{else}}<div class="muted">Nothing yet. Register jobs and renames appear here.</div>{{end}}
+  </div>
+</div>
+{{end}}

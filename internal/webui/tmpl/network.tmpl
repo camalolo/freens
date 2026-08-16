@@ -1,0 +1,24 @@
+{{define "content"}}
+<div class="page-head"><div><h1>Network</h1>
+<div class="subtitle">peers, identity, difficulty</div></div></div>
+<div class="grid cols-3 mb">
+  <div class="card"><div class="card-title">Node ID</div><div class="mono" style="font-size:.8rem;word-break:break-all">{{.NodeID}}</div></div>
+  <div class="card"><div class="card-title">Advertised</div><div class="mono">{{.Advertise}}</div>
+    <div class="muted mt">{{.DHTListen}}</div></div>
+  <div class="card"><div class="card-title">Difficulty</div><div class="big">{{.Difficulty}}</div>
+    <div class="muted">bits · retarget every {{.RetargetBlock}} claims</div></div>
+</div>
+<h2>Peers ({{.Peers}})</h2>
+<div class="table-wrap"><table>
+<tr><th>Address</th><th>Node ID</th><th>Last direct exchange</th><th>State</th></tr>
+{{range .PeerRows}}
+<tr>
+  <td class="mono">{{.Addr}}</td>
+  <td class="mono">{{printf "%.12s…" .PK}}</td>
+  <td class="mono">{{.ConfirmedText}}</td>
+  <td>{{if .ConfirmedAgo}}<span class="badge ok">confirmed</span>{{else}}<span class="badge dim">advertised</span>{{end}}</td>
+</tr>
+{{end}}
+</table></div>
+{{if .Seeds}}<h2 class="mt">Seeds</h2><div class="card mono" style="font-size:.82rem">{{range .Seeds}}<div>{{.}}</div>{{end}}</div>{{end}}
+{{end}}
