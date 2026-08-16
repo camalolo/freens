@@ -69,9 +69,16 @@ type peerbookJSON struct {
 	Peers   []peerJSON `json:"peers"`
 }
 
+// peerJSON is one persisted contact. Confirmed (unix seconds, 0 = never
+// directly confirmed) carries the routing table's anti-ghost probation
+// clock (issue #2) across restarts: without it, a daemon reload reset
+// ghost contacts to fresh probation, and a host that restarts often
+// enough (or a CLI one-shot re-running) could short-circuit its own
+// eviction forever.
 type peerJSON struct {
-	Addr string `json:"addr"`
-	PK   string `json:"pk"`
+	Addr      string `json:"addr"`
+	PK        string `json:"pk"`
+	Confirmed int64  `json:"confirmed,omitempty"`
 }
 
 // SavePeerbook persists up to 32 of the node's routing-table contacts
@@ -85,7 +92,7 @@ func SavePeerbook(peers []dht.Peer, now int64) error {
 	}
 	pj := peerbookJSON{SavedAt: now}
 	for _, p := range peers {
-		pj.Peers = append(pj.Peers, peerJSON{Addr: p.Addr, PK: fmt.Sprintf("%x", p.PublicKey)})
+		pj.Peers = append(pj.Peers, peerJSON{Addr: p.Addr, PK: fmt.Sprintf("%x", p.PublicKey), Confirmed: p.Confirmed})
 	}
 	b, err := json.MarshalIndent(pj, "", "  ")
 	if err != nil {
@@ -118,7 +125,7 @@ func LoadPeerbook() []dht.Peer {
 		if err != nil || len(pk) != 32 || p.Addr == "" {
 			continue
 		}
-		out = append(out, dht.Peer{Addr: p.Addr, PublicKey: pk})
+		out = append(out, dht.Peer{Addr: p.Addr, PublicKey: pk, Confirmed: p.Confirmed})
 	}
 	return out
 }

@@ -102,11 +102,14 @@ type Status struct {
 
 // Resolved is the POST /resolve response: the winning record for a display
 // name, rendered for humans (hex owner, base32 tld_id, dotted-quad A
-// rdata). Found is false — not an HTTP error — when nothing is published for
-// the name; the CLI distinguishes "no record" from "daemon broken" by HTTP
-// status, not by this field.
+// rdata). Found is false — not an HTTP error — when nothing is published
+// for the name OR the name is revoked (§9.5 tombstone; Revoked
+// distinguishes the two — mirrors the DNS face's NXDOMAIN); the CLI
+// distinguishes "no record" from "daemon broken" by HTTP status, not by
+// this field.
 type Resolved struct {
 	Found    bool   `json:"found"`
+	Revoked  bool   `json:"revoked,omitempty"`
 	Name     string `json:"name,omitempty"`
 	Owner    string `json:"owner,omitempty"` // hex
 	Sequence uint64 `json:"sequence,omitempty"`
@@ -483,6 +486,15 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	if env == nil || env.Record == nil {
 		writeJSON(w, http.StatusOK, Resolved{Found: false})
+		return
+	}
+	if env.IsRevoked() {
+		// §9.5: the tombstone IS the answer (the name is deliberately
+		// dead). Found:false + Revoked:true, mirroring the DNS face's
+		// NXDOMAIN — callers that counted bare Found as "resolves" (the
+		// CLI's doctor, status self-checks) were reporting revoked names
+		// as healthy.
+		writeJSON(w, http.StatusOK, Resolved{Found: false, Revoked: true, Name: req.Name})
 		return
 	}
 	writeJSON(w, http.StatusOK, resolvedFrom(labels, alias, tldID, env))

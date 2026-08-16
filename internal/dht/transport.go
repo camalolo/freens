@@ -123,10 +123,13 @@ const evictQueueCap = 64
 
 // Peer is a bootstrap peer: a UDP address plus the peer's 32-byte node public
 // key (required because recipient_id is part of every message signature, so a
-// node can only send a signed RPC to a peer whose key it knows).
+// node can only send a signed RPC to a peer whose key it knows). Confirmed
+// carries the peerbook's last-direct-exchange timestamp across restarts
+// (issue #2 probation continuity; 0 = unknown/legacy entry).
 type Peer struct {
 	Addr      string // "ip:port"
 	PublicKey []byte // 32-byte Ed25519 node public key
+	Confirmed int64  // unix seconds; 0 = never/unknown
 }
 
 // NodeConfig configures a DHT transport Node.
@@ -1486,6 +1489,26 @@ func (n *Node) AddPeer(pk []byte, addr string) error {
 	if err != nil {
 		return err
 	}
+	// A seed is an explicit trust statement, not an advertisement: it
+	// starts probation from now (ConfirmedAt 0) unless the caller knows
+	// better (AddPeerConfirmed, the peerbook reload path).
+	n.learn(c)
+	return nil
+}
+
+// AddPeerConfirmed is AddPeer with a known last-direct-exchange timestamp
+// (the peerbook reload: issue #2 probation continuity — a restart must not
+// reset a contact's age).
+func (n *Node) AddPeerConfirmed(pk []byte, addr string, confirmedAt int64) error {
+	id, err := crypto.NodeID(pk)
+	if err != nil {
+		return err
+	}
+	c, err := NewNodeContact(id, pk, addr, n.now())
+	if err != nil {
+		return err
+	}
+	c.ConfirmedAt = confirmedAt
 	n.learn(c)
 	return nil
 }
@@ -1495,7 +1518,14 @@ func (n *Node) AddPeer(pk []byte, addr string) error {
 // us from our signed ping). Failures are logged at debug level and do not abort.
 func (n *Node) Bootstrap(ctx context.Context, peers []Peer) {
 	for _, p := range peers {
-		if err := n.AddPeer(p.PublicKey, p.Addr); err != nil {
+		var err error
+		if p.Confirmed > 0 {
+			// Peerbook entry: carry its probation age (issue #2 continuity).
+			err = n.AddPeerConfirmed(p.PublicKey, p.Addr, p.Confirmed)
+		} else {
+			err = n.AddPeer(p.PublicKey, p.Addr)
+		}
+		if err != nil {
 			n.log.Debug("dht: bootstrap add peer", "addr", p.Addr, "err", err)
 			continue
 		}

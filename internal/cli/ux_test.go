@@ -586,6 +586,35 @@ func TestPassphraseKeyfiles(t *testing.T) {
 	}
 }
 
+// TestDoctorRevokedAliasIsWarn: a revoked alias must NOT count as
+// "resolves" (the §9.5 tombstone) — doctor flags it as a warning, and the
+// overall result reflects reality instead of a healthy-looking lie.
+func TestDoctorRevokedAliasIsWarn(t *testing.T) {
+	h := tempHome(t)
+	stubSysForTest(t)
+	startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
+	// A keychain alias whose stub resolve answers found:false + revoked.
+	revokedStub := startStubAdmin(t, filepath.Join(h, "admin.sock"), map[string]string{
+		"ghostname": `{"found":false,"revoked":true,"name":"ghostname"}`,
+	})
+	_ = revokedStub
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "ghostname.key"), mustTestKeypair(t)); err != nil {
+		t.Fatal(err)
+	}
+	// Redirect the probe URLs so the clock check is skipped cleanly.
+	oldProbes := clockSkewProbes
+	clockSkewProbes = nil
+	t.Cleanup(func() { clockSkewProbes = oldProbes })
+
+	out, _ := captureStdout(t, func() error { return cmdDoctor(nil) })
+	if !strings.Contains(out, "REVOKED") {
+		t.Errorf("doctor did not flag the revoked alias:\n%s", out)
+	}
+	if strings.Contains(out, "alias ghostname resolves") {
+		t.Errorf("doctor reported the revoked alias as resolving:\n%s", out)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // backup / restore
 // ---------------------------------------------------------------------------

@@ -47,3 +47,18 @@ func TestConfirmedPeersFiltersGhosts(t *testing.T) {
 		}
 	}
 }
+
+// TestConfirmedPeersCarriesProbationAge: the persisted Confirmed timestamp
+// is the contact's own (not now) — a restart must RESUME the anti-ghost
+// probation clock, not reset it (issue #2 residual: restart short-cycling).
+func TestConfirmedPeersCarriesProbationAge(t *testing.T) {
+	old := contactWithConfirmation(t, true)
+	old.ConfirmedAt = 1000 // confirmed 1000, "now" is 9000: an aging contact
+	got := confirmedPeers([]*dht.NodeContact{old}, 9000)
+	if len(got) != 1 {
+		t.Fatalf("kept %d, want 1", len(got))
+	}
+	if got[0].Confirmed != 1000 {
+		t.Errorf("persisted Confirmed = %d, want 1000 (the contact's age, not now)", got[0].Confirmed)
+	}
+}

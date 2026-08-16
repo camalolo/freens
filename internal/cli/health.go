@@ -120,12 +120,14 @@ func cmdStatus(args []string) error {
 			switch {
 			case err != nil:
 				fmt.Printf("%s → error: %v\n", a, err)
+			case r != nil && r.Revoked:
+				fmt.Printf("%s → revoked (dead by owner choice)\n", a)
 			case r == nil || !r.Found:
 				fmt.Printf("%s → not published yet (did `register` finish?)\n", a)
 			default:
-				ip := firstAdminAIP(r.RRset)
+				ip := firstAdminIP(r.RRset)
 				if ip == "" {
-					ip = "no A record"
+					ip = "no address record"
 				}
 				fmt.Printf("%s → %s · healthy\n", a, ip)
 			}
@@ -223,7 +225,14 @@ func cmdDoctor(args []string) error {
 		ctx, cancel := adminCtx()
 		for _, a := range aliases {
 			r, err := c.Resolve(ctx, a)
-			check(err == nil && r != nil && r.Found, "alias %s resolves (apex)", a)
+			switch {
+			case err != nil:
+				check(false, "alias %s resolves (apex): %v", a, err)
+			case r != nil && r.Revoked:
+				warn("alias %s is REVOKED (deliberate; un-revoke with register/name or drop the key)", a)
+			default:
+				check(err == nil && r != nil && r.Found, "alias %s resolves (apex)", a)
+			}
 		}
 		cancel()
 	}

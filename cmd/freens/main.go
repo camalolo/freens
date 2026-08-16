@@ -895,14 +895,15 @@ func savePeerbook(node *dht.Node, logger *slog.Logger) {
 
 // confirmedPeers filters contacts to those with at least one DIRECT
 // exchange (ConfirmedAt > 0 — the routing table's anti-ghost invariant) and
-// converts them to the persistence form. Exported shape: pure function.
+// converts them to the persistence form, CARRYING the confirmation age so
+// a restart resumes probation instead of resetting it (issue #2).
 func confirmedPeers(contacts []*dht.NodeContact, now int64) []dht.Peer {
 	var out []dht.Peer
 	for _, c := range contacts {
 		if c.ConfirmedAt <= 0 {
 			continue // never directly confirmed: do not persist
 		}
-		out = append(out, dht.Peer{Addr: c.Addr, PublicKey: c.PublicKey})
+		out = append(out, dht.Peer{Addr: c.Addr, PublicKey: c.PublicKey, Confirmed: c.ConfirmedAt})
 	}
 	return out
 }

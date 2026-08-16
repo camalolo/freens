@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.1 — the two nits, fixed
+- **Revoked names no longer count as "resolves".** `/resolve` reports a
+  §9.5 tombstone as `found:false, revoked:true` (mirroring the DNS
+  face's NXDOMAIN); doctor flags revoked keychain aliases as warnings
+  ("deliberate; un-revoke or drop the key"), `status` shows
+  "revoked (dead by owner choice)", and `start` no longer treats a
+  tombstoned alias as "already ours and published".
+- **Ghost probation survives restarts.** The peerbook now carries each
+  contact's last-direct-exchange timestamp (`confirmed`), and bootstrap
+  reloads it via `AddPeerConfirmed` — a restart resumes the anti-ghost
+  clock instead of resetting it, closing the "restart short-cycling
+  defeats the idle sweep" residual from v0.5.0.
+
 ## v0.5.0 — ghost contacts, IPv6 names, clock doctor, chair alerting
 - **Issue #2 fixed — advertisement can no longer launder dead contacts.**
   A contact's liveness now requires DIRECT exchange: `ConfirmedAt` is

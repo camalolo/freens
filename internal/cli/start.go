@@ -87,16 +87,18 @@ func cmdStart(args []string) error {
 		alias = norm
 	}
 
-	// "Already ours" = we hold the owner key AND the network resolves it.
-	// A found alias WITHOUT our key is somebody else's name — register must
-	// run (and will lose or win the §7.4 contest on its merits).
+	// "Already ours" = we hold the owner key AND the network resolves a
+	// LIVE record for it. A found alias WITHOUT our key is somebody else's
+	// name — register must run (and will lose or win the §7.4 contest on
+	// its merits). A REVOKED record is not "published" either (the owner
+	// deliberately killed it; re-registering is the un-revoke).
 	already := false
 	if fileExists(ownerKeyPath(alias)) {
 		if c := maybeAdmin(); c != nil {
 			ctx, cancel := adminCtx()
 			r, err := c.Resolve(ctx, alias)
 			cancel()
-			already = err == nil && r != nil && r.Found
+			already = err == nil && r != nil && r.Found && !r.Revoked
 		}
 	}
 	if already {
