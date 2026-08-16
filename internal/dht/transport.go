@@ -346,9 +346,10 @@ func (n *Node) penalized(id []byte, now int64) bool {
 // LookupStats reports what one iterative lookup did (issue #1
 // observability + the degraded-miss classification).
 type LookupStats struct {
-	ProbesSent    int      // candidate probes issued
-	ProbesFailed  int      // probes that errored (timeout / unreachable / malformed)
-	ProbedNodeIDs [][]byte // IDs probed, in order (penalized contacts excluded)
+	ProbesSent      int      // candidate probes issued
+	ProbesFailed    int      // probes that errored (timeout / unreachable / malformed)
+	ProbesThrottled int      // probes answered with §12 error 301 "throttled" (peer alive, rate-limited)
+	ProbedNodeIDs   [][]byte // IDs probed, in order (penalized contacts excluded)
 }
 
 // ErrDegradedMiss reports a lookup that found nothing while some probes
@@ -358,6 +359,17 @@ type LookupStats struct {
 // field-churn showed 60 s NXDOMAIN windows for names whose holders were
 // alive the whole time (issue #1).
 var ErrDegradedMiss = errors.New("dht: degraded miss (probe failures; the network could not be fully interrogated)")
+
+// ErrThrottled reports a get probe that was answered with the §12 rate-limit
+// error 301 "throttled": the peer is ALIVE but refused to serve the answer
+// (get-rate bucket exhausted). It is NOT a probe failure — the contact must
+// not be evicted or penalized — but the answer ("held" or "not held") was
+// never obtained, so a lookup that found nothing while throttled is a
+// degraded miss, not an authoritative one (found live while profiling: a
+// client bursting past the 50/s bucket got clean-miss NXDOMAINs that
+// negative-cached, exactly the failure mode issue #1 built ErrDegradedMiss
+// to prevent).
+var ErrThrottled = errors.New("dht: peer throttled get (§12 rate limit)")
 
 // witnessSigned records one witnessed claim for the WITNESS_COOLDOWN check:
 // the SHA-256 of the claim's §7.3 PoW prefix (which binds alias, tld_id,
@@ -1634,6 +1646,16 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 
 		roundAnswered := 0
 		for i, r := range results {
+			// §12 throttle: the peer is alive but withheld its answer. NOT a
+			// §6.2 failure (no eviction/penalty — the peer did nothing wrong;
+			// hammering it harder via the adaptive batch is also wrong, so it
+			// counts as answered), but the "held or not" question went
+			// unanswered, so a finding-nothing walk below degrades.
+			if errors.Is(r.err, ErrThrottled) {
+				stats.ProbesThrottled++
+				roundAnswered++
+				continue
+			}
 			// Kademlia failure handling (§6.2): a contact that failed its
 			// probe (timeout / unreachable / malformed address) is evicted
 			// from the routing table so it is neither re-probed by later
@@ -1675,7 +1697,7 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 			}
 		}
 	}
-	if bestEnv == nil && stats.ProbesFailed > 0 {
+	if bestEnv == nil && (stats.ProbesFailed > 0 || stats.ProbesThrottled > 0) {
 		return nil, stats, ErrDegradedMiss
 	}
 	return bestEnv, stats, nil
@@ -1784,8 +1806,9 @@ func (n *Node) findNodeRound(ctx context.Context, target []byte, c *NodeContact)
 // see hGet) when present, then the legacy single `envelope` (the §6.4 store
 // winner — a pool-carrying peer repeats it inside `envelopes`, deduplicated
 // by callers via H_record / EnvelopeWins). The returned error signals probe
-// failure (drives §6.2 eviction in IterativeGet); a y="e" response is a
-// successful exchange and yields a nil error.
+// failure (drives §6.2 eviction in IterativeGet) — with ONE exception: a
+// §12 301 "throttled" answer returns [ErrThrottled], which the walks treat
+// as "peer alive, answer withheld" (no eviction, not an authoritative miss).
 func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*wire.SignedEnvelope, []*NodeContact, error) {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
@@ -1795,8 +1818,14 @@ func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*
 	if err != nil {
 		return nil, nil, err
 	}
-	if resp == nil || resp.Y == wire.MsgTypeError {
+	if resp == nil {
 		return nil, nil, nil
+	}
+	if resp.Y == wire.MsgTypeError {
+		if code, ok := errorCode(resp); ok && code == 301 {
+			return nil, nil, ErrThrottled
+		}
+		return nil, nil, nil // any other y="e": a successful exchange, nothing offered
 	}
 	var envs []*wire.SignedEnvelope
 	if raw, ok := resp.A["envelopes"].([]any); ok {
@@ -2625,6 +2654,26 @@ func (n *Node) errResp(req *wire.Message, code int, msg string) *wire.Message {
 		return nil
 	}
 	return resp
+}
+
+// errorCode extracts the numeric "code" from a y="e" response's args, if
+// present and numeric (fxamacker/cbor decodes CBOR uints into uint64; the
+// other cases are pure defensiveness). ok is false for absent/non-numeric.
+func errorCode(resp *wire.Message) (code int, ok bool) {
+	if resp == nil {
+		return 0, false
+	}
+	switch v := resp.A["code"].(type) {
+	case uint64:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case int:
+		return v, true
+	case float64:
+		return int(v), true
+	}
+	return 0, false
 }
 
 func (n *Node) issueToken(raddr *net.UDPAddr) []byte {

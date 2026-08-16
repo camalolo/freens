@@ -21,6 +21,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
@@ -107,6 +108,7 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	queried := make(map[string]bool, len(shortlist))
 	answered := make(map[string]*NodeContact, len(shortlist)) // reachable nodes
 	probesFailed := 0
+	probesThrottled := 0
 	batchSize := constants.Alpha
 
 	for round := 0; round < maxLookupRounds; round++ {
@@ -157,6 +159,15 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 
 		roundAnswered := 0
 		for i, r := range results {
+			// §12 throttle: alive but withholding (see getFromPeer) — not a
+			// §6.2 failure, no eviction, counts as answered; the empty-result
+			// classification below treats it as non-authoritative.
+			if errors.Is(r.err, ErrThrottled) {
+				probesThrottled++
+				answered[string(batch[i].NodeID)] = batch[i]
+				roundAnswered++
+				continue
+			}
 			// §6.2 failure handling, identical to IterativeGet: evict a
 			// contact whose probe failed (unless the caller cancelled) and
 			// penalize it for deadPenaltyWindow so later walks skip it.
@@ -204,6 +215,7 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	if len(reachable) > constants.GetClosest {
 		reachable = reachable[:constants.GetClosest]
 	}
+	var finalsThrottled, finalsFailed int32 // atomic; merged after fwg.Wait
 	finals := make([][]*wire.SignedEnvelope, len(reachable))
 	var fwg sync.WaitGroup
 	for i, c := range reachable {
@@ -213,12 +225,23 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 			pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 			defer cancel()
 			envs, _, err := n.getFromPeer(pctx, key, c)
-			if err == nil {
+			switch {
+			case err == nil:
 				finals[i] = envs
+			case errors.Is(err, ErrThrottled):
+				// §12: answer withheld — the final merge did not interrogate
+				// this holder (counted for the classification below).
+				atomic.AddInt32(&finalsThrottled, 1)
+			default:
+				// Probe failure in the final merge: same non-authoritative
+				// consequence as a walk failure below.
+				atomic.AddInt32(&finalsFailed, 1)
 			}
 		}(i, c)
 	}
 	fwg.Wait()
+	probesThrottled += int(atomic.LoadInt32(&finalsThrottled))
+	probesFailed += int(atomic.LoadInt32(&finalsFailed))
 	for _, envs := range finals {
 		for _, e := range envs {
 			add(e)
@@ -226,10 +249,11 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	}
 
 	// Degraded-miss classification (issue #1): an EMPTY collected set with
-	// probe failures is not an authoritative "nobody claims this alias" —
-	// the resolver must retry (SERVFAIL) rather than negative-cache an
-	// NXDOMAIN for an alias whose claim holders were alive all along.
-	if len(collected) == 0 && probesFailed > 0 {
+	// probe failures — or §12-throttled holders whose "held or not" answer
+	// was withheld — is not an authoritative "nobody claims this alias": the
+	// resolver must retry (SERVFAIL) rather than negative-cache an NXDOMAIN
+	// for an alias whose claim holders were alive all along.
+	if len(collected) == 0 && (probesFailed > 0 || probesThrottled > 0) {
 		return nil, ErrDegradedMiss
 	}
 	return sortedByRecordHash(collected), nil

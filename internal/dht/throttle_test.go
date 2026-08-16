@@ -14,11 +14,13 @@ package dht
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/wire"
 )
 
@@ -241,5 +243,160 @@ func TestRateLimiterSweepIdle(t *testing.T) {
 	}
 	if len(l.buckets) > 10 {
 		t.Errorf("sweep left %d entries; idle ones should be gone", len(l.buckets))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Walk-side classification (found live while profiling, Aug 2026): a get
+// answered with error 301 "throttled" must surface as ErrThrottled inside the
+// iterative walks → a DEGRADED miss (retryable, never negative-cached), and
+// must NOT evict or penalize the (alive) throttling peer. The tests above
+// cover the RESPONDER; these cover the CLIENT.
+// ---------------------------------------------------------------------------
+
+// startThrottlePair builds A (rate-limited: burst 1, refill 0.5/s) holding a
+// test envelope at K_tld AND K_claim, and B (unlimited) peered with it.
+func startThrottlePair(t *testing.T) (a, b *Node, key []byte) {
+	t.Helper()
+	akp := mustKP(t)
+	var err error
+	a, err = NewNode(NodeConfig{
+		Keypair:      akp,
+		ListenAddr:   "127.0.0.1:0",
+		Store:        NewEnvelopeStore(0, nil),
+		GetRateLimit: 0.5, // one token every 2 s
+		GetBurst:     1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+
+	bkp := mustKP(t)
+	b, err = NewNode(NodeConfig{
+		Keypair:      bkp,
+		ListenAddr:   "127.0.0.1:0",
+		Store:        NewEnvelopeStore(0, nil),
+		GetRateLimit: -1, // B is never the bottleneck
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	tid, err := crypto.TldID(akp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wn, err := naming.EncodeWireName(nil, "throttled", tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	rec, err := wire.NewRecord(wn, akp.Public(), 1, uint64(now), uint64(now+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr, _ := wire.A([]byte{203, 0, 113, 5}, 300)
+	rec.RRset = []*wire.RR{rr}
+	env, err := wire.SignRecord(rec, akp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err = KeyForWireName(wn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.store.Put(key, env, now, true); err != nil {
+		t.Fatal(err)
+	}
+	// Also store at K_claim (§7.4: a claim-carrying TLD envelope lives at BOTH
+	// keys) so the CollectClaims walk — which probes K_claim — finds it.
+	kClaim, err := KeyForClaim("throttled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.store.Put(kClaim, env, now, true); err != nil {
+		t.Fatal(err)
+	}
+
+	aAddr, err := a.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.AddPeer(a.PublicKey(), aAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+	return a, b, key
+}
+
+// TestThrottledGetIsDegradedMiss: after exhausting A's burst, B's cold
+// IterativeGet must return ErrDegradedMiss — NOT a clean (nil, nil) miss that
+// the resolver would negative-cache as NXDOMAIN (the issue #1 failure mode).
+func TestThrottledGetIsDegradedMiss(t *testing.T) {
+	a, b, key := startThrottlePair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 1st get consumes the single burst token and fetches the envelope.
+	env, err := b.IterativeGet(ctx, key)
+	if err != nil || env == nil {
+		t.Fatalf("first IterativeGet: env=%v err=%v", env, err)
+	}
+
+	// 2nd get: A throttles (301) — must classify as a degraded miss.
+	b.store.Remove(key)
+	env2, _, err2 := b.IterativeGetDetailed(ctx, key)
+	if env2 != nil {
+		t.Fatal("throttled IterativeGet returned an envelope; want nil")
+	}
+	if !errors.Is(err2, ErrDegradedMiss) {
+		t.Fatalf("throttled IterativeGet err = %v, want ErrDegradedMiss", err2)
+	}
+
+	// The throttling peer must NOT have been evicted from B's table.
+	if got := b.RoutingTable().Size(); got < 1 {
+		t.Fatalf("throttled peer evicted from routing table (size %d); §12 throttling is not a §6.2 failure", got)
+	}
+
+	// After the bucket refills (2 s at 0.5 tokens/s), the same contact must
+	// serve the record again — proving no eviction AND no dead-penalty.
+	time.Sleep(2200 * time.Millisecond)
+	env3, err3 := b.IterativeGet(ctx, key)
+	if err3 != nil || env3 == nil {
+		t.Fatalf("post-refill IterativeGet: env=%v err=%v (peer wrongly penalized/evicted?)", env3, err3)
+	}
+	_ = a
+}
+
+// TestThrottledCollectClaimsIsDegradedMiss: the §7.4 claim-collection walk
+// shares the classification — an all-throttled collection with no local copy
+// returns ErrDegradedMiss instead of an empty (authoritative) set.
+func TestThrottledCollectClaimsIsDegradedMiss(t *testing.T) {
+	_, b, _ := startThrottlePair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	alias := "throttled"
+	// First collection consumes the burst token and collects the envelope.
+	set, err := b.CollectClaims(ctx, alias)
+	if err != nil || len(set) != 1 {
+		t.Fatalf("first CollectClaims: n=%d err=%v", len(set), err)
+	}
+
+	// Second collection: B holds no local copy (no cache-back happened — the
+	// node-level walk does not write the store), A throttles → degraded.
+	set2, err2 := b.CollectClaims(ctx, alias)
+	if len(set2) != 0 {
+		t.Fatalf("throttled CollectClaims returned %d envelopes; want 0", len(set2))
+	}
+	if !errors.Is(err2, ErrDegradedMiss) {
+		t.Fatalf("throttled CollectClaims err = %v, want ErrDegradedMiss", err2)
 	}
 }
