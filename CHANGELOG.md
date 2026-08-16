@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.2 — /login redirect loop fixed
+- **GET /login no longer redirects to itself** ("too many redirects",
+  found live from a LAN browser minutes after deploying v0.6.0): the
+  auth pages (/login, /bootstrap) were wrapped in the session check, so
+  an unauthenticated login page bounced to itself forever. They now sit
+  outside requireAuth — their handlers already guard their own states
+  (no password yet → /login redirects once to /bootstrap; password set →
+  /bootstrap redirects once to /login). Regression-tested for both
+  states.
+
 ## v0.6.1 — web UI fix
 - **Register-job progress polling fixed**: the live progress card 500'd
   ("no such fragment") — the jobfragment template was parsed into every
