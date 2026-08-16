@@ -325,3 +325,29 @@ func TestAutoAllowlistSkipsWAN(t *testing.T) {
 func ipMust(s string) net.IP {
 	return net.ParseIP(s)
 }
+
+// TestLoginPageNoRedirectLoop is the live "too many redirects" regression
+// (v0.6.2): GET /login must never require a session — with a password set
+// it renders the form; without one it redirects ONCE to /bootstrap.
+func TestLoginPageNoRedirectLoop(t *testing.T) {
+	s, ts := newTestServer(t, newFakeDaemon())
+	c := newUClient(t)
+
+	// No password yet: /login → single 303 to /bootstrap (which renders).
+	if code := c.get(ts.URL + "/login"); code != 303 {
+		t.Errorf("GET /login before bootstrap = %d, want 303 (to /bootstrap)", code)
+	}
+
+	// Password set, no session: /login must RENDER (200) — previously this
+	// redirected to itself forever.
+	if err := s.auth.setPassword("somepass123"); err != nil {
+		t.Fatal(err)
+	}
+	if code := c.get(ts.URL + "/login"); code != 200 {
+		t.Errorf("GET /login without a session = %d, want 200 (was a redirect loop)", code)
+	}
+	// And /bootstrap now bounces ONCE to /login (which renders).
+	if code := c.get(ts.URL + "/bootstrap"); code != 303 {
+		t.Errorf("GET /bootstrap after bootstrap = %d, want 303 (to /login)", code)
+	}
+}

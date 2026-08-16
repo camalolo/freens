@@ -101,12 +101,20 @@ func (s *Server) routes() {
 		http.Error(w, "no icon", http.StatusNoContent)
 	})
 
-	// Auth pages.
-	s.mux.HandleFunc("GET /login", s.page(s.handleLoginPage))
-	s.mux.HandleFunc("POST /login", s.handleLoginPost)
-	s.mux.HandleFunc("GET /logout", s.handleLogout)
-	s.mux.HandleFunc("GET /bootstrap", s.page(s.handleBootstrapPage))
-	s.mux.HandleFunc("POST /bootstrap", s.handleBootstrapPost)
+	// Auth pages: the auth flow itself — NOT behind requireAuth (wrapping
+	// /login in the session check made an unauthenticated GET /login
+	// redirect to itself: the original "too many redirects" bug, found live
+	// minutes after deployment). The handlers guard their own states
+	// (/login → /bootstrap when no password exists; /bootstrap → /login
+	// when one does); the CIDR gate still applies (it wraps the whole mux).
+	authPage := func(pattern string, h http.HandlerFunc) {
+		s.mux.Handle(pattern, s.logRequests(http.HandlerFunc(h)))
+	}
+	authPage("GET /login", s.handleLoginPage)
+	s.mux.Handle("POST /login", s.logRequests(http.HandlerFunc(s.handleLoginPost)))
+	s.mux.Handle("GET /logout", s.logRequests(http.HandlerFunc(s.handleLogout)))
+	authPage("GET /bootstrap", s.handleBootstrapPage)
+	s.mux.Handle("POST /bootstrap", s.logRequests(http.HandlerFunc(s.handleBootstrapPost)))
 
 	// Pages (auth + gate).
 	page := func(pattern string, h http.HandlerFunc) {
