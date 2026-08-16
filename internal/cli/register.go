@@ -24,12 +24,9 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/base32"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -43,8 +40,8 @@ import (
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/naming"
-	"github.com/camalolo/freens/internal/securekey"
 	"github.com/camalolo/freens/internal/wire"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -281,12 +278,16 @@ func cmdRegister(args []string) error {
 	// Sequence: the network's current + 1 when the name exists (a RETRY
 	// after a revocation, or any prior publication, must out-sequence it —
 	// §6.4 winner rule — or the re-publish is silently ignored); 1 for a
-	// genuinely fresh name.
+	// genuinely fresh name. Sequence discovery fetches the ENVELOPE by key
+	// (tombstones included): /resolve does not report a revoked name's
+	// sequence, so a revoke-then-re-register via Resolve alone would reset
+	// to 1 and silently lose the winner race against the tombstone (found
+	// live by the webui ops tests; the same fix as the web UI's engine).
 	seq := uint64(1)
 	if tr.daemon() {
 		sctx, scancel := adminCtx()
-		if r, rerr := tr.client.Resolve(sctx, *alias); rerr == nil && r != nil && r.Found {
-			seq = uint64(r.Sequence) + 1
+		if cur, gerr := tr.client.Get(sctx, tldID); gerr == nil && cur != nil && cur.Record != nil {
+			seq = cur.Record.Sequence + 1
 		}
 		scancel()
 	} else {
@@ -394,29 +395,12 @@ func outboundIPv4() (net.IP, error) {
 //	                 (72 h) timelock, ready to embed in the apex record
 //
 // Split out so the defaults are unit-testable without a live network.
+// recoveryPlan generates this alias's default-on spec 5.4 recovery policy
+// (3 keys, threshold 2) — delegated to internal/keychain, shared with the
+// web UI.
 func recoveryPlan(noRecovery bool, keysDir, alias, passphrase string) ([]string, *wire.RecoveryPolicyWire, error) {
-	if noRecovery {
-		return nil, nil, nil
-	}
-	paths := make([]string, 0, recoveryKeyfileCount)
-	pks := make([][]byte, 0, recoveryKeyfileCount)
-	for i := 1; i <= recoveryKeyfileCount; i++ {
-		rkp, err := crypto.Generate()
-		if err != nil {
-			return nil, nil, err
-		}
-		p := filepath.Join(keysDir, fmt.Sprintf("%s.rec%d.key", alias, i))
-		if err := writeKeyFileEnc(p, rkp, passphrase); err != nil {
-			return nil, nil, fmt.Errorf("writing recovery keyfile: %w", err)
-		}
-		paths = append(paths, p)
-		pks = append(pks, rkp.Public())
-	}
-	pol, err := wire.NewRecoveryPolicyWire(recoveryThreshold, pks, constants.RecoveryTimelock)
-	if err != nil {
-		return nil, nil, err
-	}
-	return paths, pol, nil
+	return keychain.RecoveryPlan(noRecovery, keysDir, alias, passphrase,
+		recoveryKeyfileCount, recoveryThreshold, constants.RecoveryTimelock)
 }
 
 // witnessRetryAttempts / witnessRetrySleep are the cold-routing-table
@@ -492,30 +476,11 @@ type adminWitnesser interface {
 	Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) ([][]byte, error)
 }
 
-// writeKeyFile persists a hex seed at path with 0600 (mkdir -p the parent)
-// — the legacy PLAINTEXT form (compatible with every existing tooling).
-func writeKeyFile(path string, kp *crypto.Keypair) error {
-	return writeKeyFileOpt(path, kp, "")
-}
-
-// writeKeyFileEnc persists the seed passphrase-encrypted (FREENSK1) with
-// 0600; "" writes the legacy plaintext form.
+// writeKeyFileEnc persists the seed (passphrase-encrypted FREENSK1 when
+// passphrase != "", else the legacy plaintext form) — delegated to
+// internal/keychain, shared with the web UI.
 func writeKeyFileEnc(path string, kp *crypto.Keypair, passphrase string) error {
-	return writeKeyFileOpt(path, kp, passphrase)
-}
-
-func writeKeyFileOpt(path string, kp *crypto.Keypair, passphrase string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	if passphrase == "" {
-		return os.WriteFile(path, []byte(hex.EncodeToString(kp.Seed())+"\n"), 0o600)
-	}
-	enc, err := securekey.EncryptSeed(kp.Seed(), passphrase)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, enc, 0o600)
+	return keychain.Save(path, kp, passphrase)
 }
 
 // netIP parses a dotted-quad IPv4 (the CLI's A-record convention); nil on
@@ -545,47 +510,15 @@ func claimStatePath(alias string) string {
 }
 
 // loadReusableClaim returns the persisted claim when it matches alias, owner
-// key, and difficulty (any mismatch or absence => nil: re-mine).
+// key, and difficulty (any mismatch or absence => nil: re-mine). Delegated
+// to internal/keychain, shared with the web UI.
 func loadReusableClaim(alias string, kp *crypto.Keypair, difficulty int) *claims.AliasClaim {
-	b, err := os.ReadFile(claimStatePath(alias))
-	if err != nil {
-		return nil
-	}
-	var rc reusableClaim
-	if json.Unmarshal(b, &rc) != nil || rc.Alias != alias || rc.Difficulty != difficulty {
-		return nil
-	}
-	tldID, err1 := base32Decode(rc.TldIDB32)
-	claimant, err2 := base64.StdEncoding.DecodeString(rc.ClaimantB64)
-	nonce, err3 := base64.StdEncoding.DecodeString(rc.NonceB64)
-	if err1 != nil || err2 != nil || err3 != nil || !bytes.Equal(claimant, kp.Public()) {
-		return nil
-	}
-	c := &claims.AliasClaim{Alias: alias, TldID: tldID, ClaimantPK: claimant, Timestamp: rc.Timestamp, Nonce: nonce}
-	if p, err := c.Prefix(); err == nil {
-		c.PowHash = crypto.PoWHash(p, nonce) // VerifyPoW compares against this field
-	}
-	if !c.VerifyPoW(difficulty) || !c.VerifyClaimantConsistency() {
-		return nil // tampered or stale state: never reuse unverifiable claims
-	}
-	return c
+	return keychain.LoadReusableClaim(home.KeysDir(), alias, kp, difficulty)
 }
 
 // saveReusableClaim persists the claim for cooldown-safe retries (0600).
 func saveReusableClaim(alias string, c *claims.AliasClaim) {
-	tldB32 := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(c.TldID), "="))
-	rc := reusableClaim{
-		Alias:       alias,
-		TldIDB32:    tldB32,
-		ClaimantB64: base64.StdEncoding.EncodeToString(c.ClaimantPK),
-		Timestamp:   c.Timestamp,
-		Difficulty:  difficultyOf(c),
-		NonceB64:    base64.StdEncoding.EncodeToString(c.Nonce),
-	}
-	if b, err := json.MarshalIndent(rc, "", "  "); err == nil {
-		_ = os.MkdirAll(filepath.Dir(claimStatePath(alias)), 0o700)
-		_ = os.WriteFile(claimStatePath(alias), b, 0o600)
-	}
+	keychain.SaveReusableClaim(home.KeysDir(), alias, c)
 }
 
 // difficultyOf reads the difficulty from the nonce[0] convention (Appendix

@@ -22,10 +22,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
 
+	"strings"
+
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/keychain"
 )
 
 // backupEntryRe matches the only filenames a backup (or a restore) may
@@ -55,19 +57,6 @@ func cmdBackup(args []string) error {
 
 // backupCreate bundles the keychain into one dated tar.gz.
 func backupCreate(outPath string) error {
-	entries, err := os.ReadDir(home.KeysDir())
-	if err != nil {
-		return usageErr("nothing to back up (no keychain at %s) — register a name first: %s register <name>", home.KeysDir(), ProgName)
-	}
-	var files []string
-	for _, e := range entries {
-		if !e.IsDir() && backupEntryRe.MatchString(e.Name()) {
-			files = append(files, e.Name())
-		}
-	}
-	if len(files) == 0 {
-		return usageErr("nothing to back up (no key files in %s) — register a name first: %s register <name>", home.KeysDir(), ProgName)
-	}
 	if outPath == "" {
 		outPath = "freens-backup-" + time.Now().Format("20060102-150405") + ".tar.gz"
 	}
@@ -75,48 +64,17 @@ func backupCreate(outPath string) error {
 	if err != nil {
 		abs = outPath
 	}
-
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("write %q: %w", outPath, err)
 	}
-	defer f.Close()
-	gz := gzip.NewWriter(f)
-	defer gz.Close()
-	tw := tar.NewWriter(gz)
-	defer tw.Close()
-
-	for _, name := range files {
-		b, err := os.ReadFile(filepath.Join(home.KeysDir(), name))
-		if err != nil {
-			return fmt.Errorf("read %q: %w", name, err)
-		}
-		hdr := &tar.Header{Name: name, Mode: 0o600, Size: int64(len(b)), Format: tar.FormatUSTAR}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		if _, err := tw.Write(b); err != nil {
-			return err
-		}
+	files, err := keychain.BuildBackup(f, home.KeysDir())
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
-	readme := fmt.Sprintf(backupReadmeTemplate, ProgName, strings.Join(files, "\n  "))
-	hdr := &tar.Header{Name: "RESTORE.txt", Mode: 0o644, Size: int64(len(readme)), Format: tar.FormatUSTAR}
-	if err := tw.WriteHeader(hdr); err != nil {
-		return err
+	if err != nil {
+		return fmt.Errorf("backup: %w", err)
 	}
-	if _, err := tw.Write([]byte(readme)); err != nil {
-		return err
-	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
 	fmt.Printf("backup written: %s\n", abs)
 	fmt.Printf("  %d file(s): %s\n", len(files), strings.Join(files, ", "))
 	fmt.Println()
@@ -128,9 +86,6 @@ func backupCreate(outPath string) error {
 	return nil
 }
 
-// backupRestore unpacks a backup into the keychain. Only bare keychain
-// filenames are honored (path traversal and foreign entries are rejected);
-// existing files are kept unless force.
 func backupRestore(path string, force bool) error {
 	f, err := os.Open(path)
 	if err != nil {

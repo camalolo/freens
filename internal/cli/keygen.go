@@ -12,6 +12,7 @@ import (
 
 	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/keychain"
 )
 
 // ---------------------------------------------------------------------------
@@ -93,4 +94,10 @@ func cmdMineClaim(args []string) error {
 	fmt.Printf("timestamp=%d\n", claim.Timestamp)
 	fmt.Printf("claim_cbor=%s\n", hex.EncodeToString(cb))
 	return nil
+}
+
+// writeKeyFile persists a hex seed at path (the legacy plaintext form) —
+// keychain.Save with no passphrase.
+func writeKeyFile(path string, kp *crypto.Keypair) error {
+	return keychain.Save(path, kp, "")
 }

@@ -15,16 +15,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"net"
-	"os"
-	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/wire"
 )
 
@@ -158,33 +155,15 @@ func firstAdminAIP(rrs []admin.RR) string {
 // keychain helpers
 // ---------------------------------------------------------------------------
 
-// keyFileRe matches an owner keyfile name: <alias>.key. Recovery keyfiles
-// (<alias>.rec1.key etc.) never match because the stem must be a plain
-// valid alias.
-var keyFileRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.key$`)
-
 // keychainAliases lists the aliases that have an owner key in the freens
 // keychain (home.KeysDir(), sorted) — the "which namespaces can I manage"
-// answer used by name/status/doctor.
+// answer used by name/status/doctor. (Implementation lives once in
+// internal/keychain, shared with the web UI.)
 func keychainAliases() []string {
-	entries, err := os.ReadDir(home.KeysDir())
-	if err != nil {
-		return nil
-	}
-	var aliases []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if m := keyFileRe.FindStringSubmatch(e.Name()); m != nil {
-			aliases = append(aliases, m[1])
-		}
-	}
-	sort.Strings(aliases)
-	return aliases
+	return keychain.Aliases(home.KeysDir())
 }
 
 // ownerKeyPath is the keychain location of alias' owner key.
 func ownerKeyPath(alias string) string {
-	return filepath.Join(home.KeysDir(), alias+".key")
+	return keychain.OwnerKeyPath(home.KeysDir(), alias)
 }
