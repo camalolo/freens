@@ -28,6 +28,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
@@ -419,26 +420,65 @@ func (r *Record) CanonicalBytes() ([]byte, error) {
 // decision 1); field 2 is a 64-byte Ed25519 signature over
 // [SignedEnvelope.CanonicalRecordBytes]; field 3 is the 32-byte signer public
 // key. This is the object stored in and served from the DHT.
+//
+// Immutability contract: a SignedEnvelope (and its Record) must not be
+// mutated after it is signed ([SignRecord]) or decoded ([DecodeEnvelope]) —
+// the signature covers the canonical record bytes, so any mutation invalid
+// -ates it by definition. The lazily-cached canonical serializations below
+// rely on (and enforce) that contract; the unexported fields are ignored by
+// the CBOR codec and never appear on the wire.
 type SignedEnvelope struct {
 	Record *Record `cbor:"1,keyasint"`
 	Sig    []byte  `cbor:"2,keyasint"`
 	Signer []byte  `cbor:"3,keyasint"`
+
+	// canonRecord caches Record.CanonicalBytes (the signature-covered
+	// bytes); canonFull caches the whole-envelope canonical CBOR (Bytes).
+	// Both are populated lazily and atomically — concurrent first uses may
+	// each compute the (deterministic, identical) bytes and race to store;
+	// readers always see either nil or a complete, valid slice.
+	//
+	// Why (profiling, Aug 2026): after signature-verify memoization, the
+	// re-maining CPU hotspot was Record.MarshalCBOR — every VerifySignature
+	// and RecordHash re-serialized the same envelope, and one cold resolve
+	// re-marshaled each envelope 3-4 times across layer boundaries
+	// (collect → verify → chain walk → store tie-break).
+	canonRecord atomic.Pointer[[]byte]
+	canonFull   atomic.Pointer[[]byte]
 }
 
 // CanonicalRecordBytes returns the bytes the signature covers — identical to
 // [Record.CanonicalBytes] and, by determinism, byte-identical to the embedded
-// record serialization in [SignedEnvelope.Bytes].
+// record serialization in [SignedEnvelope.Bytes]. The result is cached on the
+// envelope (see the struct's immutability contract).
 func (e *SignedEnvelope) CanonicalRecordBytes() ([]byte, error) {
 	if e.Record == nil {
 		return nil, errors.New("wire: envelope has no record")
 	}
-	return e.Record.CanonicalBytes()
+	if b := e.canonRecord.Load(); b != nil {
+		return *b, nil
+	}
+	b, err := e.Record.CanonicalBytes()
+	if err != nil {
+		return nil, err
+	}
+	e.canonRecord.Store(&b)
+	return b, nil
 }
 
 // Bytes returns the canonical CBOR of the whole envelope — what is stored and
-// transmitted in the DHT and what [SignedEnvelope.RecordHash] hashes.
+// transmitted in the DHT and what [SignedEnvelope.RecordHash] hashes. The
+// result is cached on the envelope (see the struct's immutability contract).
 func (e *SignedEnvelope) Bytes() ([]byte, error) {
-	return canonicalEM.Marshal(e)
+	if b := e.canonFull.Load(); b != nil {
+		return *b, nil
+	}
+	b, err := canonicalEM.Marshal(e)
+	if err != nil {
+		return nil, err
+	}
+	e.canonFull.Store(&b)
+	return b, nil
 }
 
 // RecordHash returns H_record = SHA-256(canonical_cbor(SignedEnvelope)) (§4.2).
@@ -491,11 +531,13 @@ func SignRecord(rec *Record, kp *crypto.Keypair) (*SignedEnvelope, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &SignedEnvelope{
+	env := &SignedEnvelope{
 		Record: rec,
 		Sig:    kp.Sign(cb),
 		Signer: kp.Public(),
-	}, nil
+	}
+	env.canonRecord.Store(&cb) // pre-populate: the just-computed signing bytes
+	return env, nil
 }
 
 // DecodeEnvelope decodes canonical CBOR envelope bytes (the DHT store payload)

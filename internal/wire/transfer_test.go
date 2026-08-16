@@ -75,9 +75,8 @@ func TestTransferVerifierSelfCertifiedRootStillPasses(t *testing.T) {
 
 	// Failure cases stay failures (root not self-certifying, no transfer
 	// evidence available).
-	forged := *tldEnv
-	forged.Signer = mustKeypair(t).Public()
-	if VerifyAuthorityChainWithTransfers([]*SignedEnvelope{&forged}, fetch) {
+	forged := forgeSigner(tldEnv, mustKeypair(t).Public())
+	if VerifyAuthorityChainWithTransfers([]*SignedEnvelope{forged}, fetch) {
 		t.Error("forged-signer root without a fetchable predecessor should fail")
 	}
 	if calls != 0 {

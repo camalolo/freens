@@ -61,11 +61,17 @@ func (k *Keypair) Sign(message []byte) []byte { return ed25519.Sign(k.priv, mess
 
 // Verify reports whether sig is a valid Ed25519 signature of message under
 // publicKey. It never returns an error for a bad signature — only false.
+//
+// Results are memoized (see verify_cache.go): repeated verification of the
+// same (publicKey, signature, message) triple — the dominant CPU cost found
+// by profiling, since envelopes are re-verified at every layer boundary —
+// returns the cached verdict without recomputing. This is transparent to
+// callers because Ed25519 verification is a pure function of its inputs.
 func Verify(publicKey, signature, message []byte) bool {
 	if len(publicKey) != ed25519.PublicKeySize || len(signature) != ed25519.SignatureSize {
 		return false
 	}
-	return ed25519.Verify(publicKey, message, signature)
+	return verifyMemoized(publicKey, signature, message)
 }
 
 // TldID returns TLD_ID = SHA-256(publicKey) — 32 bytes (§3.1, §5.2).

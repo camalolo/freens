@@ -73,6 +73,18 @@ func mustSign(t *testing.T, rec *Record, kp *crypto.Keypair) *SignedEnvelope {
 
 func zeroOwner() []byte { return bytes.Repeat([]byte{0}, constants.Ed25519PublicKeyLen) }
 
+// forgeSigner builds a fresh envelope reusing env's record and signature but
+// claiming a different signer — the standard forgery probe. It builds a NEW
+// SignedEnvelope (not a value copy) because envelopes carry lazily-cached
+// canonical bytes and are shared as immutable values (see the struct comment).
+func forgeSigner(env *SignedEnvelope, signer []byte) *SignedEnvelope {
+	return &SignedEnvelope{
+		Record: env.Record,
+		Sig:    append([]byte(nil), env.Sig...),
+		Signer: signer,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // RR
 // ---------------------------------------------------------------------------
@@ -387,16 +399,32 @@ func TestTamperBreaksSignature(t *testing.T) {
 	if !env.VerifySignature() {
 		t.Fatal("pre-tamper verify failed")
 	}
-	// Mutate RRset after signing — env.Record aliases rec.
+
+	// Tamper with the record content. Per the SignedEnvelope immutability
+	// contract, tampering is observed on a FRESH envelope over the mutated
+	// record (exactly what tampered wire bytes decode to — a cold-cache
+	// object); a warm cached envelope keeps serving its signed snapshot.
+	tampered := func() *SignedEnvelope {
+		return &SignedEnvelope{Record: rec, Sig: env.Sig, Signer: env.Signer}
+	}
+	// Mutate RRset after signing — rec aliases the envelope's record.
 	rec.RRset = append(rec.RRset, mustA(t))
-	if env.VerifySignature() {
+	if tampered().VerifySignature() {
 		t.Error("VerifySignature true after tampering RRset")
 	}
 	// Restore + mutate TTL.
 	rec.RRset = []*RR{mustA(t)}
 	rec.RRset[0].TTL = 999
-	if env.VerifySignature() {
+	if tampered().VerifySignature() {
 		t.Error("VerifySignature true after tampering TTL")
+	}
+
+	// The warm envelope's cached view is its SIGNED snapshot: VerifySignature
+	// still holds because the bytes it verified (and would re-serve) are the
+	// originally signed ones — the in-place mutation is invisible by design,
+	// which is why the immutability contract above exists.
+	if !env.VerifySignature() {
+		t.Error("warm envelope lost its valid signature (cache must serve the signed snapshot)")
 	}
 }
 
@@ -531,9 +559,8 @@ func TestIsBasicValid(t *testing.T) {
 		t.Error("now>expires should be invalid")
 	}
 	// Bad signature.
-	forged := *env
-	forged.Signer = zeroOwner()
-	if IsBasicValid(&forged, 150) {
+	forged := forgeSigner(env, zeroOwner())
+	if IsBasicValid(forged, 150) {
 		t.Error("bad signature should be invalid")
 	}
 }
@@ -649,9 +676,8 @@ func TestVerifyAuthorityChain(t *testing.T) {
 		t.Error("1-hop TLD chain should verify")
 	}
 	// Forged signer.
-	forged := *tldEnv
-	forged.Signer = mustKeypair(t).Public()
-	if VerifyAuthorityChain([]*SignedEnvelope{&forged}) {
+	forged := forgeSigner(tldEnv, mustKeypair(t).Public())
+	if VerifyAuthorityChain([]*SignedEnvelope{forged}) {
 		t.Error("forged-signer TLD chain should fail")
 	}
 

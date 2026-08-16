@@ -335,9 +335,8 @@ func TestHandoffWalkerTransferBackwardCompat(t *testing.T) {
 	if !VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{tldDel, aliceEnv}, fetch, fetchEv, 5000) {
 		t.Error("plain 2-hop delegation chain must verify via the handoffs walker")
 	}
-	forged := *tldDel
-	forged.Signer = mustKeypair(t).Public()
-	if VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{&forged, aliceEnv}, fetch, fetchEv, 5000) {
+	forged := forgeSigner(tldDel, mustKeypair(t).Public())
+	if VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{forged, aliceEnv}, fetch, fetchEv, 5000) {
 		t.Error("unauthorized child must still fail")
 	}
 	if calls != 0 {
