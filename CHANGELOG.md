@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.1 — web UI fix
+- **Register-job progress polling fixed**: the live progress card 500'd
+  ("no such fragment") — the jobfragment template was parsed into every
+  page's base set but never registered for standalone /api/job
+  execution. The register flow itself worked (mining, witnesses,
+  publish — verified live, resolving cross-box); the card just froze at
+  its first render until refresh. Found during v0.6.0 fleet verification.
+
 ## v0.6.0 — freens-web: the LAN management UI; un-revoke fixed
 - **freens-web** — a web UI for the whole system, served on the LAN:
   dashboard (daemon, peers, store, difficulty, your names' health), names
