@@ -49,6 +49,11 @@ func mustParseTemplates() {
 		"bootstrap":  "tmpl/bootstrap.tmpl",
 		"storeentry": "tmpl/storeentry.tmpl",
 		"lookupout":  "tmpl/lookupout.tmpl",
+		// jobfragment is also parsed into the base clone (inline use by the
+		// register page); registered standalone so /api/job/{id} polling can
+		// execute it on its own (v0.6.1: the missing registration made the
+		// live progress card 500 while the job itself ran fine).
+		"jobfragment": "tmpl/jobfragment.tmpl",
 	}
 	pageTemplates = make(map[string]*template.Template, len(pages))
 	for name, file := range pages {
