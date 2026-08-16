@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5.2 — hot-path performance; throttled gets stop negative-caching
+- **44× faster cold resolves (1.6 ms → 37 µs on the test N200).** Profiling
+  the live paths (new loopback benchmark suite: resolve cold/cached/network,
+  envelope verify, store ops, ping, iterative get) showed ~60% of all CPU in
+  Ed25519 verification — the SAME envelope re-verified at every layer
+  boundary (collect → §7.4 filter → chain walk → store cache-back), each
+  check re-serializing the record to canonical CBOR. Two changes:
+  `crypto.Verify` memoizes verdicts in a bounded lock-free table (key =
+  SHA-256 over all inputs, so mutation of any byte misses and re-verifies;
+  positive AND negative results cache), and `SignedEnvelope` lazily caches
+  its canonical record/envelope bytes (an explicit immutability-after-signing
+  contract — the signature covers exactly those bytes). Verified store put
+  112 µs → 0.75 µs; envelope decode+verify 222 µs → 17 µs; network-cold
+  resolve 4.8 ms → 2.3 ms (UDP-bound).
+- **§12-throttled gets degrade instead of negative-caching** (found live
+  while benchmarking): a get answered with error 301 "throttled" was treated
+  as a clean miss — an over-limit client (burst 100 @ 50/s per source IP)
+  got NXDOMAIN that sat out the 60 s negative TTL, exactly the issue-#1
+  failure mode. The walks now classify it as `ErrDegradedMiss` (SERVFAIL,
+  retried, never cached) and the throttling peer is neither evicted nor
+  penalized (it answered; it just declined to serve). `LookupStats` counts
+  `ProbesThrottled`.
+
 ## v0.5.1 — the two nits, fixed
 - **Revoked names no longer count as "resolves".** `/resolve` reports a
   §9.5 tombstone as `found:false, revoked:true` (mirroring the DNS
