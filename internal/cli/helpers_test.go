@@ -192,3 +192,19 @@ func mustWireName(t *testing.T, alias string, tldID []byte) []byte {
 	}
 	return wn
 }
+
+// mustTestEnvelope signs a minimal record over wireName at the given
+// sequence (no RRset — sequence discovery only reads Record.Sequence).
+func mustTestEnvelope(t *testing.T, kp *crypto.Keypair, wireName []byte, seq uint64) *wire.SignedEnvelope {
+	t.Helper()
+	now := uint64(2_000_000)
+	rec, err := wire.NewRecord(wireName, kp.Public(), seq, now, now+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}

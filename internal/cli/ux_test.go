@@ -408,9 +408,22 @@ func TestRevokePublishesTombstone(t *testing.T) {
 	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), map[string]string{
 		"alice": resolvedJSON("alice", 4, "203.0.113.42"),
 	})
-	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), mustTestKeypair(t)); err != nil {
+	kp := mustTestKeypair(t)
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
 		t.Fatal(err)
 	}
+	// Sequence discovery is /get-by-key now (tombstone-aware): seed a live
+	// alice envelope at sequence 4 under K_tld.
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceWire, err := naming.EncodeWireName(nil, "alice", tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliceKey := tldID // zero labels: K_tld = tld_id
+	stub.getKey, stub.getEnv = aliceKey, mustTestEnvelope(t, kp, aliceWire, 4)
 	oldTerm := sysIsTerminal
 	sysIsTerminal = func() bool { return false } // no prompt in tests
 	t.Cleanup(func() { sysIsTerminal = oldTerm })

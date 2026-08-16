@@ -74,6 +74,18 @@ func cmdName(args []string) error {
 	displayName := fs.Args()[0]
 
 	// --- current state: this name's sequence + the apex's A record ----------
+	// Sequence discovery fetches the envelope by key (tombstones included —
+	// /resolve hides a revoked name's sequence, which broke un-revoke: a
+	// post-revoke publish would reset to sequence 1 and lose the §6.4
+	// winner race; found live, same fix as the web UI's engine).
+	wireName, err := naming.EncodeWireName(labels, alias, tldID)
+	if err != nil {
+		return err
+	}
+	nameKey, err := dht.KeyForWireName(wireName)
+	if err != nil {
+		return err
+	}
 	var seq uint64 = 1
 	apexIP := strings.TrimSpace(*ip)
 	var node *dht.Node
@@ -82,8 +94,8 @@ func cmdName(args []string) error {
 	if tr.daemon() {
 		ctx, cancel := adminCtx()
 		defer cancel()
-		if r, err := tr.client.Resolve(ctx, displayName); err == nil && r != nil && r.Found {
-			seq = uint64(r.Sequence) + 1
+		if cur, gerr := tr.client.Get(ctx, nameKey); gerr == nil && cur != nil && cur.Record != nil {
+			seq = cur.Record.Sequence + 1
 		}
 		if apexIP == "" {
 			if r, err := tr.client.Resolve(ctx, alias); err == nil && r != nil {
@@ -98,15 +110,7 @@ func cmdName(args []string) error {
 			return err
 		}
 		defer node.Close()
-		wireName, err := naming.EncodeWireName(labels, alias, tldID)
-		if err != nil {
-			return err
-		}
-		key, err := dht.KeyForWireName(wireName)
-		if err != nil {
-			return err
-		}
-		if env, err := node.IterativeGet(nodeCtx, key); err == nil && env != nil {
+		if env, err := node.IterativeGet(nodeCtx, nameKey); err == nil && env != nil {
 			seq = env.Record.Sequence + 1
 		}
 		if apexIP == "" {

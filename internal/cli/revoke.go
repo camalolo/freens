@@ -75,7 +75,18 @@ func cmdRevoke(args []string) error {
 
 	// Current state: the name's live sequence (1 for a name the network
 	// has never seen — revoking an unregistered name is a no-op, refuse).
+	// Sequence discovery fetches the envelope by key (tombstones included —
+	// revoking an already-revoked name via /resolve would reset to 1 and
+	// lose the winner race; same fix as the web UI's engine).
 	tr, err := pickTransport(*peersCSV)
+	if err != nil {
+		return err
+	}
+	wireName, err := naming.EncodeWireName(labels, alias, tldID)
+	if err != nil {
+		return err
+	}
+	nameKey, err := dht.KeyForWireName(wireName)
 	if err != nil {
 		return err
 	}
@@ -85,8 +96,8 @@ func cmdRevoke(args []string) error {
 	var nodeCancel context.CancelFunc
 	if tr.daemon() {
 		ctx, cancel := adminCtx()
-		if r, err := tr.client.Resolve(ctx, displayName); err == nil && r != nil && r.Found {
-			seq = uint64(r.Sequence) + 1
+		if cur, gerr := tr.client.Get(ctx, nameKey); gerr == nil && cur != nil && cur.Record != nil {
+			seq = cur.Record.Sequence + 1
 		}
 		cancel()
 	} else {
@@ -97,15 +108,7 @@ func cmdRevoke(args []string) error {
 			return err
 		}
 		defer node.Close()
-		wireName, err := naming.EncodeWireName(labels, alias, tldID)
-		if err != nil {
-			return err
-		}
-		key, err := dht.KeyForWireName(wireName)
-		if err != nil {
-			return err
-		}
-		if env, err := node.IterativeGet(nodeCtx, key); err == nil && env != nil {
+		if env, err := node.IterativeGet(nodeCtx, nameKey); err == nil && env != nil {
 			seq = env.Record.Sequence + 1
 		}
 	}
@@ -119,10 +122,6 @@ func cmdRevoke(args []string) error {
 	}
 
 	// The §9.5 tombstone: empty RRset + revoke = true at sequence+1.
-	wireName, err := naming.EncodeWireName(labels, alias, tldID)
-	if err != nil {
-		return err
-	}
 	now := uint64(time.Now().Unix())
 	rec, err := wire.NewRecord(wireName, ownerKP.Public(), seq, now, now+uint64(constants.RecordDefaultTTL))
 	if err != nil {

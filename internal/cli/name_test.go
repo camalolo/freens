@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/naming"
 )
@@ -31,10 +32,22 @@ func TestNameViaStubAdmin(t *testing.T) {
 	}
 
 	// Stub state: www.alice already at sequence 3; apex alice -> 203.0.113.9.
+	// The sequence now comes from /get by key (tombstone-aware discovery),
+	// so the stub carries a real envelope under www.alice's key.
 	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), map[string]string{
 		"www.alice": resolvedJSON("www.alice", 3, ""),
 		"alice":     resolvedJSON("alice", 2, "203.0.113.9"),
 	})
+	wwwWire, err := naming.EncodeWireName([]string{"www"}, "alice", tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwKey, err := dht.KeyForWireName(wwwWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwEnv := mustTestEnvelope(t, kp, wwwWire, 3)
+	stub.getKey, stub.getEnv = wwwKey, wwwEnv
 
 	out, err := captureStdout(t, func() error { return cmdName([]string{"www.alice"}) })
 	if err != nil {
@@ -71,9 +84,11 @@ func TestNameViaStubAdmin(t *testing.T) {
 		}
 	}
 
-	// -ip overrides the apex inheritance; a new name starts at sequence 1.
+	// -ip overrides the apex inheritance; a new name starts at sequence 1
+	// (the /get stub is emptied so the key answers 404).
 	stub.published = nil
 	delete(stub.resolve, "www.alice") // fresh name now
+	stub.getKey, stub.getEnv = nil, nil
 	out, err = captureStdout(t, func() error { return cmdName([]string{"-ip", "198.51.100.7", "www.alice"}) })
 	if err != nil {
 		t.Fatalf("name -ip: %v\n%s", err, out)
