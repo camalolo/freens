@@ -1492,14 +1492,19 @@ func buildClaimedWorldOnce(t *testing.T, alias string, claimTS uint64, ip net.IP
 	if err != nil {
 		t.Fatalf("MineAliasClaim: %v", err)
 	}
-	// §7.3 witness quorum: W distinct node keypairs co-sign the claim.
+	// §7.3 witness quorum: W distinct node keypairs co-sign the claim (v2
+	// attestations, in-band witness clocks).
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
 	witnesses := make([]*claims.WitnessAttestation, 0, constants.W)
 	for i := 0; i < constants.W; i++ {
 		wkp, err := crypto.Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
-		w, err := claims.NewWitnessAttestation(wkp, claimTS+uint64(i), alias, tldID, tldKP.Public())
+		w, err := claims.NewWitnessAttestation(wkp, claimTS+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}

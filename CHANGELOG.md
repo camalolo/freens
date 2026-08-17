@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.7.0 — witness attestations v2: the backdating hole closed (security)
+
+Found by an external security review of the §7 alias layer, confirmed by
+a proof-of-concept through the real resolver path: **a claim re-mined
+with an artificially old timestamp, carrying five witness attestations
+fabricated from thin air, passed the full §7.4 filter and won the
+(timestamp, pow_hash, tld_id) ordering against every honest claim** —
+at zero network presence, zero witnesses contacted, and (worse) as
+*final* rather than contested, since a backdated ts is outside the 48 h
+contest window. Root causes: the v1 attestation signed the claim
+identity fields but not through a timestamp-binding commitment, so
+attestations were transplantable across re-mined claims; the resolver
+never used witness timestamps; and the §7.3 witness-set membership was
+never enforced anywhere.
+
+Four layers, one release (BREAKING for attestations — the fleet
+re-registers; see the runbook note at the end):
+
+- **Witness attestations v2 (`freens-witness-v2`)**: the signed message
+  is now `"freens-witness-v2" || claim_prefix_hash(32) || witness_ts`,
+  where claim_prefix_hash = SHA-256 of the PoW prefix — a commitment to
+  the full claim identity {alias, tld_id, timestamp, claimant_pk}. An
+  attestation now verifies against exactly the claim it was issued for:
+  transplanting fresh attestations onto a backdated re-mined claim fails
+  cryptographically. `crypto.WitnessSigningMessage`,
+  `claims.NewWitnessAttestation`, `WitnessAttestation.Verify` and the
+  §6.3 witness RPC all moved; v1 attestations fail verification by
+  construction.
+- **Corroboration band (§7.3)**: a witness counts toward the quorum
+  only if its own attestation timestamp lies within
+  `[claim.ts − 60 s, claim.ts + 1 h + 60 s]` — the honest witnessing
+  window. Modern-dated attestations no longer corroborate an old-dated
+  claim, whatever keys signed them.
+- **Witness-set membership at resolve (§7.3/§7.4)**: the resolver's
+  claim-collecting walk now returns the CONVERGED witness set — the 8
+  closest nodes it actually reached — and the quorum counts only
+  witnesses among them. Five keys minted out of thin air are not among
+  the network's witness nodes, so a fully self-consistent fabricated
+  quorum (own keys, backdated clocks) fails too. Gated: a sparse view
+  (< 8 reachable nodes — the 3-box beta fleet qualifies) names no set
+  and skips the restriction rather than enforce it against a partial
+  view. `CollectWitnesses` now runs the §7.4 "iteratively find" walk
+  (plus self-exclusion) so registrants and verifiers agree on the set.
+- **Documented residual**: against a verifier that cannot name the
+  witness set, a self-consistent fabricated quorum on a backdated claim
+  still resolves (as final). The attack cost moved from zero to a Sybil
+  attack priced by NodeID grinding against the real witness set;
+  tripwire test `TestBackdatedSparseViewResidualDocumentsSybilBound`
+  pins the behavior so a future tightening updates this note loudly.
+  Full closure needs a network dense enough to always name the set.
+
+Hardening riding along (same review):
+
+- **The witness RPC verifies the PoW before signing** (§7.3 always said
+  MUST; the implementation couldn't — the nonce/pow_hash weren't in the
+  args). `witness` now carries `nonce` + `pow_hash`; the recomputation
+  and difficulty inference run before the cooldown bucket is touched.
+- **`witness` shares the §12 per-IP throttle** with get/find_node (50
+  req/s, burst 100): it was the most expensive *unauthenticated* work a
+  stranger could induce (PoW hash + Ed25519 signature per call).
+- **Retarget integrity**: only a node's FIRST co-sign of an alias counts
+  as an "accepted claim" for Appendix A.4 difficulty retargeting —
+  re-sign floods (or honest retry traffic) no longer drive the network
+  difficulty up through the gossiped median.
+- **K_claim put screen (§6.4/§7.4)**: a put landing at K_claim now
+  passes the full §7.4 claim filter (claimant binding, PoW, corroborating
+  quorum) before entering the store or the top-2 claim pool — seeding
+  garbage claims into claim space was otherwise free DHT pollution.
+- **Store anti-censorship rule (§6.4)**: a no-prev_hash newcomer signed
+  by a key other than the live incumbent's owner can no longer win the
+  slot on sequence alone (the `sequence = MAX_UINT64` eviction DoS);
+  accepted only when the store's live PARENT record authorizes the key
+  (§8.3 delegated re-publication keeps working — verified by the
+  transferred-chain integration tests). TLD-root hand-offs must use
+  prev_hash + §8.3/§8.4 as before.
+- **Spec updated** (§6.3 witness args, §6.4 displacement rules, §7.3
+  attestation/quorum/band/membership + residual, §7.4, §10 threat
+  matrix, §10.2.1 convergence-model note, §12 throttle note).
+
+witness-round + publish, PoW not re-mined... except when the parked
+claim is older than WITNESS_COOLDOWN — found live during the v0.7.0
+fleet deploy: such a claim is un-witnessable (the anti-forgery gate
+refuses it) and register now re-mines instead of dead-looping retries).
+Test coverage: the PoC regressions (`internal/resolver/backdate_test.go`,
+`internal/claims/band_test.go`), witness-RPC PoW/throttle/cooldown
+paths, store impostor + delegation-exception + recycling, and the full
+existing suite (530 tests, 9 fuzz targets) green — plus a live
+3-box/7-node fleet deploy: all 8 unlocked names re-registered through
+the v2 witness path in one pass each (~20 s: mine → 5 co-signs →
+publish), full cross-box dig matrix green before AND after a
+simultaneous 9-unit restart (acid test), `freens doctor` clean
+everywhere (vaulttest, the passphrase-encrypted test name, still needs
+its owner to re-register interactively).
+
 ## v0.6.2 — /login redirect loop fixed
 - **GET /login no longer redirects to itself** ("too many redirects",
   found live from a LAN browser minutes after deploying v0.6.0): the

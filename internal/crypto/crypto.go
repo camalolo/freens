@@ -244,35 +244,43 @@ func NewRecoveryPolicy(threshold int, keys [][]byte, timelock int) (*RecoveryPol
 }
 
 // WitnessSigningTag is the canonical domain-separation tag for witness
-// attestations (§7.3).
-var WitnessSigningTag = []byte("freens-witness-v1")
+// attestations (§7.3). v2 (v0.7.0 security fix): the signed message now binds
+// the CLAIM PREFIX HASH — SHA-256 of the canonical CBOR identity fields
+// {alias, tld_id, timestamp, claimant_pk} — instead of the raw identity
+// fields. The prefix hash commits to the claimant-asserted timestamp, so a
+// v2 attestation can only be replayed against the exact claim identity it
+// was issued for: attestations gathered for a fresh claim can no longer be
+// transplanted onto a re-mined, backdated claim of the same alias (the
+// timestamp participates in the ordering tuple, §7.4 step 3, so such a
+// transplant was an alias-theft vector). v1 attestations ("freens-witness-v1",
+// which signed the identity fields but NOT the timestamp binding through a
+// hash) fail verification under v2 by construction — the network re-registers
+// (beta fleet runbook, v0.7.0 changelog).
+var WitnessSigningTag = []byte("freens-witness-v2")
 
-// WitnessSigningMessage returns the canonical bytes a witness signs for
-// (alias, tldID, claimantPK, ts). Length-prefixed so signing is
-// self-contained and unambiguous:
+// WitnessSigningMessage returns the canonical bytes a witness signs for a
+// claim identified by claimPrefixHash, at the witness's own clock ts.
+// Length-fixed and domain-separated so signing is self-contained and
+// unambiguous:
 //
-//	"freens-witness-v1" || uint32_be(len(alias)) || alias
-//	|| tld_id(32) || claimant_pk(32) || uint64_be(ts)
-func WitnessSigningMessage(alias string, tldID, claimantPK []byte, ts uint64) ([]byte, error) {
-	if len(tldID) != constants.SHA256Len || len(claimantPK) != constants.Ed25519PublicKeyLen {
-		return nil, fmt.Errorf("crypto: tld_id/claimant_pk must be %d bytes", constants.SHA256Len)
+//	"freens-witness-v2" || claim_prefix_hash(32) || uint64_be(witness_ts)
+//
+// claimPrefixHash is SHA-256 of the claim's PoW prefix (see
+// claims.AliasClaim.Prefix / PrefixHash): it commits to
+// (alias, tld_id, timestamp, claimant_pk) — the claim's full identity minus
+// the PoW lottery — so the witness signature covers exactly the claim it
+// saw, at the time its own clock says.
+func WitnessSigningMessage(claimPrefixHash []byte, ts uint64) ([]byte, error) {
+	if len(claimPrefixHash) != constants.SHA256Len {
+		return nil, fmt.Errorf("crypto: claim_prefix_hash must be %d bytes, got %d", constants.SHA256Len, len(claimPrefixHash))
 	}
-	ab := []byte(alias)
-	var lenBuf [4]byte
-	lenBuf[0] = byte(len(ab) >> 24)
-	lenBuf[1] = byte(len(ab) >> 16)
-	lenBuf[2] = byte(len(ab) >> 8)
-	lenBuf[3] = byte(len(ab))
 	var tsBuf [8]byte
 	for i := 0; i < 8; i++ {
 		tsBuf[7-i] = byte(ts >> (8 * i))
 	}
-	out := make([]byte, 0, len(WitnessSigningTag)+4+len(ab)+32+32+8)
+	out := make([]byte, 0, len(WitnessSigningTag)+constants.SHA256Len+8)
 	out = append(out, WitnessSigningTag...)
-	out = append(out, lenBuf[:]...)
-	out = append(out, ab...)
-	out = append(out, tldID...)
-	out = append(out, claimantPK...)
+	out = append(out, claimPrefixHash...)
 	out = append(out, tsBuf[:]...)
 	return out, nil
 }

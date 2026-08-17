@@ -7,10 +7,11 @@ package dht
 // DHTLookup.LookupClaim fetch-and-cache path used by the resolver's §9.2
 // step-3a network alias resolution.
 //
-// Mining is not needed for the RPC-level tests (the witness verifies the PoW
-// PREFIX hash binding, not the PoW itself — the nonce is not yet known at
-// witnessing time, §7.4 step 3 precedes step 2's assembly); the claim identity
-// (alias, tld_id, claimant_pk, ts) is therefore drawn from a fresh keypair.
+// Since v0.7.0 the witness verifies the PoW before signing (§7.3), so the
+// fixtures mine a real (difficulty-8, fast) nonce for every identity — the
+// claim identity (alias, tld_id, claimant_pk, ts) is drawn from a fresh
+// keypair, then the PoW pair (nonce, pow_hash) is mined once and reused
+// across the RPC-level assertions.
 
 import (
 	"bytes"
@@ -26,7 +27,9 @@ import (
 )
 
 // witnessIdentity is a claim identity fixture: a fresh claimant keypair, its
-// self-certifying tld_id, and a claimant-asserted timestamp.
+// self-certifying tld_id, and a claimant-asserted timestamp. The PoW pair is
+// mined per (identity, alias) by mineWitnessPoW — §7.3 witnesses verify it
+// before signing (v0.7.0).
 type witnessIdentity struct {
 	claimantKP *crypto.Keypair
 	tldID      []byte
@@ -46,21 +49,60 @@ func newWitnessIdentity(t *testing.T, ts uint64) *witnessIdentity {
 	return &witnessIdentity{claimantKP: kp, tldID: tid, ts: ts}
 }
 
-// witnessArgs builds the §6.3 `witness` method arguments for the identity (the
-// documented deviation from the spec's {claim_prefix_hash, claimant, ts}:
-// alias and tld_id ride along because the §7.3 attestation signature input
-// needs them).
+// withFastWitnessPoW lowers the claims package's difficulty floor to 8 for
+// the duration of one test: the fixtures mine difficulty-8 PoWs (fast), and
+// hWitness's InferDifficulty verification (nonce[0] when >= the floor, else
+// the floor) then accepts nonce[0]=8 instead of demanding the production 24.
+func withFastWitnessPoW(t *testing.T) {
+	t.Helper()
+	prev := claims.PoWDifficultyInit
+	claims.PoWDifficultyInit = 8
+	t.Cleanup(func() { claims.PoWDifficultyInit = prev })
+}
+
+// mineWitnessPoW mines a difficulty-8 (fast) PoW pair for (alias, id) — the
+// exact identity a witness re-verifies.
+func (id *witnessIdentity) mineWitnessPoW(t *testing.T, alias string) (nonce, powHash []byte) {
+	t.Helper()
+	return id.mineWitnessPoWTld(t, alias, id.tldID)
+}
+
+// mineWitnessPoWTld is mineWitnessPoW with an explicit tld_id (the
+// context-binding test gathers attestations for a tld_id that is not the
+// claimant's own).
+func (id *witnessIdentity) mineWitnessPoWTld(t *testing.T, alias string, tldID []byte) (nonce, powHash []byte) {
+	t.Helper()
+	withFastWitnessPoW(t)
+	p, err := (&claims.AliasClaim{Alias: alias, TldID: tldID, Timestamp: id.ts, ClaimantPK: id.claimantKP.Public()}).Prefix()
+	if err != nil {
+		t.Fatalf("Prefix: %v", err)
+	}
+	nonce, powHash, err = crypto.MinePoW(p, 8, 2_000_000, 16)
+	if err != nil {
+		t.Fatalf("MinePoW (fixture): %v", err)
+	}
+	return nonce, powHash
+}
+
+// witnessArgs builds the §6.3 `witness` method arguments for the identity:
+// the identity fields, their recomputed prefix hash, and a freshly mined
+// PoW pair (nonce, pow_hash) the witness re-verifies before signing (§7.3,
+// v0.7.0).
 func witnessArgs(t *testing.T, alias string, id *witnessIdentity) map[string]any {
 	t.Helper()
+	withFastWitnessPoW(t)
 	ph, err := claimPrefixHash(alias, id.tldID, id.claimantKP.Public(), id.ts)
 	if err != nil {
 		t.Fatalf("claimPrefixHash: %v", err)
 	}
+	nonce, powHash := id.mineWitnessPoW(t, alias)
 	return map[string]any{
 		"alias":             alias,
 		"tld_id":            id.tldID,
 		"claimant":          id.claimantKP.Public(),
 		"ts":                id.ts,
+		"nonce":             nonce,
+		"pow_hash":          powHash,
 		"claim_prefix_hash": ph,
 	}
 }
@@ -78,7 +120,8 @@ func TestWitnessRoundTrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, 0 /* default WITNESS_SET */)
+	nonce, powHash := id.mineWitnessPoW(t, alias)
+	atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, nonce, powHash, 0 /* default WITNESS_SET */)
 	if err != nil {
 		t.Fatalf("CollectWitnesses: %v", err)
 	}
@@ -86,8 +129,13 @@ func TestWitnessRoundTrip(t *testing.T) {
 		t.Fatalf("got %d attestations, want 1 (B is the only candidate witness)", len(atts))
 	}
 	att := atts[0]
-	// §7.3: the attestation verifies for the exact claim context...
-	if !att.Verify(alias, id.tldID, id.claimantKP.Public()) {
+	// §7.3: the attestation verifies for the exact claim identity (v2: the
+	// prefix hash of alias+tld_id+ts+claimant_pk)...
+	ph, err := claimPrefixHash(alias, id.tldID, id.claimantKP.Public(), id.ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !att.Verify(ph) {
 		t.Error("attestation does not Verify for the claim context")
 	}
 	// ...and was produced by B's node keypair (NodeID == SHA-256(node_pk)).
@@ -235,7 +283,8 @@ func TestWitnessAttestationContextBinding(t *testing.T) {
 	for i := range wrongTld {
 		wrongTld[i] = 0x11
 	}
-	atts, err := a.CollectWitnesses(ctx, alias, wrongTld, id.claimantKP.Public(), id.ts, 0)
+	nonce, powHash := id.mineWitnessPoWTld(t, alias, wrongTld)
+	atts, err := a.CollectWitnesses(ctx, alias, wrongTld, id.claimantKP.Public(), id.ts, nonce, powHash, 0)
 	if err != nil {
 		t.Fatalf("CollectWitnesses: %v", err)
 	}
@@ -243,14 +292,26 @@ func TestWitnessAttestationContextBinding(t *testing.T) {
 		t.Fatalf("got %d attestations, want 1", len(atts))
 	}
 	// Verifies for the context that was requested...
-	if !atts[0].Verify(alias, wrongTld, id.claimantKP.Public()) {
+	wrongPh, err := claimPrefixHash(alias, wrongTld, id.claimantKP.Public(), id.ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !atts[0].Verify(wrongPh) {
 		t.Error("attestation does not Verify for the context it was gathered for")
 	}
 	// ...but NOT for the claimant's real tld_id, nor a different alias/ts.
-	if atts[0].Verify(alias, id.tldID, id.claimantKP.Public()) {
+	realPh, err := claimPrefixHash(alias, id.tldID, id.claimantKP.Public(), id.ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atts[0].Verify(realPh) {
 		t.Error("attestation for wrong tld_id verified against the real tld_id")
 	}
-	if atts[0].Verify("otheralias", wrongTld, id.claimantKP.Public()) {
+	otherPh, err := claimPrefixHash("otheralias", wrongTld, id.claimantKP.Public(), id.ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atts[0].Verify(otherPh) {
 		t.Error("attestation verified against a different alias")
 	}
 }
@@ -268,6 +329,7 @@ func TestWitnessAttestationContextBinding(t *testing.T) {
 // difficulty-inference path is irrelevant to the assertions.
 func claimedTLDRecord(t *testing.T, alias string, witnessKPs []*crypto.Keypair) (*wire.SignedEnvelope, []byte) {
 	t.Helper()
+	withFastWitnessPoW(t) // the hPut K_claim screen verifies the PoW at the floor
 	claimant, err := crypto.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -281,9 +343,13 @@ func claimedTLDRecord(t *testing.T, alias string, witnessKPs []*crypto.Keypair) 
 	if err != nil {
 		t.Fatalf("MineAliasClaim: %v", err)
 	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
 	witnesses := make([]*claims.WitnessAttestation, 0, len(witnessKPs))
 	for i, wkp := range witnessKPs {
-		w, err := claims.NewWitnessAttestation(wkp, now+uint64(i), alias, tid, claimant.Public())
+		w, err := claims.NewWitnessAttestation(wkp, now+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}
@@ -323,11 +389,15 @@ func TestPublishClaimStoresAtKClaimOnPeer(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
-	wkp, err := crypto.Generate()
-	if err != nil {
-		t.Fatal(err)
+	wkps := make([]*crypto.Keypair, constants.W)
+	for i := range wkps {
+		var err error
+		wkps[i], err = crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	env, kClaim := claimedTLDRecord(t, "pubclaim", []*crypto.Keypair{wkp})
+	env, kClaim := claimedTLDRecord(t, "pubclaim", wkps)
 	kTld, err := KeyForWireName(env.Record.Name)
 	if err != nil {
 		t.Fatal(err)

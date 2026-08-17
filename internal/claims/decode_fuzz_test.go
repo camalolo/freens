@@ -46,7 +46,11 @@ func fuzzMinedClaim(f *testing.F, witnesses int) []byte {
 		if err != nil {
 			f.Fatal(err)
 		}
-		w, err := NewWitnessAttestation(wkp, uint64(1_700_000_001+i), c.Alias, c.TldID, c.ClaimantPK)
+		ph, err := c.PrefixHash()
+		if err != nil {
+			f.Fatal(err)
+		}
+		w, err := NewWitnessAttestation(wkp, c.Timestamp+uint64(1+i), ph)
 		if err != nil {
 			f.Fatal(err)
 		}
@@ -145,7 +149,11 @@ func FuzzDecodeWitnessAttestation(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	w, err := NewWitnessAttestation(kp, 1_700_000_000, "foo", tldID, claimantPK)
+	ph, err := (&AliasClaim{Alias: "foo", TldID: tldID, Timestamp: 1_700_000_000, ClaimantPK: claimantPK}).PrefixHash()
+	if err != nil {
+		f.Fatal(err)
+	}
+	w, err := NewWitnessAttestation(kp, 1_700_000_000, ph)
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -166,7 +174,7 @@ func FuzzDecodeWitnessAttestation(f *testing.F) {
 		if err != nil {
 			return
 		}
-		_ = w.Verify("foo", bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32))
+		_ = w.Verify(ph)
 		b1, err := w.CanonicalBytes()
 		if err != nil {
 			t.Fatalf("decoded attestation fails CanonicalBytes(): %v", err)

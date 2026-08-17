@@ -70,6 +70,26 @@ type ClaimSetResolver interface {
 	CollectClaims(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, error)
 }
 
+// ClaimSetWithWitnesses is the OPTIONAL v0.7.0 extension of ClaimSetResolver:
+// the same collected claim set, PLUS the converged WITNESS SET of the very
+// walk that collected it — the hex(NodeID) set of the WitnessSet = 8 closest
+// REACHED nodes to K_claim (§7.3), or nil when the source's reachable view is
+// too sparse to honestly name a set (small fleets, partitions, young tables).
+//
+// When non-nil, the resolver restricts the §7.3 quorum to witnesses among
+// that set (claims.VerifyFull): five keys minted out of thin air — however
+// valid their signatures and however consistent their timestamps — are not
+// among the network's actual witness nodes, so a fabricated quorum stops
+// counting. This closes the backdating hole's last open path (a self-dated
+// fabricated quorum on a re-mined old claim; see the v0.7.0 changelog).
+//
+// A nil set means "membership unenforced", NEVER "reject everything": the
+// source is trusted to decide when its view can name the set. dht.DHTLookup
+// satisfies this interface structurally (CollectClaimsWithWitnesses).
+type ClaimSetWithWitnesses interface {
+	CollectClaimsWithWitnesses(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, map[string]bool, error)
+}
+
 // HistoryResolver is the OPTIONAL §8.3 transfer-history source: it returns the
 // SignedEnvelope whose H_record (SHA-256 of the canonical envelope CBOR, §4.2)
 // is h — from this node's retained history or any peer's — or (nil, nil) if no
@@ -534,7 +554,7 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 		return nil, false, false // transient error is a miss here — the freens branch NXDOMAINs
 	}
 	oracle, _ := r.Freens.(DifficultyOracle)
-	claim := verifyClaimEnvelope(env, alias, now, oracle)
+	claim := verifyClaimEnvelope(env, alias, now, oracle, nil) // legacy path: no converged set
 	if claim == nil {
 		return nil, false, false
 	}
@@ -548,9 +568,13 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 //     claims nodes offer".
 //  2. Filter: each envelope individually passes the §7 checklist
 //     (verifyClaimEnvelope: structural validity, alias match, claimant
-//     binding, PoW, and ≥ W = 5 distinct verified witnesses via
-//     claims.VerifyFull — with the Appendix A.4 difficulty inference floored
-//     at the source's gossiped network difficulty when it implements
+//     binding, PoW, and ≥ W = 5 distinct CORROBORATING witnesses via
+//     claims.VerifyFull — v2 attestations bound to the claim identity and
+//     dated inside the corroboration band; when the source also implements
+//     ClaimSetWithWitnesses (v0.7.0) the witnesses are additionally
+//     restricted to the converged WITNESS_SET of the same walk, closing the
+//     fabricated-quorum hole. The Appendix A.4 difficulty inference is
+//     floored at the source's gossiped network difficulty when it implements
 //     DifficultyOracle; see effectivePoWDifficulty).
 //  3. Order the surviving claims ascending by the §7.4 step-3 lexicographic
 //     tuple (timestamp, pow_hash, tld_id) via claims.OrderClaims — "earliest
@@ -577,7 +601,16 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 // here as the contested return value, consumed by freensResolve as the §10.4
 // 60 s TTL cap (a diagnostics channel does not exist in this resolver).
 func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, alias string, now int64) (tldID []byte, contested, degraded bool) {
-	envs, err := csr.CollectClaims(ctx, alias, now)
+	var witnessSet map[string]bool // nil = membership unenforced (sparse view / legacy source)
+	var envs []*wire.SignedEnvelope
+	var err error
+	// v0.7.0: prefer the walk-consistent witness set when the source can
+	// name it; the §7.3 quorum is then restricted to the WITNESS_SET.
+	if cww, ok := csr.(ClaimSetWithWitnesses); ok {
+		envs, witnessSet, err = cww.CollectClaimsWithWitnesses(ctx, alias, now)
+	} else {
+		envs, err = csr.CollectClaims(ctx, alias, now)
+	}
 	if errors.Is(err, dht.ErrDegradedMiss) {
 		return nil, false, true // issue #1: retryable, not NXDOMAIN
 	}
@@ -587,7 +620,7 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	survivors := make([]*claims.AliasClaim, 0, len(envs))
 	oracle, _ := r.Freens.(DifficultyOracle)
 	for _, env := range envs {
-		if claim := verifyClaimEnvelope(env, alias, now, oracle); claim != nil {
+		if claim := verifyClaimEnvelope(env, alias, now, oracle, witnessSet); claim != nil {
 			survivors = append(survivors, claim)
 		}
 	}
@@ -622,23 +655,26 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 //     tld_id == claim.TldID). Together with step 1's signature check this
 //     means the claimant key itself published the claim — the §3.1
 //     self-certification that step 3b's chain walk then re-proves at K_tld.
-//  5. claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), nil,
-//     constants.W): claimant consistency (tld_id == SHA-256(claimant_pk)),
-//     recomputed PoW at the difficulty recorded in nonce[0] (Appendix A.4)
-//     or the network default — floored at the source's gossiped difficulty
-//     when it implements DifficultyOracle — and ≥ W = 5 DISTINCT verified
-//     witness attestations (each node_pk bound to its node_id and each
-//     signature verifying over the canonical §7.3 witness message).
-//     witnessSetIDs is nil — a resolver without a global routing-table view
-//     cannot honestly compute the WITNESS_SET restriction; distinctness +
-//     signature validity still hold (see the deviation note in the
-//     package report).
+//  5. claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle),
+//     witnessSet, constants.W): claimant consistency (tld_id ==
+//     SHA-256(claimant_pk)), recomputed PoW at the difficulty recorded in
+//     nonce[0] (Appendix A.4) or the network default — floored at the
+//     source's gossiped difficulty when it implements DifficultyOracle — and
+//     ≥ W = 5 DISTINCT CORROBORATING witness attestations (each node_pk
+//     bound to its node_id, each signature a v2 attestation over the claim's
+//     prefix hash, each attestation timestamp inside the corroboration band
+//     around the claim's asserted timestamp). witnessSet, when non-nil, is
+//     the converged WITNESS_SET (§7.3) named by the collecting walk — the 8
+//     closest REACHED nodes to K_claim — and the quorum counts only
+//     witnesses among them; nil keeps the legacy unenforced membership
+//     (sparse views, legacy sources), where distinctness + binding + band
+//     still hold.
 //
 // On success the returned claim's TldID is SHA-256(claimant_pk); resolution
 // then PROCEEDS with the normal §9.2 step 3b chain walk, where the TLD record
 // at K_tld must still verify against that tld_id — self-certification, so a
 // bogus claim cannot manufacture records, only point elsewhere (§3.2, §10.3).
-func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64, oracle DifficultyOracle) *claims.AliasClaim {
+func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64, oracle DifficultyOracle, witnessSet map[string]bool) *claims.AliasClaim {
 	// (1) envelope signature + time window.
 	if env == nil || !wire.IsBasicValid(env, uint64(now)) {
 		return nil
@@ -668,11 +704,12 @@ func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64, orac
 	if derr != nil || len(labels) != 0 || !bytes.Equal(nameTldID, claim.TldID) {
 		return nil
 	}
-	// (5) claimant consistency + PoW + ≥ W distinct verified witnesses.
-	// The PoW difficulty is the A.4 inference (nonce[0] when sane, else
-	// PoWDifficultyInit), floored at the source's gossiped network
-	// difficulty when it implements DifficultyOracle.
-	if !claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), nil, constants.W) {
+	// (5) claimant consistency + PoW + ≥ W distinct corroborating witnesses,
+	// optionally restricted to the converged WITNESS_SET. The PoW difficulty
+	// is the A.4 inference (nonce[0] when sane, else PoWDifficultyInit),
+	// floored at the source's gossiped network difficulty when it implements
+	// DifficultyOracle.
+	if !claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), witnessSet, constants.W) {
 		return nil
 	}
 	return claim

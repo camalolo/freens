@@ -18,6 +18,7 @@ package dht
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"sort"
 	"sync"
@@ -61,21 +62,32 @@ import (
 //     §7.4 selection must be order-independent regardless (and is — the
 //     (timestamp, pow_hash, tld_id) tuple is a total order).
 //
-// It returns (nil, nil) when neither the local store nor any reachable peer
+// It returns (nil, nil, nil) when neither the local store nor any reachable peer
 // offers a claim envelope; a non-nil error only for caller-input problems
 // (invalid alias) — network failures degrade to a (possibly empty) set.
+//
+// The SECOND return value is the CONVERGED WITNESS SET for the alias (v0.7.0,
+// the §7.3 WITNESS_SET membership enforcement): when the walk heard from at
+// least constants.WitnessSet (8) distinct reachable nodes, it is the
+// hex(NodeID) set of the 8 closest REACHED contacts to K_claim — the same set
+// a converged Kademlia walk names on any honest node, and what a verifier
+// restricts the §7.3 quorum to (claims.HasQuorum). A sparse view (< 8
+// reachable nodes — e.g. the small beta fleet) yields nil: the membership
+// check is silently NOT enforced rather than enforced against a set an
+// eclipse or a young table would skew. See DHTLookup.CollectClaimsWithWitnesses
+// for the resolver-side plumbing.
 //
 // Full §7.4 filtering (structural validity, PoW, witness quorum, ordering,
 // winner selection) is the RESOLVER's job (§6.5: the DHT does not adjudicate);
 // this method only collects and signature-checks.
-func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedEnvelope, error) {
+func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedEnvelope, map[string]bool, error) {
 	aliasN, err := naming.ValidateAlias(alias)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	key, err := KeyForClaim(aliasN)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	collected := make(map[string]*wire.SignedEnvelope) // H_record → envelope
@@ -103,7 +115,7 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 
 	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
 	if len(shortlist) == 0 {
-		return sortedByRecordHash(collected), nil // island: local copy only.
+		return sortedByRecordHash(collected), nil, nil // island: local copy only.
 	}
 	queried := make(map[string]bool, len(shortlist))
 	answered := make(map[string]*NodeContact, len(shortlist)) // reachable nodes
@@ -254,9 +266,33 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	// resolver must retry (SERVFAIL) rather than negative-cache an NXDOMAIN
 	// for an alias whose claim holders were alive all along.
 	if len(collected) == 0 && (probesFailed > 0 || probesThrottled > 0) {
-		return nil, ErrDegradedMiss
+		return nil, nil, ErrDegradedMiss
 	}
-	return sortedByRecordHash(collected), nil
+	return sortedByRecordHash(collected), convergedWitnessSet(answered, key), nil
+}
+
+// convergedWitnessSet names the §7.3 WITNESS_SET (the WitnessSet = 8 closest
+// nodes to K_claim) as this converged walk saw it: answered is every REACHED
+// contact (replies + §12-throttled-but-alive), key is K_claim. Fewer than
+// WitnessSet reachable contacts yields nil — the set would say more about
+// table sparsity (or an eclipse) than about the network, and the resolver
+// treats nil as "membership unenforced" rather than rejecting everything.
+func convergedWitnessSet(answered map[string]*NodeContact, key []byte) map[string]bool {
+	if len(answered) < constants.WitnessSet {
+		return nil
+	}
+	reached := make([]*NodeContact, 0, len(answered))
+	for _, c := range answered {
+		reached = append(reached, c)
+	}
+	sort.SliceStable(reached, func(i, j int) bool {
+		return CompareDistance(key, reached[i].NodeID, reached[j].NodeID) < 0
+	})
+	set := make(map[string]bool, constants.WitnessSet)
+	for _, c := range reached[:constants.WitnessSet] {
+		set[hex.EncodeToString(c.NodeID)] = true
+	}
+	return set
 }
 
 // StorageKeys returns every DHT key an envelope legitimately lives at:
@@ -346,10 +382,38 @@ func setKeyLess(a, b *wire.SignedEnvelope) bool {
 //
 // Resolvers wanting full §7.4 contested-alias semantics use this method;
 // LookupClaim remains the single-winner legacy path (§6.4 selection only).
+//
+// This is the SET-ONLY projection of [DHTLookup.CollectClaimsWithWitnesses]
+// (it drops the converged witness set); see that method for the v0.7.0
+// §7.3 witness-set membership enforcement the resolver can layer on top.
 func (l *DHTLookup) CollectClaims(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, error) {
+	envs, _, err := l.CollectClaimsWithWitnesses(ctx, alias, now)
+	return envs, err
+}
+
+// CollectClaimsWithWitnesses is [DHTLookup.CollectClaims] plus the CONVERGED
+// WITNESS SET of the same walk: the hex(NodeID) set of the WitnessSet = 8
+// closest REACHED nodes to K_claim, or nil when the reachable view is too
+// sparse to name a set (small fleets, partitions, eclipses — nil means the
+// resolver must NOT enforce §7.3 membership, not that it must reject).
+//
+// It structurally satisfies the resolver's optional
+// resolver.ClaimSetWithWitnesses interface (same structural-satisfaction
+// trick as CollectClaims vs resolver.ClaimSetResolver — the import would
+// cycle). A resolver that has the set passes it to claims.VerifyFull, which
+// then counts only witnesses among the WITNESS_SET — closing the
+// fabricated-quorum hole (v0.7.0): five keys minted out of thin air are not
+// among the network's actual closest nodes, so their attestations no longer
+// count toward the quorum, whatever their timestamps claim.
+//
+// Residual, documented: an adversary that BOTH grinds NodeIDs into the true
+// witness set AND forges a self-consistent (backdated) quorum still wins the
+// §7.4 ordering — that is the protocol's fundamental Sybil bound (§12),
+// priced by the grinding cost, not eliminated.
+func (l *DHTLookup) CollectClaimsWithWitnesses(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, map[string]bool, error) {
 	key, err := KeyForClaim(alias)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	collected := make(map[string]*wire.SignedEnvelope)
 	add := func(env *wire.SignedEnvelope) {
@@ -368,23 +432,28 @@ func (l *DHTLookup) CollectClaims(ctx context.Context, alias string, now int64) 
 		add(env)
 	}
 	if l.node == nil {
-		return sortedByRecordHash(collected), nil
+		return sortedByRecordHash(collected), nil, nil
 	}
 
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
-	envs, err := l.node.CollectClaims(c, alias)
+	envs, witnessSet, err := l.node.CollectClaims(c, alias)
 	if err != nil && !errors.Is(err, ErrDegradedMiss) {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, env := range envs {
 		add(env)
 	}
 	// A degraded walk (ErrDegradedMiss) with a LOCAL claim still serves
 	// the local view; only an empty-everywhere degrade propagates the
-	// sentinel (the resolver retries instead of negative-caching).
+	// sentinel (the resolver retries instead of negative-caching). A
+	// degraded walk also yields no witness set (it could not interrogate
+	// the holders, so it cannot honestly name the WITNESS_SET).
 	if errors.Is(err, ErrDegradedMiss) && len(collected) == 0 {
-		return nil, err
+		return nil, nil, err
+	}
+	if errors.Is(err, ErrDegradedMiss) {
+		witnessSet = nil
 	}
 	set := sortedByRecordHash(collected)
 	// §7.4 "storing nodes keep the top 2 by ordering": every collected claim
@@ -401,5 +470,5 @@ func (l *DHTLookup) CollectClaims(ctx context.Context, alias string, now int64) 
 	if len(set) > 0 && !l.store.Has(key, now) {
 		_, _ = l.store.Put(key, set[0], now, true)
 	}
-	return set, nil
+	return set, witnessSet, nil
 }

@@ -597,15 +597,18 @@ func decodeTldIDB32(s string) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 // witnessRequest is the /witness body: the §7.3 claim IDENTITY (alias,
-// tld_id, claimant_pk, timestamp). The PoW nonce does not exist yet at
-// witness-collection time (§7.4 step 3 precedes step 2's assembly), so what
-// rides here is exactly what the witness RPC binds: the identity fields whose
-// canonical-CBOR SHA-256 is the claim prefix hash.
+// tld_id, claimant_pk, timestamp) PLUS the PoW pair (nonce, pow_hash). Since
+// v0.7.0 the witness RPC verifies the PoW before signing (§7.3 "witnesses
+// MUST verify the PoW before signing"), so the claimant presents its mined
+// nonce and hash alongside the identity fields whose canonical-CBOR SHA-256
+// is the claim prefix hash.
 type witnessRequest struct {
 	Alias    string `json:"alias"`
 	TldID    string `json:"tld_id_hex"`
 	Claimant string `json:"claimant_hex"`
 	TS       uint64 `json:"ts"`
+	Nonce    string `json:"nonce_hex"`
+	PowHash  string `json:"pow_hash_hex"`
 }
 
 // witnessResponse carries the collected attestations as raw canonical
@@ -650,6 +653,16 @@ func (s *Server) handleWitness(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad claimant hex: "+err.Error())
 		return
 	}
+	nonce, err := hex.DecodeString(req.Nonce)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad nonce hex: "+err.Error())
+		return
+	}
+	powHash, err := hex.DecodeString(req.PowHash)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad pow_hash hex: "+err.Error())
+		return
+	}
 	ctx, cancel := capped(r)
 	defer cancel()
 
@@ -662,7 +675,7 @@ func (s *Server) handleWitness(w http.ResponseWriter, r *http.Request) {
 	}
 	s.node.IterativeFindNode(ctx, kClaim, constants.WitnessSet)
 
-	atts, err := s.node.CollectWitnesses(ctx, alias, tldID, claimant, req.TS, constants.WitnessSet)
+	atts, err := s.node.CollectWitnesses(ctx, alias, tldID, claimant, req.TS, nonce, powHash, constants.WitnessSet)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "witness collection failed: "+err.Error())
 		return

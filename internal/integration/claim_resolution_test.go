@@ -124,9 +124,13 @@ func publishClaimWorld(t *testing.T, n *claimTestNode, alias string, now int64, 
 		}
 		witnessKPs = append(witnessKPs, wkp)
 	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
 	atts := make([]*claims.WitnessAttestation, 0, len(witnessKPs))
 	for i, wkp := range witnessKPs {
-		w, err := claims.NewWitnessAttestation(wkp, uint64(now)+uint64(i), alias, tldID, claimant.Public())
+		w, err := claims.NewWitnessAttestation(wkp, uint64(now)+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}

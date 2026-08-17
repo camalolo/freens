@@ -174,12 +174,13 @@ func seqOf(env *wire.SignedEnvelope) uint64 {
 
 // Same-sequence tie-break: bytewise-greater H_record wins (wire.EnvelopeWins).
 func TestEnvelopeStoreWinnerRuleSameSequenceTieBreak(t *testing.T) {
-	// Two TLDs owned by distinct keys -> distinct names -> distinct record
-	// hashes, same sequence.
+	// Same owner, same sequence, two distinct envelopes (a re-sign with a
+	// different validity window): the bytewise-greater record hash wins
+	// regardless of arrival order — the convergence property the tie-break
+	// exists for.
 	kpA := mustKeypair(t)
-	kpB := mustKeypair(t)
 	envA := makeEnv(t, 1, 1000, 2000, kpA)
-	envB := makeEnv(t, 1, 1000, 2000, kpB)
+	envB := makeEnv(t, 1, 1001, 2001, kpA)
 	hA, _ := envA.RecordHash()
 	hB, _ := envB.RecordHash()
 	if bytes.Equal(hA, hB) {
@@ -208,6 +209,54 @@ func TestEnvelopeStoreWinnerRuleSameSequenceTieBreak(t *testing.T) {
 	// Putting the smaller back is rejected.
 	if ok, _ := s.Put(key, first, 1700, true); ok {
 		t.Error("Put(first) after second should be rejected")
+	}
+}
+
+// TestEnvelopeStoreDifferentSignerNoPrevHashRejected (v0.7.0
+// anti-censorship rule): a no-prev_hash newcomer signed by a key OTHER than
+// the live incumbent's owner can NEVER displace it — not on a higher
+// sequence (the sequence=MAX censorship vector) and not on the equal-sequence
+// hash tie-break. Before v0.7.0 the bare §6.4 winner rule let such a record
+// evict a live one, censoring the honest record out of every storing node
+// until expiry (the resolver would have rejected the impostor's chain, so
+// this was pure DoS). A DEAD incumbent (past grace) still recycles the slot.
+func TestEnvelopeStoreDifferentSignerNoPrevHashRejected(t *testing.T) {
+	kpOwner := mustKeypair(t)
+	kpSquatter := mustKeypair(t)
+	incumbent := makeEnv(t, 42, 1000, 2000, kpOwner)
+
+	// The maximal-sequenced impostor: wins EnvelopeWins on sequence alone.
+	impostor := makeEnv(t, ^uint64(0), 1000, 2000, kpSquatter)
+	// An equal-sequence impostor: wins on the hash tie-break half the time.
+	tie := makeEnv(t, 42, 1001, 2001, kpSquatter)
+
+	key := keyN(11)
+	s := NewEnvelopeStore(0, func() int64 { return 1500 })
+	if ok, _ := s.Put(key, incumbent, 1500, true); !ok {
+		t.Fatal("Put(incumbent) should be accepted")
+	}
+	if ok, _ := s.Put(key, impostor, 1600, true); ok {
+		t.Fatal("Put(sequence=MAX impostor) must be REJECTED while the incumbent is alive")
+	}
+	if ok, _ := s.Put(key, tie, 1700, true); ok {
+		t.Fatal("Put(equal-sequence impostor) must be REJECTED while the incumbent is alive")
+	}
+	if got, _ := s.Get(key, 1700); got != incumbent {
+		t.Fatal("the live incumbent must still hold the slot")
+	}
+
+	// The owner's own higher-sequence update still succeeds (§8.2).
+	update := makeEnv(t, 43, 1500, 2500, kpOwner)
+	if ok, _ := s.Put(key, update, 1600, true); !ok {
+		t.Fatal("Put(owner seq+1) should be accepted")
+	}
+
+	// After expiry + ExpiryGrace (24 h) the slot is dead: a fresh record
+	// (any signer) recycles it (§8.2 re-creation). The update above expires
+	// at 2500, so now = 2500 + grace + slack is past it.
+	fresh := makeEnv(t, 1, 89000, 99000, kpSquatter)
+	if ok, _ := s.Put(key, fresh, 89500, true); !ok {
+		t.Fatal("Put(fresh record) after expiry+grace should be accepted (slot recycling)")
 	}
 }
 

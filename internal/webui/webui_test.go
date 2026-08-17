@@ -93,7 +93,7 @@ func (f *fakeDaemon) Get(ctx context.Context, key []byte) (*wire.SignedEnvelope,
 	return f.get[string(key)], nil
 }
 
-func (f *fakeDaemon) Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) ([][]byte, error) {
+func (f *fakeDaemon) Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64, nonce, powHash []byte) ([][]byte, error) {
 	return nil, nil // overridden where needed
 }
 

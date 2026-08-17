@@ -58,13 +58,17 @@ func buildContestWorld(t *testing.T, alias string, now, claimTS int64, ip net.IP
 
 	// Steps 3-4: W distinct witness attestations (§7.3 quorum), gathered out
 	// of band as publishClaimWorld does.
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
 	atts := make([]*claims.WitnessAttestation, 0, constants.W)
 	for i := 0; i < constants.W; i++ {
 		wkp, err := crypto.Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
-		w, err := claims.NewWitnessAttestation(wkp, uint64(claimTS)+uint64(i), alias, tldID, claimant.Public())
+		w, err := claims.NewWitnessAttestation(wkp, uint64(claimTS)+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}

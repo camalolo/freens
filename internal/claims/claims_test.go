@@ -36,16 +36,22 @@ func mineTestClaim(t *testing.T, alias string, ts uint64) *AliasClaim {
 	return c
 }
 
-// makeWitnesses builds n distinct valid witness attestations for c.
+// makeWitnesses builds n distinct valid witness attestations for c, each
+// dated inside the corroboration band around c.Timestamp (an offset of i
+// seconds keeps every fixture honest under the v0.7.0 band).
 func makeWitnesses(t *testing.T, c *AliasClaim, n int) []*WitnessAttestation {
 	t.Helper()
+	prefixHash, err := c.PrefixHash()
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
 	out := make([]*WitnessAttestation, 0, n)
 	for i := 0; i < n; i++ {
 		kp, err := crypto.Generate()
 		if err != nil {
 			t.Fatalf("witness Generate: %v", err)
 		}
-		w, err := NewWitnessAttestation(kp, 1700000000+uint64(i), c.Alias, c.TldID, c.ClaimantPK)
+		w, err := NewWitnessAttestation(kp, c.Timestamp+uint64(i), prefixHash)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}
@@ -72,28 +78,39 @@ func TestWitnessAttestation(t *testing.T) {
 		t.Fatalf("TldID: %v", err)
 	}
 	claimantPK := claimantKP.Public()
-	const ts = uint64(1_700_000_000)
+	const claimTS = uint64(1_700_000_000)
+	const ts = uint64(1_700_000_000) // the witness's own clock
 
-	w, err := NewWitnessAttestation(nodeKP, ts, "foo", tldID, claimantPK)
+	// prefixFor hashes the claim identity the way a witness would.
+	prefixFor := func(alias string, tld, pk []byte, cts uint64) []byte {
+		h, err := (&AliasClaim{Alias: alias, TldID: tld, Timestamp: cts, ClaimantPK: pk}).PrefixHash()
+		if err != nil {
+			t.Fatalf("PrefixHash: %v", err)
+		}
+		return h
+	}
+	ph := prefixFor("foo", tldID, claimantPK, claimTS)
+
+	w, err := NewWitnessAttestation(nodeKP, ts, ph)
 	if err != nil {
 		t.Fatalf("NewWitnessAttestation: %v", err)
 	}
 
 	// (a) node_id binds to node_pk, sig verifies → true.
-	if !w.Verify("foo", tldID, claimantPK) {
+	if !w.Verify(ph) {
 		t.Fatal("freshly-built attestation fails Verify")
 	}
 
 	// Tamper TS → false.
 	good := w.TS
 	w.TS = good + 1
-	if w.Verify("foo", tldID, claimantPK) {
+	if w.Verify(ph) {
 		t.Fatal("Verify should fail after TS tamper")
 	}
 	w.TS = good
 
-	// Tamper alias context → false.
-	if w.Verify("bar", tldID, claimantPK) {
+	// Tamper alias context (a different claim identity) → false.
+	if w.Verify(prefixFor("bar", tldID, claimantPK, claimTS)) {
 		t.Fatal("Verify should fail with wrong alias context")
 	}
 
@@ -101,7 +118,7 @@ func TestWitnessAttestation(t *testing.T) {
 	badTld := make([]byte, len(tldID))
 	copy(badTld, tldID)
 	badTld[0] ^= 0xff
-	if w.Verify("foo", badTld, claimantPK) {
+	if w.Verify(prefixFor("foo", badTld, claimantPK, claimTS)) {
 		t.Fatal("Verify should fail with wrong tld_id context")
 	}
 
@@ -109,8 +126,17 @@ func TestWitnessAttestation(t *testing.T) {
 	badPK := make([]byte, len(claimantPK))
 	copy(badPK, claimantPK)
 	badPK[0] ^= 0xff
-	if w.Verify("foo", tldID, badPK) {
+	if w.Verify(prefixFor("foo", tldID, badPK, claimTS)) {
 		t.Fatal("Verify should fail with wrong claimant_pk context")
+	}
+
+	// v0.7.0 transplant regression: a claim re-mined with a DIFFERENT
+	// (e.g. backdated) timestamp has a different prefix hash, so the
+	// attestation must not verify against it — this is the binding that
+	// kills the backdating attack (v1 bound the identity fields but left
+	// the timestamp replayable across re-mined claims of the same alias).
+	if w.Verify(prefixFor("foo", tldID, claimantPK, claimTS-45*86400)) {
+		t.Fatal("Verify should fail against a backdated re-mined claim (transplant)")
 	}
 
 	// CanonicalBytes round-trips via DecodeWitnessAttestation.
@@ -125,7 +151,7 @@ func TestWitnessAttestation(t *testing.T) {
 	if !bytes.Equal(cb, must(w2.CanonicalBytes())) {
 		t.Fatal("CanonicalBytes not byte-stable across decode")
 	}
-	if !w2.Verify("foo", tldID, claimantPK) {
+	if !w2.Verify(ph) {
 		t.Fatal("decoded attestation fails Verify")
 	}
 
@@ -142,7 +168,7 @@ func TestWitnessAttestation(t *testing.T) {
 		TS:     ts,
 		Sig:    w.Sig,
 	}
-	if forged.Verify("foo", tldID, claimantPK) {
+	if forged.Verify(ph) {
 		t.Fatal("unbound node_id should fail Verify")
 	}
 }

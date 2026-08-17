@@ -446,7 +446,7 @@ Methods:
 | `find_node`  | `{target: bstr(32)}`                         | `{nodes: [(ip, port, node_id, pk), ...]}` — K closest |
 | `get`        | `{key: bstr(32)}`                            | `{envelope: SignedEnvelope}` or `{nodes: [...]}` |
 | `put`        | `{token: bstr, envelope: SignedEnvelope}`    | `{}`                                          |
-| `witness`    | `{claim_prefix_hash, claimant, ts}`          | `{attestation: sig}` (Section 7.4)            |
+| `witness`    | `{claim_prefix_hash, claimant, ts, alias, tld_id, nonce, pow_hash}` | `{attestation: sig, difficulty}` (Section 7.4) |
 
 Error codes: `301` generic, `302` invalid token, `303` invalid
 signature, `304` stale record (sequence too low), `305` invalid record.
@@ -467,7 +467,20 @@ tokens are `HMAC-SHA256(rotating_secret, peer_ip)` and rotate every
    validity rules (Section 4.4 as checkable locally), sequence number
    vs. what they hold. They store only if the new record strictly wins:
    higher `sequence`, or same `sequence` but bytewise-greater `H_record`
-   (tie-break for idempotent concurrent republication).
+   (tie-break for idempotent concurrent republication). A put landing
+   at `K_claim` additionally passes the full Section 7.4 claim screen
+   (claimant binding, PoW, corroborating witness quorum) before
+   entering the store or the top-2 claim pool (v0.7.0: claim-space
+   seeding of garbage claims was otherwise free). Two displacement
+   restrictions apply against a LIVE incumbent (v0.7.0
+   anti-censorship): a newcomer with `prev_hash` signed by a
+   non-owner is accepted only as a Section 8.4 recovery with quorum
+   evidence, and a newcomer WITHOUT `prev_hash` signed by a key other
+   than the incumbent's owner is accepted only when the store's live
+   PARENT record for the name authorizes that key (`parent.owner` or
+   `parent.delegation` — the Section 8.3 delegated-republication
+   path); anything else is rejected. An incumbent past
+   `expires + EXPIRY_GRACE` is dead: the slot recycles freely.
 4. Stored records are republished by the owner at `REFRESH_INTERVAL`
    (80% of time-to-expiry). Storing nodes evict at `expires + GRACE`
    (24 h grace for clock skew and network partitions).
@@ -559,9 +572,17 @@ WitnessAttestation = {
   2 : node_pk      ; bstr(32)
   3 : ts           ; uint, witness's own timestamp
   4 : sig          ; bstr(64): node_pk signs canonical
-                    ;   ("freens-witness-v1", alias, tld_id, claimant_pk, ts)
+                    ;   ("freens-witness-v2", claim_prefix_hash, ts)
 }
 ```
+
+The signed `claim_prefix_hash` is `SHA-256(prefix)` — a commitment to the
+FULL claim identity `{alias, tld_id, timestamp, claimant_pk}` (the PoW
+prefix of Section 7.3). v2 (v0.7.0 security fix): the v1 form signed the
+identity fields but let attestations gathered for one claim be replayed
+against a re-mined, backdated claim of the same alias; binding the hash
+(which covers the timestamp) makes each attestation valid for exactly
+the claim it was issued for.
 
 **Proof of work:** let `prefix` be the canonical CBOR of fields
 `{1..5}` of `AliasClaim`. Miners search `nonce` until:
@@ -578,12 +599,41 @@ laptop; thousands of aliases = real cost, while `alice.foo`-under-your-
 own-TLD remains free).
 
 **Witness quorum:** a claim is *attested* when it carries valid
-signatures from `W = 5` distinct witnesses whose node IDs are among the
-`WITNESS_SET = 8` closest nodes to `K_claim = SHA-256(0x03 ||
-"claim:" || alias)`. Witnesses MUST verify the PoW before signing and
-MUST only sign one claim per alias per `WITNESS_COOLDOWN` (1 h) unless
-a strictly earlier-ordered claim appears (they may sign both; ordering
-is computed by verifiers, not witnesses).
+v2 signatures from `W = 5` distinct CORROBORATING witnesses. Two
+conditions make a witness count (v0.7.0):
+
+1. *Membership* (when the verifier can name it): the witness node ID is
+   among the `WITNESS_SET = 8` closest nodes to
+   `K_claim = SHA-256(0x03 || "claim:" || alias)` as the verifier's
+   converged lookup observed them. A verifier whose reachable view holds
+   fewer than `WITNESS_SET` nodes (small fleets, partitions, young
+   routing tables) MUST NOT enforce membership against a partial set —
+   it skips the restriction rather than reject honest witnesses.
+2. *Corroboration band*: the witness's own attestation timestamp lies
+   within `[claim.ts - SKEW_TOLERANCE, claim.ts + WITNESS_COOLDOWN +
+   SKEW_TOLERANCE]` — the honest witnessing window (signed at mining
+   time, or re-presented during register's cooldown-safe retries, with
+   clock slack on both ends). An attestation dated outside the band is
+   not evidence for the claim's asserted time and does not count.
+
+Witnesses MUST verify the PoW before signing (the witness RPC carries
+the claim's `nonce` and `pow_hash` for exactly this purpose) and MUST
+only sign one claim per alias per `WITNESS_COOLDOWN` (1 h) unless a
+strictly earlier-ordered claim appears (they may sign both; ordering is
+computed by verifiers, not witnesses). A witness also refuses claims
+whose asserted timestamp is future-dated beyond `SKEW_TOLERANCE` or
+older than `WITNESS_COOLDOWN` (the anti-forgery gate: ordering is
+earliest-first, so an arbitrarily old claim would otherwise out-order
+every honest one forever).
+
+**Residual (documented):** against a verifier that cannot name the
+witness set, an attacker forging a fully self-consistent quorum (own
+keys, in-band backdated clocks, valid PoW) still wins the Section 7.4
+ordering for a backdated claim. The v2 binding, the band, and the
+membership gate raise this from a zero-cost attack to a Sybil attack
+priced by NodeID grinding against the real witness set; closing it
+entirely requires a network dense enough that converged lookups always
+name the `WITNESS_SET`.
 
 ### 7.4 Registration procedure
 
@@ -592,7 +642,10 @@ To claim alias `foo` for a new TLD:
 1. Generate Ed25519 TLD keypair; compute `tld_id`.
 2. Mine the PoW (Section 7.3) at current difficulty `D`.
 3. Iteratively find the `WITNESS_SET` closest nodes to `K_claim`; send
-   each a `witness` RPC with `(prefix_hash, claimant_pk, timestamp)`.
+   each a `witness` RPC with `(prefix_hash, claimant_pk, timestamp)`
+   plus the claim's `nonce`, `pow_hash`, `alias` and `tld_id` (the
+   witness re-derives the prefix hash from the identity fields and
+   verifies the PoW before signing; see Section 6.3).
 4. Assemble the claim with `≥ W` attestations.
 5. Publish the TLD record (containing the claim in field 11) and `put`
    the claim envelope at `K_claim` to the `R` closest nodes.
@@ -602,7 +655,10 @@ Resolution of a contested alias (verifier side):
 1. `get(K_claim)`; collect **all** competing claims nodes offer
    (storing nodes keep the top 2 by ordering; clients SHOULD probe
    `GET_CLOSEST` nodes and merge).
-2. Filter: structurally valid, PoW valid, witness quorum valid.
+2. Filter: structurally valid, PoW valid, witness quorum valid
+   (v2 attestations, corroboration band, and — when the collecting
+   walk reached `WITNESS_SET` or more nodes — membership in the
+   converged witness set it observed).
 3. **Order** surviving claims by the lexicographic tuple, ascending:
 
 ```
@@ -619,8 +675,12 @@ Resolution of a contested alias (verifier side):
 Witness timestamps, not claimant timestamps, are the honest ordering
 signal; the claimant `timestamp` is used only as the first tie-break
 because it is in the signed+PoW-covered prefix. A claim with
-backdated `timestamp` gains nothing: witnesses attest what they saw
-and when, and the `(pow_hash, tld_id)` tail is uncheatable.
+backdated `timestamp` gains nothing *that survives verification*:
+witnesses attest what they saw and when (v2 attestations bind the
+exact claim identity via the prefix hash, and the corroboration band
+drops attestations inconsistent with the asserted time), and the
+`(pow_hash, tld_id)` tail is uncheatable. See the documented residual
+in Section 7.3 for the sparse-view limit of this argument.
 
 ### 7.5 Honest behavior for races
 
@@ -829,14 +889,28 @@ records and TLD IDs; the alias layer is weaker (10.3).
 | Spoofed DHT STOREs              | write tokens + signed RPCs                  | defeated |
 | Node ID forgery / spoofing      | Node ID = SHA-256(node key), signed RPCs    | defeated |
 | Eclipse of a resolver           | attacker surrounds lookup path              | mitigated: `ALPHA` disjoint paths, `GET_CLOSEST` merge, `alias-pins`; not fully defeated (inherent to open DHTs) |
-| Sybil flood of alias witnesses  | attacker mints many node IDs near `K_claim` | mitigated: PoW cost per claim + witness diversity heuristics + pinned aliases; documented residual risk |
-| Backdated claim timestamps      | witness attestations + `(pow_hash, tld_id)` tie-break | gains nothing |
+| Sybil flood of alias witnesses  | attacker mints many node IDs near `K_claim` | mitigated: PoW cost per claim + converged witness-set membership where the view can name it + pinned aliases; documented residual risk |
+| Backdated claim timestamps      | v2 witness attestations (claim-bound) + corroboration band + witness-set membership (7.3) | defeated against honest witnesses; sparse-view residual documented (Sybil-priced) |
 | Alias hijack via claim race     | two near-simultaneous claims                | deterministic ordering + contest window (7.5) |
 | Key compromise                  | stolen primary key                          | recovery/rotation (8.4, 8.6); timelock cancel |
 | Recovery-key theft              | 2-of-3 required; primary cancels in timelock| defeated for single theft |
 | Storage attrition (records lost)| nodes churn, owner offline                  | replication R=8, refresh, grace; NOT defeated if owner never refreshes (by design: expired = gone) |
 | Resolver→upstream tampering     | conventional fallback path                  | use DoT/DoH/DNSSEC upstreams (RECOMMENDED) |
 | Homograph aliases (`paypa1.foo`)| human confusables                           | out of scope; client MAY display punycode/signal confusables |
+
+### 10.2.1 Convergence model of the alias layer (documented)
+
+The alias layer has NO strong first-seen: a witness's one-claim-per-
+cooldown is local state, not consensus, and two partitions can
+accumulate different quorums for one alias. Ordering is therefore a
+CONVERGENCE mechanism, not an adjudication: verifiers merge the set of
+competing claims storing nodes offer (top-2 pools, `GET_CLOSEST`
+probes), apply the deterministic `(timestamp, pow_hash, tld_id)`
+order, and treat a winner as final only after `CONTEST_WINDOW` with no
+earlier-ordered valid claim appearing. A claim that was censored or
+unreachable during its window can still surface later and displace a
+younger winner — by design. Clients needing immediate finality use
+`alias-pins` (9.3).
 
 ### 10.3 What aliases cannot defend
 
@@ -912,7 +986,11 @@ Clients MUST NOT present cryptographic ownership as an identity claim.
   spec sets very high.
 - **Freeloading is tolerated:** passive clients (no DHT participation)
   still resolve via peers, at the cost of the ecosystem's health.
-  Implementations MAY throttle passive clients' `get` rates.
+  Implementations MAY throttle passive clients' `get` rates (the
+  reference client applies one shared per-source-IP token bucket to
+  `get`, `find_node` and `witness` alike — the latter being the most
+  expensive unauthenticated request to serve: PoW verification plus an
+  Ed25519 signature).
 
 ## 13. Prior Art and Rationale
 

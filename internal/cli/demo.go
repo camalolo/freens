@@ -77,13 +77,17 @@ func cmdDemo(args []string) error {
 
 	// 3. Assemble W witnesses.
 	step(3, "%d witness nodes (WITNESS_SET closest to K_claim) co-sign the claim", constants.W)
+	prefixHash, err := claim.PrefixHash()
+	if err != nil {
+		return err
+	}
 	witnesses := make([]*claims.WitnessAttestation, 0, constants.W)
 	for i := 0; i < constants.W; i++ {
 		nkp, err := crypto.Generate()
 		if err != nil {
 			return err
 		}
-		w, err := claims.NewWitnessAttestation(nkp, uint64(now)+uint64(i), alias, aliceTID, alice.Public())
+		w, err := claims.NewWitnessAttestation(nkp, uint64(now)+uint64(i), prefixHash)
 		if err != nil {
 			return err
 		}

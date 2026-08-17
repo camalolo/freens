@@ -227,7 +227,7 @@ func cmdRegister(args []string) error {
 	if tr.daemon() {
 		fmt.Printf("witnesses: collecting %d co-signatures via the running daemon (admin socket)\n", constants.W)
 		atts, err = collectWitnessesRetried(constants.W, func(int) ([]*claims.WitnessAttestation, error) {
-			return collectWitnessesViaAdmin(ctx, tr.client, *alias, tldID, kp.Public(), claim.Timestamp)
+			return collectWitnessesViaAdmin(ctx, tr.client, *alias, tldID, kp.Public(), claim.Timestamp, claim.Nonce, claim.PowHash)
 		})
 		if err != nil {
 			return err
@@ -252,7 +252,7 @@ func cmdRegister(args []string) error {
 			// converge on a cold node.
 			found := node.IterativeFindNode(ctx, kClaim, constants.WitnessSet)
 			fmt.Printf("witness candidates (closest to K_claim): %d\n", len(found))
-			return node.CollectWitnesses(ctx, *alias, tldID, kp.Public(), claim.Timestamp, constants.WitnessSet)
+			return node.CollectWitnesses(ctx, *alias, tldID, kp.Public(), claim.Timestamp, claim.Nonce, claim.PowHash, constants.WitnessSet)
 		})
 		if err != nil {
 			return err
@@ -444,12 +444,20 @@ func collectWitnessesRetried(needed int, collect func(attempt int) ([]*claims.Wi
 // collectWitnessesViaAdmin asks the running daemon to collect the witness
 // quorum on our behalf: the daemon's routing table is already warm, and its
 // admin Witness RPC walks to the WITNESS_SET itself. Each returned raw CBOR
-// attestation is decoded, verified against (alias, tldID, claimantPK), and
-// de-duplicated by node public key.
-func collectWitnessesViaAdmin(ctx context.Context, c adminWitnesser, alias string, tldID, claimantPK []byte, ts uint64) ([]*claims.WitnessAttestation, error) {
-	raw, err := c.Witness(ctx, alias, tldID, claimantPK, ts)
+// attestation is decoded, verified against the claim's prefix hash (v2
+// binding), and de-duplicated by node public key.
+func collectWitnessesViaAdmin(ctx context.Context, c adminWitnesser, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash []byte) ([]*claims.WitnessAttestation, error) {
+	raw, err := c.Witness(ctx, alias, tldID, claimantPK, ts, nonce, powHash)
 	if err != nil {
 		return nil, fmt.Errorf("witness collection (daemon): %w", err)
+	}
+	// The v2 attestations bind the claim prefix hash; recompute it here so
+	// verification is local, not trusted from the daemon.
+	prefixHash, err := (&claims.AliasClaim{
+		Alias: alias, TldID: tldID, Timestamp: ts, ClaimantPK: claimantPK,
+	}).PrefixHash()
+	if err != nil {
+		return nil, err
 	}
 	seen := make(map[string]bool, len(raw))
 	var atts []*claims.WitnessAttestation
@@ -458,7 +466,7 @@ func collectWitnessesViaAdmin(ctx context.Context, c adminWitnesser, alias strin
 		if err != nil {
 			continue // malformed attestation: skip, the quorum decides
 		}
-		if !w.Verify(alias, tldID, claimantPK) {
+		if !w.Verify(prefixHash) {
 			continue
 		}
 		if seen[string(w.NodePK)] {
@@ -473,7 +481,7 @@ func collectWitnessesViaAdmin(ctx context.Context, c adminWitnesser, alias strin
 // adminWitnesser is the admin-client slice collectWitnessesViaAdmin needs
 // (kept as an interface so tests can drive it without a socket).
 type adminWitnesser interface {
-	Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) ([][]byte, error)
+	Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64, nonce, powHash []byte) ([][]byte, error)
 }
 
 // writeKeyFileEnc persists the seed (passphrase-encrypted FREENSK1 when
@@ -510,10 +518,17 @@ func claimStatePath(alias string) string {
 }
 
 // loadReusableClaim returns the persisted claim when it matches alias, owner
-// key, and difficulty (any mismatch or absence => nil: re-mine). Delegated
-// to internal/keychain, shared with the web UI.
+// key, difficulty AND is still witnessable (v0.7.0: the §6.3 witness RPC
+// refuses claims whose timestamp is older than WITNESS_COOLDOWN, so a parked
+// claim past that age can never gather a quorum — re-mine instead of
+// dead-looping retries against refusals). Delegated to internal/keychain,
+// shared with the web UI.
 func loadReusableClaim(alias string, kp *crypto.Keypair, difficulty int) *claims.AliasClaim {
-	return keychain.LoadReusableClaim(home.KeysDir(), alias, kp, difficulty)
+	c := keychain.LoadReusableClaim(home.KeysDir(), alias, kp, difficulty)
+	if c != nil && time.Now().Unix()-int64(c.Timestamp) >= int64(constants.WitnessCooldown) {
+		return nil // stale: older than any witness will sign — re-mine
+	}
+	return c
 }
 
 // saveReusableClaim persists the claim for cooldown-safe retries (0600).

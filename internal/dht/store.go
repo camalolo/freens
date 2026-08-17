@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/wire"
 )
 
@@ -144,10 +145,12 @@ func (s *EnvelopeStore) Now() int64 { return s.nowFn() }
 //     so it is accepted only as a §8.4 recovery hand-off — see
 //     [EnvelopeStore.PutWithEvidence] (plain Put passes nil evidence, i.e.
 //     such a newcomer is rejected). A newcomer WITHOUT prev_hash is judged by
-//     the plain winner rule unchanged (backward compatibility: existing
-//     publishers emit sequence-1 records with no prev_hash). A dead or absent
-//     incumbent means the slot is empty, so the newcomer is accepted
-//     unconditionally.
+//     the plain winner rule for the incumbent's OWNER (an ordinary §8.2
+//     update/republication: same signer); a no-prev_hash newcomer signed by a
+//     DIFFERENT key is rejected outright (v0.7.0 anti-censorship rule — see
+//     rule 3's inline comment). A dead or absent incumbent means the slot is
+//     empty, so the newcomer is accepted unconditionally (re-creation after
+//     expiry+grace).
 //  4. On acceptance: cache len(env.Bytes()), set lastAccess = now, then run
 //     EvictExpired(now) followed by enforceCap(now, protected=key). The
 //     post-accept sweeps MAY evict other entries but never the just-put key
@@ -216,6 +219,27 @@ func (s *EnvelopeStore) PutWithEvidence(key []byte, env *wire.SignedEnvelope, no
 		// PutWithEvidence for the timelock rationale).
 		if len(env.Record.PrevHash) > 0 && !bytes.Equal(env.Signer, cur.env.Record.Owner) &&
 			!s.recoveryAcceptableLocked(env, cur.env, evidence) {
+			return false, nil
+		}
+		// v0.7.0 anti-censorship rule: a DIFFERENT-signer newcomer WITHOUT
+		// prev_hash is no ordinary path — not §8.2 (the owner signs), not
+		// §8.3 (a transfer MUST carry prev_hash), not §8.4 (recovery rides
+		// its quorum evidence, above). Before v0.7.0 such a record won the
+		// slot on a bare higher sequence (EnvelopeWins), so anyone could
+		// evict a LIVE record with sequence = MAX_UINT64 — not stealing it
+		// (the resolver's authority chain still rejects the impostor) but
+		// censoring the honest record out of every storing node until
+		// expiry. It is accepted ONLY when the store's live PARENT record
+		// authorizes the newcomer's key (parent.Owner == newcomer.Signer —
+		// the name was re-owned up the chain — or parent.Delegation ==
+		// newcomer.Signer, §3.4 delegated republication): that is the one
+		// legitimate way a name changes hands without a prev_hash link (a
+		// §8.3 TLD transfer re-delegates the subtree, and the new owner
+		// republishes; the resolver proves it against the parent chain,
+		// the store merely pre-screens it). TLD roots (no parent) get no
+		// exception: their hand-offs must use prev_hash + §8.3/§8.4.
+		if len(env.Record.PrevHash) == 0 && !bytes.Equal(env.Signer, cur.env.Record.Owner) &&
+			!s.parentAuthorizesLocked(env, cur.env, now) {
 			return false, nil
 		}
 	}
@@ -434,6 +458,43 @@ func (s *EnvelopeStore) PersistTo(dir string) (int, error) {
 // ----------------------------------------------------------------------
 // Internal helpers — callers MUST already hold s.mu.
 // ----------------------------------------------------------------------
+
+// parentAuthorizesLocked reports whether the store's LIVE parent record of
+// the incumbent authorizes a different-signer newcomer: the parent is the
+// same tld_id with the incumbent's most-specific label dropped (§3.4 chain;
+// display-order labels, so the parent of [www] is the TLD root []), looked
+// up at its own name-derived key. Authorization is parent.Owner ==
+// newcomer.Signer (the name was re-owned up the chain) OR parent.Delegation
+// == newcomer.Signer (a delegated republication, e.g. after a §8.3 TLD
+// transfer re-delegates the subtree). No parent locally held (TLD root,
+// not-yet-cached parent, dead parent) → NOT authorized: the store pre-screens
+// what it can see, and the resolver's full §3.4/§8.3 chain walk remains the
+// actual authority. Caller must hold s.mu.
+func (s *EnvelopeStore) parentAuthorizesLocked(newcomer, incumbent *wire.SignedEnvelope, now int64) bool {
+	labels, tldID, err := naming.DecodeWireName(incumbent.Record.Name)
+	if err != nil || len(labels) == 0 {
+		return false // undecodable or a TLD root: no parent to ask
+	}
+	// EncodeWireName validates its alias argument but does not encode it
+	// (wire names are labels + tld_id only), so a placeholder keeps the
+	// parent's bytes identical to the original publication's.
+	parentWire, err := naming.EncodeWireName(labels[1:], "x", tldID)
+	if err != nil {
+		return false
+	}
+	parentKey, err := KeyForWireName(parentWire)
+	if err != nil {
+		return false
+	}
+	var pk [constants.SHA256Len]byte
+	copy(pk[:], parentKey)
+	parent, ok := s.entries[pk]
+	if !ok || !s.aliveLocked(parent, now) {
+		return false
+	}
+	return bytes.Equal(parent.env.Record.Owner, newcomer.Signer) ||
+		(parent.env.Record.Delegation != nil && bytes.Equal(parent.env.Record.Delegation, newcomer.Signer))
+}
 
 // aliveLocked reports whether e is still within expires + ExpiryGrace at time
 // now (§6.4 step 4 / Appendix A line 980). Caller must hold s.mu.

@@ -232,7 +232,7 @@ func (c *Client) Resolve(ctx context.Context, name string) (*Resolved, error) {
 // signature against the exact claim context). It may be shorter than the
 // witness set — possibly empty; assembling the W=5 quorum is the caller's
 // check.
-func (c *Client) Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) (atts [][]byte, err error) {
+func (c *Client) Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64, nonce, powHash []byte) (atts [][]byte, err error) {
 	var out struct {
 		Attestations []string `json:"attestations"`
 	}
@@ -241,11 +241,15 @@ func (c *Client) Witness(ctx context.Context, alias string, tldID, claimant []by
 		TldID    string `json:"tld_id_hex"`
 		Claimant string `json:"claimant_hex"`
 		TS       uint64 `json:"ts"`
+		Nonce    string `json:"nonce_hex"`
+		PowHash  string `json:"pow_hash_hex"`
 	}{
 		Alias:    alias,
 		TldID:    hex.EncodeToString(tldID),
 		Claimant: hex.EncodeToString(claimant),
 		TS:       ts,
+		Nonce:    hex.EncodeToString(nonce),
+		PowHash:  hex.EncodeToString(powHash),
 	}, &out)
 	if err != nil {
 		return nil, err

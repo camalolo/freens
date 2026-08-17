@@ -37,6 +37,7 @@ package claims
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -100,12 +101,16 @@ const maxNonceLen = 128
 //	  2 : node_pk   ; bstr(32), Ed25519 verifying key
 //	  3 : ts        ; uint, the witness's own timestamp (seconds)
 //	  4 : sig       ; bstr(64): node_pk signs canonical
-//	               ;   ("freens-witness-v1", alias, tld_id, claimant_pk, ts)
+//	               ;   ("freens-witness-v2", claim_prefix_hash, ts)
 //	}
 //
-// The signed message is built by crypto.WitnessSigningMessage — a
-// length-prefixed, self-contained byte string (no CBOR on the verify path), so
-// verification is deterministic and dependency-free.
+// The signed message is built by crypto.WitnessSigningMessage — the v2
+// claim-bound form: a fixed-size, self-contained byte string (no CBOR on the
+// verify path), so verification is deterministic and dependency-free. The
+// claim_prefix_hash (NOT carried in the attestation — verifiers recompute it
+// from the claim's identity fields via AliasClaim.PrefixHash) commits to
+// {alias, tld_id, timestamp, claimant_pk}, binding each attestation to the
+// exact claim identity it was issued for.
 type WitnessAttestation struct {
 	NodeID []byte `cbor:"1,keyasint"` // 32 = SHA-256(NodePK)
 	NodePK []byte `cbor:"2,keyasint"` // 32, Ed25519 verifying key
@@ -113,20 +118,27 @@ type WitnessAttestation struct {
 	Sig    []byte `cbor:"4,keyasint"` // 64, Ed25519 signature
 }
 
-// NewWitnessAttestation builds a fully-signed attestation from a witness
+// NewWitnessAttestation builds a fully-signed v2 attestation from a witness
 // keypair. It computes NodePK from the keypair, NodeID = SHA-256(NodePK), and
-// signs the canonical witness message for (alias, tldID, claimantPK, ts). The
-// returned attestation Verify()s true under the same context.
-func NewWitnessAttestation(nodeKP *crypto.Keypair, ts uint64, alias string, tldID, claimantPK []byte) (*WitnessAttestation, error) {
+// signs the canonical witness message for (claimPrefixHash, ts) — the v2
+// binding (see crypto.WitnessSigningMessage): the signature commits to the
+// claim's full identity {alias, tld_id, timestamp, claimant_pk} via the
+// SHA-256 of its PoW prefix, so the attestation verifies only against that
+// exact claim. The returned attestation Verify()s true under the same
+// prefix hash.
+func NewWitnessAttestation(nodeKP *crypto.Keypair, ts uint64, claimPrefixHash []byte) (*WitnessAttestation, error) {
 	if nodeKP == nil {
 		return nil, fmt.Errorf("%w: nil keypair", ErrClaim)
+	}
+	if len(claimPrefixHash) != constants.SHA256Len {
+		return nil, fmt.Errorf("%w: claim_prefix_hash must be %d bytes", ErrClaim, constants.SHA256Len)
 	}
 	nodePK := nodeKP.Public()
 	nodeID, err := crypto.NodeID(nodePK)
 	if err != nil {
 		return nil, err
 	}
-	msg, err := crypto.WitnessSigningMessage(alias, tldID, claimantPK, ts)
+	msg, err := crypto.WitnessSigningMessage(claimPrefixHash, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -139,19 +151,25 @@ func NewWitnessAttestation(nodeKP *crypto.Keypair, ts uint64, alias string, tldI
 	}, nil
 }
 
-// Verify reports whether the attestation is valid for the claim context
-// (alias, tldID, claimantPK). It returns true iff BOTH hold:
+// Verify reports whether the attestation is valid for the claim whose PoW
+// prefix hashes to claimPrefixHash. It returns true iff BOTH hold:
 //
 //   - NodeID == SHA-256(NodePK) (binds the node_id to the signing key, so a
 //     claimant cannot forge an attestation under an unrelated node_id), AND
-//   - Sig verifies under NodePK against the canonical signing input for
-//     (alias, tldID, claimantPK, TS).
+//   - Sig verifies under NodePK against the canonical v2 signing input
+//     ("freens-witness-v2" || claimPrefixHash || TS).
+//
+// Because claimPrefixHash commits to (alias, tld_id, claimant-asserted
+// timestamp, claimant_pk), an attestation gathered for one claim identity
+// cannot be replayed against a different claim for the same alias — in
+// particular not against a re-mined backdated claim (different timestamp →
+// different prefix hash → signature fails).
 //
 // It never returns an error; a bad signature, a node_id/pubkey mismatch, or a
-// wrong-length input simply returns false (matching crypto.Verify's no-raise
-// contract). Tampering ANY of (NodeID, NodePK, TS, Sig) or the claim context
-// (alias, tldID, claimantPK) makes this return false.
-func (w *WitnessAttestation) Verify(alias string, tldID, claimantPK []byte) bool {
+// wrong-length prefix hash simply returns false (matching crypto.Verify's
+// no-raise contract). Tampering ANY of (NodeID, NodePK, TS, Sig) or the claim
+// identity makes this return false.
+func (w *WitnessAttestation) Verify(claimPrefixHash []byte) bool {
 	if w == nil {
 		return false
 	}
@@ -160,8 +178,8 @@ func (w *WitnessAttestation) Verify(alias string, tldID, claimantPK []byte) bool
 	if err != nil || !bytes.Equal(nid, w.NodeID) {
 		return false
 	}
-	// (b) signature must verify under node_pk.
-	msg, err := crypto.WitnessSigningMessage(alias, tldID, claimantPK, w.TS)
+	// (b) signature must verify under node_pk over the v2 claim-bound message.
+	msg, err := crypto.WitnessSigningMessage(claimPrefixHash, w.TS)
 	if err != nil {
 		return false
 	}
@@ -317,12 +335,34 @@ func (c *AliasClaim) VerifyClaimantConsistency() bool {
 	return bytes.Equal(got, c.TldID)
 }
 
-// ValidWitnesses returns the subset of Witnesses that Verify() under
-// (Alias, TldID, ClaimantPK) and whose NodeID == SHA-256(NodePK). The subset is
-// deduplicated by NodeID keeping the FIRST occurrence: a verifier must not let
-// an attacker substitute a fresh valid signature for a NodeID already present —
-// the first one wins.
+// PrefixHash returns SHA-256(Prefix()) — the claim-prefix hash a witness
+// signs over (v2 attestation binding) and that the §6.3 witness RPC carries
+// as claim_prefix_hash. It commits to the claim's identity fields
+// {alias, tld_id, timestamp, claimant_pk}.
+func (c *AliasClaim) PrefixHash() ([]byte, error) {
+	prefix, err := c.Prefix()
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.Sum256(prefix)
+	return h[:], nil
+}
+
+// ValidWitnesses returns the subset of Witnesses that Verify() against this
+// claim's prefix hash (v2 binding: NodeID == SHA-256(NodePK) AND the
+// signature covers the claim identity via its prefix hash). The subset is
+// deduplicated by NodeID keeping the FIRST occurrence: a verifier must not
+// let an attacker substitute a fresh valid signature for a NodeID already
+// present — the first one wins.
+//
+// This is the CRYPTOGRAPHIC filter only. Quorum counting (HasQuorum,
+// VerifyFull) additionally applies the §7.3/§7.4 corroboration band — see
+// corroboratingWitnesses.
 func (c *AliasClaim) ValidWitnesses() []*WitnessAttestation {
+	prefixHash, err := c.PrefixHash()
+	if err != nil {
+		return nil // an unhashable claim identity attests nothing
+	}
 	seen := make(map[string]struct{})
 	deduped := make([]*WitnessAttestation, 0, len(c.Witnesses))
 	for _, w := range c.Witnesses {
@@ -335,20 +375,54 @@ func (c *AliasClaim) ValidWitnesses() []*WitnessAttestation {
 	}
 	out := make([]*WitnessAttestation, 0, len(deduped))
 	for _, w := range deduped {
-		if w.Verify(c.Alias, c.TldID, c.ClaimantPK) {
+		if w.Verify(prefixHash) {
 			out = append(out, w)
 		}
 	}
 	return out
 }
 
-// HasQuorum reports whether there are at least quorum DISTINCT valid witnesses
-// (after ValidWitnesses dedup). If witnessSetIDs is non-nil, only witnesses
-// whose hex(NodeID) is in the set are counted — this is the §7.3/§7.4
-// restriction to the WITNESS_SET (=8) closest nodes to
-// K_claim = SHA-256(0x03 || "claim:" || alias).
+// corroboratingWitnesses is ValidWitnesses further restricted to the
+// CORROBORATION BAND: a witness only corroborates a claim when its own
+// attestation timestamp is consistent with the claimant-asserted timestamp —
+//
+//	claim.ts - SKEW_TOLERANCE  <=  w.TS  <=  claim.ts + WITNESS_COOLDOWN + SKEW_TOLERANCE
+//
+// Rationale (v0.7.0 security fix, the §7.4 backdating hole): the §7.4 step-3
+// order is earliest-timestamp-first on the CLAIMANT-asserted timestamp, and
+// the spec's own argument is "witness timestamps, not claimant timestamps,
+// are the honest ordering signal". The honest witness flow puts w.TS within
+// [claim.ts - skew, claim.ts + cooldown + skew]: a legitimate claim is
+// witnessed at mining time (|w.TS - claim.ts| ≈ seconds) or re-presented
+// during register's cooldown-safe retries (claim.ts up to WITNESS_COOLDOWN
+// old), with SKEW_TOLERANCE (60 s) of clock slack on both ends. An
+// attestation dated OUTSIDE that band is either not from the honest flow or
+// not for this claim's asserted time — it must not count toward the quorum,
+// so a backdated claim cannot borrow modern-dated attestations (fabricated or
+// transplanted) to fake corroboration.
+func (c *AliasClaim) corroboratingWitnesses() []*WitnessAttestation {
+	lo := int64(c.Timestamp) - int64(constants.SkewTolerance)
+	hi := int64(c.Timestamp) + int64(constants.WitnessCooldown) + int64(constants.SkewTolerance)
+	out := make([]*WitnessAttestation, 0, len(c.Witnesses))
+	for _, w := range c.ValidWitnesses() {
+		if ts := int64(w.TS); ts >= lo && ts <= hi {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// HasQuorum reports whether there are at least quorum DISTINCT
+// CORROBORATING witnesses: valid v2 attestations (see ValidWitnesses) whose
+// own timestamps fall inside the corroboration band around the claim's
+// asserted timestamp. If witnessSetIDs is non-nil, only witnesses whose
+// hex(NodeID) is in the set are counted — this is the §7.3/§7.4 restriction
+// to the WITNESS_SET (=8) closest nodes to
+// K_claim = SHA-256(0x03 || "claim:" || alias), which the RESOLVER enforces
+// when its lookup converged on a routing view dense enough to name that set
+// (nil = view too sparse; see the DHTLookup witness-set plumbing).
 func (c *AliasClaim) HasQuorum(witnessSetIDs map[string]bool, quorum int) bool {
-	valid := c.ValidWitnesses()
+	valid := c.corroboratingWitnesses()
 	counted := make(map[string]struct{}, len(valid))
 	for _, w := range valid {
 		k := hex.EncodeToString(w.NodeID)
@@ -531,8 +605,11 @@ func OrderClaims(claims []*AliasClaim) []*AliasClaim {
 //   - the PoW is valid at difficultyBits (<0 / InferDifficulty → inferred from
 //     Nonce[0] when sane, else PoWDifficultyInit) — recomputed, never trusting
 //     the stored hash;
-//   - the witness quorum is met among distinct valid witnesses, optionally
-//     restricted to witnessSetIDs (the WITNESS_SET closest to K_claim).
+//   - the witness quorum is met among DISTINCT CORROBORATING witnesses: v2
+//     attestations bound to this claim's prefix hash, dated inside the
+//     corroboration band around the claim's asserted timestamp (see
+//     corroboratingWitnesses), optionally restricted to witnessSetIDs (the
+//     WITNESS_SET closest to K_claim when the verifier's view can name it).
 func VerifyFull(c *AliasClaim, difficultyBits int, witnessSetIDs map[string]bool, quorum int) bool {
 	if !c.VerifyClaimantConsistency() {
 		return false

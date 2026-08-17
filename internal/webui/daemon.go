@@ -22,7 +22,7 @@ type Daemon interface {
 	Publish(ctx context.Context, env *wire.SignedEnvelope) (int, error)
 	PublishClaim(ctx context.Context, env *wire.SignedEnvelope) error
 	Get(ctx context.Context, key []byte) (*wire.SignedEnvelope, error)
-	Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) ([][]byte, error)
+	Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64, nonce, powHash []byte) ([][]byte, error)
 	Store(ctx context.Context) (*admin.StoreResponse, error)
 	Difficulty(ctx context.Context) (*admin.Difficulty, error)
 }
@@ -60,8 +60,8 @@ func (d *daemonClient) Get(ctx context.Context, key []byte) (*wire.SignedEnvelop
 	return d.c.Get(ctx, key)
 }
 
-func (d *daemonClient) Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64) ([][]byte, error) {
-	return d.c.Witness(ctx, alias, tldID, claimant, ts)
+func (d *daemonClient) Witness(ctx context.Context, alias string, tldID, claimant []byte, ts uint64, nonce, powHash []byte) ([][]byte, error) {
+	return d.c.Witness(ctx, alias, tldID, claimant, ts, nonce, powHash)
 }
 
 func (d *daemonClient) Store(ctx context.Context) (*admin.StoreResponse, error) {

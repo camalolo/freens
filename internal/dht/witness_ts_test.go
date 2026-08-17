@@ -3,7 +3,8 @@
 // permanent alias theft once cooldowns lapse). Legitimate windows: signed
 // at mining time (fresh) or re-presented inside register's cooldown-safe
 // retry window; anything future-dated beyond skew or older than the
-// cooldown is refused.
+// cooldown is refused. Since v0.7.0 the witness ALSO verifies the claim's
+// PoW (§7.3) — the fixture mines a real difficulty-8 pair per case.
 package dht
 
 import (
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 )
@@ -41,10 +43,24 @@ func witnessTSCase(t *testing.T, tsOffset int64) int {
 		t.Fatal(err)
 	}
 	ts := uint64(time.Now().Unix() + tsOffset)
+	const alias = "ts-test"
+	withFastWitnessPoW(t)
+
+	// Mine the PoW for this exact (backdated/fresh/future) identity: the
+	// witness verifies it before its timestamp gate, so the refusal under
+	// test is the ts gate's, not a PoW artifact.
+	prefix, err := (&claims.AliasClaim{Alias: alias, TldID: tldID, Timestamp: ts, ClaimantPK: kp.Public()}).Prefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, powHash, err := crypto.MinePoW(prefix, 8, 2_000_000, 16)
+	if err != nil {
+		t.Fatalf("MinePoW (fixture): %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	atts, err := a.CollectWitnesses(ctx, "ts-test", tldID, kp.Public(), ts, 1)
+	atts, err := a.CollectWitnesses(ctx, alias, tldID, kp.Public(), ts, nonce, powHash, 1)
 	if err != nil {
 		t.Fatalf("CollectWitnesses(offset=%d): %v", tsOffset, err)
 	}

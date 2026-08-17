@@ -191,7 +191,7 @@ func TestRegisterDaemonPathCooldownSafe(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	atts, err := collectWitnessesViaAdmin(ctx, c, "alice", tldID, kp.Public(), claim.Timestamp)
+	atts, err := collectWitnessesViaAdmin(ctx, c, "alice", tldID, kp.Public(), claim.Timestamp, claim.Nonce, claim.PowHash)
 	if err != nil {
 		t.Fatalf("re-witness (daemon transport): %v", err)
 	}

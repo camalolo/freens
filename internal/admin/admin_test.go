@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
+	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/naming"
@@ -188,6 +189,12 @@ func makeTLDRecord(t *testing.T, kp *crypto.Keypair, alias string) (*wire.Signed
 // prefix-hash binding — both by design).
 func makeClaimTLDRecord(t *testing.T, kp *crypto.Keypair, alias string) (*wire.SignedEnvelope, *claims.AliasClaim, []byte) {
 	t.Helper()
+	// v0.7.0: the hPut K_claim screen runs the full §7.4 filter, so the
+	// fixture claim needs its W-witness quorum (in-band v2 attestations)
+	// and the fast-difficulty floor to survive publication at K_claim.
+	prevD := claims.PoWDifficultyInit
+	claims.PoWDifficultyInit = 8
+	t.Cleanup(func() { claims.PoWDifficultyInit = prevD })
 	claim, err := claims.MineAliasClaim(alias, kp, uint64(time.Now().Unix()), 8, 1<<20, 12)
 	if err != nil {
 		t.Fatalf("mine claim: %v", err)
@@ -195,6 +202,26 @@ func makeClaimTLDRecord(t *testing.T, kp *crypto.Keypair, alias string) (*wire.S
 	if !claim.VerifyPoW(8) {
 		t.Fatal("mined claim does not verify at its own difficulty (fixture sanity)")
 	}
+	tid, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < constants.W; i++ {
+		wkp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := claims.NewWitnessAttestation(wkp, claim.Timestamp+uint64(i), ph)
+		if err != nil {
+			t.Fatalf("NewWitnessAttestation: %v", err)
+		}
+		claim.Witnesses = append(claim.Witnesses, w)
+	}
+	_ = tid
 	env, key := makeTLDRecord(t, kp, alias)
 	cb, err := claim.CanonicalBytes()
 	if err != nil {
@@ -547,9 +574,28 @@ func TestWitness(t *testing.T) {
 	}
 	ts := uint64(time.Now().Unix())
 
+	// Since v0.7.0 the witness verifies the PoW before signing (§7.3): mine
+	// a fast difficulty-8 pair for the identity (and lower the claims
+	// package's floor to match, as the other fixtures do).
+	prevD := claims.PoWDifficultyInit
+	claims.PoWDifficultyInit = 8
+	t.Cleanup(func() { claims.PoWDifficultyInit = prevD })
+	prefix, err := (&claims.AliasClaim{Alias: "witfoo", TldID: tldID, Timestamp: ts, ClaimantPK: claimant.Public()}).Prefix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, powHash, err := crypto.MinePoW(prefix, 8, 2_000_000, 16)
+	if err != nil {
+		t.Fatalf("MinePoW (fixture): %v", err)
+	}
+	ph, err := (&claims.AliasClaim{Alias: "witfoo", TldID: tldID, Timestamp: ts, ClaimantPK: claimant.Public()}).PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	atts, err := c.Witness(ctx, "witfoo", tldID, claimant.Public(), ts)
+	atts, err := c.Witness(ctx, "witfoo", tldID, claimant.Public(), ts, nonce, powHash)
 	if err != nil {
 		t.Fatalf("Witness: %v", err)
 	}
@@ -561,7 +607,7 @@ func TestWitness(t *testing.T) {
 		if derr != nil {
 			t.Fatalf("attestation %d does not decode: %v", i, derr)
 		}
-		if !att.Verify("witfoo", tldID, claimant.Public()) {
+		if !att.Verify(ph) {
 			t.Errorf("attestation %d does not §7.3-verify for the claim identity", i)
 		}
 		if !bytes.Equal(att.NodeID, b.ID()) {

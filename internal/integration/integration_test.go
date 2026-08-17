@@ -82,14 +82,19 @@ func TestEndToEndFlow(t *testing.T) {
 		t.Fatal("VerifyPoW(InferDifficulty): want true")
 	}
 
-	// 3. Build W witnesses (distinct node keypairs) co-signing the claim.
+	// 3. Build W witnesses (distinct node keypairs) co-signing the claim
+	// (v2 attestations, bound to the claim's prefix hash).
+	claimPh, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
 	witnesses := make([]*claims.WitnessAttestation, 0, constants.W)
 	for i := 0; i < constants.W; i++ {
 		nkp, err := crypto.Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
-		w, err := claims.NewWitnessAttestation(nkp, uint64(now)+uint64(i), "foo", aliceTID, alice.Public())
+		w, err := claims.NewWitnessAttestation(nkp, uint64(now)+uint64(i), claimPh)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -119,7 +124,7 @@ func TestEndToEndFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	extraW, err := claims.NewWitnessAttestation(extraKP, uint64(now)+999, "foo", aliceTID, alice.Public())
+	extraW, err := claims.NewWitnessAttestation(extraKP, uint64(now)+999, claimPh)
 	if err != nil {
 		t.Fatal(err)
 	}

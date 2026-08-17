@@ -91,13 +91,17 @@ func buildClaimWorldBelow(t *testing.T, alias string, difficulty, ceiling int) (
 			t.Fatalf("fixture: could not mine below %d bits at difficulty %d in 500 attempts", ceiling, difficulty)
 		}
 	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
 	witnesses := make([]*claims.WitnessAttestation, 0, constants.W)
 	for i := 0; i < constants.W; i++ {
 		wkp, err := crypto.Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
-		att, err := claims.NewWitnessAttestation(wkp, claimTS+uint64(i), alias, tldID, claimant.Public())
+		att, err := claims.NewWitnessAttestation(wkp, claimTS+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}

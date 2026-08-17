@@ -35,6 +35,7 @@ import (
 // envelopes can be ordered (T vs T+1) per §7.4 step 3.
 func contestedClaimEnv(t *testing.T, alias string, ts uint64) (*wire.SignedEnvelope, []byte) {
 	t.Helper()
+	withFastWitnessPoW(t) // the hPut K_claim screen verifies the PoW at the floor
 	claimant, err := crypto.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -47,13 +48,17 @@ func contestedClaimEnv(t *testing.T, alias string, ts uint64) (*wire.SignedEnvel
 	if err != nil {
 		t.Fatalf("MineAliasClaim: %v", err)
 	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
 	witnesses := make([]*claims.WitnessAttestation, 0, constants.W)
 	for i := 0; i < constants.W; i++ {
 		wkp, err := crypto.Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
-		w, err := claims.NewWitnessAttestation(wkp, ts+uint64(i), alias, tid, claimant.Public())
+		w, err := claims.NewWitnessAttestation(wkp, ts+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}
@@ -135,7 +140,7 @@ func TestCollectClaimsMergesCompetingClaims(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	set, err := c.CollectClaims(ctx, alias)
+	set, _, err := c.CollectClaims(ctx, alias)
 	if err != nil {
 		t.Fatalf("CollectClaims: %v", err)
 	}
@@ -185,7 +190,7 @@ func TestCollectClaimsIncludesLocalCopyAndDedupes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	set, err := c.CollectClaims(ctx, alias)
+	set, _, err := c.CollectClaims(ctx, alias)
 	if err != nil {
 		t.Fatalf("CollectClaims: %v", err)
 	}
@@ -209,7 +214,7 @@ func TestCollectClaimsIncludesLocalCopyAndDedupes(t *testing.T) {
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
-	set2, err := c.CollectClaims(ctx, alias)
+	set2, _, err := c.CollectClaims(ctx, alias)
 	if err != nil {
 		t.Fatalf("CollectClaims (local only): %v", err)
 	}
@@ -232,7 +237,7 @@ func TestCollectClaimsUnknownAlias(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	set, err := c.CollectClaims(ctx, "no-such-claim-anywhere")
+	set, _, err := c.CollectClaims(ctx, "no-such-claim-anywhere")
 	if err != nil {
 		t.Fatalf("CollectClaims(unknown): %v", err)
 	}

@@ -180,9 +180,13 @@ func buildXferWorld(t *testing.T, a *xferNode, alias string, now int64) *xferWor
 		}
 		witnessKPs = append(witnessKPs, wkp)
 	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
 	atts := make([]*claims.WitnessAttestation, 0, len(witnessKPs))
 	for i, wkp := range witnessKPs {
-		att, err := claims.NewWitnessAttestation(wkp, uint64(now)+uint64(i), alias, tldID, k1.Public())
+		att, err := claims.NewWitnessAttestation(wkp, uint64(now)+uint64(i), ph)
 		if err != nil {
 			t.Fatalf("NewWitnessAttestation: %v", err)
 		}

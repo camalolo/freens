@@ -1188,14 +1188,25 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		return n.errResp(m, 305, "bad record name or key")
 	}
 	// §7.4 line 602-604 ("storing nodes keep the top 2 by ordering"): a put
-	// landing at K_claim ALSO offers the envelope into the top-2 claim pool —
-	// REGARDLESS of the winner-slot outcome below. Two competing claims at
-	// equal sequence resolve the single store slot by the H_record
-	// tie-break, but both belong in the pool so verifiers collecting "all
-	// competing claims nodes offer" still see the pair.
+	// landing at K_claim passes the §7.4 step-2 claim screen BEFORE it can
+	// enter the node's stores — claimant consistency (tld_id binds to the
+	// claimant key), a recomputed PoW, and ≥ W corroborating v2 witnesses
+	// (claims.VerifyFull; witnessSetIDs is nil here — membership is a
+	// RESOLVER-side check that needs a converged routing view, not a
+	// storing-node one). Before v0.7.0 a garbage claim — fabricated quorum,
+	// invalid PoW, backdated timestamps — was pooled and stored as long as
+	// its CARRIER envelope was well-signed, which made claim-space seeding
+	// (DHT pollution / backdated-priority propagation) free; the screen
+	// costs ~W Ed25519 verifies, the same order as the envelope verify
+	// above. The envelope then ALSO goes into the top-2 claim pool so
+	// verifiers collecting "all competing claims nodes offer" still see the
+	// pair.
 	poolKept := false
 	if claim, cerr := claims.DecodeAliasClaim(env.Record.Claim); cerr == nil {
 		if kClaim, kerr := KeyForClaim(claim.Alias); kerr == nil && bytes.Equal(key, kClaim) {
+			if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
+				return n.errResp(m, 305, "claim fails the §7.4 filter (PoW/quorum)")
+			}
 			n.claims.Offer(kClaim, env)
 			poolKept = n.claims.Contains(kClaim, recordHashOrNil(env)) // offered now or already pooled
 		}
@@ -1274,25 +1285,36 @@ func (n *Node) putKeyFor(m *wire.Message, env *wire.SignedEnvelope) ([]byte, err
 // valid signatures from W = 5 distinct witnesses").
 //
 // DEVIATION from §6.3 (documented, spec is underspecified here): the table
-// gives arguments {claim_prefix_hash, claimant, ts} only, but the
-// WitnessAttestation signature input (§7.3 lines 561-563) is
-// ("freens-witness-v1", alias, tld_id, claimant_pk, ts). The PoW prefix hash
-// is SHA-256 over the canonical CBOR identity fields {alias, tld_id, ts,
-// claimant_pk} (Appendix C.1) and is a one-way digest — a witness cannot
-// recover alias/tld_id from it, yet it MUST bind both into the signed
-// attestation. The method therefore carries two extra arguments: "alias"
-// (text) and "tld_id" (bstr). Both are re-verified against the supplied
-// claim_prefix_hash, so a requester cannot make the node sign a message for
-// (alias, tld_id) pairs other than the ones hashed into the prefix.
+// gives arguments {claim_prefix_hash, claimant, ts} only, but the attestation
+// must bind the full claim identity, and §7.3 also demands "witnesses MUST
+// verify the PoW before signing" — neither is computable from a one-way
+// digest alone. The method therefore carries four extra arguments: "alias"
+// (text), "tld_id" (bstr), "nonce" (bstr) and "pow_hash" (bstr). The identity
+// fields are re-verified against the supplied claim_prefix_hash, and the PoW
+// pair is re-verified against the prefix (below), so a requester cannot make
+// the node sign a message for a claim other than the one it can demonstrate.
 //
 // Checks performed, in order:
 //
-//  1. Structural: alias validates per §3.2; tld_id is 32 bytes; claimant is a
-//     32-byte Ed25519 public key; ts is a uint.
-//  2. Prefix binding: claim_prefix_hash == SHA-256(PoW prefix(alias, tld_id,
+//  1. Throttle (§12): the same per-source-IP token bucket as get/find_node
+//     (NodeConfig.GetRateLimit / GetBurst; default 50/s burst 100). A witness
+//     RPC costs a CBOR decode, a SHA-256 PoW re-verification AND an Ed25519
+//     signature — the most expensive unauthenticated work a stranger can
+//     induce — so it draws from the same read budget rather than floating
+//     free (a witness-RPC flood is a CPU DoS otherwise; excess requests get
+//     error 301 "throttled", an answer rather than a drop).
+//  2. Structural: alias validates per §3.2; tld_id is 32 bytes; claimant is a
+//     32-byte Ed25519 public key; ts is a uint; nonce/pow_hash are present.
+//  3. Prefix binding: claim_prefix_hash == SHA-256(PoW prefix(alias, tld_id,
 //     claimant, ts)) — recomputed via the claims package's prefix builder, so
 //     client and witness agree byte-for-byte with the mining input.
-//  3. §7.3 WITNESS_COOLDOWN (constants.WitnessCooldown = 3600 s): the node
+//  4. PoW verification (§7.3: "witnesses MUST verify the PoW before
+//     signing"): SHA-256(prefix || nonce) must equal the supplied pow_hash
+//     AND meet the difficulty inferred from nonce[0] (Appendix A.4
+//     convention, floored at PoWDifficultyInit). The hash is recomputed,
+//     never trusted; an invalid PoW is refused with 305 — this node does not
+//     lend its identity to a claim it has not checked.
+//  5. §7.3 WITNESS_COOLDOWN (constants.WitnessCooldown = 3600 s): the node
 //     signs at most ONE claim per alias per cooldown window. Re-signing the
 //     SAME claim (same prefix hash) is allowed (idempotent refresh); a
 //     DIFFERENT claim for the same alias inside the window is refused with
@@ -1300,26 +1322,44 @@ func (n *Node) putKeyFor(m *wire.Message, env *wire.SignedEnvelope) ([]byte, err
 //     earlier-ordered claim; ordering is a verifier-side computation, so the
 //     conservative refusal here is safe — the requester retries after the
 //     cooldown or with other witnesses.)
-//  4. Co-sign via claims.NewWitnessAttestation with the NODE's keypair; the
-//     attestation TS is this witness's OWN clock (§7.3 line 560: "witness's
-//     own timestamp"), not the claimant-asserted ts.
+//  6. Co-sign via claims.NewWitnessAttestation with the NODE's keypair. The
+//     attestation is v2-bound to the recomputed claim prefix hash (so the
+//     signature commits to the claim identity INCLUDING its timestamp — it
+//     cannot be transplanted onto a re-mined, backdated claim), and its TS is
+//     this witness's OWN clock (§7.3 line 560: "witness's own timestamp"),
+//     not the claimant-asserted ts.
 //
 // On success the response carries {attestation: canonical-CBOR
 // WitnessAttestation} plus the node's current PoW difficulty (Appendix A.4:
 // "Nodes gossip the current D in witness responses"). Attesting is logged at
 // info level.
 //
+// Appendix A.4 retarget accounting: only the FIRST co-sign of a given alias
+// by this node counts as an "accepted claim" (n.diff.recordAccepted).
+// Idempotent re-signs of the same claim and competing claims for an alias
+// this node already signed do not inflate the acceptance count — otherwise a
+// re-sign flood (or honest retry traffic) would drive the network difficulty
+// up through the gossiped median. witnessLast is in-memory, so a restarted
+// node counts each alias once per run: acceptable for a retarget statistic,
+// and stated here so the limitation is explicit.
+//
 // A Passive node (§6.1) still witnesses: witnessing signs a timestamp, it
 // stores nothing, so it is participation only in the weak §7 sense this node
 // already opted into by joining the network.
-func (n *Node) hWitness(m *wire.Message, _ *net.UDPAddr) *wire.Message {
+func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	// (1) §12 per-source-IP throttle, shared with get/find_node.
+	if !n.allowRead(raddr) {
+		return n.errResp(m, 301, "throttled")
+	}
 	alias, _ := m.A["alias"].(string)
 	tldID, _ := m.A["tld_id"].([]byte)
 	claimant, _ := m.A["claimant"].([]byte)
 	prefixHash, _ := m.A["claim_prefix_hash"].([]byte)
+	nonce, _ := m.A["nonce"].([]byte)
+	powHash, _ := m.A["pow_hash"].([]byte)
 	ts, ok := asUint64(m.A["ts"])
 	aliasN, aerr := naming.ValidateAlias(alias)
-	if !ok || aerr != nil {
+	if !ok || aerr != nil || len(nonce) == 0 || len(powHash) != constants.SHA256Len {
 		return n.errResp(m, 305, "bad witness args")
 	}
 	if len(tldID) != constants.SHA256Len || len(claimant) != constants.Ed25519PublicKeyLen {
@@ -1332,6 +1372,20 @@ func (n *Node) hWitness(m *wire.Message, _ *net.UDPAddr) *wire.Message {
 	}
 	if len(prefixHash) != constants.SHA256Len || !bytes.Equal(prefixHash, want) {
 		return n.errResp(m, 305, "bad claim prefix hash")
+	}
+	// (4) PoW verification via the claims package's exact prefix builder and
+	// difficulty inference (nonce[0] when sane, else PoWDifficultyInit):
+	// VerifyPoW recomputes SHA-256(prefix || nonce), compares it to the
+	// supplied pow_hash, and checks the leading zero bits.
+	if !(&claims.AliasClaim{
+		Alias:      aliasN,
+		TldID:      tldID,
+		Timestamp:  ts,
+		Nonce:      nonce,
+		ClaimantPK: claimant,
+		PowHash:    powHash,
+	}).VerifyPoW(claims.InferDifficulty) {
+		return n.errResp(m, 305, "invalid proof-of-work")
 	}
 
 	// Claim-timestamp sanity (the §7.4 anti-forgery gate, found auditing
@@ -1370,8 +1424,10 @@ func (n *Node) hWitness(m *wire.Message, _ *net.UDPAddr) *wire.Message {
 		return n.errResp(m, 301, "cooldown")
 	}
 
-	// Co-sign with the node keypair; TS is the witness's own clock.
-	att, err := claims.NewWitnessAttestation(n.kp, uint64(now), aliasN, tldID, claimant)
+	// Co-sign with the node keypair; TS is the witness's own clock; the
+	// v2 attestation binds the recomputed prefix hash `want` (the claim
+	// identity, timestamp included).
+	att, err := claims.NewWitnessAttestation(n.kp, uint64(now), want)
 	if err != nil {
 		return n.errResp(m, 305, "attestation failed")
 	}
@@ -1379,9 +1435,13 @@ func (n *Node) hWitness(m *wire.Message, _ *net.UDPAddr) *wire.Message {
 	if err != nil {
 		return n.errResp(m, 301, "attestation encode failed")
 	}
-	// Appendix A.4: count the accepted claim; every PoWRetargetBlock
-	// acceptances the node's own difficulty retargets over the block span.
-	n.diff.recordAccepted(now)
+	// Appendix A.4: count the accepted claim only on this node's FIRST
+	// co-sign of the alias (`seen` from the witnessLast probe above);
+	// every PoWRetargetBlock acceptances the node's own difficulty
+	// retargets over the block span.
+	if !seen {
+		n.diff.recordAccepted(now)
+	}
 	n.log.Info("dht: witnessed alias claim",
 		"alias", aliasN, "claimant", HexID(claimant), "ts", now)
 	return n.okResp(m, map[string]any{
@@ -1985,22 +2045,31 @@ func (n *Node) publishKeyed(ctx context.Context, key []byte, env *wire.SignedEnv
 // Client-side witness collection (§7.4 registration steps 3-4)
 // ---------------------------------------------------------------------------
 
+// witnessSelfSlack is how many EXTRA candidates CollectWitnesses asks the
+// iterative walk for, so that dropping this node's own ID (which the walk
+// legitimately returns among the closest — Kademlia does not exclude the
+// walker) still leaves `count` witness candidates.
+const witnessSelfSlack = 4
+
 // CollectWitnesses implements the claimant side of §7.4 registration step 3:
 // "iteratively find the WITNESS_SET closest nodes to K_claim; send each a
-// witness RPC with (prefix_hash, claimant_pk, timestamp)". It selects the
-// count contacts of the routing table closest to K_claim (count <= 0 defaults
-// to constants.WitnessSet = 8), sends the signed witness queries in parallel,
-// and returns every attestation that (a) decodes, (b) verifies for the exact
-// claim context (alias, tldID, claimantPK) per §7.3, and (c) was produced by
-// the node it was fetched from (attestation NodeID == the queried contact's
-// Node ID) — so a malicious peer cannot relay someone else's or a forged
-// attestation. Results are deduplicated by NodeID.
+// witness RPC with (prefix_hash, claimant_pk, timestamp)". It runs the
+// iterative Kademlia walk on K_claim (§7.4 "iteratively find" — a converged,
+// not merely local-table, view of the closest set) and takes the count
+// closest contacts it yields (count <= 0 defaults to constants.WitnessSet =
+// 8), sending the signed witness queries in parallel. Each query carries the
+// claim's nonce and pow_hash so the witnesses can verify the PoW (§7.3).
+// CollectWitnesses returns every attestation that (a) decodes, (b) verifies
+// against the claim's prefix hash (v2 binding) per §7.3, and (c) was
+// produced by the node it was fetched from (attestation NodeID == the
+// queried contact's Node ID) — so a malicious peer cannot relay someone
+// else's or a forged attestation. Results are deduplicated by NodeID.
 //
 // Errors from unreachable/refusing peers are swallowed (witness gathering is
 // best-effort; the caller re-queries or proceeds when < W attestations come
 // back). The returned slice may therefore be shorter than count — possibly
 // empty; assembling ≥ W attestations (§7.3 quorum) is the caller's check.
-func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claimantPK []byte, ts uint64, count int) ([]*claims.WitnessAttestation, error) {
+func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash []byte, count int) ([]*claims.WitnessAttestation, error) {
 	aliasN, err := naming.ValidateAlias(alias)
 	if err != nil {
 		return nil, err
@@ -2010,6 +2079,9 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 	}
 	if len(claimantPK) != constants.Ed25519PublicKeyLen {
 		return nil, fmt.Errorf("dht: claimant must be %d bytes, got %d", constants.Ed25519PublicKeyLen, len(claimantPK))
+	}
+	if len(nonce) == 0 || len(powHash) != constants.SHA256Len {
+		return nil, fmt.Errorf("dht: witness RPC needs the PoW pair (nonce, pow_hash) — witnesses verify the PoW before signing (§7.3)")
 	}
 	if count <= 0 {
 		count = constants.WitnessSet // WITNESS_SET = 8 candidate witnesses (§7.3)
@@ -2023,16 +2095,44 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 		return nil, err
 	}
 
+	// §7.4 step 3: "Iteratively find the WITNESS_SET closest nodes to
+	// K_claim". The walk (not a bare local-table Closest) is what makes the
+	// registrant's witness set and a verifier's converged view of the 8
+	// closest agree — Kademlia convergence — which the resolver-side
+	// witness-set membership check depends on. On a cold table the walk
+	// simply returns the bootstrap-reachable candidates. SELF is excluded
+	// (the walk's shortlist legitimately contains this node's own ID —
+	// learned back from peers — but the routing table never holds it, and a
+	// claimant co-signing its own claim is no witness at all); the walk is
+	// therefore asked for count+witnessSelfSlack candidates so the filter
+	// cannot shrink the haul below count.
+	candidates := n.IterativeFindNode(ctx, kClaim, count+witnessSelfSlack)
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if !bytes.Equal(c.NodeID, n.ID()) {
+			filtered = append(filtered, c)
+		}
+	}
+	candidates = filtered
+	if len(candidates) > count {
+		candidates = candidates[:count]
+	}
+	if len(candidates) == 0 {
+		// Island / no reachable peers: fall back to the local view (empty
+		// on a true island) so the caller still gets whatever it can.
+		candidates = n.rt.Closest(kClaim, count)
+	}
+
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
 		out []*claims.WitnessAttestation
 	)
-	for _, c := range n.rt.Closest(kClaim, count) {
+	for _, c := range candidates {
 		wg.Add(1)
 		go func(c *NodeContact) {
 			defer wg.Done()
-			att := n.witnessFromPeer(ctx, c, aliasN, tldID, claimantPK, ts, prefixHash)
+			att := n.witnessFromPeer(ctx, c, aliasN, tldID, claimantPK, ts, nonce, powHash, prefixHash)
 			if att == nil {
 				return
 			}
@@ -2058,11 +2158,13 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 }
 
 // witnessFromPeer issues one §6.3 witness RPC to c and returns the parsed,
-// context-verified attestation (nil on any failure — see CollectWitnesses).
-// The arguments carry the §6.3-documented deviation: alias and tld_id ride
-// alongside claim_prefix_hash/claimant/ts because the attestation signature
-// input (§7.3 lines 561-563) needs both.
-func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string, tldID, claimantPK []byte, ts uint64, prefixHash []byte) *claims.WitnessAttestation {
+// claim-verified attestation (nil on any failure — see CollectWitnesses).
+// The arguments carry the §6.3-documented deviation: alias, tld_id and the
+// PoW pair (nonce, pow_hash) ride alongside claim_prefix_hash/claimant/ts —
+// the witness re-derives the prefix hash from the identity fields, and
+// re-verifies the PoW, before its v2 signature (bound to the prefix hash) is
+// worth anything.
+func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash, prefixHash []byte) *claims.WitnessAttestation {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
 		return nil
@@ -2072,6 +2174,8 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 		"tld_id":            tldID,
 		"claimant":          claimantPK,
 		"ts":                ts,
+		"nonce":             nonce,
+		"pow_hash":          powHash,
 		"claim_prefix_hash": prefixHash,
 	})
 	if err != nil || resp == nil || resp.Y != wire.MsgTypeResponse {
@@ -2091,8 +2195,9 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 	if err != nil {
 		return nil
 	}
-	// Verify against the claim context AND bind to the answering node.
-	if !att.Verify(alias, tldID, claimantPK) {
+	// Verify against the claim identity (via the prefix hash the peer was
+	// asked to bind) AND bind to the answering node.
+	if !att.Verify(prefixHash) {
 		return nil
 	}
 	if !bytes.Equal(att.NodeID, c.NodeID) {

@@ -9,6 +9,7 @@ package dht
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -127,7 +128,7 @@ func TestDifficultyRetargetAdvancesAfterBlock(t *testing.T) {
 }
 
 // TestWitnessRetargetOverTheWire: the same retarget driven by REAL witness
-// RPCs — 2016 successful co-signs on the witnessing node (whose Now is
+// RPCs — 2016 first-time co-signs on the witnessing node (whose Now is
 // injected) advance its gossiped difficulty after POW_RETARGET_BLOCK.
 func TestWitnessRetargetOverTheWire(t *testing.T) {
 	t0 := time.Now().Unix()
@@ -138,11 +139,15 @@ func TestWitnessRetargetOverTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// GetRateLimit: -1 — the witness RPC shares the §12 per-source bucket
+	// with get (v0.7.0), and 2016 back-to-back co-signs from one test IP
+	// would otherwise be throttled long before the block completes.
 	b, err := NewNode(NodeConfig{
-		Keypair:    kp,
-		ListenAddr: "127.0.0.1:0",
-		Store:      NewEnvelopeStore(0, nil),
-		Now:        func() int64 { return clock.Load() },
+		Keypair:     kp,
+		ListenAddr:  "127.0.0.1:0",
+		Store:       NewEnvelopeStore(0, nil),
+		Now:         func() int64 { return clock.Load() },
+		GetRateLimit: -1,
 	})
 	if err != nil {
 		t.Fatalf("NewNode witness: %v", err)
@@ -161,20 +166,23 @@ func TestWitnessRetargetOverTheWire(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The claimant re-requests the SAME claim (same prefix hash — the §7.3
-	// cooldown allows idempotent re-signing) 2016 times; each successful
-	// co-sign counts as one accepted claim. The block's span is stretched to
-	// 4x the target interval just before the block-completing witness.
-	const alias = "retargetfoo"
-	id := newWitnessIdentity(t, uint64(t0))
+	// Since v0.7.0 only the FIRST co-sign of an alias counts as an accepted
+	// claim (re-signs of the same claim no longer inflate the count — a
+	// re-sign flood must not drive the network difficulty up), so the block
+	// is filled with 2016 DISTINCT aliases, each co-signed once. The block's
+	// span is stretched to 4x the target interval just before the
+	// block-completing witness.
 	slow := int64(4 * constants.PoWTargetInterval)
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 	for i := 0; i < constants.PoWRetargetBlock; i++ {
 		if i == constants.PoWRetargetBlock-1 {
 			clock.Store(t0 + slow) // complete the block with a 4x-slow span
 		}
-		atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, 1)
+		alias := fmt.Sprintf("retargetfoo%d", i)
+		id := newWitnessIdentity(t, uint64(t0))
+		nonce, powHash := id.mineWitnessPoW(t, alias)
+		atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, nonce, powHash, 1)
 		if err != nil {
 			t.Fatalf("CollectWitnesses %d: %v", i, err)
 		}
@@ -221,7 +229,8 @@ func TestCollectWitnessesRecordsObservedDifficulty(t *testing.T) {
 	id := newWitnessIdentity(t, uint64(time.Now().Unix()))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, 2)
+	nonce, powHash := id.mineWitnessPoW(t, alias)
+	atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, nonce, powHash, 2)
 	if err != nil {
 		t.Fatalf("CollectWitnesses: %v", err)
 	}

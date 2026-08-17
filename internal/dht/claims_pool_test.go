@@ -256,7 +256,7 @@ func TestCollectClaimsTwoPublishersViaPoolPath(t *testing.T) {
 	}
 
 	// A third node merges the pool's top-2 over the wire.
-	set, err := d.CollectClaims(ctx, alias)
+	set, _, err := d.CollectClaims(ctx, alias)
 	if err != nil {
 		t.Fatalf("CollectClaims: %v", err)
 	}

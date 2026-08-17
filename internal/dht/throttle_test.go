@@ -385,14 +385,14 @@ func TestThrottledCollectClaimsIsDegradedMiss(t *testing.T) {
 
 	alias := "throttled"
 	// First collection consumes the burst token and collects the envelope.
-	set, err := b.CollectClaims(ctx, alias)
+	set, _, err := b.CollectClaims(ctx, alias)
 	if err != nil || len(set) != 1 {
 		t.Fatalf("first CollectClaims: n=%d err=%v", len(set), err)
 	}
 
 	// Second collection: B holds no local copy (no cache-back happened — the
 	// node-level walk does not write the store), A throttles → degraded.
-	set2, err2 := b.CollectClaims(ctx, alias)
+	set2, _, err2 := b.CollectClaims(ctx, alias)
 	if len(set2) != 0 {
 		t.Fatalf("throttled CollectClaims returned %d envelopes; want 0", len(set2))
 	}

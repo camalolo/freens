@@ -266,9 +266,8 @@ func TestRecoveryPolicy(t *testing.T) {
 }
 
 func TestWitnessSigningMessage(t *testing.T) {
-	tid := bytes.Repeat([]byte{1}, 32)
-	pk := bytes.Repeat([]byte{2}, 32)
-	msg, err := WitnessSigningMessage("foo", tid, pk, 12345)
+	ph := bytes.Repeat([]byte{1}, 32) // a claim prefix hash
+	msg, err := WitnessSigningMessage(ph, 12345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,16 +275,14 @@ func TestWitnessSigningMessage(t *testing.T) {
 		t.Error("missing tag prefix")
 	}
 	want := append([]byte{}, WitnessSigningTag...)
-	want = append(want, 0, 0, 0, 3, 'f', 'o', 'o')
-	want = append(want, tid...)
-	want = append(want, pk...)
+	want = append(want, ph...)
 	// uint64_be(12345) = 0x0000000000003039
 	want = append(want, 0, 0, 0, 0, 0, 0, 0x30, 0x39)
 	if !bytes.Equal(msg, want) {
 		t.Errorf("msg = %x, want %x", msg, want)
 	}
-	if _, err := WitnessSigningMessage("foo", tid[:31], pk, 1); err == nil {
-		t.Error("should reject 31-byte tld_id")
+	if _, err := WitnessSigningMessage(ph[:31], 1); err == nil {
+		t.Error("should reject 31-byte prefix hash")
 	}
 }
 

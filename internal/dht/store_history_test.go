@@ -239,11 +239,15 @@ func TestEnvelopeStoreHistoryDoesNotChangeWinnerSemantics(t *testing.T) {
 	}
 
 	// Same-sequence tie-break: exactly one of the two envelopes wins; the
-	// winner's identity is the plain §6.4 rule, unaffected by history. (The
-	// two envelopes come from DIFFERENT owner keys: Ed25519 is deterministic,
-	// so same key + same record bytes would be one and the same envelope.)
+	// winner's identity is the plain §6.4 rule, unaffected by history. Since
+	// v0.7.0 the different-signer displacement is REJECTED outright (the
+	// anti-censorship rule — see TestEnvelopeStoreDifferentSignerNoPrevHash-
+	// Rejected), so the bytewise tie-break is exercised on the SAME owner's
+	// two distinct sequence-7 envelopes (a re-sign with a different validity
+	// window; same key + same record bytes would be one and the same
+	// envelope).
 	a := makeEnv(t, 7, 1000, 9000, kp)
-	b := makeEnv(t, 7, 1000, 9000, kp2) // same sequence, different content
+	b := makeEnv(t, 7, 1001, 9001, kp)
 	ha, hb := histHash(t, a), histHash(t, b)
 	wantA := bytes.Compare(ha, hb) > 0
 	putOK(t, s, key, a, 1600)

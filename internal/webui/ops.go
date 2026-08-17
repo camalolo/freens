@@ -142,9 +142,14 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 		}
 	}
 
-	// Claim: parked first (cooldown-safe retries), else mine.
+	// Claim: parked first (cooldown-safe retries), else mine. A parked
+	// claim older than WITNESS_COOLDOWN is un-witnessable (the §6.3 gate)
+	// and is discarded — re-mine rather than dead-loop refusals.
 	now := time.Now().Unix()
 	claim := keychain.LoadReusableClaim(e.keysDir, alias, kp, diff)
+	if claim != nil && now-int64(claim.Timestamp) >= int64(constants.WitnessCooldown) {
+		claim = nil // stale: older than any witness will sign
+	}
 	reused := claim != nil
 	if !reused {
 		tell("mining the claim (difficulty %d)…", diff)
@@ -160,7 +165,7 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	// Witnesses via the daemon (the §7.3 cooldown-safe retry loop; the
 	// claim.Timestamp stays fixed across retries).
 	tell("collecting %d witness signatures…", constants.W)
-	atts, err := e.collectWitnesses(ctx, alias, tldID, kp.Public(), claim.Timestamp)
+	atts, err := e.collectWitnesses(ctx, alias, tldID, kp.Public(), claim.Timestamp, claim.Nonce, claim.PowHash)
 	if err != nil {
 		return RegisterResult{}, err
 	}
@@ -222,11 +227,20 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 
 // collectWitnesses is the daemon-mode §7.3 loop: ask the daemon's node to
 // co-sign, keep the best haul across 3 attempts (10 s apart — the CLI's
-// cold-table self-heal), verify + dedupe each haul.
-func (e *opsEnv) collectWitnesses(ctx context.Context, alias string, tldID, claimantPK []byte, ts uint64) ([]*claims.WitnessAttestation, error) {
+// cold-table self-heal), verify + dedupe each haul. The mined PoW pair rides
+// along: witnesses verify the PoW before signing (§7.3).
+func (e *opsEnv) collectWitnesses(ctx context.Context, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash []byte) ([]*claims.WitnessAttestation, error) {
+	// The v2 attestations bind the claim prefix hash; recompute it so
+	// verification is local, not trusted from the daemon.
+	prefixHash, perr := (&claims.AliasClaim{
+		Alias: alias, TldID: tldID, Timestamp: ts, ClaimantPK: claimantPK,
+	}).PrefixHash()
+	if perr != nil {
+		return nil, userErr("claim identity: %v", perr)
+	}
 	var best []*claims.WitnessAttestation
 	for attempt := 1; attempt <= 3; attempt++ {
-		raw, err := e.d.Witness(ctx, alias, tldID, claimantPK, ts)
+		raw, err := e.d.Witness(ctx, alias, tldID, claimantPK, ts, nonce, powHash)
 		if err != nil {
 			return nil, userErr("witness collection (daemon): %v", err)
 		}
@@ -234,7 +248,7 @@ func (e *opsEnv) collectWitnesses(ctx context.Context, alias string, tldID, clai
 		var atts []*claims.WitnessAttestation
 		for _, b := range raw {
 			w, derr := claims.DecodeWitnessAttestation(b)
-			if derr != nil || !w.Verify(alias, tldID, claimantPK) || seen[string(w.NodePK)] {
+			if derr != nil || !w.Verify(prefixHash) || seen[string(w.NodePK)] {
 				continue
 			}
 			seen[string(w.NodePK)] = true
