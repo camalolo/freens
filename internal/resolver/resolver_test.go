@@ -1419,9 +1419,9 @@ func TestFreensRRToDNSMappings(t *testing.T) {
 // intentionally NOT parallel: the claims difficulty is package state.
 func withFastPoW(t *testing.T) {
 	t.Helper()
-	saved := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	t.Cleanup(func() { claims.PoWDifficultyInit = saved })
+	saved := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(saved) })
 }
 
 // claimedWorld is a complete §7-registered fixture: a mined + W-witnessed

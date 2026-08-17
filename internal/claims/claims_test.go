@@ -16,9 +16,9 @@ import (
 // too slow for tests; we mine at 8 and lower the inference floor to match.
 func withDifficulty(t *testing.T, d int, fn func()) {
 	t.Helper()
-	prev := PoWDifficultyInit
-	PoWDifficultyInit = d
-	t.Cleanup(func() { PoWDifficultyInit = prev })
+	prev := PoWDifficultyInit.Load()
+	PoWDifficultyInit.Store(int32(d))
+	t.Cleanup(func() { PoWDifficultyInit.Store(prev) })
 	fn()
 }
 

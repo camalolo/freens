@@ -55,9 +55,9 @@ func newWitnessIdentity(t *testing.T, ts uint64) *witnessIdentity {
 // the floor) then accepts nonce[0]=8 instead of demanding the production 24.
 func withFastWitnessPoW(t *testing.T) {
 	t.Helper()
-	prev := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	t.Cleanup(func() { claims.PoWDifficultyInit = prev })
+	prev := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(prev) })
 }
 
 // mineWitnessPoW mines a difficulty-8 (fast) PoW pair for (alias, id) — the

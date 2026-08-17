@@ -34,9 +34,9 @@ import (
 // cleanup) so difficulty-8 claims are spec-valid via the inference path.
 func withFastPoW(t *testing.T) {
 	t.Helper()
-	saved := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	t.Cleanup(func() { claims.PoWDifficultyInit = saved })
+	saved := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(saved) })
 }
 
 // storeLookup used to be defined locally here; it now lives once in

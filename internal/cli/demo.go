@@ -34,9 +34,9 @@ func cmdDemo(args []string) error {
 	// library reads PoWDifficultyInit at call time, so the default
 	// difficulty-inference path is exercised exactly as in production (just at
 	// 8 bits instead of 24).
-	savedDiff := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	defer func() { claims.PoWDifficultyInit = savedDiff }()
+	savedDiff := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	defer func() { claims.PoWDifficultyInit.Store(savedDiff) }()
 
 	const (
 		now   int64  = 2_000_000

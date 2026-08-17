@@ -42,6 +42,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
@@ -70,10 +71,16 @@ var canonicalEM = func() cbor.EncMode {
 
 // PoWDifficultyInit is the default PoW difficulty (bits) used by VerifyPoW /
 // VerifyFull / SelectWinner / OrderClaims when the difficulty cannot be
-// inferred from Nonce[0]. It is a VARIABLE (shadowing the const
-// constants.PoWDifficultyInit) so tests may lower it for fast mining; production
-// code leaves it at constants.PoWDifficultyInit.
-var PoWDifficultyInit = constants.PoWDifficultyInit
+// inferred from Nonce[0]. It is an ATOMIC VARIABLE (shadowing the const
+// constants.PoWDifficultyInit) so tests — and cmd/freens-cli's demo — may
+// retune it WHILE NODE GOROUTINES ARE VERIFYING PoWS (the race detector
+// flags a plain-var swap against a live hWitness/VerifyPoW reader); the
+// atomics establish the happens-before the plain var lacked. Production
+// code never writes it after init and leaves it at
+// constants.PoWDifficultyInit.
+var PoWDifficultyInit atomic.Int32
+
+func init() { PoWDifficultyInit.Store(int32(constants.PoWDifficultyInit)) }
 
 // InferDifficulty, passed as the difficultyBits argument to VerifyPoW or
 // VerifyFull, requests inferring the difficulty: if Nonce is non-empty and
@@ -308,10 +315,10 @@ func (c *AliasClaim) Prefix() ([]byte, error) {
 func (c *AliasClaim) VerifyPoW(difficultyBits int) bool {
 	d := difficultyBits
 	if d < 0 {
-		if len(c.Nonce) >= 1 && int(c.Nonce[0]) >= PoWDifficultyInit {
+		if len(c.Nonce) >= 1 && int(c.Nonce[0]) >= int(PoWDifficultyInit.Load()) {
 			d = int(c.Nonce[0])
 		} else {
-			d = PoWDifficultyInit
+			d = int(PoWDifficultyInit.Load())
 		}
 	}
 	prefix, err := c.Prefix()

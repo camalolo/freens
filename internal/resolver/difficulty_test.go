@@ -290,8 +290,8 @@ func TestDifficultySetPathFloorRejectsBelowFloor(t *testing.T) {
 // A.4 without paying for real 24/26-bit mining: only the computed difficulty
 // is asserted, not a mined hash.
 func TestEffectivePoWDifficulty(t *testing.T) {
-	if claims.PoWDifficultyInit != constants.PoWDifficultyInit {
-		t.Skipf("claims.PoWDifficultyInit = %d (test downshift active); production matrix needs the default", claims.PoWDifficultyInit)
+	if int(claims.PoWDifficultyInit.Load()) != constants.PoWDifficultyInit {
+		t.Skipf("claims.PoWDifficultyInit = %d (test downshift active); production matrix needs the default", claims.PoWDifficultyInit.Load())
 	}
 	claimAt := func(nonceByte int) *claims.AliasClaim {
 		return &claims.AliasClaim{Nonce: []byte{byte(nonceByte), 1, 2, 3}}

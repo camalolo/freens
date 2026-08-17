@@ -13,10 +13,10 @@ import (
 	"github.com/camalolo/freens/internal/crypto"
 )
 
-func powDifficultyInit() int { return claims.PoWDifficultyInit }
+func powDifficultyInit() int { return int(claims.PoWDifficultyInit.Load()) }
 func powDifficultySet(v int) func() {
-	claims.PoWDifficultyInit = 8
-	return func() { claims.PoWDifficultyInit = v }
+	claims.PoWDifficultyInit.Store(8)
+	return func() { claims.PoWDifficultyInit.Store(int32(v)) }
 }
 func statFile(p string) (os.FileInfo, error) { return os.Stat(p) }
 func mkdirAllImpl(p string, mode os.FileMode) error {

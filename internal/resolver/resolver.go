@@ -756,15 +756,16 @@ func effectivePoWDifficulty(c *claims.AliasClaim, oracle DifficultyOracle) int {
 	// Replicate claims.VerifyPoW's InferDifficulty inference (the sentinel's
 	// documented rule); the hash itself is recomputed inside VerifyPoW at
 	// whatever difficulty is returned here.
-	inferred := claims.PoWDifficultyInit
-	if c != nil && len(c.Nonce) >= 1 && int(c.Nonce[0]) >= claims.PoWDifficultyInit {
+	baseline := int(claims.PoWDifficultyInit.Load())
+	inferred := baseline
+	if c != nil && len(c.Nonce) >= 1 && int(c.Nonce[0]) >= baseline {
 		inferred = int(c.Nonce[0])
 	}
-	floor := oracle.NetworkDifficulty() - (constants.PoWDifficultyInit - claims.PoWDifficultyInit)
+	floor := oracle.NetworkDifficulty() - (constants.PoWDifficultyInit - baseline)
 	// A.4: the check never drops below the verifier's POW_DIFFICULTY_INIT
 	// baseline (a misbehaving oracle cannot lower it either).
-	if floor < claims.PoWDifficultyInit {
-		floor = claims.PoWDifficultyInit
+	if floor < baseline {
+		floor = baseline
 	}
 	if floor > inferred {
 		return floor

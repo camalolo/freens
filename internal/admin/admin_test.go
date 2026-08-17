@@ -192,9 +192,9 @@ func makeClaimTLDRecord(t *testing.T, kp *crypto.Keypair, alias string) (*wire.S
 	// v0.7.0: the hPut K_claim screen runs the full §7.4 filter, so the
 	// fixture claim needs its W-witness quorum (in-band v2 attestations)
 	// and the fast-difficulty floor to survive publication at K_claim.
-	prevD := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	t.Cleanup(func() { claims.PoWDifficultyInit = prevD })
+	prevD := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(prevD) })
 	claim, err := claims.MineAliasClaim(alias, kp, uint64(time.Now().Unix()), 8, 1<<20, 12)
 	if err != nil {
 		t.Fatalf("mine claim: %v", err)
@@ -577,9 +577,9 @@ func TestWitness(t *testing.T) {
 	// Since v0.7.0 the witness verifies the PoW before signing (§7.3): mine
 	// a fast difficulty-8 pair for the identity (and lower the claims
 	// package's floor to match, as the other fixtures do).
-	prevD := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	t.Cleanup(func() { claims.PoWDifficultyInit = prevD })
+	prevD := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(prevD) })
 	prefix, err := (&claims.AliasClaim{Alias: "witfoo", TldID: tldID, Timestamp: ts, ClaimantPK: claimant.Public()}).Prefix()
 	if err != nil {
 		t.Fatal(err)

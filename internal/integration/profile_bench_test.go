@@ -258,9 +258,9 @@ func (w *packingWriter) Hijack()                   {}
 // withBenchPoW lowers the mining difficulty so setup stays fast (restored on
 // return), matching withFastPoW in the test files.
 func withBenchPoW(b testing.TB) {
-	saved := claims.PoWDifficultyInit
-	claims.PoWDifficultyInit = 8
-	b.Cleanup(func() { claims.PoWDifficultyInit = saved })
+	saved := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	b.Cleanup(func() { claims.PoWDifficultyInit.Store(saved) })
 }
 
 // assertBenchReply unpacks the writer's last packed reply and fails the
