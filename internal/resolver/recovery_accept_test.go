@@ -84,8 +84,11 @@ func newRecoveredWorld(t *testing.T, notAfterOffset int64) *recoveredWorld {
 		t.Fatal(err)
 	}
 
-	// R1: self-certifying root with the §5.4 policy (field 10).
-	r1Rec, err := wire.NewRecord(tldWire, k1.Public(), 1, uint64(fixedNow-100), uint64(fixedNow+3600))
+	// R1: self-certifying root with the §5.4 policy (field 10). Created two
+	// hours before fixedNow so a declaration whose timelock elapsed at
+	// fixedNow-60 satisfies VerifyRecovery's timelock bound (NotBefore >=
+	// R1.Created + 3600).
+	r1Rec, err := wire.NewRecord(tldWire, k1.Public(), 1, uint64(fixedNow-7200), uint64(fixedNow+3600))
 	if err != nil {
 		t.Fatal(err)
 	}

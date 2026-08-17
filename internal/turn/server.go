@@ -22,6 +22,11 @@ type ServerConfig struct {
 	// MaxAllocsPerIP caps concurrent allocations per client source IP
 	// (default 8) — the primary abuse gate (see package comment).
 	MaxAllocsPerIP int
+	// MaxTotalAllocs caps concurrent allocations across ALL clients
+	// (default DefaultMaxTotalAllocs) — the daemon-wide FD/goroutine
+	// gate; auth binds to a node key, not a source address, so the
+	// per-IP cap alone cannot stop a spoofed-source Allocate flood.
+	MaxTotalAllocs int
 	// DefaultLifetime is granted when an Allocate carries no LIFETIME or
 	// asks for 0 (default 600s, RFC 8656's recommendation). Allocations
 	// die at expiry unless Refreshed.
@@ -44,6 +49,9 @@ type ServerConfig struct {
 
 const (
 	defaultMaxAllocsPerIP = 8
+	// DefaultMaxTotalAllocs is the fallback for MaxTotalAllocs — every
+	// allocation costs a relay socket, a relayLoop goroutine, and a timer.
+	DefaultMaxTotalAllocs = 128
 	defaultLifetime       = 600 * time.Second
 	defaultMaxLifetime    = 3600 * time.Second
 	defaultMaxPermissions = 64
@@ -98,6 +106,9 @@ type Server struct {
 func ListenTURN(cfg ServerConfig) (*Server, error) {
 	if cfg.MaxAllocsPerIP <= 0 {
 		cfg.MaxAllocsPerIP = defaultMaxAllocsPerIP
+	}
+	if cfg.MaxTotalAllocs <= 0 {
+		cfg.MaxTotalAllocs = DefaultMaxTotalAllocs
 	}
 	if cfg.DefaultLifetime <= 0 {
 		cfg.DefaultLifetime = defaultLifetime
@@ -256,6 +267,17 @@ func (s *Server) clearFails(ip string) {
 	s.mu.Unlock()
 }
 
+// decPerIP drops one per-IP allocation count, deleting the entry at zero:
+// perIP is only otherwise rebuilt in Close, so stale zero entries would
+// grow the map for the process lifetime. Caller holds s.mu.
+func (s *Server) decPerIP(ip string) {
+	if n := s.perIP[ip]; n > 1 {
+		s.perIP[ip] = n - 1
+	} else {
+		delete(s.perIP, ip)
+	}
+}
+
 // handleAllocate authenticates, enforces caps, and grants a relayed socket.
 // An existing allocation for the same 5-tuple is REPLACED (idempotent for
 // client retries after a lost response; RFC 8656 would 437 here — our
@@ -269,6 +291,18 @@ func (s *Server) handleAllocate(m *message, raddr *net.UDPAddr) {
 		return
 	}
 	s.clearFails(ip)
+
+	// Daemon-wide cap BEFORE any socket/goroutine/timer exists: allocs
+	// only ever grows on the serve goroutine (we are it), so this count
+	// is final — a rejected Allocate must leave nothing behind.
+	s.mu.Lock()
+	total := len(s.allocs)
+	s.mu.Unlock()
+	if total >= s.cfg.MaxTotalAllocs {
+		s.errorResp(m, raddr, errInsufficientCapacity, "insufficient capacity")
+		s.log.Warn("turn: allocate rejected — total cap", "allocs", total, "cap", s.cfg.MaxTotalAllocs)
+		return
+	}
 
 	lt := s.grantLifetime(m.lifetime())
 
@@ -313,7 +347,7 @@ func (s *Server) handleAllocate(m *message, raddr *net.UDPAddr) {
 	}
 	if old, ok := s.allocs[raddr.String()]; ok { // replace (see doc comment)
 		delete(s.allocs, raddr.String())
-		s.perIP[ip]--
+		s.decPerIP(ip) // may drop the entry; the ++ below re-adds it
 		_ = old.relay.Close()
 	}
 	s.allocs[raddr.String()] = a
@@ -395,10 +429,7 @@ func (s *Server) expire(key string, a *allocation) {
 		return // refreshed in the meantime
 	}
 	delete(s.allocs, key)
-	ip := a.client.IP.String()
-	if s.perIP[ip] > 0 {
-		s.perIP[ip]--
-	}
+	s.decPerIP(a.client.IP.String())
 	a.mu.Unlock()
 	_ = a.relay.Close()
 	s.mu.Unlock()
@@ -425,9 +456,7 @@ func (s *Server) handleRefresh(m *message, raddr *net.UDPAddr) {
 	if req == 0 { // explicit deallocate
 		s.mu.Lock()
 		delete(s.allocs, raddr.String())
-		if s.perIP[raddr.IP.String()] > 0 {
-			s.perIP[raddr.IP.String()]--
-		}
+		s.decPerIP(raddr.IP.String())
 		s.mu.Unlock()
 		_ = a.relay.Close()
 		resp := newMessage(methodRefresh, classSuccess)

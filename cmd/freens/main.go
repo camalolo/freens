@@ -78,13 +78,19 @@ import (
 )
 
 // builtinDefaultConfig is used when -config is absent: a safe "* = dns-first"
-// resolver listening on 127.0.0.1:53 with public upstreams (spec §9.1).
+// resolver listening on 127.0.0.1:53 with public upstreams (spec §9.1). The
+// freens community namespace gets an explicit freens-first route: it is not
+// an ICANN TLD, so asking public upstreams for it first only leaks every
+// freens name (and lets a spoofed upstream NOERROR shadow the DHT answer —
+// found in the v0.7.1 security audit); freens-first still falls through to
+// DNS on a miss, preserving the non-surprising default for ordinary names.
 const builtinDefaultConfig = `[listen]
 udp = 127.0.0.1:53
 tcp = 127.0.0.1:53
 [upstream]
 servers = 9.9.9.9, 1.1.1.1
 [tld-routes]
+freens = freens-first
 * = dns-first
 `
 
@@ -490,7 +496,14 @@ func run(args []string) error {
 		go renewLoop(dhtNode, store, logger, renewStop)
 	}
 
-	upstream := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
+	// Upstream wiring: plaintext UDP/TCP to the configured servers, or —
+	// when [upstream] doh is set — RFC 8484 DoH with the plaintext servers
+	// as fallback (the doh key was parsed-but-ignored before v0.7.1).
+	plain := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
+	var upstream resolver.Upstream = plain
+	if cfg.UpstreamDoH != "" {
+		upstream = &resolver.DoHUpstream{URL: cfg.UpstreamDoH, Fallback: plain}
+	}
 	res := resolver.New(cfg, freens, upstream)
 
 	// Operational metrics (hardening part 1): the registry always exists —

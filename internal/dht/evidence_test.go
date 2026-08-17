@@ -53,7 +53,10 @@ func evidenceKit(t *testing.T, notBefore uint64) (r1, r2 *wire.SignedEnvelope, k
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
-	r1Rec, err := wire.NewRecord(name, k1.Public(), 1, uint64(now-100), uint64(now+3600))
+	// R1 predates the declaration by more than the policy timelock (3600 s),
+	// so evidence with notBefore >= now-3600 satisfies VerifyRecovery's
+	// timelock bound (NotBefore >= prevCreated + Timelock).
+	r1Rec, err := wire.NewRecord(name, k1.Public(), 1, uint64(now-7200), uint64(now+3600))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,8 +251,10 @@ func TestEvidencePersistRoundTrip(t *testing.T) {
 // TestStoreAcceptsRecoveryDisplacementWithEvidence: R2 (owner = signer = K2,
 // prev_hash-linked, sequence+1) displaces an ALIVE R1 incumbent only through
 // PutWithEvidence with a quorum-valid declaration; the displaced R1 lands in
-// the §8.3 history as usual. Any notBefore works: the store gates on QUORUM
-// alone (the timelock is a resolve-time decision).
+// the §8.3 history as usual. The declaration's not_before only needs to
+// satisfy VerifyRecovery's timelock bound (NotBefore >= R1.Created+3600; the
+// kit ages R1 by 7200 s, so anything >= now-3600 works): the elapsed-time
+// gate is a resolve-time decision.
 func TestStoreAcceptsRecoveryDisplacementWithEvidence(t *testing.T) {
 	r1, r2, key, evidence, _ := evidenceKit(t, uint64(time.Now().Unix()+7200)) // not yet due
 	s := NewEnvelopeStore(0, nil)

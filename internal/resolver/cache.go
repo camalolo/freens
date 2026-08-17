@@ -38,6 +38,13 @@ import (
 // oldest-first).
 const DefaultCacheMaxEntries = 4096
 
+// cacheSweepEvery is how many puts happen between full expired-sweeps. The
+// pre-v0.7.1 code swept the WHOLE map on EVERY insert (O(4096) under the
+// cache mutex all queries share); expiry is already enforced per-entry on
+// Get, so a periodic sweep (plus oldest-eviction at capacity) keeps the same
+// correctness at 1/64th the amortized insert cost.
+const cacheSweepEvery = 64
+
 // cacheKey identifies a cached outcome: the question name, type, and class.
 // A question with different name/qtype/qclass is a different cache entry.
 type cacheKey struct {
@@ -70,6 +77,7 @@ type ResponseCache struct {
 	maxEntries int
 	now        func() int64 // wall-clock seconds
 	nextStamp  uint64
+	sinceSweep int // inserts since the last full expired-sweep (cadence: cacheSweepEvery)
 	// hits/misses optionally count get() outcomes; nil (the default, or a
 	// SetMetrics(nil) call) leaves the cache uninstrumented.
 	hits   *metrics.Counter
@@ -132,22 +140,24 @@ func (c *ResponseCache) countMiss() {
 
 // get returns the cached outcome for key, with every answer RR deep-copied
 // and its TTL decayed to the remaining cache lifetime. ok is false on a miss
-// or an expired entry (which is dropped).
+// or an expired entry (which is dropped). The hit/miss counters are bumped
+// OUTSIDE the cache mutex (each does a strings.Join + its own lock; counting
+// under c.mu serialized every query against every insert).
 func (c *ResponseCache) get(key cacheKey) (rrs []dns.RR, rcode int, aa bool, ok bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	e, hit := c.entries[key]
 	if !hit {
+		c.mu.Unlock()
 		c.countMiss()
 		return nil, 0, false, false
 	}
 	now := c.now()
 	if now >= e.expiresAt {
 		delete(c.entries, key)
+		c.mu.Unlock()
 		c.countMiss()
 		return nil, 0, false, false
 	}
-	c.countHit()
 	remaining := uint32(e.expiresAt - now)
 	out := make([]dns.RR, len(e.rrs))
 	for i, rr := range e.rrs {
@@ -155,7 +165,10 @@ func (c *ResponseCache) get(key cacheKey) (rrs []dns.RR, rcode int, aa bool, ok 
 		cp.Header().Ttl = remaining
 		out[i] = cp
 	}
-	return out, e.rcode, e.aa, true
+	rcode, aa = e.rcode, e.aa
+	c.mu.Unlock()
+	c.countHit()
+	return out, rcode, aa, true
 }
 
 // putFreens stores a freens-sourced (aa == true) ResolveQuestion outcome per
@@ -208,7 +221,13 @@ func (c *ResponseCache) putFreens(key cacheKey, rrs []dns.RR, rcode int, aa bool
 	defer c.mu.Unlock()
 	c.nextStamp++
 	e.stamp = c.nextStamp
-	c.sweepExpiredLocked(now)
+	// Periodic full sweep (per-entry expiry is enforced on Get regardless);
+	// see cacheSweepEvery for why this is not per-insert.
+	c.sinceSweep++
+	if c.sinceSweep >= cacheSweepEvery {
+		c.sweepExpiredLocked(now)
+		c.sinceSweep = 0
+	}
 	if len(c.entries) >= c.maxEntries {
 		c.evictOldestLocked()
 	}

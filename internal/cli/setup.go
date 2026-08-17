@@ -108,9 +108,22 @@ var sysStatExists = func(path string) bool {
 	return err == nil
 }
 
-// sysWriteEtc writes content to a privileged path (mode) via sudo -n
-// (temp file + mkdir -p + cp + chmod). Returns an error when sudo could not
-// run non-interactively — callers then print the manual commands.
+// etcStagingSuffix names sysWriteEtc's staging file: content lands at
+// <dest><etcStagingSuffix> first and is mv'd over the destination from the
+// SAME directory (same filesystem => rename(2), i.e. atomic).
+const etcStagingSuffix = ".freens.new"
+
+// sysWriteEtc writes content to a privileged path (mode) via sudo -n,
+// ATOMICALLY: temp file -> mkdir -p -> cp to <path>.freens.new (staged
+// next to the destination) -> chmod -> mv -f over the destination. The
+// rename replaces the old file with NO gap — at every instant the box
+// holds either the old or the new file, so a crash or sudo failure
+// mid-sequence can never leave the machine without /etc/resolv.conf. The
+// mv also replaces a resolved-stub SYMLINK at the destination rather
+// than writing through it (a plain write would land in /run and be
+// regenerated on the next restart). On failure the staged file is
+// removed (best effort) and the error returned — callers then print the
+// manual commands.
 var sysWriteEtc = func(path string, content []byte, mode os.FileMode) error {
 	tmp, err := os.CreateTemp("", "freens-setup-*")
 	if err != nil {
@@ -125,13 +138,24 @@ var sysWriteEtc = func(path string, content []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	staging := path + etcStagingSuffix
+	cleanupStaging := func() { _ = sudoRun("wiring the OS resolver", "rm", "-f", staging) }
 	if err := sudoRun("wiring the OS resolver", "mkdir", "-p", filepath.Dir(path)); err != nil {
 		return err
 	}
-	if err := sudoRun("wiring the OS resolver", "cp", tmpName, path); err != nil {
+	if err := sudoRun("wiring the OS resolver", "cp", tmpName, staging); err != nil {
+		cleanupStaging()
 		return err
 	}
-	return sudoRun("wiring the OS resolver", "chmod", fmt.Sprintf("%04o", uint32(mode)), path)
+	if err := sudoRun("wiring the OS resolver", "chmod", fmt.Sprintf("%04o", uint32(mode)), staging); err != nil {
+		cleanupStaging()
+		return err
+	}
+	if err := sudoRun("wiring the OS resolver", "mv", "-f", staging, path); err != nil {
+		cleanupStaging()
+		return err
+	}
+	return nil
 }
 
 // sysReadFile is os.ReadFile as a var for tests.
@@ -272,21 +296,26 @@ func wireOSResolver() string {
 		return "OS resolver: MANUAL step printed above (sudo failed) — port-53 redirect to " + addr
 	}
 
-	// 2) resolv.conf -> plain "nameserver 127.0.0.1" (backup alongside).
+	// 2) resolv.conf -> plain "nameserver 127.0.0.1" (backup alongside,
+	//    taken only when ABSENT: a re-run after DHCP/NetworkManager
+	//    rewrote resolv.conf must not clobber the one pristine pre-freens
+	//    backup with an intermediate version — os.Stat suffices, /etc is
+	//    searchable and stat needs no read permission on the file).
 	cur, _ := sysReadFile(pathResolvConf)
 	if strings.HasPrefix(string(cur), "nameserver 127.0.0.1\n") {
 		return "OS resolver: already wired (resolv.conf -> 127.0.0.1, :53 -> " + addr + " redirect)"
 	}
-	if err := sudoRun("backing up "+pathResolvConf, "cp", pathResolvConf, pathResolvBackup); err != nil {
-		printManualCommands("resolv.conf backup + rewrite", manual[len(manual)-1:])
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
+	if !sysStatExists(pathResolvBackup) {
+		if err := sudoRun("backing up "+pathResolvConf, "cp", pathResolvConf, pathResolvBackup); err != nil {
+			printManualCommands("resolv.conf backup + rewrite", manual[len(manual)-1:])
+			return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
+		}
 	}
-	// Replace the file (rm first: through a resolved stub symlink a plain
-	// write would land in /run and be regenerated on the next restart).
-	if err := sudoRun("rewriting "+pathResolvConf, "rm", "-f", pathResolvConf); err != nil {
-		printManualCommands("resolv.conf backup + rewrite", manual[len(manual)-1:])
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
-	}
+	// Replace the file atomically (sysWriteEtc: cp to <path>.freens.new ->
+	// chmod -> mv -f). There is no rm-first gap without /etc/resolv.conf
+	// anymore, and the mv still bypasses a resolved stub symlink (it
+	// replaces the symlink itself; writing through it would land in /run
+	// and be regenerated on the next restart).
 	if err := sysWriteEtc(pathResolvConf, []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
 		printManualCommands("resolv.conf rewrite", manual[len(manual)-1:])
 		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
@@ -540,11 +569,14 @@ udp = 127.0.0.1:5300
 tcp = 127.0.0.1:5300
 
 ; Routing: dns-first is the SAFE default (spec line 772) — conventional
-; names go to the upstream resolvers, freens names (unknown to DNS)
-; still resolve through the freens branch. A plain "* = freens" route
-; would make this daemon authoritative-only and NXDOMAIN the rest of
-; the internet.
+; names go to the upstream resolvers. The freens community namespace is NOT
+; an ICANN TLD: asking upstreams for it first only leaks freens names in
+; plaintext (and lets a spoofed upstream answer shadow the DHT one), so it
+; gets an explicit freens-first route — freens first, DNS on a miss.
+; A plain "* = freens" route would make this daemon authoritative-only and
+; NXDOMAIN the rest of the internet.
 [tld-routes]
+freens = freens-first
 * = dns-first
 
 ; DHT side (spec 6): public listener, node identity, persistent store.

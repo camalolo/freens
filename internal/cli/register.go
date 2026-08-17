@@ -146,10 +146,15 @@ func cmdRegister(args []string) error {
 		if keyPath == "" {
 			keyPath = ownerKeyPath(*alias) // <home>/keys/<alias>.key
 		}
-		// Passphrase policy (interactive default: ask; empty twice or a
-		// non-terminal = plaintext legacy form). One passphrase covers the
-		// owner key AND the recovery keyfiles below.
-		keyPassphrase = promptNewPassphrase()
+		// Passphrase policy (interactive default: ask; empty twice, or
+		// the explicit FREENS_ALLOW_PLAINTEXT_KEY=1 non-terminal opt-in,
+		// = plaintext legacy form). One passphrase covers the owner key
+		// AND the recovery keyfiles below.
+		var perr error
+		keyPassphrase, perr = promptNewPassphrase()
+		if perr != nil {
+			return perr
+		}
 		if err := writeKeyFileEnc(keyPath, kp, keyPassphrase); err != nil {
 			return fmt.Errorf("writing owner key: %w", err)
 		}

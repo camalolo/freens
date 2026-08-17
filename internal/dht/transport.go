@@ -116,6 +116,21 @@ const (
 	limiterIdle = 10 * time.Minute
 )
 
+// Default per-source-IP put throttle (v0.7.1). A put is the most expensive
+// unauthenticated-CPU work a peer can induce (envelope decode + signature +
+// PoW + up to maxWitnessEvaluations witness verifies per packet, inline on
+// the readLoop goroutine), and its only authorization gate — the write
+// token — is minted freely by every ping/get response, so token possession
+// bounds nothing. 10 puts/s per source with a burst of 20 is ~2 orders of
+// magnitude above honest publication traffic (republish waves land at a few
+// puts per source per 60 s scan) while capping one source's store-CPU
+// share; excess puts are answered with error 301 "throttled" like reads
+// (explicit backpressure beats silence).
+const (
+	defaultPutRateLimit = 10.0 // req/s per source IP
+	defaultPutBurst     = 20   // back-to-back puts per idle source
+)
+
 // evictQueueCap bounds the pending §6.2 live-eviction requests. Combined with
 // the per-bucket coalescing (evictPending) it guarantees the maintenance path
 // can never accumulate unbounded work under a contact flood.
@@ -197,6 +212,15 @@ type NodeConfig struct {
 	// number of queries an idle source may send back-to-back). Zero ⇒ 100.
 	// Ignored when GetRateLimit < 0.
 	GetBurst int
+	// PutRateLimit caps put requests per observed source IP (token bucket,
+	// requests/second). See defaultPutRateLimit for the rationale: a put is
+	// the costliest CPU work a peer can induce and the write token gates
+	// authorization, not rate. Zero ⇒ 10. Negative disables put throttling.
+	// Excess puts are answered with error 301 "throttled".
+	PutRateLimit float64
+	// PutBurst is the token-bucket burst paired with PutRateLimit. Zero ⇒ 20.
+	// Ignored when PutRateLimit < 0.
+	PutBurst int
 	// Advertise is the address peers should dial to reach this node (§6.2
 	// line 422-423: "nodes advertise (ip, port, node_pubkey)"). Empty ⇒
 	// today's behavior (peers learn the OBSERVED UDP source address, which
@@ -257,6 +281,7 @@ type Node struct {
 	claims *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
 	diff   *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
 	getLim *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
+	putLim *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
 	log    *slog.Logger
 	nowFn  func() int64
 
@@ -459,6 +484,19 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		}
 		getLim = newRateLimiter(rate, burst)
 	}
+	// Per-source-IP put throttle: negative rate ⇒ disabled.
+	var putLim *rateLimiter
+	if cfg.PutRateLimit >= 0 {
+		rate := cfg.PutRateLimit
+		if rate == 0 {
+			rate = defaultPutRateLimit
+		}
+		burst := cfg.PutBurst
+		if burst <= 0 {
+			burst = defaultPutBurst
+		}
+		putLim = newRateLimiter(rate, burst)
+	}
 	return &Node{
 		kp:             cfg.Keypair,
 		id:             id,
@@ -474,6 +512,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		claims:         NewClaimPool(),
 		diff:           newDifficultyState(now()),
 		getLim:         getLim,
+		putLim:         putLim,
 		log:            log,
 		nowFn:          now,
 		advertise:      cfg.Advertise,
@@ -1165,6 +1204,15 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if n.passive {
 		return n.errResp(m, 301, "passive node")
 	}
+	// Per-source-IP put throttle (v0.7.1; see defaultPutRateLimit): the
+	// put path's CPU cost (envelope decode + verify + PoW + witness checks)
+	// runs inline on the readLoop goroutine, and write tokens are minted
+	// freely by every ping/get — only a rate gate bounds a single source's
+	// share of that CPU. Checked BEFORE the token: cheaper, and a source
+	// hammering puts should learn to back off even if its tokens are valid.
+	if !n.allowPut(raddr) {
+		return n.errResp(m, 301, "throttled")
+	}
 	token, _ := m.A["token"].([]byte)
 	envBytes, _ := m.A["envelope"].([]byte)
 	// §8.4 recovery evidence (optional): the put of a recovery hand-off
@@ -1398,11 +1446,17 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	// WITNESS_COOLDOWN old). Anything outside [now - cooldown, now + skew]
 	// is refused: not future-dated beyond the live-race skew window, not
 	// older than the cooldown that legitimizes re-presentation.
-	nowTS := n.now()
-	if int64(ts) > nowTS+int64(constants.SkewTolerance) {
+	//
+	// All comparisons are uint64-native: ts is an attacker-controlled
+	// uint64, and a CBOR negative int decodes through asUint64 to a HUGE
+	// value — the pre-v0.7.1 int64(ts) conversions made both gates below
+	// wrap negative (future check false, age check underflow false) for any
+	// ts >= 2^63, admitting year-292-billion claims past the sanity gate.
+	nowU := uint64(n.now())
+	if ts > nowU+uint64(constants.SkewTolerance) {
 		return n.errResp(m, 305, "claim ts in the future")
 	}
-	if nowTS-int64(ts) > int64(constants.WitnessCooldown) {
+	if ts <= nowU && nowU-ts > uint64(constants.WitnessCooldown) {
 		return n.errResp(m, 305, "claim ts too old")
 	}
 
@@ -2675,6 +2729,15 @@ func (n *Node) allowRead(raddr *net.UDPAddr) bool {
 	return n.getLim.allow(normIP(raddr.IP))
 }
 
+// allowPut consumes one put token for the observed source of raddr (see
+// defaultPutRateLimit). Always true when put throttling is disabled.
+func (n *Node) allowPut(raddr *net.UDPAddr) bool {
+	if n.putLim == nil {
+		return true
+	}
+	return n.putLim.allow(normIP(raddr.IP))
+}
+
 // rateLimiter is a mutex-guarded map of token buckets keyed by source IP:
 // each key holds `burst` tokens, refilled at `rate` per second; a query costs
 // one. State is tiny (two fields/IP) and lazily expired: once the map exceeds
@@ -2713,6 +2776,17 @@ func (l *rateLimiter) allow(key []byte) bool {
 	if !ok {
 		if len(l.buckets) >= limiterMaxEntries {
 			l.sweepIdleLocked(now)
+			// The idle sweep may not free enough (an attacker sustaining
+			// >10k distinct live sources — IPv6 gives them unbounded
+			// source addresses). Cap the map for real: evict the
+			// least-recently-touched entries down to 3/4 of the ceiling,
+			// then admit the new key (a hard cap that refuses new keys
+			// would let an attacker lock honest IPs out of the map; an
+			// uncapped map is an unbounded-memory bug — found auditing
+			// the flood paths).
+			if len(l.buckets) >= limiterMaxEntries {
+				l.evictLRULocked(limiterMaxEntries - limiterMaxEntries/4)
+			}
 		}
 		b = &tokenBucket{tokens: l.burst, last: now}
 		l.buckets[k] = b
@@ -2735,6 +2809,30 @@ func (l *rateLimiter) sweepIdleLocked(now time.Time) {
 		if now.Sub(b.last) > limiterIdle {
 			delete(l.buckets, k)
 		}
+	}
+}
+
+// evictLRULocked drops least-recently-touched entries until len(buckets) is
+// at most target (never dropping a bucket touched within the last second, so
+// an in-progress honest burst survives). Caller must hold l.mu.
+func (l *rateLimiter) evictLRULocked(target int) {
+	type lastT struct {
+		k    string
+		last time.Time
+	}
+	all := make([]lastT, 0, len(l.buckets))
+	for k, b := range l.buckets {
+		all = append(all, lastT{k, b.last})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].last.Before(all[j].last) })
+	cutoff := time.Now().Add(-time.Second)
+	dropped := 0
+	for _, e := range all {
+		if len(l.buckets)-dropped <= target || e.last.After(cutoff) {
+			break
+		}
+		delete(l.buckets, e.k)
+		dropped++
 	}
 }
 

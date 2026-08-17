@@ -145,8 +145,8 @@ func parseHandoffFlags(subcommand, newSeedFlag string, args []string) (*handoffF
 		newSeedFlag: newSeedFlag,
 	}
 	fs.StringVar(&hf.prevPath, "prev-envelope", "", "path to the previous signed envelope .cbor (the record whose name is being handed off)")
-	fs.StringVar(&hf.newSeedHex, strings.TrimPrefix(newSeedFlag, "-"), "", "hex Ed25519 seed of the fresh key that will own the name after the hand-off")
-	fs.StringVar(&hf.signerHex, "signer-seed", "", "hex Ed25519 seed of the CURRENT owner key — §8.3: the hand-off is signed by the previous owner")
+	fs.StringVar(&hf.newSeedHex, strings.TrimPrefix(newSeedFlag, "-"), "", "hex Ed25519 seed of the fresh key that will own the name after the hand-off; @path reads it from a keyfile (avoids ps exposure)")
+	fs.StringVar(&hf.signerHex, "signer-seed", "", "hex Ed25519 seed of the CURRENT owner key — §8.3: the hand-off is signed by the previous owner; @path reads it from a keyfile (avoids ps exposure)")
 	fs.StringVar(&hf.ip, "ip", "", "optional IPv4 for a replacement A record (omit to carry over the previous RRset)")
 	fs.StringVar(&hf.expiresStr, "expires", "", "expires unix timestamp (default: now+"+strconv.Itoa(constants.RecordDefaultTTL)+"s)")
 	fs.Uint64Var(&hf.ttl, "ttl", 300, "A record TTL in seconds (only used with -ip)")
@@ -349,8 +349,8 @@ func cmdRotate(args []string) error {
 func cmdRecover(args []string) error {
 	fs := flag.NewFlagSet("recover", flag.ContinueOnError)
 	prevPath := fs.String("prev-envelope", "", "path to the previous signed envelope .cbor (whose field-10 recovery policy is used)")
-	newOwnerSeedHex := fs.String("new-owner-seed", "", "hex Ed25519 seed of the fresh primary key that will own the name after recovery")
-	recoverySeedsCSV := fs.String("recovery-seeds", "", "comma-separated hex seeds of the recovery keys (must be a subset of the policy's field-10 keys)")
+	newOwnerSeedHex := fs.String("new-owner-seed", "", "hex Ed25519 seed of the fresh primary key that will own the name after recovery; @path reads it from a keyfile (avoids ps exposure)")
+	recoverySeedsCSV := fs.String("recovery-seeds", "", "comma-separated hex seeds of the recovery keys (must be a subset of the policy's field-10 keys); each entry may also be @path (avoids ps exposure)")
 	out := fs.String("out", "", "path to write the RecoveryEvidence CBOR")
 	outEnvelope := fs.String("out-envelope", "", "additionally write the spec 8.4 recovered record R2 as a signed envelope .cbor here "+
 		"(owner = the NEW key, sequence = prev+1, prev_hash = H(prev), signed by the NEW owner — the opposite of transfer). "+
@@ -434,7 +434,7 @@ func cmdRecover(args []string) error {
 	// The same check covers the optional R2 envelope below: it pairs R2 with
 	// exactly this evidence, so verifying the evidence at now=NotBefore is
 	// verifying the envelope's acceptance precondition (§8.4 step 3).
-	if ok := wire.VerifyRecovery(policy, ev, prevHash, notBefore); !ok && len(sigs) >= int(policy.Threshold) {
+	if ok := wire.VerifyRecovery(policy, ev, prevHash, prev.Record.Created, notBefore); !ok && len(sigs) >= int(policy.Threshold) {
 		return cryptoErr("assembled recovery evidence failed self-verification")
 	}
 	evBytes, err := ev.Bytes()
@@ -646,6 +646,13 @@ func cmdVerifyRecovery(args []string) error {
 	case quorum < int(policy.Threshold):
 		return cryptoErr("status=quorum %d/%d BELOW THRESHOLD — only %d of the required %d distinct policy keys produced valid signatures",
 			quorum, len(policy.Keys), quorum, policy.Threshold)
+	case ev.NotBefore < prev.Record.Created+policy.Timelock:
+		// The same timelock bound wire.VerifyRecovery enforces: a
+		// declaration cannot predate the recovered record's creation plus
+		// the policy timelock (§8.4 line 694's execute_not_before = now +
+		// timelock; a backdated NotBefore zeroes the cancellation window).
+		return cryptoErr("status=BACKDATED — execute_not_before (%d) < prev_created + timelock (%d + %d); a compromised quorum cannot shrink the §8.4 cancellation window",
+			ev.NotBefore, prev.Record.Created, policy.Timelock)
 	case now < ev.NotBefore:
 		return cryptoErr("status=quorum %d/%d OK, timelock not elapsed — executable at %s (%d s remaining, spec 8.4 step 3)",
 			quorum, len(policy.Keys), notBefore, int64(ev.NotBefore)-int64(now))

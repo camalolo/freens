@@ -4,10 +4,13 @@ package resolver
 // and a concrete Upstream that forwards to conventional recursive resolvers.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/camalolo/freens/internal/metrics"
@@ -142,28 +145,29 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 	}
 
 	q := m.Question[0]
+	ck := cacheKeyFor(q)
 
 	// §10.4: consult the response cache BEFORE resolving so a cached hit
 	// never re-executes the lookup chain. Only freens-sourced outcomes are
 	// ever stored (putFreens ignores aa == false), so DNS-forwarded answers
 	// always reach the upstream.
-	var ck cacheKey
-	caching := r.Cache != nil
-	if caching {
-		ck = cacheKeyFor(q)
+	if r.Cache != nil {
 		if rrs, rcode, aa, ok := r.Cache.get(ck); ok {
 			resp.Rcode = rcode
 			resp.Answer = rrs
 			resp.Authoritative = aa
-			_ = w.WriteMsg(resp)
+			writeReply(w, resp)
 			return
 		}
 	}
 
-	rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
+	// resolveShared: single-flight the resolution (concurrent identical
+	// queries share one DHT walk; the leader caches the outcome per §10.4 —
+	// which is why the old putFreens call moved inside it).
+	rrs, rcode, aa, err := r.resolveShared(context.Background(), q, ck)
 	if err != nil {
 		resp.Rcode = dns.RcodeServerFailure
-		_ = w.WriteMsg(resp)
+		writeReply(w, resp)
 		return
 	}
 	resp.Rcode = rcode
@@ -174,8 +178,19 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 	// is meaningful for any rcode that an authoritative server would emit
 	// (including NXDOMAIN/NODATA), so we set it verbatim from the resolver.
 	resp.Authoritative = aa
-	if caching {
-		r.Cache.putFreens(ck, rrs, rcode, aa)
+	writeReply(w, resp)
+}
+
+// writeReply sends resp, truncating UDP responses that exceed the classic
+// 512-byte datagram budget so the client sees TC + TCP fallback instead of a
+// silently-dropped oversized datagram (miekg/dns never frames UDP errors for
+// us; pre-v0.7.1 a >512 B answer simply vanished — found auditing the TXT
+// paths). No-op truncation for TCP.
+func writeReply(w dns.ResponseWriter, resp *dns.Msg) {
+	if addr := w.RemoteAddr(); addr != nil {
+		if _, isUDP := addr.(*net.UDPAddr); isUDP {
+			resp.Truncate(dns.MinMsgSize)
+		}
 	}
 	_ = w.WriteMsg(resp)
 }
@@ -246,4 +261,76 @@ func ensureDNSPort(srv string) string {
 		return srv
 	}
 	return srv + ":53"
+}
+
+// DoHUpstream is an Upstream that forwards over RFC 8484 DNS-over-HTTPS
+// (POST application/dns-message), honoring the [upstream] doh config key
+// that existed pre-v0.7.1 but was silently never wired (every query —
+// including, under the old dns-first default, freens-namespace names —
+// left in plaintext UDP). Fallback is the plain DNSUpstream server list:
+// when DoH fails (network, 4xx/5xx, malformed response) the query is
+// retried over conventional DNS rather than erroring out, so wiring DoH
+// never reduces availability. A nil Fallback makes DoH the only path.
+type DoHUpstream struct {
+	URL      string        // the DoH endpoint (e.g. https://dns.example/dns-query)
+	Timeout  time.Duration // per-request timeout; default 5 s
+	Client   *http.Client  // default: a client with Timeout applied
+	Fallback *DNSUpstream  // optional plaintext fallback (tried after DoH fails)
+}
+
+// Forward implements Upstream: one DoH POST of the packed query; on success
+// (HTTP 200 with a decodable DNS message) the response is returned as-is.
+func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
+	if u == nil || u.URL == "" {
+		return nil, errors.New("resolver: no DoH URL configured")
+	}
+	timeout := u.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	client := u.Client
+	if client == nil {
+		client = &http.Client{Timeout: timeout}
+	}
+	payload, err := q.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("resolver: pack query for DoH: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.URL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("resolver: DoH request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH round trip: %w", err))
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH status %d", resp.StatusCode))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH body: %w", err))
+	}
+	out := new(dns.Msg)
+	if err := out.Unpack(body); err != nil {
+		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH response unpack: %w", err))
+	}
+	return out, nil
+}
+
+// fallbackOr retries q over the plaintext Fallback (if any) after a DoH
+// failure, chaining both errors; without a fallback the DoH error is
+// returned as-is.
+func (u *DoHUpstream) fallbackOr(ctx context.Context, q *dns.Msg, dohErr error) (*dns.Msg, error) {
+	if u.Fallback == nil {
+		return nil, dohErr
+	}
+	resp, err := u.Fallback.Forward(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("%v (plaintext fallback also failed: %w)", dohErr, err)
+	}
+	return resp, nil
 }

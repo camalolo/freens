@@ -110,8 +110,11 @@ func Load(path, passphrase string) (*crypto.Keypair, error) {
 	return crypto.FromSeed(seed)
 }
 
-// Save persists kp at path (0600, parent dirs 0700); passphrase "" writes
-// the legacy plaintext hex form, non-empty writes the FREENSK1 envelope.
+// Save persists kp at path atomically (temp file + rename, always 0600 —
+// even over a pre-existing file with looser permissions, which an
+// in-place os.WriteFile would keep); passphrase "" writes the legacy
+// plaintext hex form, non-empty writes the FREENSK1 envelope. A crash
+// mid-write can no longer truncate the previous copy of the key.
 func Save(path string, kp *crypto.Keypair, passphrase string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -126,7 +129,48 @@ func Save(path string, kp *crypto.Keypair, passphrase string) error {
 			return err
 		}
 	}
-	return os.WriteFile(path, data, 0o600)
+	return writeFileAtomic(path, data)
+}
+
+// writeFileAtomic durably replaces path with data: write a temp file in
+// the SAME directory, fsync it, rename it over path, then fsync the
+// directory so the rename itself survives a crash. Any failure before the
+// rename removes the temp file (no litter, path untouched — the old bytes
+// stay intact).
+func writeFileAtomic(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(tmp.Name()) // best effort: no temp litter on failure
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Chmod(tmp.Name(), 0o600); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	d, derr := os.Open(dir)
+	if derr != nil {
+		return derr
+	}
+	defer d.Close()
+	return d.Sync() // make the rename durable
 }
 
 // IsEncryptedPath reports whether the keyfile at path carries the FREENSK1

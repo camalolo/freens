@@ -8,11 +8,13 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/keychain"
+	"golang.org/x/term"
 )
 
 // ---------------------------------------------------------------------------
@@ -21,7 +23,7 @@ import (
 
 func cmdGenKey(args []string) error {
 	fs := flag.NewFlagSet("gen-key", flag.ContinueOnError)
-	out := fs.String("out", "", "write the seed as a 0600 keyfile (64 hex chars + newline) for use as -owner-key @<path> etc.")
+	out := fs.String("out", "", "write the seed as a 0600 PLAINTEXT keyfile (64 hex chars + newline) for use as -owner-key @<path> etc.; without a terminal this needs "+EnvAllowPlaintextKey+"=1 (register can write passphrase-encrypted keyfiles)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -41,9 +43,17 @@ func cmdGenKey(args []string) error {
 	fmt.Printf("tld_id=%s\n", hex.EncodeToString(tldID))
 	fmt.Printf("tld_id_b32=%s\n", base32.StdEncoding.EncodeToString(tldID))
 	if *out != "" {
+		// -out always writes the plaintext form: no silent plaintext
+		// keyfiles — interactive use warns, non-interactive use needs the
+		// explicit FREENS_ALLOW_PLAINTEXT_KEY=1 opt-in (same policy as
+		// register's passphrase prompt).
+		if err := plaintextKeyPolicy(term.IsTerminal(int(os.Stdin.Fd())), os.Getenv(EnvAllowPlaintextKey)); err != nil {
+			return fmt.Errorf("-out: %w", err)
+		}
 		if err := writeKeyFile(*out, kp); err != nil {
 			return fmt.Errorf("writing keyfile: %w", err)
 		}
+		fmt.Printf("warning: %s is a PLAINTEXT (unencrypted) key file — anyone who can read it owns the name; prefer passphrase-encrypted keyfiles from `register`\n", *out)
 		fmt.Printf("keyfile=%s (0600; use as -owner-key @%s on other subcommands)\n", *out, *out)
 	}
 	return nil

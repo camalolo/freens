@@ -42,7 +42,7 @@ type RegisterInput struct {
 	IP         string // IPv4 dotted quad or IPv6 literal ("" = outbound default)
 	TTL        uint64 // A/AAAA TTL seconds (0 = 300)
 	NoRecovery bool   // skip the default-on 3-of-2 recovery policy
-	Passphrase string // "" = plaintext keyfiles (the CLI default)
+	Passphrase string // REQUIRED in the web UI: keys are always encrypted at rest
 }
 
 // RegisterResult reports what a successful register did.
@@ -76,6 +76,15 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 		if progress != nil {
 			progress(fmt.Sprintf(format, a...))
 		}
+	}
+	// The web UI never writes unencrypted keyfiles. An empty passphrase
+	// used to fall through to keychain.Save's plaintext mode (the CLI's
+	// default) and silently leave raw secret keys on disk — audit F3 —
+	// so it is rejected FIRST, before any key is generated, parked, or
+	// written (the form sends a single passphrase field, so emptiness is
+	// the only mismatch possible).
+	if strings.TrimSpace(in.Passphrase) == "" {
+		return RegisterResult{}, userErr("a passphrase is required — the web UI does not write unencrypted keyfiles")
 	}
 	alias, err := naming.ValidateAlias(in.Alias)
 	if err != nil {

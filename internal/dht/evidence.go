@@ -73,6 +73,12 @@ func (s *EnvelopeStore) putEvidenceValidated(recordHash, raw []byte) error {
 	if len(recordHash) != constants.SHA256Len {
 		return fmt.Errorf("dht: evidence key must be %d bytes, got %d", constants.SHA256Len, len(recordHash))
 	}
+	if len(raw) > maxEvidenceBlobLen {
+		// Honest declarations are ~threshold×64 + 32 + 8 bytes; anything
+		// datagram-maximal is padding aimed at the memory budget or the
+		// get-reflection payload, not proof material.
+		return fmt.Errorf("dht: recovery evidence blob is %d bytes (max %d)", len(raw), maxEvidenceBlobLen)
+	}
 	if _, err := wire.DecodeRecoveryEvidence(raw); err != nil {
 		return fmt.Errorf("dht: invalid recovery evidence: %w", err)
 	}
@@ -157,16 +163,22 @@ func (s *EnvelopeStore) PersistEvidenceTo(dir string) (int, error) {
 }
 
 // putEvidenceLocked inserts raw under k, tracking first-insertion order for
-// the FIFO bound; on overflow the oldest-inserted entry is dropped. Caller
-// must hold s.mu.
+// the FIFO bound; on overflow — by count (evidenceMax) or total bytes
+// (evidenceMaxBytes) — the oldest-inserted entry is dropped (keeping at
+// least one entry: a single oversized blob cannot evict itself forever; the
+// per-blob cap above already bounds that case). Caller must hold s.mu.
 func (s *EnvelopeStore) putEvidenceLocked(k [constants.SHA256Len]byte, raw []byte) {
 	if _, ok := s.evidence[k]; !ok {
 		s.evidenceOrder = append(s.evidenceOrder, k)
+	} else {
+		s.evidenceBytes -= len(s.evidence[k]) // replace: old bytes leave the budget
 	}
 	s.evidence[k] = raw
-	for len(s.evidence) > evidenceMax && len(s.evidenceOrder) > 0 {
+	s.evidenceBytes += len(raw)
+	for (len(s.evidence) > evidenceMax || s.evidenceBytes > s.evidMaxBytes) && len(s.evidence) > 1 {
 		oldest := s.evidenceOrder[0]
 		s.evidenceOrder = s.evidenceOrder[1:]
+		s.evidenceBytes -= len(s.evidence[oldest])
 		delete(s.evidence, oldest)
 	}
 }
@@ -221,9 +233,11 @@ func (s *EnvelopeStore) recoveryAcceptableLocked(newEnv, prevEnv *wire.SignedEnv
 	if err != nil {
 		return false
 	}
-	// Quorum over the incumbent's policy; timelock trivially passed
-	// (now = NotBefore) — effectiveness is decided at resolve time.
-	return wire.VerifyRecovery(prevEnv.Record.Recovery, ev, hPrev, ev.NotBefore)
+	// Quorum over the incumbent's policy; the elapsed-time gate trivially
+	// passes (now = NotBefore) on purpose — effectiveness is decided at
+	// resolve time — but the NotBefore >= prev.Created + Timelock bound
+	// inside VerifyRecovery still applies (no zero-window backdating).
+	return wire.VerifyRecovery(prevEnv.Record.Recovery, ev, hPrev, prevEnv.Record.Created, ev.NotBefore)
 }
 
 // ---------------------------------------------------------------------------

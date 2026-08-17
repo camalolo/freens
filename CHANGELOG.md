@@ -1,5 +1,109 @@
 # Changelog
 
+## v0.7.1 — security & performance hardening (application audit)
+
+A full application audit (untrusted-input handling, at-rest secrets,
+web/admin surfaces, resource bounds, hot-path performance) produced this
+release: every HIGH finding fixed, the cheap performance wins landed,
+and the remaining accepted-risk items documented below.
+
+Security fixes:
+
+- **ClaimPool bounds + PoW gate (§7.4 storing side)** — the top-2 claim
+  pool grew one key per distinct alias FOREVER, and the collect path
+  (DHTLookup.CollectClaims → Offer) admitted envelopes on
+  envelope-signature alone, so a malicious peer could pool zero-PoW
+  claims for unlimited aliases at no mint cost (memory exhaustion).
+  Offer now enforces the §7.4 claim screen (claimant consistency +
+  recomputed PoW) and the pool is bounded by key count (4096, FIFO
+  whole-key eviction) and total bytes (16 MiB).
+- **Per-source-IP put throttle** — a put is the costliest CPU a peer can
+  induce (decode + signature + PoW + witness verifies, inline on the
+  readLoop) and write tokens are minted by every ping/get, so they gated
+  authorization, not rate. New NodeConfig.PutRateLimit/PutBurst
+  (default 10/s burst 20 per source IP; error 301 "throttled").
+- **Witness verification cap** — claims.ValidWitnesses evaluates at most
+  16 deduplicated attestations (2× WITNESS_SET); a ≤64 KB claim
+  previously cost ~400 Ed25519 verifies on the storing node.
+- **§8.4 timelock bound** — VerifyRecovery now enforces
+  `NotBefore >= prev_created + policy.Timelock`: a compromised quorum
+  can no longer backdate execute_not_before to 0 and take effect with no
+  cancellation window (the CLI's verify-recovery reports the same
+  BACKDATED status). prevCreated == 0 keeps the legacy check for
+  callers that cannot know it.
+- **Witness claim-ts gate vs huge uint64** — ts ≥ 2^63 wrapped both
+  int64 sanity gates negative and got co-signed; the comparisons are
+  uint64-native now.
+- **History/evidence byte budgets** — the §8.3 history and §8.4
+  evidence tables were count-capped (4096) but byte-uncapped (~256 MB
+  of network-sourced data each beyond the documented store budget).
+  Both now carry 16 MiB byte budgets (oldest-first/FIFO eviction) and
+  evidence blobs over 64 KiB are rejected outright.
+- **rateLimiter hard cap** — >10k distinct live sources no longer grow
+  the per-IP bucket map unbounded (least-recently-touched entries are
+  evicted at the ceiling).
+- **freens namespace never leaks upstream first** — the shipped default
+  configs (builtin + `freens setup`) now route `freens = freens-first`:
+  the community TLD is not an ICANN TLD, so dns-first only leaked every
+  freens name to public plaintext upstreams and let a spoofed upstream
+  NOERROR shadow the DHT answer. Existing freens.conf files need the
+  route line added (or re-run setup).
+- **DoH wired** — `[upstream] doh` was parsed but never used; it now
+  drives an RFC 8484 DoH upstream (resolver.DoHUpstream) with the
+  plaintext servers as automatic fallback.
+- **webui**: bootstrap is atomic under a lock (first-visitor TOCTOU),
+  login lockout counts failures per IPv4 /24 · IPv6 /64 (source-address
+  rotation defeated the per-IP counters), Register rejects empty
+  passphrases (no more silent plaintext keyfiles), and Status results
+  are cached 1 s per render (the login page no longer amplifies daemon
+  round-trips pre-auth).
+- **keys at rest**: keychain.Save is atomic (temp + fsync + rename +
+  dir fsync; a torn write can no longer destroy the only owner key) and
+  always lands 0600 even over a pre-existing loose-perms file. CLI
+  passphrase policy: a MISMATCH now aborts (it used to proceed with NO
+  passphrase), and non-interactive plaintext keys require the explicit
+  FREENS_ALLOW_PLAINTEXT_KEY=1 opt-in. gen-key/lifecycle flag help now
+  documents the @keyfile form everywhere (avoids ps/proc exposure of
+  raw seeds).
+- **setup**: /etc writes (resolv.conf, unit) are staged
+  (`<dest>.freens.new` → `mv -f`): the box always has either the old or
+  the new file — the rm-then-cp window that could leave no resolv.conf
+  is gone. The pristine resolv.conf backup is never overwritten on
+  re-setup.
+- **TURN**: total allocation cap (DefaultMaxTotalAllocs = 128, error
+  508; spoofed-source Allocate floods can no longer exhaust the
+  daemon's FDs) and the per-IP allocation map is garbage-collected on
+  expiry/release.
+
+Performance fixes:
+
+- **CompareDistance is allocation-free** (byte-wise stack XOR-compare;
+  was 2 heap slices per comparison inside every walk sort — thousands of
+  allocations per lookup).
+- **RecordHash cached per envelope** (atomic, like the canonical-byte
+  caches; the claim-collection sort comparator re-hashed full envelopes
+  O(n log n) per collect).
+- **VerifyFull builds the PoW prefix once** and shares it between the
+  PoW and witness stages (was 2 canonical-CBOR encodes per claim).
+- **Resolver single-flight**: concurrent identical questions share one
+  resolution and DHT walk (the cache-expiry stampede ran N walks and
+  could self-trip peers' §12 throttle into SERVFAIL bursts).
+- **ResponseCache**: full expired-sweeps run every 64 inserts (was every
+  insert, O(4096) under the shared mutex) and hit/miss counters moved
+  outside the lock.
+- **DNS correctness along the way**: >255 B TXT rdata maps to
+  multi-string character-strings (an un-packable answer used to be
+  silently dropped) and UDP answers over 512 B truncate with TC set
+  instead of vanishing as oversized datagrams.
+
+Known accepted risks (documented, not fixed here): webui serves plain
+HTTP on the LAN by design (TLS would need a PKI story for LAN boxes);
+the recovery declaration instant remains unattestable without trusted
+timestamps (the new bound removes the zero-window forgery; a
+predecessor older than the timelock still admits a past-dated
+NotBefore); TURN auth remains "any freens node key" (opt-in community
+relay, now allocation-capped).
+
 ## v0.7.0 — witness attestations v2: the backdating hole closed (security)
 
 Found by an external security review of the §7 alias layer, confirmed by

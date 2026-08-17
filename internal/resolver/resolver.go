@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
@@ -184,12 +185,62 @@ type Resolver struct {
 	// on the DNS server path (ServeDNS); direct ResolveQuestion callers
 	// always hit the namespace. nil disables caching.
 	Cache *ResponseCache
+
+	// Single-flight state (v0.7.1): concurrent identical questions share one
+	// resolution — see resolveShared. Lazily initialized under flightMu so
+	// zero-value/embedded Resolvers keep working.
+	flightMu sync.Mutex
+	flights  map[cacheKey]*resFlight
+}
+
+// resFlight is one in-flight (or just-completed) shared resolution.
+type resFlight struct {
+	done  chan struct{} // closed when rrs/rcode/aa/err are set
+	rrs   []dns.RR
+	rcode int
+	aa    bool
+	err   error
 }
 
 // New builds a Resolver with a default clock. Cfg, Freens, and Upstream may be
 // nil (the resolver degrades gracefully: freens misses, DNS refused).
 func New(cfg *Config, freens RecordLookup, upstream Upstream) *Resolver {
 	return &Resolver{Cfg: cfg, Freens: freens, Upstream: upstream}
+}
+
+// resolveShared runs ResolveQuestion with per-question single-flight:
+// concurrent queries with the same (qname, qtype, qclass) — the cache-expiry
+// stampede, a fan-out of N client goroutines at once — share ONE resolution
+// and its outcome instead of each running its own DHT claim walk + chain
+// walk (N simultaneous walks also trip peers' §12 read throttle and
+// self-inflict ErrThrottled SERVFAILs, field-observed as bursty failures at
+// 60 s TTL boundaries). The leader stores the outcome in Cache (when wired)
+// before waking the followers; followers return the shared result verbatim
+// (identical question ⇒ identical namespace answer at the same instant).
+func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKey) ([]dns.RR, int, bool, error) {
+	r.flightMu.Lock()
+	if f, ok := r.flights[ck]; ok {
+		r.flightMu.Unlock()
+		<-f.done
+		return f.rrs, f.rcode, f.aa, f.err
+	}
+	f := &resFlight{done: make(chan struct{})}
+	if r.flights == nil {
+		r.flights = make(map[cacheKey]*resFlight)
+	}
+	r.flights[ck] = f
+	r.flightMu.Unlock()
+
+	f.rrs, f.rcode, f.aa, f.err = r.ResolveQuestion(ctx, q)
+	if r.Cache != nil {
+		r.Cache.putFreens(ck, f.rrs, f.rcode, f.aa)
+	}
+
+	r.flightMu.Lock()
+	delete(r.flights, ck)
+	r.flightMu.Unlock()
+	close(f.done)
+	return f.rrs, f.rcode, f.aa, f.err
 }
 
 func (r *Resolver) now() int64 {
@@ -830,7 +881,26 @@ func freensRRToDNS(name string, rr *wire.RR, expires, now int64) dns.RR {
 		return &dns.AAAA{Hdr: hdr, AAAA: net.IP(rr.Rdata)}
 	case wire.RRTypeTXT:
 		hdr.Rrtype = dns.TypeTXT
-		return &dns.TXT{Hdr: hdr, Txt: []string{string(rr.Rdata)}}
+		// A freens TXT rdata may exceed 255 bytes (§4.3 caps the record,
+		// not the string), but one dns.TXT string is an RFC 1035
+		// character-string (<= 255). Pre-v0.7.1 a longer rdata produced an
+		// un-packable response and WriteMsg failed — the client got
+		// silence instead of an answer. Chunk the rdata into <= 255-byte
+		// character-strings (the standard multi-string TXT form; the
+		// concatenated rdata is what round-trips).
+		if len(rr.Rdata) == 0 {
+			return &dns.TXT{Hdr: hdr, Txt: []string{""}}
+		}
+		txt := make([]string, 0, (len(rr.Rdata)+254)/255)
+		for len(rr.Rdata) > 0 {
+			n := len(rr.Rdata)
+			if n > 255 {
+				n = 255
+			}
+			txt = append(txt, string(rr.Rdata[:n]))
+			rr.Rdata = rr.Rdata[n:]
+		}
+		return &dns.TXT{Hdr: hdr, Txt: txt}
 	case wire.RRTypeNS:
 		// §4.3: rdata = wire_name of target (freens) or DNS name (hybrid).
 		// The hybrid form is emitted as-is when it is a valid DNS hostname.

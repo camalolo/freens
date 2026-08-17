@@ -17,7 +17,7 @@
 //     <home>/webui/auth (0600), bootstrapped by the FIRST visitor ("set
 //     your password") and then required for everything else. Sessions are
 //     in-memory (24 h) with HttpOnly+SameSite=Lax cookies; logins are
-//     rate-limited per source IP.
+//     rate-limited per source subnet (IPv4 /24, IPv6 /64).
 //   - Mutations additionally require the X-Requested-With header (htmx
 //     always sends it; plain cross-site form posts cannot set it) — CSRF
 //     defense in depth on top of SameSite.

@@ -445,6 +445,14 @@ type SignedEnvelope struct {
 	// (collect → verify → chain walk → store tie-break).
 	canonRecord atomic.Pointer[[]byte]
 	canonFull   atomic.Pointer[[]byte]
+
+	// recHash caches SHA-256(canonFull) — H_record. RecordHash is called
+	// repeatedly on the same envelope (DHT store tie-breaks, §7.4 claim-pool
+	// dedupe, chain-link checks, sort comparators during claim collection);
+	// before this cache each call re-hashed the full canonical bytes, and
+	// the claims-pool sort comparator made that O(n log n) hashes per
+	// collect. Populated lazily/atomically like the byte caches above.
+	recHash atomic.Pointer[[sha256.Size]byte]
 }
 
 // CanonicalRecordBytes returns the bytes the signature covers — identical to
@@ -483,13 +491,21 @@ func (e *SignedEnvelope) Bytes() ([]byte, error) {
 
 // RecordHash returns H_record = SHA-256(canonical_cbor(SignedEnvelope)) (§4.2).
 // It covers the WHOLE envelope (record + sig + signer) and is used for
-// prev_hash chaining (§8.3) and the §6.4 DHT store tie-break.
+// prev_hash chaining (§8.3) and the §6.4 DHT store tie-break. The result is
+// cached on the envelope (see the immutability contract); the returned slice
+// aliases the cached array, so callers must not mutate it (all in-repo
+// callers treat hashes as read-only compare/copy keys).
 func (e *SignedEnvelope) RecordHash() ([]byte, error) {
+	if h := e.recHash.Load(); h != nil {
+		return h[:], nil
+	}
 	b, err := e.Bytes()
 	if err != nil {
 		return nil, err
 	}
-	h := sha256.Sum256(b)
+	var h [sha256.Size]byte
+	h = sha256.Sum256(b)
+	e.recHash.Store(&h)
 	return h[:], nil
 }
 

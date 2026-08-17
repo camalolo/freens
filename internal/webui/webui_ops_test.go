@@ -60,8 +60,9 @@ func TestOpsRegisterFullFlow(t *testing.T) {
 
 	var steps []string
 	res, err := f.ops.Register(ctx, RegisterInput{
-		Alias: "opsflow",
-		IP:    "203.0.113.90",
+		Alias:      "opsflow",
+		IP:         "203.0.113.90",
+		Passphrase: "flow secret one", // F3: the web UI always encrypts
 	}, func(s string) { steps = append(steps, s) })
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -100,7 +101,7 @@ func TestOpsRegisterFullFlow(t *testing.T) {
 	}
 
 	// Re-register reuses the claim (no re-mine) and bumps the sequence.
-	res2, err := f.ops.Register(context.Background(), RegisterInput{Alias: "opsflow", IP: "203.0.113.91"}, nil)
+	res2, err := f.ops.Register(context.Background(), RegisterInput{Alias: "opsflow", IP: "203.0.113.91", Passphrase: "flow secret one"}, nil)
 	if err != nil {
 		t.Fatalf("re-Register: %v", err)
 	}
@@ -117,12 +118,15 @@ func TestOpsSetNameRenewRevoke(t *testing.T) {
 	ctx, cancelMain := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancelMain()
 
-	if _, err := f.ops.Register(ctx, RegisterInput{Alias: "lifecycle", IP: "203.0.113.80"}, nil); err != nil {
+	// F3: the owner key is always encrypted now, so every op below must
+	// present the passphrase Register chose.
+	const pass = "cycle secret"
+	if _, err := f.ops.Register(ctx, RegisterInput{Alias: "lifecycle", IP: "203.0.113.80", Passphrase: pass}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
 	// Sub-name.
-	if seq, err := f.ops.SetName(ctx, "www.lifecycle", "203.0.113.81", 300, ""); err != nil || seq != 1 {
+	if seq, err := f.ops.SetName(ctx, "www.lifecycle", "203.0.113.81", 300, pass); err != nil || seq != 1 {
 		t.Fatalf("SetName www: seq=%d err=%v", seq, err)
 	}
 	if r, err := f.daem.Resolve(ctx, "www.lifecycle"); err != nil || r == nil || !r.Found {
@@ -132,39 +136,41 @@ func TestOpsSetNameRenewRevoke(t *testing.T) {
 	}
 
 	// Change it (sequence bumps).
-	if seq, err := f.ops.SetName(ctx, "www.lifecycle", "203.0.113.82", 300, ""); err != nil || seq != 2 {
+	if seq, err := f.ops.SetName(ctx, "www.lifecycle", "203.0.113.82", 300, pass); err != nil || seq != 2 {
 		t.Fatalf("SetName change: seq=%d err=%v", seq, err)
 	}
 
 	// Renew the fresh record without force: refused.
-	if _, err := f.ops.Renew(ctx, "www.lifecycle", "", false); err == nil {
+	if _, err := f.ops.Renew(ctx, "www.lifecycle", pass, false); err == nil {
 		t.Fatal("renew of a fresh record without force must refuse")
 	}
-	if seq, err := f.ops.Renew(ctx, "www.lifecycle", "", true); err != nil || seq != 3 {
+	if seq, err := f.ops.Renew(ctx, "www.lifecycle", pass, true); err != nil || seq != 3 {
 		t.Fatalf("forced renew: seq=%d err=%v", seq, err)
 	}
 
 	// Revoke the apex (typed confirmation is the handler's job). The apex
 	// carries its own sequence: register=1, so the tombstone is 2 (www's
 	// sequence above is a different key's).
-	if seq, err := f.ops.Revoke(ctx, "lifecycle", ""); err != nil || seq != 2 {
+	if seq, err := f.ops.Revoke(ctx, "lifecycle", pass); err != nil || seq != 2 {
 		t.Fatalf("Revoke: seq=%d err=%v", seq, err)
 	}
 	if r, err := f.daem.Resolve(ctx, "lifecycle"); err != nil || r == nil || !r.Revoked {
 		t.Fatalf("resolve revoked: %v %+v", err, r)
 	}
 	// And the tombstone bumps the next publish's sequence base.
-	if seq, err := f.ops.SetName(ctx, "lifecycle", "203.0.113.83", 300, ""); err != nil || seq != 3 {
+	if seq, err := f.ops.SetName(ctx, "lifecycle", "203.0.113.83", 300, pass); err != nil || seq != 3 {
 		t.Fatalf("post-revoke SetName: seq=%d err=%v", seq, err)
 	}
 }
 
 func TestOpsRegisterBadInputs(t *testing.T) {
 	f := newOpsFixture(t)
-	if _, err := f.ops.Register(context.Background(), RegisterInput{Alias: "BAD!", IP: "1.2.3.4"}, nil); err == nil {
+	// Passphrase supplied so each failure below is the INPUT's fault, not
+	// F3's empty-passphrase gate.
+	if _, err := f.ops.Register(context.Background(), RegisterInput{Alias: "BAD!", IP: "1.2.3.4", Passphrase: "bad inputs"}, nil); err == nil {
 		t.Error("uppercase alias must fail")
 	}
-	if _, err := f.ops.Register(context.Background(), RegisterInput{Alias: "ok", IP: "not-an-ip"}, nil); err == nil {
+	if _, err := f.ops.Register(context.Background(), RegisterInput{Alias: "ok", IP: "not-an-ip", Passphrase: "bad inputs"}, nil); err == nil {
 		t.Error("garbage IP must fail")
 	}
 	if _, err := f.ops.SetName(context.Background(), "no-owner.example", "1.2.3.4", 300, ""); err == nil {

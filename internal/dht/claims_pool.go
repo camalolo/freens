@@ -41,23 +41,58 @@ import (
 // ClaimPool is the §7.4 "storing nodes keep the top 2 by ordering" store: for
 // each K_claim it holds at most 2 claim envelopes, best-first by the §7.4
 // step-3 ordering tuple. All methods are safe for concurrent use.
+//
+// Boundedness (v0.7.1 hardening): the pool is capped BOTH by key count
+// (claimPoolMaxKeys, FIFO whole-key eviction of the oldest-inserted key) and
+// by total pooled bytes (claimPoolMaxBytes, counting each pooled envelope's
+// canonical size). Before the caps the byKey map grew without bound — one
+// entry (up to 2 × ~64 KB envelopes + decoded claims) per DISTINCT alias
+// ever pooled, forever, which a malicious peer could drive via the collect
+// path (claims_lookup offers every collected envelope into the local pool)
+// at zero PoW cost. Offer additionally enforces the §7.4 step-2 claim screen
+// (claimant consistency + recomputed PoW) so only claims a STORING node would
+// have accepted at hPut can occupy pool memory.
 type ClaimPool struct {
 	mu sync.Mutex
 	// byKey maps K_claim → the 1-or-2 pooled claims, ordered best-first.
 	byKey map[[constants.SHA256Len]byte][]pooledClaim
+	// order records first-insertion order of byKey's keys (FIFO eviction
+	// source); a key re-Offered keeps its original position.
+	order [][constants.SHA256Len]byte
+	// bytes is the sum of every pooled envelope's canonical size (the
+	// byte budget). maxKeys/maxBytes are fields (defaults from the consts
+	// below) so tests can shrink the budgets.
+	bytes    int
+	maxKeys  int
+	maxBytes int
 }
 
+// Pool bounds. 4096 keys × 2 × ~4 KB typical claim envelopes ≈ 32 MB worst
+// case at the byte cap alone; the key cap keeps map/index overhead bounded
+// for tiny envelopes, the byte cap keeps memory bounded for maximal (~64 KB)
+// ones. Both are defense-in-depth ceilings far above honest fleet scale.
+const (
+	claimPoolMaxKeys  = 4096
+	claimPoolMaxBytes = 16 << 20 // 16 MiB
+)
+
 // pooledClaim is one pool member: the envelope, its decoded AliasClaim (the
-// ordering input, decoded once at Offer), and its H_record (the dedupe key).
+// ordering input, decoded once at Offer), its H_record (the dedupe key), and
+// its canonical byte size (the byte-budget accounting unit).
 type pooledClaim struct {
 	env   *wire.SignedEnvelope
 	claim *claims.AliasClaim
 	h     []byte // H_record = SHA-256(canonical envelope)
+	size  int    // len(env.Bytes()), cached for the byte budget
 }
 
 // NewClaimPool returns an empty ClaimPool.
 func NewClaimPool() *ClaimPool {
-	return &ClaimPool{byKey: make(map[[constants.SHA256Len]byte][]pooledClaim)}
+	return &ClaimPool{
+		byKey:    make(map[[constants.SHA256Len]byte][]pooledClaim),
+		maxKeys:  claimPoolMaxKeys,
+		maxBytes: claimPoolMaxBytes,
+	}
 }
 
 // claimOrderLess is the §7.4 step-3 ascending total order on AliasClaims,
@@ -83,7 +118,17 @@ func claimOrderLess(a, b *claims.AliasClaim) bool {
 // an undecodable envelope, or an envelope without a decodable AliasClaim
 // (field 11) returns false — the pool is claim-key-space-only by construction.
 //
-// Signature validity is the caller's job (hPut verifies before offering;
+// Claim screen (v0.7.1): the decoded claim must pass the §7.4 step-2
+// PoW-side filter — claimant consistency (TldID == SHA-256(ClaimantPK)) and
+// a recomputed PoW at the inferred difficulty — BEFORE it may occupy pool
+// memory. hPut already runs the full VerifyFull screen (PoW + quorum) before
+// offering; the pool-side gate exists for the OTHER caller, the collect path
+// (claims_lookup.go), whose remote-sourced envelopes previously entered the
+// pool on envelope-signature alone — a zero-PoW memory-exhaustion vector.
+// Quorum is NOT re-checked here (the resolver applies it per query; pooled
+// storage mirrors what hPut would have retained).
+//
+// Signature validity remains the caller's job (hPut verifies before offering;
 // CollectClaims verifies before merging).
 func (p *ClaimPool) Offer(key []byte, env *wire.SignedEnvelope) bool {
 	if p == nil || len(key) != constants.SHA256Len || env == nil || env.Record == nil {
@@ -93,22 +138,31 @@ func (p *ClaimPool) Offer(key []byte, env *wire.SignedEnvelope) bool {
 	if err != nil {
 		return false
 	}
+	// §7.4 claim screen: no PoW, no pool slot.
+	if !claim.VerifyClaimantConsistency() || !claim.VerifyPoW(claims.InferDifficulty) {
+		return false
+	}
 	h, err := env.RecordHash()
 	if err != nil {
 		return false
 	}
-	pc := pooledClaim{env: env, claim: claim, h: h}
+	envBytes, err := env.Bytes()
+	if err != nil {
+		return false
+	}
+	pc := pooledClaim{env: env, claim: claim, h: h, size: len(envBytes)}
 	var k [constants.SHA256Len]byte
 	copy(k[:], key)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cur := p.byKey[k]
+	cur, ok := p.byKey[k]
 	for _, m := range cur {
 		if bytes.Equal(m.h, h) {
 			return false // already pooled (H_record dedupe)
 		}
 	}
+	newKey := !ok
 	if len(cur) >= 2 {
 		// Full: keep the newcomer only if it beats the worst member strictly;
 		// an equal tuple (same claim contents in a different envelope) loses
@@ -116,15 +170,41 @@ func (p *ClaimPool) Offer(key []byte, env *wire.SignedEnvelope) bool {
 		if !claimOrderLess(pc.claim, cur[1].claim) {
 			return false
 		}
-		cur = cur[:1] // drop the worst
+		p.bytes -= cur[1].size // the evicted worst leaves the byte budget
+		cur = cur[:1]          // drop the worst
 	}
 	cur = append(cur, pc)
+	p.bytes += pc.size
 	// Maintain best-first order (<= 2 members; stable for equal tuples).
 	if len(cur) == 2 && claimOrderLess(cur[1].claim, cur[0].claim) {
 		cur[0], cur[1] = cur[1], cur[0]
 	}
 	p.byKey[k] = cur
+	if newKey {
+		p.order = append(p.order, k)
+		p.evictOverBudgetLocked(k)
+	}
 	return true
+}
+
+// evictOverBudgetLocked enforces the pool bounds, evicting whole keys
+// oldest-inserted-first (FIFO) until both the key-count and byte budgets
+// hold. The just-inserted key protect is only dropped when it is the sole
+// remaining key (a single key cannot evict itself into a livelock; the
+// budgets are ceilings, not hard invariants for pathological singles).
+// Caller must hold p.mu.
+func (p *ClaimPool) evictOverBudgetLocked(protected [constants.SHA256Len]byte) {
+	for (len(p.byKey) > p.maxKeys || p.bytes > p.maxBytes) && len(p.order) > 0 {
+		oldest := p.order[0]
+		if oldest == protected && len(p.order) == 1 {
+			return // never evict the only (newest) key: the budget is soft for one entry
+		}
+		p.order = p.order[1:]
+		for _, m := range p.byKey[oldest] {
+			p.bytes -= m.size
+		}
+		delete(p.byKey, oldest)
+	}
 }
 
 // Contains reports whether the envelope with H_record h is currently pooled

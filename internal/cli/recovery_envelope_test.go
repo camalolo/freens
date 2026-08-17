@@ -149,7 +149,7 @@ func TestRecoverOutEnvelopeBuildsR2(t *testing.T) {
 	}
 	// The pairing invariant: R2 + this evidence verify against R1's policy
 	// at the earliest executable instant (the self-check cmdRecover ran).
-	if !wire.VerifyRecovery(rec.Recovery, ev, r1Hash, ev.NotBefore) {
+	if !wire.VerifyRecovery(rec.Recovery, ev, r1Hash, r1.Record.Created, ev.NotBefore) {
 		t.Error("R2's paired evidence must verify against R1's policy after the timelock")
 	}
 }

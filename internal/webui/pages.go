@@ -553,6 +553,20 @@ func (s *Server) handleBootstrapPost(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/bootstrap?err="+urlQuery("passwords differ"), http.StatusSeeOther)
 		return
 	}
+	// Bootstrap is check-then-set and must be ATOMIC: two simultaneous
+	// POSTs on a fresh install both passed the unlocked check above and
+	// both set a password (the second silently replacing the first —
+	// TOCTOU, audit F1). bootMu spans the re-check and the write, so of
+	// any number of racers exactly one reaches setPassword; the losers
+	// take the same /login redirect a sequential second POST would.
+	// Nesting is safe in this direction only (bootMu → a.mu; see
+	// authStore) — never the reverse.
+	s.auth.bootMu.Lock()
+	defer s.auth.bootMu.Unlock()
+	if s.auth.bootstrapped() {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
 	if err := s.auth.setPassword(p1); err != nil {
 		http.Redirect(w, r, "/bootstrap?err="+urlQuery(err.Error()), http.StatusSeeOther)
 		return

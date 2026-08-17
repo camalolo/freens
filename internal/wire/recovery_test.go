@@ -143,29 +143,33 @@ func TestDecodeRecoveryEvidenceErrors(t *testing.T) {
 func TestVerifyRecoveryThreshold(t *testing.T) {
 	policy, keys, prevHash, newPK := recoveryTestKit(t, 2)
 	notBefore := uint64(1_000_000)
+	// The recovered record was created exactly one timelock before the
+	// declaration's execute_not_before (the honest §8.4 flow), so the
+	// timelock bound inside VerifyRecovery is satisfied with equality.
+	prevCreated := notBefore - policy.Timelock
 
 	// Valid 2-of-3 quorum, after the timelock.
 	ev := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: signRecovery(t, keys[:2], prevHash, newPK, notBefore), NotBefore: notBefore}
-	if !VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if !VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("threshold quorum after timelock should verify")
 	}
 
 	// Order-insensitive.
 	ev.Signatures = signRecovery(t, []*crypto.Keypair{keys[2], keys[0]}, prevHash, newPK, notBefore)
-	if !VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if !VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("shuffled quorum should verify")
 	}
 
 	// Below threshold (1 of 2 needed).
 	ev.Signatures = signRecovery(t, keys[:1], prevHash, newPK, notBefore)
-	if VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("below-threshold quorum should fail")
 	}
 
 	// The same key's signature duplicated does not double-count.
 	one := signRecovery(t, keys[:1], prevHash, newPK, notBefore)
 	ev.Signatures = [][]byte{one[0], append([]byte(nil), one[0]...)}
-	if VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("duplicated signature must count once")
 	}
 
@@ -175,14 +179,14 @@ func TestVerifyRecoveryThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev.Signatures = append(signRecovery(t, keys[:1], prevHash, newPK, notBefore), foreign.Sign(mustMsg(t, prevHash, newPK, notBefore)))
-	if VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("foreign-key signature should not count toward the threshold")
 	}
 
 	// Tampered signature.
 	ev.Signatures = signRecovery(t, keys[:2], prevHash, newPK, notBefore)
 	ev.Signatures[0][0] ^= 0xff
-	if VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("tampered signature should fail")
 	}
 }
@@ -199,29 +203,73 @@ func mustMsg(t *testing.T, prevHash, newPK []byte, notBefore uint64) []byte {
 func TestVerifyRecoveryBindingAndTimelock(t *testing.T) {
 	policy, keys, prevHash, newPK := recoveryTestKit(t, 2)
 	notBefore := uint64(1_000_000)
+	prevCreated := notBefore - policy.Timelock
 	sigs := signRecovery(t, keys[:2], prevHash, newPK, notBefore)
 
 	// Replay onto a different NewOwnerPK: the signatures no longer match the
 	// signed message, so the declaration fails.
 	otherPK := bytes.Repeat([]byte{0x77}, constants.Ed25519PublicKeyLen)
-	if VerifyRecovery(policy, &RecoveryEvidence{NewOwnerPK: otherPK, Signatures: sigs, NotBefore: notBefore}, prevHash, notBefore) {
+	if VerifyRecovery(policy, &RecoveryEvidence{NewOwnerPK: otherPK, Signatures: sigs, NotBefore: notBefore}, prevHash, prevCreated, notBefore) {
 		t.Error("evidence replayed onto a different new owner should fail")
 	}
 
 	// Replay onto a different prev record (name): prev_hash is bound into the
 	// signed message.
 	otherHash := bytes.Repeat([]byte{0xcd}, constants.SHA256Len)
-	if VerifyRecovery(policy, &RecoveryEvidence{NewOwnerPK: newPK, Signatures: sigs, NotBefore: notBefore}, otherHash, notBefore) {
+	if VerifyRecovery(policy, &RecoveryEvidence{NewOwnerPK: newPK, Signatures: sigs, NotBefore: notBefore}, otherHash, prevCreated, notBefore) {
 		t.Error("evidence replayed onto a different prev_hash should fail")
 	}
 
 	// Timelock not yet elapsed (§8.4: effective only after the timelock).
 	ev := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: sigs, NotBefore: notBefore}
-	if VerifyRecovery(policy, ev, prevHash, notBefore-1) {
+	if VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore-1) {
 		t.Error("recovery before execute_not_before should fail")
 	}
-	if !VerifyRecovery(policy, ev, prevHash, notBefore) {
+	if !VerifyRecovery(policy, ev, prevHash, prevCreated, notBefore) {
 		t.Error("recovery exactly at execute_not_before should verify (timelock elapsed)")
+	}
+}
+
+// TestVerifyRecoveryTimelockBound pins the v0.7.1 hardening: a compromised
+// quorum cannot backdate execute_not_before below the recovered record's
+// creation + policy timelock — the zero-cancellation-window forgery.
+func TestVerifyRecoveryTimelockBound(t *testing.T) {
+	policy, keys, prevHash, newPK := recoveryTestKit(t, 2) // Timelock = 3600
+	prevCreated := uint64(500_000)
+
+	// Honest flow: declaration made at prevCreated+10, NotBefore = that +
+	// timelock — bound satisfied.
+	honestNB := prevCreated + 10 + policy.Timelock
+	honest := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: signRecovery(t, keys[:2], prevHash, newPK, honestNB), NotBefore: honestNB}
+	if !VerifyRecovery(policy, honest, prevHash, prevCreated, honestNB) {
+		t.Error("honest declaration (NotBefore = declare_at + timelock) should verify")
+	}
+
+	// Backdated to exactly the bound: still admissible (the bound IS the
+	// earliest defensible declaration instant).
+	atBound := prevCreated + policy.Timelock
+	bound := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: signRecovery(t, keys[:2], prevHash, newPK, atBound), NotBefore: atBound}
+	if !VerifyRecovery(policy, bound, prevHash, prevCreated, atBound) {
+		t.Error("NotBefore == prevCreated + timelock should verify (bound with equality)")
+	}
+
+	// Backdated below the bound: rejected EVEN with a full valid quorum and
+	// the elapsed-time gate passed (now far in the future).
+	backdated := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: signRecovery(t, keys[:2], prevHash, newPK, prevCreated), NotBefore: prevCreated}
+	if VerifyRecovery(policy, backdated, prevHash, prevCreated, prevCreated+10*policy.Timelock) {
+		t.Error("NotBefore < prevCreated + timelock must fail even with a valid quorum")
+	}
+
+	// NotBefore = 0 (the audit's instant-effect forgery): rejected.
+	zero := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: signRecovery(t, keys[:2], prevHash, newPK, 0), NotBefore: 0}
+	if VerifyRecovery(policy, zero, prevHash, prevCreated, ^uint64(0)) {
+		t.Error("NotBefore = 0 on a recent predecessor must fail")
+	}
+
+	// prevCreated = 0 (unknown creation) keeps the legacy behavior: no bound.
+	zero2 := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: signRecovery(t, keys[:2], prevHash, newPK, 0), NotBefore: 0}
+	if !VerifyRecovery(policy, zero2, prevHash, 0, 1) {
+		t.Error("prevCreated = 0 disables the bound (legacy callers)")
 	}
 }
 
@@ -231,18 +279,18 @@ func TestVerifyRecoveryMalformed(t *testing.T) {
 	sigs := signRecovery(t, keys[:2], prevHash, newPK, notBefore)
 	ev := &RecoveryEvidence{NewOwnerPK: newPK, Signatures: sigs, NotBefore: notBefore}
 
-	if VerifyRecovery(nil, ev, prevHash, notBefore) {
+	if VerifyRecovery(nil, ev, prevHash, 0, notBefore) {
 		t.Error("nil policy should fail")
 	}
-	if VerifyRecovery(policy, nil, prevHash, notBefore) {
+	if VerifyRecovery(policy, nil, prevHash, 0, notBefore) {
 		t.Error("nil evidence should fail")
 	}
-	if VerifyRecovery(policy, ev, []byte{1, 2}, notBefore) {
+	if VerifyRecovery(policy, ev, []byte{1, 2}, 0, notBefore) {
 		t.Error("short prevRecordHash should fail")
 	}
 	// Zero-threshold policy is unsignable by construction and unverifiable.
 	bad := &RecoveryPolicyWire{Threshold: 0, Keys: policy.Keys}
-	if VerifyRecovery(bad, ev, prevHash, notBefore) {
+	if VerifyRecovery(bad, ev, prevHash, 0, notBefore) {
 		t.Error("threshold < 1 should fail")
 	}
 	// Duplicate policy keys count once: a [K1, K1] policy with threshold 2
@@ -251,7 +299,7 @@ func TestVerifyRecoveryMalformed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if VerifyRecovery(dup, ev, prevHash, notBefore) {
+	if VerifyRecovery(dup, ev, prevHash, 0, notBefore) {
 		t.Error("duplicate policy keys must not satisfy a 2-threshold")
 	}
 }

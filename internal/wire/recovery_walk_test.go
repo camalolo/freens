@@ -111,7 +111,9 @@ func TestHandoffWalkerRecoveryAcceptedAfterTimelock(t *testing.T) {
 	k1, k2 := mustKeypair(t), mustKeypair(t)
 	r1 := makeRecoveryRoot(t, k1, "foo", policy)
 	r2 := makeRecoveryHop(t, r1, k2, policy, 2500, 4000)
-	notBefore := uint64(3_000)
+	// notBefore must satisfy VerifyRecovery's timelock bound
+	// (>= R1.Created (1000) + policy.Timelock (3600) = 4600).
+	notBefore := uint64(5_000)
 	ev := hopEvidence(t, r1, r2, keys[:2], notBefore)
 
 	fetch := fetchMap(nil, r1)
@@ -150,7 +152,7 @@ func TestHandoffWalkerRecoveryQuorumMissing(t *testing.T) {
 	k1, k2 := mustKeypair(t), mustKeypair(t)
 	r1 := makeRecoveryRoot(t, k1, "foo", policy)
 	r2 := makeRecoveryHop(t, r1, k2, policy, 2500, 4000)
-	ev := hopEvidence(t, r1, r2, keys[:1], 1000) // 1 of the required 2
+	ev := hopEvidence(t, r1, r2, keys[:1], 5_000) // 1 of the required 2
 
 	if VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{r2}, fetchMap(nil, r1),
 		evidenceFetcher(map[*SignedEnvelope]*RecoveryEvidence{r2: ev}), 5000) {
@@ -176,7 +178,7 @@ func TestHandoffWalkerRecoveryWrongPolicy(t *testing.T) {
 	k1, k2 := mustKeypair(t), mustKeypair(t)
 	r1 := makeRecoveryRoot(t, k1, "foo", policy)
 	r2 := makeRecoveryHop(t, r1, k2, policy, 2500, 4000)
-	ev := hopEvidence(t, r1, r2, foreign[:2], 1000)
+	ev := hopEvidence(t, r1, r2, foreign[:2], 5_000)
 
 	if VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{r2}, fetchMap(nil, r1),
 		evidenceFetcher(map[*SignedEnvelope]*RecoveryEvidence{r2: ev}), 5000) {
@@ -215,11 +217,12 @@ func TestHandoffWalkerMixedTransferThenRecovery(t *testing.T) {
 	r2.Record.Recovery = policy2
 	r2 = mustSign(t, r2.Record, k1)                   // re-sign with the policy embedded
 	r3 := makeRecoveryHop(t, r2, k3, nil, 2600, 4000) // §8.4: K3 signs, policy rotated
-	ev := hopEvidence(t, r2, r3, keys2[:2], 1000)
+	// Bound for this hop: prev = r2 (Created 2500) + Timelock 3600 = 6100.
+	ev := hopEvidence(t, r2, r3, keys2[:2], 6_200)
 
 	fetch := fetchMap(nil, r1, r2)
 	fetchEv := evidenceFetcher(map[*SignedEnvelope]*RecoveryEvidence{r3: ev})
-	if !VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{r3}, fetch, fetchEv, 5000) {
+	if !VerifyAuthorityChainWithHandoffs([]*SignedEnvelope{r3}, fetch, fetchEv, 6_300) {
 		t.Error("mixed transfer-then-recovery chain should verify")
 	}
 	// Without the evidence the recovery hop (and only it) fails.

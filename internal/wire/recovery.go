@@ -144,9 +144,10 @@ func RecoverySigningMessage(prevRecordHash, newOwnerPK []byte, executeNotBefore 
 }
 
 // VerifyRecovery reports whether evidence satisfies policy for the record
-// whose H_record is prevRecordHash at instant now (§8.4 lines 689-707).
+// whose H_record is prevRecordHash, created at prevCreated (unix seconds),
+// at instant now (§8.4 lines 689-707).
 //
-// Two conditions must hold:
+// Three conditions must hold:
 //
 //   - Quorum: at least policy.Threshold DISTINCT policy keys have each
 //     produced a valid Ed25519 signature over
@@ -156,16 +157,34 @@ func RecoverySigningMessage(prevRecordHash, newOwnerPK []byte, executeNotBefore 
 //     signature simply fails to contribute (duplicate policy keys are
 //     likewise counted once).
 //
-//   - Timelock (§8.4 line 694): the declaration carries
-//     execute_not_before = evidence.NotBefore (signed by the quorum, so it
-//     cannot be moved after the fact); the recovery takes effect only once
-//     the timelock has elapsed, i.e. now >= evidence.NotBefore. During the
-//     window the current primary key cancels by publishing a
-//     higher-sequence record (§8.4 step 2) — a DHT/resolver concern outside
-//     this pure function.
+//   - Timelock bound (v0.7.1 hardening): the declaration's
+//     execute_not_before cannot predate the recovered record's creation
+//     plus the policy timelock —
+//
+//     evidence.NotBefore >= prevCreated + policy.Timelock
+//
+//     §8.4 line 694 defines execute_not_before = now_declaration +
+//     timelock, and a declaration can only exist after the record it
+//     recovers (it is anchored at that record's H_record), so an honest
+//     declaration always satisfies the bound. Without it, a compromised
+//     quorum could backdate NotBefore to 0 and take effect with NO
+//     cancellation window at all — the exact §8.4 step-2 race the timelock
+//     exists to give the current primary. The bound is not perfect (the
+//     declaration moment itself is unattestable without trusted
+//     timestamps; a predecessor older than the timelock still admits a
+//     past-dated NotBefore), but it removes the zero-window forgery and
+//     costs verifiers one comparison.
+//
+//   - Timelock elapsed (§8.4 line 694 / step 3): the recovery takes effect
+//     only once now >= evidence.NotBefore. During the window the current
+//     primary key cancels by publishing a higher-sequence record (§8.4
+//     step 2) — a DHT/resolver concern outside this pure function.
 //
 // Non-raising: any nil argument, wrong length, or failed check yields false.
-func VerifyRecovery(policy *RecoveryPolicyWire, evidence *RecoveryEvidence, prevRecordHash []byte, now uint64) bool {
+// prevCreated == 0 (unknown) disables the timelock-bound check (callers that
+// genuinely cannot know the predecessor's creation time keep the old
+// behavior; production walkers always pass the real value).
+func VerifyRecovery(policy *RecoveryPolicyWire, evidence *RecoveryEvidence, prevRecordHash []byte, prevCreated, now uint64) bool {
 	if policy == nil || evidence == nil {
 		return false
 	}
@@ -177,6 +196,19 @@ func VerifyRecovery(policy *RecoveryPolicyWire, evidence *RecoveryEvidence, prev
 	}
 	if len(evidence.NewOwnerPK) != constants.Ed25519PublicKeyLen {
 		return false
+	}
+	// Timelock bound: NotBefore >= prevCreated + Timelock, checked with
+	// saturation so a huge Timelock cannot wrap around to zero.
+	if prevCreated != 0 {
+		var bound uint64
+		if policy.Timelock > ^uint64(0)-prevCreated {
+			bound = ^uint64(0) // overflow: the bound is effectively "never".
+		} else {
+			bound = prevCreated + policy.Timelock
+		}
+		if evidence.NotBefore < bound {
+			return false
+		}
 	}
 	msg, err := RecoverySigningMessage(prevRecordHash, evidence.NewOwnerPK, evidence.NotBefore)
 	if err != nil {

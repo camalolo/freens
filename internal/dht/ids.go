@@ -11,7 +11,6 @@
 package dht
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -63,8 +62,17 @@ func XORBytes(a, b []byte) ([]byte, error) {
 // CompareDistance reports which of a or b is closer to target under the XOR
 // metric: -1 if a is closer, +1 if b is closer, and 0 if the two are
 // equidistant. The XOR(target,a) and XOR(target,b) results are each 32 bytes;
-// bytes.Compare on them is exactly a big-endian unsigned-numeric comparison
-// (leading bytes dominate), which is the canonical Kademlia ordering.
+// comparing them bytewise from the most-significant byte is exactly a
+// big-endian unsigned-numeric comparison, which is the canonical Kademlia
+// ordering.
+//
+// Implementation note: the comparison is computed BYTE-BY-TELE on the stack
+// (xor of one byte from each side at a time) — it allocates NOTHING. This
+// function is the comparator inside every shortlist sort of every iterative
+// walk and every RoutingTable.Closest call; the previous
+// XORBytes-then-bytes.Compare shape heap-allocated two 32-byte slices per
+// comparison, which profiling showed as thousands of avoidable allocations
+// per lookup (GC pressure on the arm64 fleet).
 //
 // Golden vector (by construction):
 //
@@ -73,12 +81,20 @@ func XORBytes(a, b []byte) ([]byte, error) {
 // CompareDistance assumes well-formed (32-byte) inputs; on a length mismatch
 // it returns 0 since the function has no error channel.
 func CompareDistance(target, a, b []byte) int {
-	da, errA := XORBytes(target, a)
-	db, errB := XORBytes(target, b)
-	if errA != nil || errB != nil {
+	if len(target) != IDLen || len(a) != IDLen || len(b) != IDLen {
 		return 0
 	}
-	return bytes.Compare(da, db)
+	for i := 0; i < IDLen; i++ {
+		da := target[i] ^ a[i]
+		db := target[i] ^ b[i]
+		if da != db {
+			if da < db {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
 }
 
 // bitLenU8 returns the bit-length of a byte — the index of its highest set

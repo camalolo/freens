@@ -322,10 +322,10 @@ func TestRecoverEndToEnd(t *testing.T) {
 	}
 
 	// §8.4 step 3: verifies only once the timelock has elapsed.
-	if wire.VerifyRecovery(policy, ev, prevHash, uint64(now)) {
+	if wire.VerifyRecovery(policy, ev, prevHash, prevEnv.Record.Created, uint64(now)) {
 		t.Error("recovery must not verify before the timelock elapses")
 	}
-	if !wire.VerifyRecovery(policy, ev, prevHash, ev.NotBefore) {
+	if !wire.VerifyRecovery(policy, ev, prevHash, prevEnv.Record.Created, ev.NotBefore) {
 		t.Error("threshold quorum after the timelock must verify")
 	}
 
@@ -345,7 +345,7 @@ func TestRecoverEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if wire.VerifyRecovery(policy, sub, prevHash, sub.NotBefore) {
+	if wire.VerifyRecovery(policy, sub, prevHash, prevEnv.Record.Created, sub.NotBefore) {
 		t.Error("below-threshold evidence must not verify")
 	}
 

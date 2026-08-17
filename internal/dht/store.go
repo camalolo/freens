@@ -64,10 +64,28 @@ type entry struct {
 // heap or LRU list bookkeeping is warranted.
 const historyMax = 4096
 
+// historyMaxBytes bounds the history's total canonical bytes (v0.7.1): the
+// count cap alone admitted ~4096 × 64 KB ≈ 256 MB of network-sourced
+// envelopes pinned in "audit" memory on top of the 256 MiB live-store
+// budget — ~2× the documented NodeStorageMax ceiling. The byte budget keeps
+// the audit trail's footprint proportional to what it actually holds.
+const historyMaxBytes = 16 << 20 // 16 MiB
+
 // evidenceMax bounds the §8.4 recovery-evidence table (evidence.go): like the
 // §8.3 history, a bounded audit side-table next to the single-winner live
 // map, evicting first-inserted-first-out at overflow.
 const evidenceMax = 4096
+
+// Evidence-table byte bounds (v0.7.1): the count cap alone admitted
+// ~4096 × 64 KB ≈ 256 MB of network-sourced blobs (the UDP datagram limit is
+// the only per-blob ceiling, and a blob needs only DECODE validity — not a
+// quorum — to be retained). The per-blob cap rejects pathological blobs
+// outright; the total budget keeps the table's footprint bounded, and also
+// shrinks the §6.3 get-reflection payload an attacker can pre-plant.
+const (
+	maxEvidenceBlobLen = 64 << 10 // 64 KiB per blob (datagram-sized ceiling)
+	evidenceMaxBytes   = 16 << 20 // 16 MiB total
+)
 
 // EnvelopeStore is the in-process DHT envelope store implementing the §6.4
 // winner rule and the §12 eviction policy. Each 32-byte key retains at most
@@ -82,16 +100,24 @@ type EnvelopeStore struct {
 
 	// history retains superseded envelopes (§8.3) keyed by THEIR OWN H_record
 	// (not by DHT key): the displaced incumbent on every winning Put, plus
-	// everything dropped by the expired/LRU sweeps. Bounded by historyMax.
-	history map[[constants.SHA256Len]byte]*entry
+	// everything dropped by the expired/LRU sweeps. Bounded by historyMax
+	// entries AND histMaxBytes total bytes (fields so tests can shrink the
+	// budgets; the exported defaults are the consts above).
+	history      map[[constants.SHA256Len]byte]*entry
+	histMaxBytes int // byte budget; set by NewEnvelopeStore from historyMaxBytes
+	historyBytes int // sum of history entries' cached sizes (byte budget)
 
 	// evidence retains §8.4 recovery-declaration evidence (wire.Recovery
 	// Evidence) keyed by the H_record of the envelope it was published WITH
 	// (the recovery record itself, not the recovered predecessor) — the key
 	// the resolver's hand-off walk fetches it by. Bounded by evidenceMax
-	// (FIFO via evidenceOrder). Guarded by mu like every other field.
+	// entries, maxEvidenceBlobLen bytes per blob and evidMaxBytes total
+	// (FIFO via evidenceOrder; a field so tests can shrink the budget).
+	// Guarded by mu like every other field.
 	evidence      map[[constants.SHA256Len]byte][]byte
 	evidenceOrder [][constants.SHA256Len]byte // insertion order, oldest first (FIFO eviction)
+	evidMaxBytes  int                         // byte budget; set by NewEnvelopeStore from evidenceMaxBytes
+	evidenceBytes int                         // sum of retained blob lengths (byte budget)
 }
 
 // NewEnvelopeStore constructs an empty EnvelopeStore. If maxBytes <= 0 it
@@ -109,11 +135,13 @@ func NewEnvelopeStore(maxBytes int, nowFn func() int64) *EnvelopeStore {
 		clock = func() int64 { return time.Now().Unix() }
 	}
 	return &EnvelopeStore{
-		maxBytes: maxBytes,
-		nowFn:    clock,
-		entries:  make(map[[constants.SHA256Len]byte]*entry),
-		history:  make(map[[constants.SHA256Len]byte]*entry),
-		evidence: make(map[[constants.SHA256Len]byte][]byte),
+		maxBytes:     maxBytes,
+		nowFn:        clock,
+		entries:      make(map[[constants.SHA256Len]byte]*entry),
+		history:      make(map[[constants.SHA256Len]byte]*entry),
+		histMaxBytes: historyMaxBytes,
+		evidence:     make(map[[constants.SHA256Len]byte][]byte),
+		evidMaxBytes: evidenceMaxBytes,
 	}
 }
 
@@ -699,8 +727,9 @@ func (s *EnvelopeStore) PersistHistoryTo(dir string) (int, error) {
 
 // retainHistoryLocked moves a departing envelope (displaced by a winning Put
 // or dropped by an expired/LRU sweep) into the bounded §8.3 history, keyed by
-// its own H_record. On overflow the entry with the smallest lastAccess is
-// evicted (bytewise-smaller hash breaks ties for determinism, mirroring
+// its own H_record. On overflow — by count (historyMax) or total bytes
+// (historyMaxBytes) — the entry with the smallest lastAccess is evicted
+// (bytewise-smaller hash breaks ties for determinism, mirroring
 // enforceCapLocked). An envelope whose CBOR encoding fails is silently not
 // retained — retention must never fail the caller's accept/evict path.
 // Caller must hold s.mu.
@@ -712,19 +741,31 @@ func (s *EnvelopeStore) retainHistoryLocked(e *entry) {
 	if err != nil {
 		return
 	}
+	if e.size == 0 {
+		// Synthetic entries (RetainHistory's seeding path) carry no cached
+		// size; compute it once for the byte budget.
+		if b, berr := e.env.Bytes(); berr == nil {
+			e.size = len(b)
+		}
+	}
 	var hk [constants.SHA256Len]byte
 	copy(hk[:], h)
 	// The entry pointer left the live map on every call path, so owning it
 	// here is exclusive; its lastAccess freezes at the retention order.
+	if old, ok := s.history[hk]; ok {
+		s.historyBytes -= old.size // replace: the old bytes leave the budget
+	}
 	s.history[hk] = e
-	if len(s.history) > historyMax {
+	s.historyBytes += e.size
+	for (len(s.history) > historyMax || s.historyBytes > s.histMaxBytes) && len(s.history) > 1 {
 		s.evictHistoryOldestLocked()
 	}
 }
 
 // evictHistoryOldestLocked deletes the history entry with the smallest
 // lastAccess (bytewise-smaller hash key breaks ties), mirroring the
-// min-scan shape of enforceCapLocked. Caller must hold s.mu.
+// min-scan shape of enforceCapLocked, and returns its bytes to the budget.
+// Caller must hold s.mu.
 func (s *EnvelopeStore) evictHistoryOldestLocked() {
 	var oldestKey [constants.SHA256Len]byte
 	var oldest int64
@@ -736,6 +777,7 @@ func (s *EnvelopeStore) evictHistoryOldestLocked() {
 		}
 	}
 	if found {
+		s.historyBytes -= s.history[oldestKey].size
 		delete(s.history, oldestKey)
 	}
 }

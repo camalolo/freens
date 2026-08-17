@@ -136,7 +136,7 @@ func TestMakeRecordRecoveryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !wire.VerifyRecovery(pol, ev, prevHash, ev.NotBefore) {
+	if !wire.VerifyRecovery(pol, ev, prevHash, env.Record.Created, ev.NotBefore) {
 		t.Error("threshold evidence over the CLI-built policy must verify after the timelock")
 	}
 }

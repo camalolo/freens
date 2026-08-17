@@ -40,8 +40,8 @@
 //
 // Abuse posture, stated plainly: possession of SOME freens node key is cheap
 // (anyone can generate one), so the signature binds allocations to an
-// identity, not to an ACL. The real gates are the server's per-IP
-// allocation cap, bounded lifetimes with mandatory refresh, per-allocation
+// identity, not to an ACL. The real gates are the server's per-IP and
+// total allocation caps, bounded lifetimes with mandatory refresh, per-allocation
 // permission lists, and the failed-auth rate limit. Operators wanting
 // stronger policy should front the port (firewall) or run the relay for a
 // known community only.
@@ -117,6 +117,11 @@ const (
 	// authTag domain-separates the node-key signature (mirrors
 	// wire.RecoverySigningTag).
 	authTag = "freens-turn-v1"
+
+	// errInsufficientCapacity is 508 "Insufficient Capacity" (RFC 5766
+	// §6) — the server cannot spare another relay. The other error codes
+	// sent (401/437/438) are inline at their single send sites.
+	errInsufficientCapacity = 508
 )
 
 // msgType packs method + class into the 14-bit STUN message type

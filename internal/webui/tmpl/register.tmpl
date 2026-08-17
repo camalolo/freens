@@ -14,9 +14,9 @@
         <div class="hint">empty = this machine's outbound address; IPv6 becomes an AAAA record</div></div>
       <div class="field"><label>TTL (seconds)</label>
         <input type="number" name="ttl" value="300" min="60"></div>
-      <div class="field"><label>Key passphrase (optional)</label>
-        <input type="password" name="passphrase" autocomplete="new-password">
-        <div class="hint">encrypts the owner + recovery keys at rest; needed for every future update</div></div>
+      <div class="field"><label>Key passphrase</label>
+        <input type="password" name="passphrase" autocomplete="new-password" required>
+        <div class="hint">encrypts the owner + recovery keys at rest — required, and needed for every future update</div></div>
       <label class="row"><input type="checkbox" name="recovery" checked style="width:auto">
         <span>generate recovery keys <span class="faint">(3 keys, 2 needed — recommended)</span></span></label>
       <button class="btn primary" type="submit" id="regbtn">Claim name</button>

@@ -96,6 +96,17 @@ var ErrClaim = errors.New("claims: invalid claim or attestation")
 // maxNonceLen is the spec bound on the PoW nonce (§7.3: bstr(<=128)).
 const maxNonceLen = 128
 
+// maxWitnessEvaluations caps how many witness attestations ValidWitnesses
+// will Ed25519-verify for ONE claim: 2× the §7.3 WITNESS_SET (8) = 16. A
+// legitimate claim carries ≤ WitnessSet-ish attestations (registration asks
+// the 8 closest nodes; redundancy adds a few), while the CBOR packet bound
+// alone admits ~400 — each costing an Ed25519 verify on the verifying node.
+// The cap bounds a claim's verification cost to a constant regardless of the
+// carrier's size (DoS hardening; the witness list order is claimant-chosen
+// and signature-covered, so truncation cannot hide a legitimate quorum from
+// its own claimant).
+const maxWitnessEvaluations = 2 * constants.WitnessSet
+
 // ---------------------------------------------------------------------------
 // §7.3 — WitnessAttestation
 // ---------------------------------------------------------------------------
@@ -325,6 +336,14 @@ func (c *AliasClaim) VerifyPoW(difficultyBits int) bool {
 	if err != nil {
 		return false
 	}
+	return c.verifyPoWFromPrefix(prefix, d)
+}
+
+// verifyPoWFromPrefix is the PoW check with the (allocating) canonical
+// prefix already built: SHA-256(prefix, nonce) must equal PowHash AND have
+// at least d leading zero bits. VerifyFull shares one prefix build between
+// the PoW check and the witness check instead of rebuilding it per stage.
+func (c *AliasClaim) verifyPoWFromPrefix(prefix []byte, d int) bool {
 	recomputed := crypto.PoWHash(prefix, c.Nonce)
 	if !bytes.Equal(recomputed, c.PowHash) {
 		return false
@@ -360,7 +379,8 @@ func (c *AliasClaim) PrefixHash() ([]byte, error) {
 // signature covers the claim identity via its prefix hash). The subset is
 // deduplicated by NodeID keeping the FIRST occurrence: a verifier must not
 // let an attacker substitute a fresh valid signature for a NodeID already
-// present — the first one wins.
+// present — the first one wins. At most maxWitnessEvaluations deduplicated
+// attestations are cryptographically evaluated (see its comment).
 //
 // This is the CRYPTOGRAPHIC filter only. Quorum counting (HasQuorum,
 // VerifyFull) additionally applies the §7.3/§7.4 corroboration band — see
@@ -370,6 +390,14 @@ func (c *AliasClaim) ValidWitnesses() []*WitnessAttestation {
 	if err != nil {
 		return nil // an unhashable claim identity attests nothing
 	}
+	return c.validWitnessesFromPrefixHash(prefixHash)
+}
+
+// validWitnessesFromPrefixHash is ValidWitnesses with the claim's prefix
+// hash already computed (VerifyFull builds it once and shares it between the
+// PoW check and the witness check — Prefix()/PrefixHash are pure allocation
+// + SHA-256 work that must not be repeated per stage).
+func (c *AliasClaim) validWitnessesFromPrefixHash(prefixHash []byte) []*WitnessAttestation {
 	seen := make(map[string]struct{})
 	deduped := make([]*WitnessAttestation, 0, len(c.Witnesses))
 	for _, w := range c.Witnesses {
@@ -379,6 +407,9 @@ func (c *AliasClaim) ValidWitnesses() []*WitnessAttestation {
 		}
 		seen[key] = struct{}{}
 		deduped = append(deduped, w)
+		if len(deduped) >= maxWitnessEvaluations {
+			break // evaluation cap reached (see maxWitnessEvaluations)
+		}
 	}
 	out := make([]*WitnessAttestation, 0, len(deduped))
 	for _, w := range deduped {
@@ -408,10 +439,20 @@ func (c *AliasClaim) ValidWitnesses() []*WitnessAttestation {
 // so a backdated claim cannot borrow modern-dated attestations (fabricated or
 // transplanted) to fake corroboration.
 func (c *AliasClaim) corroboratingWitnesses() []*WitnessAttestation {
+	ph, err := c.PrefixHash()
+	if err != nil {
+		return nil // an unhashable claim identity attests nothing
+	}
+	return c.corroboratingWitnessesFromPrefixHash(ph)
+}
+
+// corroboratingWitnessesFromPrefixHash is corroboratingWitnesses with the
+// claim's prefix hash precomputed (VerifyFull's shared-prefix path).
+func (c *AliasClaim) corroboratingWitnessesFromPrefixHash(prefixHash []byte) []*WitnessAttestation {
 	lo := int64(c.Timestamp) - int64(constants.SkewTolerance)
 	hi := int64(c.Timestamp) + int64(constants.WitnessCooldown) + int64(constants.SkewTolerance)
 	out := make([]*WitnessAttestation, 0, len(c.Witnesses))
-	for _, w := range c.ValidWitnesses() {
+	for _, w := range c.validWitnessesFromPrefixHash(prefixHash) {
 		if ts := int64(w.TS); ts >= lo && ts <= hi {
 			out = append(out, w)
 		}
@@ -429,7 +470,17 @@ func (c *AliasClaim) corroboratingWitnesses() []*WitnessAttestation {
 // when its lookup converged on a routing view dense enough to name that set
 // (nil = view too sparse; see the DHTLookup witness-set plumbing).
 func (c *AliasClaim) HasQuorum(witnessSetIDs map[string]bool, quorum int) bool {
-	valid := c.corroboratingWitnesses()
+	ph, err := c.PrefixHash()
+	if err != nil {
+		return false
+	}
+	return c.hasQuorumFromPrefixHash(ph, witnessSetIDs, quorum)
+}
+
+// hasQuorumFromPrefixHash is HasQuorum with the claim's prefix hash
+// precomputed (VerifyFull's shared-prefix path).
+func (c *AliasClaim) hasQuorumFromPrefixHash(prefixHash []byte, witnessSetIDs map[string]bool, quorum int) bool {
+	valid := c.corroboratingWitnessesFromPrefixHash(prefixHash)
 	counted := make(map[string]struct{}, len(valid))
 	for _, w := range valid {
 		k := hex.EncodeToString(w.NodeID)
@@ -617,15 +668,30 @@ func OrderClaims(claims []*AliasClaim) []*AliasClaim {
 //     corroboration band around the claim's asserted timestamp (see
 //     corroboratingWitnesses), optionally restricted to witnessSetIDs (the
 //     WITNESS_SET closest to K_claim when the verifier's view can name it).
+//
+// The canonical PoW prefix (and its hash) is built ONCE and shared by the
+// PoW and witness stages — Prefix() allocates and re-encodes canonical CBOR
+// on every call, and this filter runs on the hot path of every claim put
+// and every resolver claim verification.
 func VerifyFull(c *AliasClaim, difficultyBits int, witnessSetIDs map[string]bool, quorum int) bool {
 	if !c.VerifyClaimantConsistency() {
 		return false
 	}
-	if !c.VerifyPoW(difficultyBits) {
+	d := difficultyBits
+	if d < 0 {
+		if len(c.Nonce) >= 1 && int(c.Nonce[0]) >= int(PoWDifficultyInit.Load()) {
+			d = int(c.Nonce[0])
+		} else {
+			d = int(PoWDifficultyInit.Load())
+		}
+	}
+	prefix, err := c.Prefix()
+	if err != nil {
 		return false
 	}
-	if !c.HasQuorum(witnessSetIDs, quorum) {
+	if !c.verifyPoWFromPrefix(prefix, d) {
 		return false
 	}
-	return true
+	ph := sha256.Sum256(prefix)
+	return c.hasQuorumFromPrefixHash(ph[:], witnessSetIDs, quorum)
 }

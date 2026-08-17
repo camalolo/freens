@@ -179,6 +179,8 @@ func verifyRecoveryHop(cur, prev *SignedEnvelope, fetchEvidence func([]byte) (*R
 	if err != nil {
 		return false
 	}
-	// Quorum over prev's policy + §8.4 timelock at the caller's clock.
-	return VerifyRecovery(prev.Record.Recovery, ev, hPrev, now)
+	// Quorum over prev's policy + §8.4 timelock at the caller's clock
+	// (NotBefore >= prev.Created + policy.Timelock is enforced inside —
+	// see VerifyRecovery's timelock bound).
+	return VerifyRecovery(prev.Record.Recovery, ev, hPrev, prev.Record.Created, now)
 }
