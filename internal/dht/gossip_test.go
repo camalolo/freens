@@ -143,10 +143,10 @@ func TestWitnessRetargetOverTheWire(t *testing.T) {
 	// with get (v0.7.0), and 2016 back-to-back co-signs from one test IP
 	// would otherwise be throttled long before the block completes.
 	b, err := NewNode(NodeConfig{
-		Keypair:     kp,
-		ListenAddr:  "127.0.0.1:0",
-		Store:       NewEnvelopeStore(0, nil),
-		Now:         func() int64 { return clock.Load() },
+		Keypair:      kp,
+		ListenAddr:   "127.0.0.1:0",
+		Store:        NewEnvelopeStore(0, nil),
+		Now:          func() int64 { return clock.Load() },
 		GetRateLimit: -1,
 	})
 	if err != nil {

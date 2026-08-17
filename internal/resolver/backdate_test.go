@@ -89,8 +89,8 @@ func bdWorld(t *testing.T, alias string, claimTS, attTS uint64, n int) (*claims.
 // bdSetSource is a ClaimSetWithWitnesses fake: fixed envelopes + a fixed
 // witness set (nil = sparse view).
 type bdSetSource struct {
-	envs []*wire.SignedEnvelope
-	set  map[string]bool
+	envs  []*wire.SignedEnvelope
+	set   map[string]bool
 	inner RecordLookup // the chain walk after alias resolution (unused here)
 }
 
