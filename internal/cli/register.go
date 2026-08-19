@@ -69,7 +69,7 @@ func cmdRegister(args []string) error {
 	ip := fs.String("ip", "", "IPv4 address for the apex A record (default: this machine's outbound IPv4)")
 	ttl := fs.Uint64("ttl", 300, "apex A record TTL in seconds")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-node-pk> (standalone mode; default: the running daemon)")
-	difficulty := fs.Int("difficulty", constants.PoWDifficultyInit, "PoW difficulty in bits (default: the network difficulty, 24 bits)")
+	difficulty := fs.Int("difficulty", constants.PoWDifficultyInit, "PoW difficulty in bits (default: the daemon's gossiped network difficulty, floor 24 bits; standalone -peers mode: 24)")
 	maxIters := fs.Int("max-iters", 500_000_000, "max PoW search iterations (~4s at 24 bits on a modern core)")
 	ownerKey := fs.String("owner-key", "", "owner key: 64-hex-char seed or @keyfile (default: generate a fresh key)")
 	outKey := fs.String("out-key", "", "where to write a GENERATED owner key (default <home>/keys/<alias>.key; 0600)")
@@ -189,6 +189,27 @@ func cmdRegister(args []string) error {
 		fmt.Println("recovery: NONE (-no-recovery) — if the owner key is lost the name cannot be re-pointered (spec 8.4)")
 	}
 
+	// --- transport: daemon (admin socket) or standalone -peers --------------
+	// Picked BEFORE mining: in daemon mode the Appendix A.4 difficulty
+	// oracle (GET /difficulty — the median of the peers' advertised values)
+	// raises the mining target above the flag default when the network has
+	// retargeted up. v0.8.0: the help text always claimed "network
+	// difficulty"; now the claim is true. Standalone mode has no daemon to
+	// ask and keeps the flag value (floor 24).
+	tr, err := pickTransport(*peersCSV)
+	if err != nil {
+		return err
+	}
+	if tr.daemon() {
+		dctx, dcancel := adminCtx()
+		if d, derr := tr.client.Difficulty(dctx); derr == nil && d.Difficulty > *difficulty {
+			fmt.Printf("network difficulty %d bits (gossiped via the daemon) — mining above the %d-bit default\n",
+				d.Difficulty, *difficulty)
+			*difficulty = d.Difficulty
+		}
+		dcancel()
+	}
+
 	// --- §7.3 PoW (REUSED across retries with the same owner key) -----------
 	// A failed attempt (e.g. not enough witnesses yet) must not burn the
 	// alias: §7.3's WITNESS_COOLDOWN lets each witness re-sign the SAME
@@ -210,12 +231,6 @@ func cmdRegister(args []string) error {
 		fmt.Println("  reusing the previously mined claim (same owner key — cooldown-safe)")
 	}
 	fmt.Printf("  PoW found: pow_hash=%s\n", hex.EncodeToString(claim.PowHash[:8]))
-
-	// --- transport: daemon (admin socket) or standalone -peers --------------
-	tr, err := pickTransport(*peersCSV)
-	if err != nil {
-		return err
-	}
 
 	// --- witness collection (§7.3) -------------------------------------------
 	// Both paths pass claim.Timestamp — NOT a fresh now — so every retry

@@ -670,13 +670,56 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	}
 	survivors := make([]*claims.AliasClaim, 0, len(envs))
 	oracle, _ := r.Freens.(DifficultyOracle)
+	// §8.4 reuse window (v0.8.0): dead-but-offered claim envelopes act as
+	// tombstones. While one is inside ALIAS_REUSE_DELAY past its expiry and
+	// no surviving claim's carrier OVERLAPS it (created before the
+	// tombstone's expires — an unbroken renewal chain), the alias is
+	// cooling off: the resolver selects no winner (NXDOMAIN). Everything
+	// is re-verified locally from signatures (see verifyClaimContents);
+	// a live claim that predates the death exempts the alias (renewal /
+	// pre-death transfer, ownership continuity).
+	var maxDeadExpires int64
+	minLiveCreated := int64(-1)
 	for _, env := range envs {
 		if claim := verifyClaimEnvelope(env, alias, now, oracle, witnessSet); claim != nil {
 			survivors = append(survivors, claim)
+			if minLiveCreated < 0 || int64(env.Record.Created) < minLiveCreated {
+				minLiveCreated = int64(env.Record.Created)
+			}
+			continue
+		}
+		// Tombstone candidate: same full content screen minus liveness
+		// (no oracle floor and no WITNESS_SET membership — the claim was
+		// mined and witnessed days ago; A.4's "any historically valid D"
+		// and set churn both argue for the relaxed check), plus dead and
+		// inside the window. Revoked carriers (§8.5, deliberate death)
+		// are not tombstones. The §4.4 checks IsBasicValid would have
+		// done on the live path are applied here explicitly EXCEPT the
+		// time window (structure, signature, sequence).
+		if env != nil && env.Record != nil && !env.IsRevoked() &&
+			env.Record.Version == constants.ProtoVersion &&
+			env.Record.Sequence >= 1 &&
+			env.Record.Validate() == nil &&
+			env.VerifySignature() &&
+			uint64(now) >= env.Record.Expires &&
+			int64(env.Record.Expires)+int64(constants.AliasReuseDelay) > now &&
+			verifyClaimContents(env, alias, now, nil, nil) != nil {
+			if int64(env.Record.Expires) > maxDeadExpires {
+				maxDeadExpires = int64(env.Record.Expires)
+			}
 		}
 	}
 	if len(survivors) == 0 {
 		return nil, false, false // every competing claim failed the §7.4 step-2 filter
+	}
+	if maxDeadExpires > 0 && minLiveCreated >= maxDeadExpires {
+		// §8.4: the alias is inside its reuse window and no surviving
+		// carrier overlaps the dead lease (every live claim was created
+		// at/after the death — a fresh re-claim, or a resurrection: a
+		// fresh carrier of the old identity) — no winner until the window
+		// closes. A live carrier created BEFORE the death is an unbroken
+		// renewal chain and exempts the alias.
+		return nil, false, false
 	}
 	winner := claims.SelectWinner(claims.OrderClaims(survivors))
 	if winner == nil {
@@ -728,6 +771,24 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 func verifyClaimEnvelope(env *wire.SignedEnvelope, alias string, now int64, oracle DifficultyOracle, witnessSet map[string]bool) *claims.AliasClaim {
 	// (1) envelope signature + time window.
 	if env == nil || !wire.IsBasicValid(env, uint64(now)) {
+		return nil
+	}
+	return verifyClaimContents(env, alias, now, oracle, witnessSet)
+}
+
+// verifyClaimContents is verifyClaimEnvelope WITHOUT the §4.4 liveness gate
+// (step 1): the full per-claim screen — claim decode, alias match, claim-ts
+// sanity, claimant binding to the carrier, PoW, and the ≥ W corroborating
+// witness quorum — over the envelope's signed CONTENT only, every check of
+// which is timeless (signature, PoW, attestations all verify identically
+// after the carrier expires). The §8.4 tombstone path reuses it exactly
+// because a dead claim's evidence must still verify (see resolveClaimSet).
+//
+// PRECONDITION (the caller owns the §4.4 envelope-level checks — structure,
+// signature, and on the live path the time window): env is non-nil with a
+// non-nil Record whose envelope signature has been verified.
+func verifyClaimContents(env *wire.SignedEnvelope, alias string, now int64, oracle DifficultyOracle, witnessSet map[string]bool) *claims.AliasClaim {
+	if env == nil || env.Record == nil {
 		return nil
 	}
 	// (2) claim decode (field 11 raw canonical CBOR).

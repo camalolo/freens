@@ -765,6 +765,42 @@ cannot be re-pointered; after expiry it disappears and (for aliases)
 the alias becomes claimable again after `ALIAS_REUSE_DELAY` (30 days
 past the claim's own expiry).
 
+**Reuse window (v0.8.0 — enforcement of `ALIAS_REUSE_DELAY`).** For
+`ALIAS_REUSE_DELAY` past a claim carrier's signed `expires`, the alias
+is in a *reuse window* during which new claims for it are not served.
+The evidence (the "tombstone") is the EXPIRED CLAIM ENVELOPE ITSELF —
+carrier signature, claimant binding, PoW, and the witness attestations
+are all timeless and verify identically after death, so no new wire
+format is needed. Storing nodes retain expired claim envelopes in their
+§7.4 top-2 pools until `expires + ALIAS_REUSE_DELAY` (bounded storage,
+persisted across restarts, best-effort availability like every DHT
+value), and collectors re-offer them to verifiers. During an open
+window:
+
+- **witnesses** refuse to co-sign a *different* claim for the alias
+  (error 301 "alias in reuse window"; the refusal is classified apart
+  from cooldown/throttle so registrants learn to retry after the
+  window, not to add peers);
+- **storing nodes** refuse a `put` at `K_claim` whose carrier was
+  created at/after the tombstone's `expires` — a *fresh carrier of the
+  SAME claim identity created before its predecessor expired* is a
+  renewal (ownership continuity) and stays valid, while one created
+  after is a resurrection of the dead lease through its still-attached
+  attestations, and is refused;
+- **resolvers** select no winner for the alias (NXDOMAIN) when no live
+  claim's carrier was created before the tombstone's `expires`.
+
+A carrier with `revoke = true` (§8.5, deliberate death) is NOT a
+tombstone. Tombstone quorum verification does not apply `WITNESS_SET`
+membership (the converged set names today's closest nodes and churns
+over a 30-day window); binding, distinctness, and the corroboration
+band still apply, and every consumer re-verifies the full content — a
+PoW-valid but quorum-less fabrication pooled by a rogue node must not
+lock an alias. Enforcement is best-effort at the availability of a
+retained envelope: a network that retains no copy of the dead claim
+cannot distinguish the window (the same R-replication availability
+argument as record storage).
+
 ### 8.5 Revoke
 
 A record with `revoke = true` and empty `rrset` marks the name
@@ -1023,7 +1059,10 @@ of magnitude cheaper to run.
    question and the most likely place v2 will differ from v1.
 2. **Alias expiry and reuse.** Should popular aliases require periodic
    re-attestation to stay mapped, or does first-claim-last-forever
-   recreate squatting at the alias layer?
+   recreate squatting at the alias layer? (Partially answered in
+   v0.8.0: expired aliases now cool off inside a 30-day reuse window,
+   §8.4; whether LIVE popular aliases should also require periodic
+   re-attestation remains open.)
 3. **Difficulty retargeting governance.** Appendix A.4 targets a claim
    rate, but someone must define the target; who, and how, without a
    central body?
@@ -1060,11 +1099,11 @@ of magnitude cheaper to run.
 | `WITNESS_SET`         | 8        | candidate witnesses (closest to `K_claim`) |
 | `WITNESS_COOLDOWN`    | 3600 s   | min spacing between a witness's signatures on competing claims |
 | `POW_DIFFICULTY_INIT` | 24 bits  | initial claim PoW difficulty               |
-| `POW_RETARGET_BLOCK`  | 2016 claims | difficulty retarget interval            |
+| `POW_RETARGET_BLOCK`  | 256 claims | difficulty retarget interval (v0.8.0)   |
 | `POW_TARGET_RATE`     | 1 / 600 s| target global claim rate                   |
 | `SKEW_TOLERANCE`      | 60 s     | near-simultaneous claim window             |
 | `CONTEST_WINDOW`      | 172800 s | contested-alias finalization wait          |
-| `ALIAS_REUSE_DELAY`   | 2592000 s| alias re-claimable after expiry            |
+| `ALIAS_REUSE_DELAY`   | 2592000 s| alias re-claimable after expiry (§8.4 reuse window; enforced since v0.8.0) |
 | `RECOVERY_TIMELOCK`   | 259200 s | default recovery delay (72 h)              |
 | `RESPONSE_TTL_CAP`    | 3600 s   | max TTL emitted by resolver                |
 | `NEG_TTL`             | 60 s     | negative caching                            |
@@ -1075,15 +1114,29 @@ of magnitude cheaper to run.
 Every `POW_RETARGET_BLOCK` accepted claims, computing nodes adjust:
 
 ```
-D_new = D_old + clamp(ceil(log2(actual_interval / target_interval)), -2, +2)
+D_new = D_old + clamp(round(log2(target_block_span / actual_block_span)), -2, +2)
 ```
 
-using the wall-clock span of the retarget block. Nodes gossip the
-current `D` in `witness` responses; clients use the median of the
-`GET_CLOSEST` nodes' advertised values. Forks in `D` are harmless:
-claims are individually verified against *any* historically valid `D ≥
-POW_DIFFICULTY_INIT` recorded with the claim (`pow_bits` SHOULD be
-recorded in `nonce`'s first byte for this purpose).
+where `actual_block_span` is the wall-clock span of the completed retarget
+block and `target_block_span = POW_RETARGET_BLOCK × 600 s` is the span the
+target rate (one claim per `POW_TARGET_RATE` interval) would produce.
+(v0.8.0 corrected form: the v0.1 draft inverted the ratio and compared a
+whole block's span against the per-claim target, so a registration flood
+lowered D to the floor while a quiet network ratcheted it up — the exact
+opposite of the anti-squatting intent of §7.1; `round` replaces `ceil` so
+span jitter at equilibrium does not bias D upward.) The control direction
+is load-sensitive in the anti-squatting sense: a block that completes
+FASTER than the target span — claims arriving too quickly, the
+mass-squatting scenario — RAISES the difficulty; a slower block lowers
+it, floored at `POW_DIFFICULTY_INIT`. `POW_RETARGET_BLOCK` is 256 claims
+(≈ 42.7 h of target-rate registration per block; lowered from 2016 in
+v0.8.0 so a retarget can fire on a network smaller than Bitcoin).
+
+Nodes gossip the current `D` in `witness` responses; clients use the
+median of the `GET_CLOSEST` nodes' advertised values. Forks in `D` are
+harmless: claims are individually verified against *any* historically
+valid `D ≥ POW_DIFFICULTY_INIT` recorded with the claim (`pow_bits` SHOULD
+be recorded in `nonce`'s first byte for this purpose).
 
 ## Appendix B. Wire Format Summary
 

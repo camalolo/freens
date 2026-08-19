@@ -50,9 +50,9 @@ const (
 
 // Proof-of-Work / difficulty.
 const (
-	PoWDifficultyInit = 24   // initial claim PoW difficulty (bits)
-	PoWRetargetBlock  = 2016 // difficulty retarget interval (accepted claims)
-	PoWTargetInterval = 600  // target global claim interval (seconds)
+	PoWDifficultyInit = 24  // initial claim PoW difficulty (bits)
+	PoWRetargetBlock  = 256 // difficulty retarget interval (accepted claims)
+	PoWTargetInterval = 600 // target global claim interval (seconds)
 )
 
 // Aliases / claims / timing.
@@ -89,19 +89,36 @@ const (
 	DHTKeyPrefixClaim   byte = 0x03 // K_claim = SHA-256(0x03 || "claim:" || alias)
 )
 
-// RetargetDifficulty implements the Appendix A.4 difficulty-retarget rule:
+// RetargetDifficulty implements the Appendix A.4 difficulty-retarget rule
+// (v0.8.0 corrected form):
 //
-//	D_new = D_old + clamp(ceil(log2(actual_interval / target_interval)), -2, +2)
+//	D_new = D_old + clamp(round(log2(target_block_span / actual_block_span)), -2, +2)
 //
-// using the wall-clock span of the retarget block. The result never falls
-// below PoWDifficultyInit.
-func RetargetDifficulty(dOld, actualInterval, targetInterval int) int {
-	ratio := float64(actualInterval) / float64(targetInterval)
-	delta := int(math.Ceil(math.Log2(ratio)))
-	if delta < -2 {
-		delta = -2
-	} else if delta > 2 {
-		delta = 2
+// where actualBlockSpan is the wall-clock span over which the last
+// PoWRetargetBlock accepted claims arrived and targetBlockSpan is the span
+// the target rate (PoWRetargetBlock claims, one per PoWTargetInterval)
+// would produce. The control direction is anti-squatting load-sensitive: a
+// block that completes FASTER than the target span — claims arriving too
+// quickly, the mass-squatting scenario — RAISES the difficulty; a slower
+// block lowers it, floored at PoWDifficultyInit. (Before v0.8.0 the ratio
+// was inverted AND compared the whole block's span against the per-claim
+// target, so a registration flood lowered D to the floor and a quiet
+// network ratcheted it up — the exact opposite of the stated A.4 goal; the
+// ceil→round change removes the upward drift unbiased span jitter caused.)
+func RetargetDifficulty(dOld, actualBlockSpan, targetBlockSpan int) int {
+	var delta int
+	switch {
+	case targetBlockSpan <= 0:
+		return max(dOld, PoWDifficultyInit) // degenerate target: no change
+	case actualBlockSpan <= 0:
+		delta = 2 // instantaneous block: maximally fast ⇒ maximal step up
+	default:
+		delta = int(math.Round(math.Log2(float64(targetBlockSpan) / float64(actualBlockSpan))))
+		if delta < -2 {
+			delta = -2
+		} else if delta > 2 {
+			delta = 2
+		}
 	}
 	dNew := dOld + delta
 	if dNew < PoWDifficultyInit {

@@ -94,13 +94,31 @@ func TestRenewEnvelopeRefusesRevoked(t *testing.T) {
 
 func TestShouldRenew(t *testing.T) {
 	now := time.Now().Unix()
-	if !ShouldRenew(now, now-10) {
+	ttl := int64(constants.RecordDefaultTTL)
+	if !ShouldRenew(now, now-ttl, now-10) {
 		t.Error("expired record does not need renewal")
 	}
-	if !ShouldRenew(now, now+1000) {
-		t.Error("record inside the 20% window does not renew")
+	if !ShouldRenew(now, now-ttl, now+1000) {
+		t.Error("record inside the final 20% of its own lifetime does not renew")
 	}
-	if ShouldRenew(now, now+int64(float64(constants.RecordDefaultTTL)*0.9)) {
-		t.Error("record at 90% lifetime renews too early")
+	if ShouldRenew(now, now-ttl, now+int64(float64(ttl)*0.9)) {
+		t.Error("record at 90% of its own lifetime renews too early")
+	}
+	// v0.8.0: the anchor is the record's OWN window, not RecordDefaultTTL —
+	// a 30-day record (RecordMaxTTL) must NOT be renewed at the 24 h cadence
+	// (day 19 of 30 was ~37% elapsed, far outside any renewal threshold).
+	long := int64(constants.RecordMaxTTL)
+	if ShouldRenew(now, now-long, now+int64(float64(long)*0.7)) {
+		t.Error("30-day record at 30% elapsed renewed at the default-TTL cadence (anchor regression)")
+	}
+	if !ShouldRenew(now, now-long, now+int64(float64(long)*0.05)) {
+		t.Error("30-day record inside its final 20% does not renew")
+	}
+	// Degenerate window (created after expires, still "unexpired" on the
+	// clock — unreachable through wire.Validate, defensive only) falls
+	// back to the default-TTL cadence: a large remaining lifetime does
+	// NOT renew instantly.
+	if ShouldRenew(now, now+80000, now+77760) {
+		t.Error("degenerate (created>expires) record with a large remaining lifetime renews instantly")
 	}
 }

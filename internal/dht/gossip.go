@@ -1,20 +1,25 @@
-// Package dht — gossip.go implements the Appendix A.4 difficulty machinery
-// (spec lines 995-1008):
+// Package dht — gossip.go implements the Appendix A.4 difficulty machinery:
 //
 //	"Every POW_RETARGET_BLOCK accepted claims, computing nodes adjust:
-//	    D_new = D_old + clamp(ceil(log2(actual_interval / target_interval)), -2, +2)
-//	 using the wall-clock span of the retarget block. Nodes gossip the
-//	 current D in witness responses; clients use the median of the
-//	 GET_CLOSEST nodes' advertised values. Forks in D are harmless: claims
-//	 are individually verified against *any* historically valid D >=
-//	 POW_DIFFICULTY_INIT recorded with the claim."
+//	    D_new = D_old + clamp(round(log2(target_block_span / actual_block_span)), -2, +2)
+//	 where target_block_span = POW_RETARGET_BLOCK x 600 s. Blocks completing
+//	 FASTER than the target span raise D (claims arriving too quickly — the
+//	 mass-squatting scenario); slower blocks lower it, floored at
+//	 POW_DIFFICULTY_INIT. Nodes gossip the current D in witness responses;
+//	 clients use the median of the GET_CLOSEST nodes' advertised values.
+//	 Forks in D are harmless: claims are individually verified against *any*
+//	 historically valid D >= POW_DIFFICULTY_INIT recorded with the claim."
+//
+// (v0.8.0 corrected form; the v0.1 draft inverted the ratio and compared a
+// whole block's span against the per-claim target, so a registration flood
+// lowered D and a quiet network ratcheted it up.)
 //
 // Two halves live here:
 //
 //   - The OWN difficulty (difficultyState): starts at constants.PoWDifficultyInit
 //     (24 bits), counts accepted claims (each successful hWitness co-sign is
 //     one acceptance, §7.4 registration step 3), and every
-//     constants.PoWRetargetBlock (2016) accepted claims recomputes D via
+//     constants.PoWRetargetBlock (256) accepted claims recomputes D via
 //     constants.RetargetDifficulty over the wall-clock span of the block,
 //     resetting the block start. It is stamped into every witness response
 //     ("Nodes gossip the current D in witness responses").
@@ -28,6 +33,9 @@
 package dht
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"sort"
 	"sync"
 
@@ -76,9 +84,11 @@ func (d *difficultyState) currentDifficulty() int {
 // recordAccepted counts one accepted claim (a successful witness co-sign) and
 // performs the Appendix A.4 retarget when the block completes: every
 // constants.PoWRetargetBlock acceptances, D is adjusted by
-// clamp(ceil(log2(actual_interval / target_interval)), -2, +2) over the
-// wall-clock span now-blockStart (constants.RetargetDifficulty), and the
-// block restarts at now. now is the node's own clock.
+// clamp(round(log2(target_block_span / actual_block_span)), -2, +2) where
+// actual_block_span is the wall-clock span now-blockStart and the target span
+// is PoWRetargetBlock × PoWTargetInterval (v0.8.0: fast blocks raise D,
+// slow blocks lower it — see constants.RetargetDifficulty). The block then
+// restarts at now. now is the node's own clock.
 func (d *difficultyState) recordAccepted(now int64) {
 	if d == nil {
 		return
@@ -87,7 +97,11 @@ func (d *difficultyState) recordAccepted(now int64) {
 	defer d.mu.Unlock()
 	d.accepted++
 	if d.accepted >= constants.PoWRetargetBlock {
-		d.current = constants.RetargetDifficulty(d.current, int(now-d.blockStart), constants.PoWTargetInterval)
+		d.current = constants.RetargetDifficulty(
+			d.current,
+			int(now-d.blockStart),
+			constants.PoWRetargetBlock*constants.PoWTargetInterval,
+		)
 		d.blockStart = now
 		d.accepted = 0
 	}
@@ -146,6 +160,113 @@ func (d *difficultyState) medianObserved() (int, bool) {
 // per Appendix A.4 (gossiped in this node's witness responses).
 func (n *Node) currentDifficulty() int {
 	return n.diff.currentDifficulty()
+}
+
+// ---------------------------------------------------------------------------
+// Appendix A.4 state persistence (v0.8.0)
+// ---------------------------------------------------------------------------
+
+// difficultyStateJSON is the persisted form of difficultyState: without it a
+// restart reset the node to PoWDifficultyInit with a fresh block — an
+// attacker could dodge a raised difficulty (or donate a lowered one) with a
+// reboot, and honest nodes lost their accepted-claim progress. The observed
+// ring rides along (losing it only resets the gossiped median until fresh
+// witness responses arrive).
+type difficultyStateJSON struct {
+	Current    int   `json:"current"`
+	Accepted   int   `json:"accepted"`
+	BlockStart int64 `json:"block_start"`
+	Observed   []int `json:"observed,omitempty"`
+}
+
+// snapshot returns the persisted form under the state's lock.
+func (d *difficultyState) snapshot() difficultyStateJSON {
+	if d == nil {
+		return difficultyStateJSON{Current: constants.PoWDifficultyInit}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return difficultyStateJSON{
+		Current:    d.current,
+		Accepted:   d.accepted,
+		BlockStart: d.blockStart,
+		Observed:   append([]int(nil), d.observed...),
+	}
+}
+
+// restore loads a persisted snapshot (defensively floored at
+// PoWDifficultyInit and sanity-capped; accepted is clamped below one block).
+func (d *difficultyState) restore(j difficultyStateJSON) {
+	if d == nil {
+		return
+	}
+	cur := j.Current
+	if cur < constants.PoWDifficultyInit || cur > maxObservedDifficulty {
+		cur = constants.PoWDifficultyInit
+	}
+	acc := j.Accepted
+	if acc < 0 || acc >= constants.PoWRetargetBlock {
+		acc = 0
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.current = cur
+	d.accepted = acc
+	d.blockStart = j.BlockStart
+	if len(j.Observed) > 0 {
+		obs := make([]int, 0, difficultyRingSize)
+		for _, v := range j.Observed {
+			if v >= constants.PoWDifficultyInit && v <= maxObservedDifficulty {
+				obs = append(obs, v)
+			}
+		}
+		if len(obs) > difficultyRingSize {
+			obs = obs[len(obs)-difficultyRingSize:]
+		}
+		d.observed = obs
+	}
+}
+
+// SaveDifficultyState atomically writes the node's Appendix A.4 difficulty
+// state (own D, block counter/start, observed ring) to path as JSON.
+func (n *Node) SaveDifficultyState(path string) error {
+	if n == nil || n.diff == nil {
+		return nil
+	}
+	b, err := json.Marshal(n.diff.snapshot())
+	if err != nil {
+		return fmt.Errorf("dht: encode difficulty state: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return fmt.Errorf("dht: write difficulty state: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("dht: rename difficulty state: %w", err)
+	}
+	return nil
+}
+
+// LoadDifficultyState restores a persisted difficulty state. A missing file
+// is not an error (first boot); a malformed one is (corrupt state should be
+// loud, not silently resettable).
+func (n *Node) LoadDifficultyState(path string) error {
+	if n == nil || n.diff == nil {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("dht: read difficulty state: %w", err)
+	}
+	var j difficultyStateJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return fmt.Errorf("dht: decode difficulty state %q: %w", path, err)
+	}
+	n.diff.restore(j)
+	return nil
 }
 
 // NetworkDifficulty returns the difficulty a claimant should mine at: the

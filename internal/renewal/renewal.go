@@ -20,21 +20,31 @@ import (
 	"github.com/camalolo/freens/internal/wire"
 )
 
-// RenewThreshold: a record is renewed once its remaining lifetime drops
-// below this fraction of RecordDefaultTTL (80% elapsed — the same cadence
-// as the §6.4 step-4 republish timer, which re-copies at 80% but cannot
-// extend the signed expiry; this is the extension it cannot do).
+// RenewThreshold: a record is renewed once the elapsed share of its OWN
+// lifetime passes this fraction (80% — the same cadence as the §6.4 step-4
+// republish timer, which re-copies at 80% but cannot extend the signed
+// expiry; this is the extension it cannot do). v0.8.0: the threshold was
+// anchored at RecordDefaultTTL, so a record published with a longer
+// lifetime (up to RecordMaxTTL, 30 d) was re-signed every ~19 h — harmless
+// but needlessly churning sequence numbers; the anchor is now the record's
+// actual created..expires window, matching republishDue exactly.
 const RenewThreshold = 0.8
 
-// ShouldRenew reports whether a record expiring at `expires` needs a
-// renewal now (inside the final 20% of RecordDefaultTTL, or already
-// expired — renewal inside the §12 grace window re-lights the name).
-func ShouldRenew(now, expires int64) bool {
+// ShouldRenew reports whether a record created at `created` and expiring at
+// `expires` needs a renewal now (inside the final 1-RenewThreshold of its
+// own lifetime, or already expired — renewal inside the §12 grace window
+// re-lights the name). A non-positive or degenerate window falls back to the
+// default-TTL cadence.
+func ShouldRenew(now, created, expires int64) bool {
 	remaining := expires - now
 	if remaining <= 0 {
 		return true // already expired: renew on sight (grace window)
 	}
-	return remaining < int64(float64(constants.RecordDefaultTTL)*(1-RenewThreshold))
+	lifetime := expires - created
+	if lifetime <= 0 {
+		lifetime = int64(constants.RecordDefaultTTL)
+	}
+	return remaining < int64(float64(lifetime)*(1-RenewThreshold))
 }
 
 // RenewEnvelope re-signs prev's content as a fresh lease: same name, owner,

@@ -111,7 +111,7 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 	if prev.IsRevoked() {
 		return fmt.Errorf("record is revoked (deliberate; un-revoke with register/name)")
 	}
-	if !force && !renewal.ShouldRenew(now, int64(prev.Record.Expires)) {
+	if !force && !renewal.ShouldRenew(now, int64(prev.Record.Created), int64(prev.Record.Expires)) {
 		remaining := time.Until(time.Unix(int64(prev.Record.Expires), 0)).Round(time.Minute)
 		fmt.Printf("%s: fresh (%s left) — skipping (use -force)\n", display, remaining)
 		return nil

@@ -53,6 +53,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1255,6 +1256,18 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 			if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
 				return n.errResp(m, 305, "claim fails the §7.4 filter (PoW/quorum)")
 			}
+			// §8.4 reuse window (v0.8.0): a put at K_claim of a claim whose
+			// alias is cooling off inside ALIAS_REUSE_DELAY past a dead
+			// claim's expiry is refused — the tombstone is the expired claim
+			// envelope this node's pool still holds (fully re-verified;
+			// claims_tombstone.go). A same-identity carrier OVERLAPPING the
+			// dead lease is a renewal and passes; one created at/after the
+			// expiry is a resurrection and is refused.
+			if inPH, perr := claim.PrefixHash(); perr == nil {
+				if n.claimReuseRefusal(claim.Alias, inPH, env, n.now()) > 0 {
+					return n.errResp(m, 301, "alias in reuse window")
+				}
+			}
 			n.claims.Offer(kClaim, env)
 			poolKept = n.claims.Contains(kClaim, recordHashOrNil(env)) // offered now or already pooled
 		}
@@ -1461,7 +1474,20 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	}
 
 	// §7.3 WITNESS_COOLDOWN: one (re-signable) claim per alias per window.
+	//
+	// §8.4 reuse window (v0.8.0), checked BEFORE any state is recorded: if
+	// this node's pool still holds a fully-verified tombstone (an expired
+	// claim envelope) for the alias whose ALIAS_REUSE_DELAY window is open,
+	// a DIFFERENT claim for it is refused — the alias is cooling off. The
+	// incoming claim's own identity is exempt here (re-presentations are
+	// bounded by the ts gate above; a resurrection attempt cannot pass it),
+	// and the pooled evidence is re-verified from its signatures (a rogue
+	// peer pooling a PoW-valid but quorum-less fabrication must not be able
+	// to lock an alias — claims_tombstone.go).
 	now := n.now()
+	if n.claimReuseRefusal(aliasN, prefixHash, nil, now) > 0 {
+		return n.errResp(m, 301, "alias in reuse window")
+	}
 	n.witnessMu.Lock()
 	last, seen := n.witnessLast[aliasN]
 	cooling := seen &&
@@ -2178,15 +2204,19 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 	}
 
 	var (
-		mu  sync.Mutex
-		wg  sync.WaitGroup
-		out []*claims.WitnessAttestation
+		mu            sync.Mutex
+		wg            sync.WaitGroup
+		out           []*claims.WitnessAttestation
+		refusedWindow int32 // atomic: candidates that answered "alias in reuse window"
 	)
 	for _, c := range candidates {
 		wg.Add(1)
 		go func(c *NodeContact) {
 			defer wg.Done()
-			att := n.witnessFromPeer(ctx, c, aliasN, tldID, claimantPK, ts, nonce, powHash, prefixHash)
+			att, refused := n.witnessFromPeer(ctx, c, aliasN, tldID, claimantPK, ts, nonce, powHash, prefixHash)
+			if refused {
+				atomic.AddInt32(&refusedWindow, 1)
+			}
 			if att == nil {
 				return
 			}
@@ -2208,20 +2238,29 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 		seen[k] = true
 		deduped = append(deduped, att)
 	}
+	// §8.4: an empty haul because every candidate refused on the reuse
+	// window is a DISTINCT failure from "network too small" — surface the
+	// sentinel so registrants can tell the user to retry after the window
+	// instead of adding peers.
+	if len(deduped) == 0 && atomic.LoadInt32(&refusedWindow) > 0 {
+		return nil, ErrAliasReuseWindow
+	}
 	return deduped, nil
 }
 
 // witnessFromPeer issues one §6.3 witness RPC to c and returns the parsed,
-// claim-verified attestation (nil on any failure — see CollectWitnesses).
+// claim-verified attestation (nil on any failure — see CollectWitnesses),
+// plus whether the peer's refusal was an §8.4 reuse-window refusal (used by
+// CollectWitnesses to distinguish "alias cooling off" from "no witnesses").
 // The arguments carry the §6.3-documented deviation: alias, tld_id and the
 // PoW pair (nonce, pow_hash) ride alongside claim_prefix_hash/claimant/ts —
 // the witness re-derives the prefix hash from the identity fields, and
 // re-verifies the PoW, before its v2 signature (bound to the prefix hash) is
 // worth anything.
-func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash, prefixHash []byte) *claims.WitnessAttestation {
+func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash, prefixHash []byte) (*claims.WitnessAttestation, bool) {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	resp, err := n.sendQuery(ctx, addr, c.NodeID, "witness", map[string]any{
 		"alias":             alias,
@@ -2232,8 +2271,20 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 		"pow_hash":          powHash,
 		"claim_prefix_hash": prefixHash,
 	})
-	if err != nil || resp == nil || resp.Y != wire.MsgTypeResponse {
-		return nil
+	if err != nil || resp == nil {
+		return nil, false
+	}
+	// §8.4: a peer's explicit "alias in reuse window" refusal is reported
+	// separately from a generic failure so CollectWitnesses can classify
+	// the haul (error responses carry {"code", "msg"}).
+	if resp.Y == wire.MsgTypeError {
+		if msg, _ := resp.A["msg"].(string); strings.Contains(msg, "reuse window") {
+			return nil, true
+		}
+		return nil, false
+	}
+	if resp.Y != wire.MsgTypeResponse {
+		return nil, false
 	}
 	// Appendix A.4 ("Nodes gossip the current D in witness responses"):
 	// record the advertised difficulty in the observed ring for
@@ -2243,21 +2294,21 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 	}
 	raw, _ := resp.A["attestation"].([]byte)
 	if len(raw) == 0 {
-		return nil
+		return nil, false
 	}
 	att, err := claims.DecodeWitnessAttestation(raw)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	// Verify against the claim identity (via the prefix hash the peer was
 	// asked to bind) AND bind to the answering node.
 	if !att.Verify(prefixHash) {
-		return nil
+		return nil, false
 	}
 	if !bytes.Equal(att.NodeID, c.NodeID) {
-		return nil
+		return nil, false
 	}
-	return att
+	return att, false
 }
 
 // ErrNoPeers signals that Publish had no peers to store to.
@@ -2621,8 +2672,14 @@ func (l *DHTLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wi
 		return env, nil
 	}
 	// Miss. A stale cached copy is still served (offline resilience —
-	// better a valid-signature stale record than an error). Only with
-	// NOTHING cached does the miss classification escape:
+	// better a valid-signature stale record than an error). This includes
+	// the CLEAN-miss case (every reachable holder answered "not held"):
+	// a deleted or lapsed name may keep resolving from a local cache until
+	// its SIGNED expires — the lease semantics of §4.4/§6.4 (deletion in
+	// freens is "stop renewing and let the lease die", never a network
+	// erase), NOT a bug; the resolver's per-serve IsBasicValid gate is what
+	// bounds it. Only with NOTHING cached does the miss classification
+	// escape:
 	//
 	//   clean miss (every reachable holder answered "not held"):
 	//     (nil, nil) — the resolver's NXDOMAIN, negative-cacheable.

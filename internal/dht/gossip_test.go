@@ -94,17 +94,19 @@ func TestObserveRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-// TestDifficultyRetargetAdvancesAfterBlock: 2015 accepted claims do not move
-// D; the 2016th (POW_RETARGET_BLOCK) retargets by
-// clamp(ceil(log2(actual/target)), -2, +2) over the block's wall-clock span.
-// Slow block (4x target interval) ⇒ +2; then a fast block (span ~0) ⇒ -2,
-// floored at POW_DIFFICULTY_INIT.
+// TestDifficultyRetargetAdvancesAfterBlock: PoWRetargetBlock-1 accepted
+// claims do not move D; the block-completing claim retargets by
+// clamp(round(log2(target_block_span / actual_block_span)), -2, +2)
+// (v0.8.0 corrected direction: FAST blocks raise D — the mass-squatting
+// scenario gets MORE expensive — and slow blocks lower it, floored at
+// POW_DIFFICULTY_INIT).
 func TestDifficultyRetargetAdvancesAfterBlock(t *testing.T) {
 	t0 := int64(1_700_000_000)
-	slow := int64(4 * constants.PoWTargetInterval) // 2400 s vs 600 s target → log2(4)=+2
+	fast := int64(1)                                                            // block span ~0 s vs the 256x600 s target ⇒ +2 (clamped)
+	slow := int64(4 * constants.PoWRetargetBlock * constants.PoWTargetInterval) // 4x target span ⇒ -2
 
 	// Drive the state machine directly (block-started-at-t0); the wire-level
-	// variant (2016 real witness RPCs) is covered below.
+	// variant (256 real witness RPCs) is covered below.
 	st := newDifficultyState(t0)
 	for i := 0; i < constants.PoWRetargetBlock-1; i++ {
 		st.recordAccepted(t0)
@@ -112,24 +114,26 @@ func TestDifficultyRetargetAdvancesAfterBlock(t *testing.T) {
 	if got := st.currentDifficulty(); got != constants.PoWDifficultyInit {
 		t.Fatalf("difficulty moved after %d acceptances, want unchanged %d", got, constants.PoWDifficultyInit)
 	}
-	st.recordAccepted(t0 + slow) // the 2016th completes the block
+	st.recordAccepted(t0 + fast) // the block-completing claim: instantaneous block
 	if got := st.currentDifficulty(); got != constants.PoWDifficultyInit+2 {
-		t.Fatalf("slow-block retarget = %d, want %d", got, constants.PoWDifficultyInit+2)
+		t.Fatalf("fast-block retarget = %d, want %d (+2: claims arriving too quickly raise the price)", got, constants.PoWDifficultyInit+2)
 	}
-	// Block restarted: another full block at a ~zero span retargets down by
-	// the clamp, but never below POW_DIFFICULTY_INIT.
+	// Block restarted: a 4x-slow block lowers D by the clamp (26 -> 24,
+	// the floor).
 	for i := 0; i < constants.PoWRetargetBlock-1; i++ {
-		st.recordAccepted(t0 + slow)
+		st.recordAccepted(t0 + fast)
 	}
-	st.recordAccepted(t0 + slow + 1)
+	st.recordAccepted(t0 + fast + slow)
 	if got := st.currentDifficulty(); got != constants.PoWDifficultyInit {
-		t.Fatalf("fast-block retarget = %d, want floor %d", got, constants.PoWDifficultyInit)
+		t.Fatalf("slow-block retarget = %d, want floor %d", got, constants.PoWDifficultyInit)
 	}
 }
 
 // TestWitnessRetargetOverTheWire: the same retarget driven by REAL witness
-// RPCs — 2016 first-time co-signs on the witnessing node (whose Now is
-// injected) advance its gossiped difficulty after POW_RETARGET_BLOCK.
+// RPCs — 256 first-time co-signs on the witnessing node (whose Now is
+// injected) advance its gossiped difficulty after POW_RETARGET_BLOCK: the
+// block completes with a ~zero span (a registration burst), which must
+// RAISE D by the clamp (v0.8.0 direction).
 func TestWitnessRetargetOverTheWire(t *testing.T) {
 	t0 := time.Now().Unix()
 	var clock atomic.Int64
@@ -169,16 +173,12 @@ func TestWitnessRetargetOverTheWire(t *testing.T) {
 	// Since v0.7.0 only the FIRST co-sign of an alias counts as an accepted
 	// claim (re-signs of the same claim no longer inflate the count — a
 	// re-sign flood must not drive the network difficulty up), so the block
-	// is filled with 2016 DISTINCT aliases, each co-signed once. The block's
-	// span is stretched to 4x the target interval just before the
-	// block-completing witness.
-	slow := int64(4 * constants.PoWTargetInterval)
+	// is filled with POW_RETARGET_BLOCK DISTINCT aliases, each co-signed
+	// once. All co-signs happen at t0: the block's span is ~zero (a
+	// registration burst), which under the v0.8.0 direction must raise D.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 	for i := 0; i < constants.PoWRetargetBlock; i++ {
-		if i == constants.PoWRetargetBlock-1 {
-			clock.Store(t0 + slow) // complete the block with a 4x-slow span
-		}
 		alias := fmt.Sprintf("retargetfoo%d", i)
 		id := newWitnessIdentity(t, uint64(t0))
 		nonce, powHash := id.mineWitnessPoW(t, alias)
@@ -191,7 +191,7 @@ func TestWitnessRetargetOverTheWire(t *testing.T) {
 		}
 	}
 	if got := b.diff.currentDifficulty(); got != constants.PoWDifficultyInit+2 {
-		t.Fatalf("witness difficulty after %d co-signs = %d, want %d (+2 per A.4 on a 4x-slow block)",
+		t.Fatalf("witness difficulty after %d co-signs = %d, want %d (+2 per A.4 on a burst block)",
 			constants.PoWRetargetBlock, got, constants.PoWDifficultyInit+2)
 	}
 }

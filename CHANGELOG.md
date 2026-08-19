@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.8.0 — protocol audit: retarget correction, §8.4 reuse window
+
+From a protocol-semantics audit (expiry, anti-squatting economics,
+alias re-claim): the Appendix A.4 difficulty retarget had its control
+direction inverted and its units wrong, and the spec's §8.4
+ALIAS_REUSE_DELAY was declared but unenforceable — nothing alias-keyed
+survived a claim's expiry. Both are fixed at the SPEC level first, then
+implemented.
+
+Protocol fixes:
+
+- **A.4 difficulty retarget: direction + units + cadence (spec
+  amendment)** — the rule compared a whole retarget block's wall-clock
+  span against the *per-claim* target (600 s), and the ratio ran
+  backwards: a registration flood LOWERED the difficulty to the 24-bit
+  floor (the mass-squatting scenario got cheaper the more it was used)
+  while a quiet network ratcheted D up +2 per block. Corrected form:
+  `D += clamp(round(log2(target_block_span / actual_block_span)), ±2)`
+  with `target_block_span = POW_RETARGET_BLOCK × 600 s` — fast blocks
+  raise D, slow blocks lower it (floor 24); `round` (was `ceil`)
+  removes the upward drift from span jitter at equilibrium.
+  `POW_RETARGET_BLOCK` lowered 2016 → 256 (≈ 42.7 h at target rate) so
+  a retarget can actually fire on a sub-Bitcoin-scale network.
+- **§8.4 ALIAS_REUSE_DELAY: the 30-day reuse window is now enforced
+  (spec amendment)** — the tombstone is the EXPIRED CLAIM ENVELOPE
+  ITSELF (signature, PoW and witness attestations are timeless), so no
+  new wire format: storing nodes retain dead claim envelopes in the
+  §7.4 pool until `expires + 30 d` and re-offer them to collectors;
+  witnesses refuse to co-sign a different claim for a windowed alias
+  (error 301 "alias in reuse window", classified apart from
+  "network too small"); storing nodes refuse K_claim puts of carriers
+  created after the tombstone's expiry (a same-identity carrier
+  OVERLAPPING the dead lease is a renewal and passes — a resurrection
+  via still-attached old attestations does not); resolvers select no
+  winner while the window is open. Revoked carriers (§8.5) are not
+  tombstones. Full content re-verification everywhere — a rogue node
+  pooling PoW-valid/quorum-less fabrications cannot lock an alias.
+
+Daemon:
+
+- **Difficulty + claim-pool persistence** — the A.4 difficulty state
+  (own D, block counter, observed ring) was RAM-only: a restart reset a
+  raised difficulty to 24 (dodgeable by reboot) and dropped every
+  in-window tombstone (the reuse window evaporated on restart). Both
+  now persist beside the store snapshots (`difficulty.json`,
+  `claims-pool/*.cbor`) on the 60 s tick and at shutdown, and reload at
+  boot.
+- **Auto-renew anchors at the record's OWN lifetime** —
+  `renewal.ShouldRenew` computed its 80% threshold against
+  RecordDefaultTTL, so a record published with a longer lease (up to
+  30 d) was re-signed every ~19 h; the threshold now uses the record's
+  actual created..expires window, matching the §6.4 republish timer.
+
+CLI / UX:
+
+- **`freens register` consults the difficulty oracle** — the -difficulty
+  help always said "the network difficulty" while the CLI mined at a
+  static 24 (only the web UI consulted the daemon's gossiped median).
+  In daemon mode register now raises its mining target to the gossiped
+  difficulty; standalone `-peers` mode keeps the flag value and says
+  so. A witness's §8.4 reuse-window refusal surfaces as "retry after
+  the window", not as "the network is too small".
+
+Documentation:
+
+- The deliberate stale-serve-on-clean-miss in DHTLookup.Lookup (a
+  deleted name resolving locally until its SIGNED expires — lease
+  semantics, bounded by the resolver's per-serve validity gate) is now
+  documented at the code site.
+
 ## v0.7.1 — security & performance hardening (application audit)
 
 A full application audit (untrusted-input handling, at-rest secrets,

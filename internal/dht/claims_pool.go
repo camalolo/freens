@@ -31,6 +31,12 @@ package dht
 
 import (
 	"bytes"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/camalolo/freens/internal/claims"
@@ -93,6 +99,33 @@ func NewClaimPool() *ClaimPool {
 		maxKeys:  claimPoolMaxKeys,
 		maxBytes: claimPoolMaxBytes,
 	}
+}
+
+// PersistClaimPoolDir persists the node's claim pool (Node wrapper for the
+// daemon's persist loop). Returns the number of envelopes written.
+func (n *Node) PersistClaimPoolDir(dir string) (int, error) {
+	if n == nil || n.claims == nil {
+		return 0, nil
+	}
+	return n.claims.PersistClaimPoolTo(dir, n.now())
+}
+
+// LoadClaimPoolDir restores a persisted claim pool (Node wrapper for the
+// daemon's startup path). Returns the number of envelopes pooled.
+func (n *Node) LoadClaimPoolDir(dir string) (int, error) {
+	if n == nil || n.claims == nil {
+		return 0, nil
+	}
+	return n.claims.RetainClaimPool(dir, n.now())
+}
+
+// SweepClaimPool drops pool entries past their §8.4 reuse window (Node
+// wrapper; see ClaimPool.Sweep). Returns the number dropped.
+func (n *Node) SweepClaimPool(now int64) int {
+	if n == nil || n.claims == nil {
+		return 0
+	}
+	return n.claims.Sweep(now)
 }
 
 // claimOrderLess is the §7.4 step-3 ascending total order on AliasClaims,
@@ -247,4 +280,195 @@ func (p *ClaimPool) Top2(key []byte) []*wire.SignedEnvelope {
 		out[i] = m.env
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// §8.4 reuse-window retention (v0.8.0) + persistence
+// ---------------------------------------------------------------------------
+
+// Sweep drops every pooled entry whose carrier is expired MORE THAN
+// AliasReuseDelay ago — past that point the envelope can neither win (dead)
+// nor open the §8.4 reuse window (closed), so retaining it is pure memory.
+// Live entries and dead-but-in-window entries (the §8.4 tombstones) are
+// kept. It returns the number of entries dropped. Callers: the daemon's
+// persist loop (once a minute) and PersistTo's write path, so the pool
+// self-cleans without a timer.
+func (p *ClaimPool) Sweep(now int64) int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	dropped := 0
+	var deadKeys [][constants.SHA256Len]byte
+	for k, members := range p.byKey {
+		keep := members[:0]
+		for _, m := range members {
+			if now >= int64(m.env.Record.Expires)+int64(constants.AliasReuseDelay) {
+				p.bytes -= m.size
+				dropped++
+				continue
+			}
+			keep = append(keep, m)
+		}
+		if len(keep) == 0 {
+			delete(p.byKey, k)
+			deadKeys = append(deadKeys, k)
+			continue
+		}
+		p.byKey[k] = keep
+	}
+	if len(deadKeys) > 0 {
+		dead := make(map[[constants.SHA256Len]byte]struct{}, len(deadKeys))
+		for _, k := range deadKeys {
+			dead[k] = struct{}{}
+		}
+		order := p.order[:0]
+		for _, k := range p.order {
+			if _, ok := dead[k]; ok {
+				continue
+			}
+			order = append(order, k)
+		}
+		p.order = order
+	}
+	return dropped
+}
+
+// PoolEntry is one pooled claim envelope plus the K_claim it is pooled under
+// (the ClaimPool persistence unit).
+type PoolEntry struct {
+	Key []byte
+	Env *wire.SignedEnvelope
+}
+
+// Entries returns a snapshot of every pooled (key, envelope) pair, ordered
+// deterministically by key then H_record — the PersistTo source.
+func (p *ClaimPool) Entries() []PoolEntry {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]PoolEntry, 0, len(p.byKey))
+	for k, members := range p.byKey {
+		key := make([]byte, constants.SHA256Len)
+		copy(key, k[:])
+		for _, m := range members {
+			out = append(out, PoolEntry{Key: key, Env: m.env})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return poolEntryLess(out[i], out[j]) })
+	return out
+}
+
+// poolEntryLess orders pool entries by (key, H_record) for a deterministic
+// persistence order; on a hash error it degrades to false (sort tolerates).
+func poolEntryLess(a, b PoolEntry) bool {
+	if c := bytes.Compare(a.Key, b.Key); c != 0 {
+		return c < 0
+	}
+	ha, e1 := a.Env.RecordHash()
+	hb, e2 := b.Env.RecordHash()
+	if e1 != nil || e2 != nil {
+		return false
+	}
+	return bytes.Compare(ha, hb) < 0
+}
+
+// PersistClaimPoolTo writes every pooled claim envelope as
+// <H_record hex>.cbor into dir (created if missing), after a Sweep so only
+// live claims and in-window §8.4 tombstones are written. Same
+// temp-file-then-rename write as EnvelopeStore.PersistTo. Returns the number
+// written.
+func (p *ClaimPool) PersistClaimPoolTo(dir string, now int64) (int, error) {
+	if p == nil {
+		return 0, nil
+	}
+	p.Sweep(now)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, fmt.Errorf("dht: persist-claim-pool mkdir %q: %w", dir, err)
+	}
+	written := 0
+	for _, e := range p.Entries() {
+		b, err := e.Env.Bytes()
+		if err != nil {
+			continue
+		}
+		h, err := e.Env.RecordHash()
+		if err != nil {
+			continue
+		}
+		name := hex.EncodeToString(h)
+		final := filepath.Join(dir, name+".cbor")
+		tmp, err := os.CreateTemp(dir, "."+name+".tmp-*")
+		if err != nil {
+			return written, fmt.Errorf("dht: persist-claim-pool temp file in %q: %w", dir, err)
+		}
+		if _, err := tmp.Write(b); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist-claim-pool write %q: %w", tmp.Name(), err)
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist-claim-pool close %q: %w", tmp.Name(), err)
+		}
+		if err := os.Rename(tmp.Name(), final); err != nil {
+			os.Remove(tmp.Name())
+			return written, fmt.Errorf("dht: persist-claim-pool rename %q: %w", final, err)
+		}
+		written++
+	}
+	return written, nil
+}
+
+// RetainClaimPool loads persisted claim envelopes (written by
+// PersistClaimPoolTo) back into the pool: each file is decoded, its K_claim
+// re-derived from the embedded claim (the same canonical rule as
+// StorageKeys), and — only while still worth pooling (alive or inside its
+// §8.4 reuse window) — Offered. Envelopes past their window are skipped
+// (silently; the next persist rewrites the directory without them).
+// Signatures are re-verified here since these envelopes come from disk, not
+// from a network peer that already checked them.
+func (p *ClaimPool) RetainClaimPool(dir string, now int64) (int, error) {
+	if p == nil {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("dht: retain-claim-pool read %q: %w", dir, err)
+	}
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".cbor") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return count, err
+		}
+		env, err := wire.DecodeEnvelope(data)
+		if err != nil || env.Record == nil || len(env.Record.Claim) == 0 || !env.VerifySignature() {
+			continue
+		}
+		claim, cerr := claims.DecodeAliasClaim(env.Record.Claim)
+		if cerr != nil {
+			continue
+		}
+		kClaim, kerr := KeyForClaim(claim.Alias)
+		if kerr != nil {
+			continue
+		}
+		if now >= int64(env.Record.Expires)+int64(constants.AliasReuseDelay) {
+			continue // window closed: not worth a pool slot
+		}
+		if p.Offer(kClaim, env) {
+			count++
+		}
+	}
+	return count, nil
 }

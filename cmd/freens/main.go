@@ -344,6 +344,22 @@ func run(args []string) error {
 		}
 		dhtNode = node
 		dhtLookup = dht.NewDHTLookup(store, node)
+		// v0.8.0: restore the Appendix A.4 difficulty state and the §7.4
+		// claim pool (live claims + §8.4 tombstones) from the load/persist
+		// dir — without this, every restart reset the node's difficulty to
+		// PoWDifficultyInit (a raised difficulty was dodgeable by reboot)
+		// and dropped every in-window tombstone (the §8.4 reuse window
+		// evaporated on restart).
+		if loadEffective != "" {
+			if err := node.LoadDifficultyState(filepath.Join(loadEffective, difficultyStateFile)); err != nil {
+				logger.Warn("could not restore difficulty state", "error", err)
+			}
+			if pc, perr := node.LoadClaimPoolDir(filepath.Join(loadEffective, claimsPoolDir)); perr != nil {
+				logger.Warn("could not restore claim pool", "error", perr)
+			} else if pc > 0 {
+				logger.Info("restored pooled claims (incl. §8.4 tombstones)", "count", pc)
+			}
+		}
 		// Local control socket (internal/admin): the single-binary CLI's
 		// admin-aware commands (publish/resolve/register/name/…) talk to
 		// THIS daemon through it instead of spinning their own DHT nodes —
@@ -463,7 +479,7 @@ func run(args []string) error {
 			logger.Warn("-persist requires -dht; ignoring", "dir", persistEffective)
 		} else {
 			persistStop = make(chan struct{})
-			go persistLoop(store, dhtLookup, persistEffective, persistStop, logger)
+			go persistLoop(store, dhtLookup, dhtNode, persistEffective, persistStop, logger)
 		}
 	}
 
@@ -757,6 +773,7 @@ func run(args []string) error {
 		} else if ec > 0 {
 			logger.Info("persisted recovery evidence at shutdown", "count", ec)
 		}
+		persistAuxState(dhtNode, persistEffective, logger)
 	}
 	return firstErr
 }
@@ -764,6 +781,15 @@ func run(args []string) error {
 // fetchMetaFile is the sidecar (next to the *.cbor envelopes) recording which
 // persisted envelopes are network caches and when they were fetched.
 const fetchMetaFile = "fetched.json"
+
+// difficultyStateFile is the persisted Appendix A.4 difficulty state (own D,
+// retarget-block counter/start, observed ring) — v0.8.0: a restart must not
+// reset a raised difficulty.
+const difficultyStateFile = "difficulty.json"
+
+// claimsPoolDir holds the persisted §7.4 claim pool (live claims + §8.4
+// tombstones), one <H_record hex>.cbor per envelope.
+const claimsPoolDir = "claims-pool"
 
 // effectiveLoadDir resolves the startup seed directory: an explicit -load
 // always wins; otherwise, when persistence is configured, the persist dir
@@ -805,10 +831,28 @@ func persistFetchMeta(l *dht.DHTLookup, dir string, logger *slog.Logger) {
 	}
 }
 
+// persistAuxState persists the non-envelope daemon state that must survive a
+// restart alongside the store snapshots: the Appendix A.4 difficulty state
+// (v0.8.0) and the §7.4 claim pool (live claims + §8.4 tombstones). Both are
+// best-effort — logged, never fatal — like every persist here.
+func persistAuxState(node *dht.Node, dir string, logger *slog.Logger) {
+	if node == nil {
+		return
+	}
+	if err := node.SaveDifficultyState(filepath.Join(dir, difficultyStateFile)); err != nil {
+		logger.Error("persist difficulty state failed", "error", err)
+	}
+	if pc, perr := node.PersistClaimPoolDir(filepath.Join(dir, claimsPoolDir)); perr != nil {
+		logger.Error("persist claim pool failed", "error", perr)
+	} else if pc > 0 {
+		logger.Info("persisted pooled claims (incl. §8.4 tombstones)", "count", pc)
+	}
+}
+
 // persistLoop snapshots the envelope store into dir every 60s until stop is
 // closed. Errors are logged, never fatal: the next tick (or the final
 // shutdown-time PersistTo) retries.
-func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, stop <-chan struct{}, logger *slog.Logger) {
+func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, node *dht.Node, dir string, stop <-chan struct{}, logger *slog.Logger) {
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
 	for {
@@ -831,6 +875,7 @@ func persistLoop(store *dht.EnvelopeStore, lookup *dht.DHTLookup, dir string, st
 			} else if ec > 0 {
 				logger.Info("persisted recovery evidence", "dir", filepath.Join(dir, "evidence"), "count", ec)
 			}
+			persistAuxState(node, dir, logger)
 		case <-stop:
 			return
 		}
@@ -1012,7 +1057,7 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		if !mine {
 			continue // not ours: cached/relayed records are their owners' business
 		}
-		if !renewal.ShouldRenew(now, int64(env.Record.Expires)) {
+		if !renewal.ShouldRenew(now, int64(env.Record.Created), int64(env.Record.Expires)) {
 			continue
 		}
 		fresh, err := renewal.RenewEnvelope(env, kp, now)
