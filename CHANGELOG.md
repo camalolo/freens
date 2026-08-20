@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.9.0 — anti-sniping: the witness present window
+
+From a front-running question ("should the name stay hidden until
+minted, like some blockchain name systems?"): freens claims already
+hide the alias from the storage layer (`K_claim` is a hash of it), but
+the `witness` RPC necessarily discloses it — the alias is inside the
+PoW prefix a witness must re-verify before signing. Combined with §7.4's
+earliest-timestamp-first ordering and a witness age gate of
+`WITNESS_COOLDOWN` (1 h), a listener on a victim's witness round could
+mine a competing claim backdated up to an hour and out-order the
+victim's — a steal feasible whenever the accepted age exceeds the
+victim's mine-plus-witness latency. Full commit–reveal registration
+(hiding the name even from witnesses until minted) was weighed and
+deferred (§7.1 options table); the cheap fix below removes the
+realistic attack instead.
+
+Protocol fixes:
+
+- **`WITNESS_PRESENT_WINDOW = 300 s` (spec amendment, §7.3 + Appendix
+  A)** — witnesses now refuse claims whose asserted ts is older than 5
+  minutes (was `WITNESS_COOLDOWN`, 1 h): an honest registration (mining
+  at the initial difficulty plus the 3×10 s retry cycle) completes well
+  inside the window, so nothing legitimate is lost, while a sniper's
+  backdate margin shrinks twelvefold. The verifier-side corroboration
+  band tracks the same window (`[claim.ts - skew, claim.ts + window +
+  skew]`) so resolvers accept exactly what witnesses would sign — band
+  and gate must agree, or attestations no honest witness produces would
+  still corroborate. §7.3 also now states explicitly that conservatively
+  refusing a second claim inside the cooldown (what the implementation
+  always did) is conformant, and §7.1 records hidden-name commit–reveal
+  as considered/deferred with the disclosure analysis.
+
+Implementation:
+
+- **Witness RPC age gate** (`hWitness`) enforces the window with the
+  same uint64-safe comparisons as before; the parked-claim reuse in
+  `freens register` and the web UI discards claims older than the
+  window and re-mines (previously the staleness threshold was the 1 h
+  cooldown — a parked claim between 5 min and 1 h old would otherwise
+  dead-loop against "claim ts too old" refusals). Parked-claim reuse
+  remains free for prompt retries; witnesses' 1 h per-alias signature
+  cooldown is unchanged.
+
+Tests: `TestWitnessRefusesSniperBackdate` and
+`TestWitnessAcceptsPresentWindowAgedRetry` pin the new gate edges;
+`TestCorroborationBandEdges` gains the 1-h-late-attestation (=
+pre-v0.9.0 band edge) rejection.
+
 ## v0.8.0 — protocol audit: retarget correction, §8.4 reuse window
 
 From a protocol-semantics audit (expiry, anti-squatting economics,

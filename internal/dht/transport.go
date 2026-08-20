@@ -1449,16 +1449,32 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		return n.errResp(m, 305, "invalid proof-of-work")
 	}
 
-	// Claim-timestamp sanity (the §7.4 anti-forgery gate, found auditing
+	// Claim-timestamp sanity (the §7.3 anti-forgery gate, found auditing
 	// what becomes of a revoked alias): §7.4 orders competing claims
 	// EARLIEST-timestamp-first, so a claim forged with ts≈0 would
 	// permanently out-order every honest claim once its holder's cooldown
 	// lapses — stealing the alias without breaking any key. A legitimate
 	// claim is witnessed at mining time (|ts - now| ≈ seconds) or
 	// re-presented during register's cooldown-safe retries (ts up to
-	// WITNESS_COOLDOWN old). Anything outside [now - cooldown, now + skew]
-	// is refused: not future-dated beyond the live-race skew window, not
-	// older than the cooldown that legitimizes re-presentation.
+	// WITNESS_PRESENT_WINDOW old). Anything outside
+	// [now - present window, now + skew] is refused: not future-dated
+	// beyond the live-race skew window, not older than the window that
+	// legitimizes re-presentation.
+	//
+	// v0.9.0 ANTI-SNIPING TIGHTENING (was WITNESS_COOLDOWN = 1 h): this
+	// RPC necessarily discloses the alias to its witness set (the alias is
+	// inside the PoW prefix the witness must re-verify), so a listener on
+	// the witness round could mine a competing claim BACKDATED to the
+	// gate's edge and out-order the victim under §7.4's earliest-first
+	// rule. Such a steal is feasible only while the accepted age exceeds
+	// the victim's mine-plus-witness latency (the sniper needs
+	// ts_sniper < ts_victim ≈ now - victim_elapsed, with ts_sniper ≥
+	// now - window). An honest registration — mining at D=24 plus the
+	// 3×10 s retry cycle — completes well inside 5 minutes, so a 5-minute
+	// window covers every honest re-presentation while shrinking the
+	// backdate margin 12×. Parked claims older than the window are
+	// discarded by the register flow (loadReusableClaim), which re-mines
+	// instead of dead-looping against refusals.
 	//
 	// All comparisons are uint64-native: ts is an attacker-controlled
 	// uint64, and a CBOR negative int decodes through asUint64 to a HUGE
@@ -1469,7 +1485,7 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if ts > nowU+uint64(constants.SkewTolerance) {
 		return n.errResp(m, 305, "claim ts in the future")
 	}
-	if ts <= nowU && nowU-ts > uint64(constants.WitnessCooldown) {
+	if ts <= nowU && nowU-ts > uint64(constants.WitnessPresentWindow) {
 		return n.errResp(m, 305, "claim ts too old")
 	}
 

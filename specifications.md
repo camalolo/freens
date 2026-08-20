@@ -528,6 +528,7 @@ considered:
 | Proof of stake / deposit  | lock tokens to register            | Requires a token + ledger = reintroduces a blockchain and a market; rejected as default |
 | Auction                   | names sold to highest bidder       | Recreates a centralized market, favors wealth, needs an auctioneer/ledger; rejected |
 | Purely cryptographic names| name = `7f4a9c...` derived from key | Zero collision, zero squatting; but unusable by humans; kept as the *identity* layer (Section 3.1) |
+| Hidden-name commit–reveal | two-phase register: witness a commitment `H(alias‖salt)`, reveal the alias after a delay | Defeats front-running observers; but freens claims already hide the alias from the storage layer (`K_claim` hashes it) — the one pre-publication disclosure is the witness RPC, narrowed by the `WITNESS_PRESENT_WINDOW` gate (§7.3); costs a second round trip, a mandatory commit–reveal delay and unrevealed-commit cleanup; deferred as a §7 v2 candidate, not rejected |
 
 **Chosen default:** first-valid-registration-wins, where "first" is
 established by (a) a **witness quorum** of DHT peers co-signing the
@@ -610,21 +611,45 @@ conditions make a witness count (v0.7.0):
    routing tables) MUST NOT enforce membership against a partial set —
    it skips the restriction rather than reject honest witnesses.
 2. *Corroboration band*: the witness's own attestation timestamp lies
-   within `[claim.ts - SKEW_TOLERANCE, claim.ts + WITNESS_COOLDOWN +
+   within `[claim.ts - SKEW_TOLERANCE, claim.ts + WITNESS_PRESENT_WINDOW +
    SKEW_TOLERANCE]` — the honest witnessing window (signed at mining
    time, or re-presented during register's cooldown-safe retries, with
    clock slack on both ends). An attestation dated outside the band is
    not evidence for the claim's asserted time and does not count.
 
-Witnesses MUST verify the PoW before signing (the witness RPC carries
-the claim's `nonce` and `pow_hash` for exactly this purpose) and MUST
+Witnesses MUST verify the PoW before signing (the witness RPC carries the
+claim's `nonce` and `pow_hash` for exactly this purpose) and MUST
 only sign one claim per alias per `WITNESS_COOLDOWN` (1 h) unless a
 strictly earlier-ordered claim appears (they may sign both; ordering is
-computed by verifiers, not witnesses). A witness also refuses claims
-whose asserted timestamp is future-dated beyond `SKEW_TOLERANCE` or
-older than `WITNESS_COOLDOWN` (the anti-forgery gate: ordering is
-earliest-first, so an arbitrarily old claim would otherwise out-order
-every honest one forever).
+computed by verifiers, not witnesses — conservatively refusing the
+second claim is also conformant, as the reference implementation does).
+A witness also refuses claims whose asserted timestamp is future-dated
+beyond `SKEW_TOLERANCE` or older than `WITNESS_PRESENT_WINDOW`
+(5 min; the anti-forgery gate: ordering is earliest-first, so an
+arbitrarily old claim would otherwise out-order every honest one
+forever).
+
+**Why so tight (v0.9.0, anti-sniping):** the age gate was formerly
+`WITNESS_COOLDOWN` (1 h). But the witness RPC necessarily discloses the
+alias to its witness set — the alias is inside the PoW prefix a witness
+must re-verify before signing — so a listener on the witness round could
+mine a competing claim backdated to the gate's edge and out-order the
+victim under §7.4's earliest-first rule. Such a steal is feasible only
+while the accepted age exceeds the victim's mine-plus-witness latency
+(the sniper needs `ts_sniper < ts_victim ≈ now − victim_elapsed`, with
+`ts_sniper ≥ now − window`); an honest registration — mining at the
+initial difficulty plus the 3×10 s retry cycle — completes well inside
+5 minutes, so `WITNESS_PRESENT_WINDOW` covers every honest
+re-presentation while shrinking the backdate margin twelvefold. The
+corroboration band (above) tracks the same window so the verifier side
+accepts exactly what the witness side would sign; late cross-run
+retries re-mine rather than re-present. (Claims are otherwise hidden
+from the network: they are stored at `K_claim = SHA-256(...)` of the
+alias, so storing nodes and passive observers never learn it before
+publication.) Closing the residual — a listener who can complete a
+fresh mine faster than the victim, needing no backdating at all —
+would require commit–reveal registration (see §7.1), deferred as a v2
+candidate.
 
 **Residual (documented):** against a verifier that cannot name the
 witness set, an attacker forging a fully self-consistent quorum (own
@@ -1098,6 +1123,7 @@ of magnitude cheaper to run.
 | `W`                   | 5        | witness quorum size                        |
 | `WITNESS_SET`         | 8        | candidate witnesses (closest to `K_claim`) |
 | `WITNESS_COOLDOWN`    | 3600 s   | min spacing between a witness's signatures on competing claims |
+| `WITNESS_PRESENT_WINDOW` | 300 s | max age of a claim ts a witness accepts (anti-forgery + anti-sniping gate, §7.3; v0.9.0, was `WITNESS_COOLDOWN`) |
 | `POW_DIFFICULTY_INIT` | 24 bits  | initial claim PoW difficulty               |
 | `POW_RETARGET_BLOCK`  | 256 claims | difficulty retarget interval (v0.8.0)   |
 | `POW_TARGET_RATE`     | 1 / 600 s| target global claim rate                   |

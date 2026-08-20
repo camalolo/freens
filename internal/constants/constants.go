@@ -43,9 +43,10 @@ const (
 
 // Witnessing.
 const (
-	W               = 5    // witness quorum size
-	WitnessSet      = 8    // candidate witnesses (closest to K_claim)
-	WitnessCooldown = 3600 // min spacing between a witness's signatures on competing claims (1 h)
+	W                    = 5    // witness quorum size
+	WitnessSet           = 8    // candidate witnesses (closest to K_claim)
+	WitnessCooldown      = 3600 // min spacing between a witness's signatures on competing claims (1 h)
+	WitnessPresentWindow = 300  // max age of a claim ts a witness accepts (5 min; v0.9.0)
 )
 
 // Proof-of-Work / difficulty.

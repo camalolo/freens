@@ -424,20 +424,25 @@ func (c *AliasClaim) validWitnessesFromPrefixHash(prefixHash []byte) []*WitnessA
 // CORROBORATION BAND: a witness only corroborates a claim when its own
 // attestation timestamp is consistent with the claimant-asserted timestamp —
 //
-//	claim.ts - SKEW_TOLERANCE  <=  w.TS  <=  claim.ts + WITNESS_COOLDOWN + SKEW_TOLERANCE
+//	claim.ts - SKEW_TOLERANCE  <=  w.TS  <=  claim.ts + WITNESS_PRESENT_WINDOW + SKEW_TOLERANCE
 //
 // Rationale (v0.7.0 security fix, the §7.4 backdating hole): the §7.4 step-3
 // order is earliest-timestamp-first on the CLAIMANT-asserted timestamp, and
 // the spec's own argument is "witness timestamps, not claimant timestamps,
 // are the honest ordering signal". The honest witness flow puts w.TS within
-// [claim.ts - skew, claim.ts + cooldown + skew]: a legitimate claim is
+// [claim.ts - skew, claim.ts + present window + skew]: a legitimate claim is
 // witnessed at mining time (|w.TS - claim.ts| ≈ seconds) or re-presented
-// during register's cooldown-safe retries (claim.ts up to WITNESS_COOLDOWN
-// old), with SKEW_TOLERANCE (60 s) of clock slack on both ends. An
-// attestation dated OUTSIDE that band is either not from the honest flow or
-// not for this claim's asserted time — it must not count toward the quorum,
-// so a backdated claim cannot borrow modern-dated attestations (fabricated or
-// transplanted) to fake corroboration.
+// during register's cooldown-safe retries (claim.ts up to
+// WITNESS_PRESENT_WINDOW old), with SKEW_TOLERANCE (60 s) of clock slack on
+// both ends. An attestation dated OUTSIDE that band is either not from the
+// honest flow or not for this claim's asserted time — it must not count
+// toward the quorum, so a backdated claim cannot borrow modern-dated
+// attestations (fabricated or transplanted) to fake corroboration.
+//
+// v0.9.0: the band's upper edge tracks the witness RPC's age gate, which was
+// tightened from WITNESS_COOLDOWN (1 h) to WITNESS_PRESENT_WINDOW (5 min) —
+// band and gate must agree, or attestations no honest witness would sign
+// would still corroborate on the verifier side.
 func (c *AliasClaim) corroboratingWitnesses() []*WitnessAttestation {
 	ph, err := c.PrefixHash()
 	if err != nil {
@@ -450,7 +455,7 @@ func (c *AliasClaim) corroboratingWitnesses() []*WitnessAttestation {
 // claim's prefix hash precomputed (VerifyFull's shared-prefix path).
 func (c *AliasClaim) corroboratingWitnessesFromPrefixHash(prefixHash []byte) []*WitnessAttestation {
 	lo := int64(c.Timestamp) - int64(constants.SkewTolerance)
-	hi := int64(c.Timestamp) + int64(constants.WitnessCooldown) + int64(constants.SkewTolerance)
+	hi := int64(c.Timestamp) + int64(constants.WitnessPresentWindow) + int64(constants.SkewTolerance)
 	out := make([]*WitnessAttestation, 0, len(c.Witnesses))
 	for _, w := range c.validWitnessesFromPrefixHash(prefixHash) {
 		if ts := int64(w.TS); ts >= lo && ts <= hi {

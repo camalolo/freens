@@ -152,11 +152,12 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	}
 
 	// Claim: parked first (cooldown-safe retries), else mine. A parked
-	// claim older than WITNESS_COOLDOWN is un-witnessable (the §6.3 gate)
-	// and is discarded — re-mine rather than dead-loop refusals.
+	// claim older than WITNESS_PRESENT_WINDOW is un-witnessable (the §6.3
+	// gate, tightened in v0.9.0) and is discarded — re-mine rather than
+	// dead-loop refusals.
 	now := time.Now().Unix()
 	claim := keychain.LoadReusableClaim(e.keysDir, alias, kp, diff)
-	if claim != nil && now-int64(claim.Timestamp) >= int64(constants.WitnessCooldown) {
+	if claim != nil && now-int64(claim.Timestamp) >= int64(constants.WitnessPresentWindow) {
 		claim = nil // stale: older than any witness will sign
 	}
 	reused := claim != nil

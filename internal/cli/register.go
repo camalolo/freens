@@ -217,6 +217,11 @@ func cmdRegister(args []string) error {
 	// carries a fresh timestamp = a new prefix hash = cooldown-refused. So
 	// the mined claim persists next to the owner key and every retry with
 	// that key reuses it verbatim; -difficulty changes invalidate it.
+	// v0.9.0 horizon: the reuse only pays while the claim stays inside
+	// WITNESS_PRESENT_WINDOW (5 min) of its mining time — past that the
+	// witness age gate refuses it (and the verifier corroboration band
+	// would drop late attestations anyway), so loadReusableClaim discards
+	// it and this run re-mines.
 	fmt.Printf("mining claim (difficulty %d bits)...\n", *difficulty)
 	ts := uint64(time.Now().Unix())
 	claim := loadReusableClaim(*alias, kp, *difficulty)
@@ -538,14 +543,14 @@ func claimStatePath(alias string) string {
 }
 
 // loadReusableClaim returns the persisted claim when it matches alias, owner
-// key, difficulty AND is still witnessable (v0.7.0: the §6.3 witness RPC
-// refuses claims whose timestamp is older than WITNESS_COOLDOWN, so a parked
-// claim past that age can never gather a quorum — re-mine instead of
+// key, difficulty AND is still witnessable (v0.9.0: the §6.3 witness RPC
+// refuses claims whose timestamp is older than WITNESS_PRESENT_WINDOW, so a
+// parked claim past that age can never gather a quorum — re-mine instead of
 // dead-looping retries against refusals). Delegated to internal/keychain,
 // shared with the web UI.
 func loadReusableClaim(alias string, kp *crypto.Keypair, difficulty int) *claims.AliasClaim {
 	c := keychain.LoadReusableClaim(home.KeysDir(), alias, kp, difficulty)
-	if c != nil && time.Now().Unix()-int64(c.Timestamp) >= int64(constants.WitnessCooldown) {
+	if c != nil && time.Now().Unix()-int64(c.Timestamp) >= int64(constants.WitnessPresentWindow) {
 		return nil // stale: older than any witness will sign — re-mine
 	}
 	return c

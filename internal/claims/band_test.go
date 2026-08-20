@@ -117,7 +117,7 @@ func TestCorroborationBandEdges(t *testing.T) {
 	}
 
 	lo := int64(ts) - int64(constants.SkewTolerance)
-	hi := int64(ts) + int64(constants.WitnessCooldown) + int64(constants.SkewTolerance)
+	hi := int64(ts) + int64(constants.WitnessPresentWindow) + int64(constants.SkewTolerance)
 
 	cases := []struct {
 		name string
@@ -127,9 +127,14 @@ func TestCorroborationBandEdges(t *testing.T) {
 		{"exactly at lower edge (claim.ts - skew)", uint64(lo), true},
 		{"one second below lower edge", uint64(lo - 1), false},
 		{"witnessed at mining time", ts, true},
-		{"cooldown-aged retry", uint64(ts + constants.WitnessCooldown), true},
+		{"present-window-aged retry", uint64(ts + constants.WitnessPresentWindow), true},
 		{"exactly at upper edge", uint64(hi), true},
 		{"one second above upper edge", uint64(hi + 1), false},
+		// v0.9.0 tightening regression: before the witness age gate shrank
+		// from WITNESS_COOLDOWN to WITNESS_PRESENT_WINDOW, an attestation a
+		// full hour late still corroborated — exactly the borrowed-modern-
+		// attestations shape a backdated sniper claim would take.
+		{"1 h-late attestation (pre-v0.9.0 band edge)", uint64(ts + constants.WitnessCooldown), false},
 		{"modern-dated on an old claim (45 days late)", ts + 45*86400, false},
 	}
 	for _, tc := range cases {

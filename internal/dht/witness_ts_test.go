@@ -1,10 +1,13 @@
-// witness_ts_test.go — the §7.4 anti-forgery gate: witnesses bound the
-// CLAIM's timestamp (earliest-first ordering makes a forged ts≈0 claim a
+// witness_ts_test.go — the §7.3 claim-timestamp sanity gate: witnesses bound
+// the CLAIM's timestamp (earliest-first ordering makes a forged ts≈0 claim a
 // permanent alias theft once cooldowns lapse). Legitimate windows: signed
-// at mining time (fresh) or re-presented inside register's cooldown-safe
-// retry window; anything future-dated beyond skew or older than the
-// cooldown is refused. Since v0.7.0 the witness ALSO verifies the claim's
-// PoW (§7.3) — the fixture mines a real difficulty-8 pair per case.
+// at mining time (fresh) or re-presented inside register's retry window
+// (WITNESS_PRESENT_WINDOW, v0.9.0: tightened from WITNESS_COOLDOWN for
+// anti-sniping — the witness RPC discloses the alias, so a listener could
+// otherwise backdate a competing claim to the gate's edge and out-order the
+// victim per §7.4); anything future-dated beyond skew or older than the
+// present window is refused. Since v0.7.0 the witness ALSO verifies the
+// claim's PoW (§7.3) — the fixture mines a real difficulty-8 pair per case.
 package dht
 
 import (
@@ -74,7 +77,7 @@ func TestWitnessRefusesFutureDatedClaim(t *testing.T) {
 }
 
 func TestWitnessRefusesAncientClaim(t *testing.T) {
-	offset := -int64(constants.WitnessCooldown) - 3600 // an hour past the cooldown
+	offset := -int64(constants.WitnessPresentWindow) - 3600 // far past any window
 	if got := witnessTSCase(t, offset); got != 0 {
 		t.Errorf("forged ancient (ts≈0-style) claim gathered %d attestations; witnesses must refuse", got)
 	}
@@ -86,11 +89,23 @@ func TestWitnessAcceptsFreshClaim(t *testing.T) {
 	}
 }
 
-func TestWitnessAcceptsCooldownAgedRetry(t *testing.T) {
-	// A register retry re-presents the mined claim up to the cooldown
-	// later (the cooldown-safe retry design) — must still be witnessed.
-	offset := -int64(constants.WitnessCooldown) + 120 // just inside the window
+func TestWitnessAcceptsPresentWindowAgedRetry(t *testing.T) {
+	// A register retry re-presents the mined claim up to
+	// WITNESS_PRESENT_WINDOW later (the cooldown-safe retry design) — must
+	// still be witnessed.
+	offset := -int64(constants.WitnessPresentWindow) + 120 // just inside the window
 	if got := witnessTSCase(t, offset); got != 1 {
-		t.Errorf("cooldown-aged retry gathered %d attestations, want 1", got)
+		t.Errorf("present-window-aged retry gathered %d attestations, want 1", got)
+	}
+}
+
+func TestWitnessRefusesSniperBackdate(t *testing.T) {
+	// v0.9.0 regression: a claim backdated just past WITNESS_PRESENT_WINDOW
+	// is a sniper's out-ordering attempt, not an honest retry (registration
+	// completes well inside the window). Under the pre-v0.9.0 gate
+	// (WITNESS_COOLDOWN = 1 h) this exact claim was accepted.
+	offset := -int64(constants.WitnessPresentWindow) - 120
+	if got := witnessTSCase(t, offset); got != 0 {
+		t.Errorf("sniper backdate gathered %d attestations; witnesses must refuse", got)
 	}
 }
