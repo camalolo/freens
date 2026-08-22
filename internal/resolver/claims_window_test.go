@@ -147,6 +147,64 @@ func TestResolveQuestionReuseWindowAllowsOverlappingRenewal(t *testing.T) {
 	}
 }
 
+// TestResolveQuestionReuseWindowSameIdentityResurrection (v0.9.1, the
+// 2026-08-22 fleet deadlock): a verified tombstone whose OWN claim identity
+// comes back on a live carrier created AFTER the death resolves normally —
+// the claimant re-asserting its lapsed lease is ownership continuity (only
+// the claimant key can sign the carrier; the PoW and attestations are the
+// ones the alias was registered with). v0.8.0 refused this and locked every
+// alias whose auto-renewal arrived one tick late.
+func TestResolveQuestionReuseWindowSameIdentityResurrection(t *testing.T) {
+	tomb := windowedWorld(t, "foo", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 60),
+		fixedNow-200, fixedNow-50, true) // dead 50 s ago: window open
+
+	// Re-wrap the TOMBSTONE'S OWN claim (same identity, same witnesses) in
+	// a fresh carrier created AFTER the death — the daemon auto-renew
+	// shape (renewal.RenewEnvelope embeds prev.Record.Claim verbatim).
+	cb, err := tomb.claim.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshRec, err := wire.NewRecord(tomb.tldEnv.Record.Name, tomb.tldKP.Public(),
+		tomb.tldEnv.Record.Sequence+1, uint64(fixedNow-30), uint64(fixedNow+86400))
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshRec.Claim = cb
+	freshTldEnv, err := wire.SignRecord(freshRec, tomb.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The www record under the same (resurrected) identity must resolve.
+	wwwWire, err := naming.EncodeWireName([]string{"www"}, "foo", tomb.tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwRec, err := wire.NewRecord(wwwWire, tomb.tldKP.Public(), 1, uint64(fixedNow-100), uint64(fixedNow+3600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwRec.RRset = []*wire.RR{{Type: wire.RRTypeA, TTL: 300, Rdata: net.IPv4(203, 0, 113, 61).To4()}}
+	freshWWWEnv, err := wire.SignRecord(wwwRec, tomb.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tomb.wwwEnv = freshWWWEnv // the lookup serves the fresh www record
+	tomb.tldEnv = freshTldEnv
+
+	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{freshTldEnv}, tomb)
+	rrs, rcode, rerr := resolveFoo(t, lookup)
+	if rerr != nil {
+		t.Fatalf("ResolveQuestion: %v", rerr)
+	}
+	if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+		t.Fatalf("rcode=%d len=%d, want NOERROR/1 (same-identity resurrection is ownership continuity)", rcode, len(rrs))
+	}
+	if a := rrs[0].(*dns.A); !a.A.Equal(net.IPv4(203, 0, 113, 61)) {
+		t.Errorf("A.A = %s, want the resurrected carrier's record", a.A)
+	}
+}
+
 // TestResolveQuestionReuseWindowCloses: past expires + ALIAS_REUSE_DELAY the
 // tombstone is inert — a fresh claim resolves.
 func TestResolveQuestionReuseWindowCloses(t *testing.T) {

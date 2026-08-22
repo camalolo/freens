@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.9.1 — §8.4 hotfix: same-identity resurrection is ownership continuity
+
+Found live on the LAN fleet (2026-08-22): every freens name on the
+3-box/7-node network resolved NXDOMAIN through the DNS path while
+`freens status`/`doctor` stayed green — the resolver's §7.4 claim
+filter and the K_claim put path were refusing the fleet's own renewed
+claims as "resurrections".
+
+What happened, end to end:
+
+1. Claim carriers live 24 h; the daemon's auto-renew loop re-signs and
+   republishes them at 80% of lifetime. The v0.9.0 fleet restarted
+   daily (deploys), so the first daemon that ran > 24 h hit its first
+   in-place renewal — which the storing nodes REFUSED (below), the
+   carriers expired, and the aliases entered the §8.4 30-day reuse
+   window against their own tombstones.
+2. The refusal itself: v0.8.0's "renewal vs re-claim" rule rejected a
+   same-identity carrier created at/after the predecessor's `expires`
+   ("a resurrection — re-claiming through the back door by re-wrapping
+   the old identity"). But the §7.4 pools retain EVERY generation of a
+   claim's carriers, so once the FIRST generation died, every later
+   renewal was compared against that older tombstone and refused — an
+   unbroken renewal chain was indistinguishable from a resurrection
+   under the per-candidate check. The fleet was structurally doomed
+   from its first late renewal tick.
+3. Diagnosis was slowed by `PublishKeyedAt` collapsing every failure —
+   including "accepted by 0 of N peers" (peers *refusing* the put) —
+   into `ErrNoPeers` ("dht: no peers known"), which read as a phantom
+   connectivity problem while the routing table held 6 confirmed
+   peers.
+
+The fix (spec §8.4 amended to match):
+
+- A carrier of a tombstone's OWN claim identity is always accepted —
+  at the K_claim put, and as an exemption from the resolver's
+  no-winner-inside-the-window rule. Only the claimant key can sign
+  such a carrier, and it embeds the exact claim (same PoW, same
+  attestations) that registered the alias: renewal and resurrection
+  are both ownership continuity, never re-claims. The window now
+  refuses only DIFFERENT-identity claims — the anti-squat property it
+  was designed for, fully preserved.
+- `PublishKeyedAt` returns the last underlying error on total failure
+  (`ErrNoPeers` only when no peer was even attempted).
+- Regression tests: wire-level hPut accepts a same-identity carrier
+  created after the death (the fleet's exact state); the resolver
+  resolves a tombstone's own identity on a fresh post-death carrier;
+  the different-identity refusals (put, witness, resolver lock) are
+  re-pinned unchanged.
+
 ## v0.9.0 — anti-sniping: the witness present window
 
 From a front-running question ("should the name stay hidden until

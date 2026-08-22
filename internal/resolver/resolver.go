@@ -670,22 +670,39 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	}
 	survivors := make([]*claims.AliasClaim, 0, len(envs))
 	oracle, _ := r.Freens.(DifficultyOracle)
-	// §8.4 reuse window (v0.8.0): dead-but-offered claim envelopes act as
-	// tombstones. While one is inside ALIAS_REUSE_DELAY past its expiry and
-	// no surviving claim's carrier OVERLAPS it (created before the
-	// tombstone's expires — an unbroken renewal chain), the alias is
-	// cooling off: the resolver selects no winner (NXDOMAIN). Everything
-	// is re-verified locally from signatures (see verifyClaimContents);
-	// a live claim that predates the death exempts the alias (renewal /
-	// pre-death transfer, ownership continuity).
+	// §8.4 reuse window (v0.8.0; exemption refined v0.9.1): dead-but-offered
+	// claim envelopes act as tombstones. While one is inside
+	// ALIAS_REUSE_DELAY past its expiry and no surviving claim is continuity
+	// with the dead lease, the alias is cooling off: the resolver selects no
+	// winner (NXDOMAIN). Continuity is EITHER of:
+	//
+	//   - a surviving carrier created BEFORE the tombstone's expires (the
+	//     v0.8.0 unbroken-renewal-chain rule), OR
+	//   - a surviving carrier of the TOMBSTONE'S OWN claim identity
+	//     (v0.9.1): the claimant re-asserting its lapsed lease — only the
+	//     claimant key can sign such a carrier, and it embeds the exact
+	//     claim (same PoW, same attestations) that registered the alias.
+	//     Without this, any owner whose renewal arrived late (daemon
+	//     downtime, publish failures) locked the alias for the full 30-day
+	//     window — found live fleet-wide 2026-08-22.
+	//
+	// Everything is re-verified locally from signatures (see
+	// verifyClaimContents).
 	var maxDeadExpires int64
-	minLiveCreated := int64(-1)
+	var maxDeadPH []byte // strongest tombstone's claim identity
+	type liveClaim struct {
+		claim   *claims.AliasClaim
+		created int64
+		ph      []byte
+	}
+	liveClaims := make([]liveClaim, 0, len(envs))
 	for _, env := range envs {
 		if claim := verifyClaimEnvelope(env, alias, now, oracle, witnessSet); claim != nil {
-			survivors = append(survivors, claim)
-			if minLiveCreated < 0 || int64(env.Record.Created) < minLiveCreated {
-				minLiveCreated = int64(env.Record.Created)
+			ph, pherr := claim.PrefixHash()
+			if pherr != nil {
+				continue // unhashable identity: cannot prove continuity
 			}
+			liveClaims = append(liveClaims, liveClaim{claim, int64(env.Record.Created), ph})
 			continue
 		}
 		// Tombstone candidate: same full content screen minus liveness
@@ -706,20 +723,40 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 			verifyClaimContents(env, alias, now, nil, nil) != nil {
 			if int64(env.Record.Expires) > maxDeadExpires {
 				maxDeadExpires = int64(env.Record.Expires)
+				if deadClaim, derr := claims.DecodeAliasClaim(env.Record.Claim); derr == nil {
+					if ph, pherr := deadClaim.PrefixHash(); pherr == nil {
+						maxDeadPH = ph
+					} else {
+						maxDeadPH = nil
+					}
+				} else {
+					maxDeadPH = nil
+				}
 			}
 		}
 	}
-	if len(survivors) == 0 {
+	if len(liveClaims) == 0 {
 		return nil, false, false // every competing claim failed the §7.4 step-2 filter
 	}
-	if maxDeadExpires > 0 && minLiveCreated >= maxDeadExpires {
-		// §8.4: the alias is inside its reuse window and no surviving
-		// carrier overlaps the dead lease (every live claim was created
-		// at/after the death — a fresh re-claim, or a resurrection: a
-		// fresh carrier of the old identity) — no winner until the window
-		// closes. A live carrier created BEFORE the death is an unbroken
-		// renewal chain and exempts the alias.
-		return nil, false, false
+	if maxDeadExpires > 0 {
+		continuity := false
+		for _, lc := range liveClaims {
+			if lc.created < maxDeadExpires ||
+				(len(maxDeadPH) > 0 && bytes.Equal(lc.ph, maxDeadPH)) {
+				continuity = true
+				break
+			}
+		}
+		if !continuity {
+			// §8.4: the alias is inside its reuse window and no surviving
+			// claim is continuity with the dead lease (every survivor is a
+			// fresh re-claim post-dating the death) — no winner until the
+			// window closes.
+			return nil, false, false
+		}
+	}
+	for _, lc := range liveClaims {
+		survivors = append(survivors, lc.claim)
 	}
 	winner := claims.SelectWinner(claims.OrderClaims(survivors))
 	if winner == nil {

@@ -806,14 +806,26 @@ window:
   (error 301 "alias in reuse window"; the refusal is classified apart
   from cooldown/throttle so registrants learn to retry after the
   window, not to add peers);
-- **storing nodes** refuse a `put` at `K_claim` whose carrier was
-  created at/after the tombstone's `expires` — a *fresh carrier of the
-  SAME claim identity created before its predecessor expired* is a
-  renewal (ownership continuity) and stays valid, while one created
-  after is a resurrection of the dead lease through its still-attached
-  attestations, and is refused;
-- **resolvers** select no winner for the alias (NXDOMAIN) when no live
-  claim's carrier was created before the tombstone's `expires`.
+- **storing nodes** refuse a `put` at `K_claim` carrying a *different*
+  claim identity while a verified tombstone's window is open. A carrier
+  of the tombstone's OWN claim identity is always accepted (v0.9.1):
+  only the claimant key can sign it, and it embeds the exact claim —
+  same PoW, same attestations — that registered the alias, so whether
+  it overlaps the dead lease (a renewal) or post-dates it (a
+  resurrection after a lapse) it is ownership continuity, not a
+  re-claim. (v0.8.0 refused the resurrection case; found live on the
+  LAN fleet 2026-08-22 that this locked every alias whose auto-renewal
+  arrived one tick late — the pools retain every dead generation, so
+  after the first generation's death even perfectly-overlapping later
+  renewals were refused against the older tombstone, deadlocking the
+  whole namespace into `ALIAS_REUSE_DELAY`.)
+- **resolvers** select no winner for the alias (NXDOMAIN) while a
+  verified tombstone's window is open and no surviving claim is
+  *continuity* with the dead lease: either a carrier created before
+  the tombstone's `expires` (an unbroken renewal chain) or a carrier
+  of the tombstone's own claim identity (the claimant re-asserting
+  its lapsed lease; v0.9.1 — same reasoning as the storing-node rule
+  above).
 
 A carrier with `revoke = true` (§8.5, deliberate death) is NOT a
 tombstone. Tombstone quorum verification does not apply `WITNESS_SET`

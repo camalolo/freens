@@ -32,18 +32,24 @@
 // the alias: that would be the denial-of-registration attack the window
 // itself must not enable.)
 //
-// # Renewal vs re-claim (the resurrection hole)
+// # Renewal vs re-claim (v0.9.1: same identity is always continuity)
 //
 // A fresh carrier of a STILL-LIVE claim is a renewal (overlap: created
-// before the predecessor's expires) and stays valid. A fresh carrier
-// created AFTER the predecessor expired is a RESURRECTION — re-claiming
-// through the back door by re-wrapping the old claim identity (whose
-// attestations ride in field 7) without any new witness round. The
-// hPut-side check (claimReuseRefusal with a non-nil incoming envelope)
-// refuses exactly that: same identity + created >= predecessor expires.
-// The witness path cannot resurrect at all — the §6.3 claim-ts gate refuses
-// any claim older than WITNESS_COOLDOWN, and a claim whose carrier already
-// lived out a full lease is far past it.
+// before the predecessor's expires). v0.8.0 additionally refused a
+// same-identity carrier created AFTER the predecessor expired — a
+// "resurrection" — on the theory that re-wrapping the old identity
+// without a new witness round was a back door. Found live on the LAN
+// fleet (2026-08-22) that the opposite is true: only the claimant key
+// can sign a same-identity carrier, and it carries the exact claim
+// (same PoW, same attestations) that registered the alias, so a
+// resurrection IS ownership continuity — while refusing it locked every
+// alias whose auto-renewal arrived one tick late (the pools retain every
+// dead generation, so after the first generation's death even perfectly
+// overlapping later renewals were refused against the OLDER tombstone,
+// deadlocking the whole namespace into ALIAS_REUSE_DELAY). The window
+// now refuses only DIFFERENT-identity claims; the witness path is
+// unchanged (the §6.3 claim-ts gate already refuses re-presentations
+// that old).
 //
 // A carrier with revoke = true (§8.5) is NOT a tombstone: revocation is a
 // deliberate death, not an abandoned one, and must not freeze the alias for
@@ -139,14 +145,17 @@ func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) int64 {
 //     refuses the presentation (a new claim while the alias is cooling off);
 //
 //   - a candidate with the SAME identity is the incoming claim's own dead
-//     predecessor: allowed when the new carrier overlaps the old lease
-//     (created < expires — a renewal), refused when it post-dates it
-//     (created >= expires — a resurrection; incomingEnv == nil, the witness
-//     path, never triggers this branch: the §6.3 ts gate already refuses
-//     re-presentations that old).
-//
+//     predecessor: NEVER a refusal (v0.9.1). A same-identity carrier can
+//     only be signed by the claimant key itself, and it carries the exact
+//     claim — same PoW, same attestations — that registered the alias:
+//     whether it overlaps the dead lease (a renewal) or post-dates it (a
+//     resurrection after a lapse) is ownership continuity either way, not
+//     a re-claim. Refusing it (v0.8.0's "resurrection hole" rule) locked
+//     every alias whose owner's renewal arrived one tick late — found live
+//     on the LAN fleet (2026-08-22: whole-namespace NXDOMAIN after the
+//     first in-place renewal generation died in the pools).
 // It returns the refusing window's end time (> 0 ⇒ refuse), or 0.
-func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, incomingEnv *wire.SignedEnvelope, now int64) int64 {
+func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, now int64) int64 {
 	if n == nil || n.claims == nil {
 		return 0
 	}
@@ -172,11 +181,9 @@ func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, incomi
 			continue
 		}
 		if bytes.Equal(candPH, incomingPrefixHash) {
-			// Same claim identity: renewal (overlap) passes; a carrier
-			// created at/after the predecessor's expiry is a resurrection.
-			if incomingEnv != nil && int64(incomingEnv.Record.Created) >= int64(cand.Record.Expires) {
-				return end
-			}
+			// Same claim identity: the tombstone's own claim, re-carried
+			// by its claimant (v0.9.1) — renewal or resurrection, both
+			// are ownership continuity. Never refused.
 			continue
 		}
 		// Different identity inside an open window: §8.4 refuses.

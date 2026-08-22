@@ -1256,15 +1256,17 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 			if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
 				return n.errResp(m, 305, "claim fails the §7.4 filter (PoW/quorum)")
 			}
-			// §8.4 reuse window (v0.8.0): a put at K_claim of a claim whose
-			// alias is cooling off inside ALIAS_REUSE_DELAY past a dead
-			// claim's expiry is refused — the tombstone is the expired claim
-			// envelope this node's pool still holds (fully re-verified;
-			// claims_tombstone.go). A same-identity carrier OVERLAPPING the
-			// dead lease is a renewal and passes; one created at/after the
-			// expiry is a resurrection and is refused.
+			// §8.4 reuse window (v0.8.0; same-identity rule relaxed in
+			// v0.9.1): a put at K_claim of a claim whose alias is cooling
+			// off inside ALIAS_REUSE_DELAY past a dead claim's expiry is
+			// refused — the tombstone is the expired claim envelope this
+			// node's pool still holds (fully re-verified;
+			// claims_tombstone.go). Only DIFFERENT-identity claims are
+			// refused: the same identity re-carried by its claimant is
+			// ownership continuity (renewal or resurrection), never a
+			// re-claim.
 			if inPH, perr := claim.PrefixHash(); perr == nil {
-				if n.claimReuseRefusal(claim.Alias, inPH, env, n.now()) > 0 {
+				if n.claimReuseRefusal(claim.Alias, inPH, n.now()) > 0 {
 					return n.errResp(m, 301, "alias in reuse window")
 				}
 			}
@@ -1501,7 +1503,7 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	// peer pooling a PoW-valid but quorum-less fabrication must not be able
 	// to lock an alias — claims_tombstone.go).
 	now := n.now()
-	if n.claimReuseRefusal(aliasN, prefixHash, nil, now) > 0 {
+	if n.claimReuseRefusal(aliasN, prefixHash, now) > 0 {
 		return n.errResp(m, 301, "alias in reuse window")
 	}
 	n.witnessMu.Lock()
@@ -2097,15 +2099,26 @@ func (n *Node) PublishClaim(ctx context.Context, env *wire.SignedEnvelope) error
 // set: K_tld/K_name plus K_claim for claim-carrying records). Exported for
 // the daemon's auto-renew loop, which re-publishes a re-signed envelope at
 // every key its predecessor legitimately lived at. Best-effort like Publish:
-// nil when at least one target accepted.
+// nil when at least one target accepted. On total failure the LAST underlying
+// error is returned (v0.9.1: it used to collapse every failure — including
+// "accepted by 0 of N peers", i.e. peers refusing the put — into ErrNoPeers,
+// which masked the 2026-08-22 §8.4 deadlock as a phantom connectivity
+// problem); ErrNoPeers is returned only when no key could even be attempted
+// against a known peer.
 func (n *Node) PublishKeyedAt(ctx context.Context, keys [][]byte, env *wire.SignedEnvelope) error {
 	published := false
+	var lastErr error
 	for _, k := range keys {
 		if err := n.publishKeyed(ctx, k, env, nil); err == nil {
 			published = true
+		} else {
+			lastErr = err
 		}
 	}
 	if !published {
+		if lastErr != nil {
+			return lastErr
+		}
 		return ErrNoPeers
 	}
 	return nil

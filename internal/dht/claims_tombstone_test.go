@@ -141,15 +141,14 @@ func TestReuseWindowEndMatrix(t *testing.T) {
 	}
 }
 
-// TestClaimReuseRefusalRenewalVsResurrection: a same-identity fresh carrier
-// OVERLAPPING the dead lease passes (renewal / ownership continuity); one
-// created at/after the death is refused (resurrection); a different identity
-// is refused outright while the window is open; the witness path
-// (incomingEnv == nil) never refuses on same identity.
+// TestClaimReuseRefusalRenewalVsResurrection: a same-identity presentation
+// (renewal or resurrection — v0.9.1 treats both as ownership continuity)
+// is never refused; a different identity is refused outright while the
+// window is open; a quorum-less fabrication pools but locks nothing.
 func TestClaimReuseRefusalRenewalVsResurrection(t *testing.T) {
 	now := time.Now().Unix()
 	alias := "renewfoo"
-	dead, deadClaim, deadKP := tombstoneFixture(t, alias, uint64(now-90000), now-90000, now-3600, true, false)
+	dead, deadClaim, _ := tombstoneFixture(t, alias, uint64(now-90000), now-90000, now-3600, true, false)
 	phDead, err := deadClaim.PrefixHash()
 	if err != nil {
 		t.Fatal(err)
@@ -164,28 +163,22 @@ func TestClaimReuseRefusalRenewalVsResurrection(t *testing.T) {
 		t.Fatal("fixture: dead claim not pooled")
 	}
 
-	// Same identity, carrier created BEFORE the death: renewal ⇒ pass.
-	renewal := resignCarrier(t, dead, deadKP, deadClaim, now-70000, now+80000, 2)
-	if end := n.claimReuseRefusal(alias, phDead, renewal, now); end != 0 {
-		t.Errorf("overlapping renewal refused (end=%d), want allowed", end)
-	}
-	// Same identity, carrier created AT/after the death: resurrection ⇒ refuse.
-	resurrection := resignCarrier(t, dead, deadKP, deadClaim, now-1800, now+80000, 3)
-	if end := n.claimReuseRefusal(alias, phDead, resurrection, now); end == 0 {
-		t.Error("resurrection (created >= dead expires) allowed, want refused")
-	}
-	// Witness path never refuses a same-identity presentation.
-	if end := n.claimReuseRefusal(alias, phDead, nil, now); end != 0 {
-		t.Errorf("witness path refused a same-identity presentation (end=%d)", end)
+	// Same identity (renewal — created before the death — or resurrection —
+	// created after; v0.9.1 treats both as ownership continuity): never
+	// refused. The v0.8.0 refusal of the resurrection case deadlocked the
+	// whole LAN fleet on 2026-08-22 when auto-renewal arrived one tick
+	// late.
+	if end := n.claimReuseRefusal(alias, phDead, now); end != 0 {
+		t.Errorf("same-identity presentation refused (end=%d), want allowed", end)
 	}
 
 	// Different identity inside the window: refused.
-	other, otherClaim, _ := tombstoneFixture(t, alias, uint64(now-10), now-10, now+86000, true, false)
+	_, otherClaim, _ := tombstoneFixture(t, alias, uint64(now-10), now-10, now+86000, true, false)
 	phOther, err := otherClaim.PrefixHash()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if end := n.claimReuseRefusal(alias, phOther, other, now); end == 0 {
+	if end := n.claimReuseRefusal(alias, phOther, now); end == 0 {
 		t.Error("different identity inside the window allowed, want refused")
 	}
 
@@ -199,7 +192,7 @@ func TestClaimReuseRefusalRenewalVsResurrection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if end := n2.claimReuseRefusal(alias, phOther, other, now); end != 0 {
+	if end := n2.claimReuseRefusal(alias, phOther, now); end != 0 {
 		t.Errorf("quorum-less fabrication locked the alias (end=%d)", end)
 	}
 	_ = phFake
@@ -363,6 +356,20 @@ func TestHPutRefusalInsideWindow(t *testing.T) {
 	}
 	if resp == nil || resp.Y != wire.MsgTypeResponse {
 		t.Fatalf("renewal put: resp.Y = %v, want ok", resp.Y)
+	}
+
+	// Same identity, carrier created AFTER the death (resurrection): ALSO
+	// accepted (v0.9.1, the 2026-08-22 fleet deadlock: after a renewal
+	// lapse the pools hold the dead generation, and refusing the
+	// claimant's own re-assertion locked the alias for ALIAS_REUSE_DELAY).
+	resurrection := resignCarrier(t, dead, deadKP, deadClaim, now-1800, now+80000, 3)
+	resp, err = put(resurrection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.Y != wire.MsgTypeResponse {
+		msg, _ := resp.A["msg"].(string)
+		t.Fatalf("resurrection put: resp.Y = %v msg=%q, want ok (v0.9.1 ownership continuity)", resp.Y, msg)
 	}
 }
 
