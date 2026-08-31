@@ -1,5 +1,58 @@
 # Changelog
 
+## unreleased — self-healing renewals, async admin publishes, `forget` + `uninstall`
+
+Four operations findings from the 2026-08-31/09-01 cleanup session, plus
+the two verbs the cleanup runbook was missing:
+
+- **Auto-renewal sequence stall (found live on the seed box):** the
+  daemon's `renewOnce` published a renewal at seq N+1 to the peers but
+  never installed it in its OWN store, so every later tick re-read the
+  stale N, re-signed a *different* envelope at the same N+1 (fresh
+  timestamps), and was refused everywhere — `accepted by 0 of 7 peers`
+  every ten minutes while the network record starved toward its lease
+  end. The same stall silently explains pre-upgrade records never
+  gaining their §9.5 TLSCA binding (camalolo needed `renew -force` by
+  hand). `renewOnce` now feeds the fresh envelope back into the local
+  store (K_tld/K_name + K_claim, mirroring the admin handler's
+  storeLocally), so the sequence advances exactly once per lease.
+- **Idempotent puts are no longer refusals:** an envelope carrying the
+  ALREADY-STORED record (identical §6.4 H_record — replica refreshes,
+  duplicate renewals) now returns success from the store instead of
+  losing the winner check. Republish loops read honest acceptance
+  counts; "accepted by 0 of N" regains its meaning as genuine refusal.
+  A stale-sequence re-put still cannot resurrect over a live higher
+  sequence (the identical-check compares against the CURRENT incumbent).
+- **Async admin publishes:** POST /publish accepts {"async":true} →
+  202 {"job": id} with the outcome at GET /job/{id} (registry: done /
+  accepted-count / error, pruned after an hour). The CLI's
+  Publish/PublishClaim always ride the job under a 2-minute budget —
+  the keyed K_claim leg walks its own keyspace and can outrun any sane
+  HTTP budget (found live: the client died at 15 s while the
+  daemon-side publish completed a minute later). Wire-compatible both
+  ways: a pre-async daemon ignores the field and answers the old
+  synchronous shape, which the client treats as the final result.
+- **`freens forget <name>`:** the cleanup verb the runbook was doing by
+  hand — revoke (the §9.5 tombstone, signed while the key still exists)
+  THEN prune the key material (owner key, §8.4 recovery keys, parked
+  claim state) in that order; a failed revoke keeps the keys. Names
+  that are absent or already revoked skip straight to pruning.
+  `-keep-keys` is plain revoke; `-yes` is required in non-interactive
+  sessions (deleting key material is the one-way part). Sub-names under
+  the apex are separate records and are called out in the output.
+- **`freens uninstall`:** the one-command removal matching what setup and
+  the ecosystem put on the machine: stop + disable every ACTIVE freens*
+  systemd unit (discovered — daemon, freens-web, comm chairs — plus
+  timers like freens-health), remove the unit files (globbed, regular
+  files only, legacy --user unit included), reverse the OS resolver
+  wiring (shared code with `setup -uninstall`), then the optional
+  extras: `-trust` removes the §9.5 local root + cross-cert anchors
+  from the system CA bundle and the spool tree (NSS profiles get the
+  exact certutil commands printed — they are per-user databases);
+  `-purge` deletes the ENTIRE state dir (keys!) and is gated by -yes in
+  scripts. Windows routes through the SCM uninstall core under one UAC
+  gate with the flags preserved through the relaunch.
+
 ## v0.11.0 — Windows 10/11: SCM service + automatic setup
 
 Windows goes from "unsupported" to the same one-command story as Linux:

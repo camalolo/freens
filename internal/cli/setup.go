@@ -433,22 +433,66 @@ func printManualCommands(what string, cmds []string) {
 // ---------------------------------------------------------------------------
 
 func setupUninstall() error {
-	// System service off + unit removed.
-	fmt.Println("running: systemctl disable --now freens.service")
-	if err := sudoRun("stopping freens.service", "systemctl", "disable", "--now", "freens.service"); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: warning: disable failed (%v) — service not installed?\n", ProgName, err)
+	uninstallServices()
+	removeUnitFiles()
+	unwireOSResolver()
+
+	fmt.Println()
+	fmt.Printf("uninstalled: service + OS resolver wiring removed.\n")
+	fmt.Printf("KEPT (your keys, names, and store): %s\n", home.Dir())
+	fmt.Printf("delete everything with: rm -rf %s\n", home.Dir())
+	return nil
+}
+
+// uninstallServices stops and disables every ACTIVE freens* systemd unit —
+// services AND timers (the daemon, freens-web, comm chairs, the doctor
+// timer) — then reloads the manager. On a box without systemd it says so.
+// Shared by `setup -uninstall` and `freens uninstall`.
+func uninstallServices() {
+	units := activeFreensUnits()
+	timers := listFreensTimers()
+	if len(units) == 0 && len(timers) == 0 {
+		fmt.Println("no active freens* systemd units found")
+		return
 	}
-	unitPath, _, err := systemdUnit()
-	if err == nil && sysStatExists(unitPath) {
-		if err := sudoRun("removing the unit file", "rm", "-f", unitPath); err != nil {
-			printManualCommands("remove unit file", []string{"sudo rm -f " + unitPath})
-		} else {
-			fmt.Printf("removed: %s\n", unitPath)
+	for _, u := range units {
+		fmt.Println("running: systemctl disable --now " + u)
+		if err := sudoRun("stopping "+u, "systemctl", "disable", "--now", u); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: disable failed for %s (%v)\n", ProgName, u, err)
+		}
+	}
+	for _, u := range timers {
+		fmt.Println("running: systemctl disable --now " + u)
+		if err := sudoRun("stopping "+u, "systemctl", "disable", "--now", u); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: disable failed for %s (%v)\n", ProgName, u, err)
 		}
 	}
 	fmt.Println("running: systemctl daemon-reload")
 	if err := sudoRun("reloading systemd", "systemctl", "daemon-reload"); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: daemon-reload failed (%v)\n", ProgName, err)
+	}
+}
+
+// removeUnitFiles deletes every freens* unit file from the systemd unit
+// directory (only regular files — glob hits like freens.service.wants
+// directories are left alone), plus any pre-v0.3.0 --user unit. Shared by
+// `setup -uninstall` and `freens uninstall`.
+func removeUnitFiles() {
+	files, err := filepath.Glob(filepath.Join(sysUnitDir(), "freens*"))
+	if err == nil {
+		for _, f := range files {
+			if !sysStatExists(f) {
+				continue
+			}
+			if info, err := os.Stat(f); err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if err := sudoRun("removing the unit file", "rm", "-f", f); err != nil {
+				printManualCommands("remove unit file "+f, []string{"sudo rm -f " + f})
+				continue
+			}
+			fmt.Printf("removed: %s\n", f)
+		}
 	}
 	// Any pre-v0.3.0 user unit goes too.
 	if legacy := legacyUserUnitPath(); legacy != "" && sysStatExists(legacy) {
@@ -458,7 +502,22 @@ func setupUninstall() error {
 		}
 		_ = systemctlUser("daemon-reload")
 	}
+}
 
+// sysUnitDir is the systemd unit directory the verbs manage (var-gated for
+// tests via pathSystemctlUnit, which stubSysForTest points into a temp dir).
+var sysUnitDir = func() string {
+	if pathSystemctlUnit != "" {
+		return filepath.Dir(pathSystemctlUnit)
+	}
+	return "/etc/systemd/system"
+}
+
+// unwireOSResolver reverses wireOSResolver: the :53 NAT redirect table,
+// the legacy v0.2.0 systemd-resolved drop-in, and the resolv.conf restore
+// (kept when present — the one pristine pre-freens backup). Shared by
+// `setup -uninstall` and `freens uninstall`.
+func unwireOSResolver() {
 	// NAT redirect rules: drop our table (iptables variants are per-rule;
 	// printed as manual steps if the table path fails).
 	if err := sudoRun("removing the port-53 redirect rules", "nft", "delete", "table", "ip", nftTableName); err != nil {
@@ -509,12 +568,6 @@ func setupUninstall() error {
 		}
 		printManualCommands("remove freens from resolv.conf", cmds)
 	}
-
-	fmt.Println()
-	fmt.Printf("uninstalled: service + OS resolver wiring removed.\n")
-	fmt.Printf("KEPT (your keys, names, and store): %s\n", home.Dir())
-	fmt.Printf("delete everything with: rm -rf %s\n", home.Dir())
-	return nil
 }
 
 // ---------------------------------------------------------------------------

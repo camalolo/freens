@@ -139,10 +139,13 @@ func (c *Client) Status(ctx context.Context) (*Status, error) {
 	return &st, nil
 }
 
-// envelopeRequest is the publish-family request body.
+// envelopeRequest is the publish-family request body. Async asks the
+// daemon to run the publish as a pollable job (see Client.publish) —
+// daemons without the endpoint ignore it and answer synchronously.
 type envelopeRequest struct {
 	Envelope string `json:"envelope"`
 	Claim    bool   `json:"claim,omitempty"`
+	Async    bool   `json:"async,omitempty"`
 }
 
 // Publish publishes env through the daemon's node (POST /publish): the §6.4
@@ -162,7 +165,15 @@ func (c *Client) PublishClaim(ctx context.Context, env *wire.SignedEnvelope) err
 	return err
 }
 
-// publish is the shared body of Publish/PublishClaim.
+// publish is the shared body of Publish/PublishClaim. It runs the publish
+// as a daemon-side JOB (POST /publish {"async":true}) and polls
+// GET /job/{id} for the outcome: a keyed K_claim publish walks its own
+// keyspace and can outlive any sane HTTP budget (found live 2026-08-31 —
+// the synchronous call died at the client's 15 s while the daemon-side
+// operation completed a minute later). A daemon WITHOUT the job endpoint
+// (pre-async) ignores the unknown field and answers the old synchronous
+// shape (200 {"accepted":N}), which this loop treats as the final result —
+// new client ↔ old daemon and old client ↔ new daemon both work.
 func (c *Client) publish(ctx context.Context, env *wire.SignedEnvelope, claim bool) (int, error) {
 	if env == nil {
 		return 0, fmt.Errorf("admin: nil envelope")
@@ -172,16 +183,52 @@ func (c *Client) publish(ctx context.Context, env *wire.SignedEnvelope, claim bo
 		return 0, fmt.Errorf("admin: encode envelope: %w", err)
 	}
 	var out struct {
-		Accepted int `json:"accepted"`
+		Accepted int    `json:"accepted"`
+		Job      string `json:"job"`
 	}
 	_, err = c.do(ctx, http.MethodPost, "/publish", &envelopeRequest{
 		Envelope: base64.StdEncoding.EncodeToString(b),
 		Claim:    claim,
+		Async:    true,
 	}, &out)
 	if err != nil {
 		return 0, err
 	}
-	return out.Accepted, nil
+	if out.Job == "" {
+		// Synchronous answer: either a pre-async daemon or an early
+		// failure shape — the accepted count is the final result.
+		return out.Accepted, nil
+	}
+	return c.pollJob(ctx, out.Job)
+}
+
+// pollJob waits for one admin job to finish, the CALLER's ctx bounding the
+// whole wait (per-request budgets are the Client's own).
+func (c *Client) pollJob(ctx context.Context, id string) (int, error) {
+	t := time.NewTicker(400 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("admin: publish job %s did not finish: %w", id, ctx.Err())
+		case <-t.C:
+			var out struct {
+				Done     bool   `json:"done"`
+				Accepted int    `json:"accepted"`
+				Error    string `json:"error"`
+			}
+			if _, err := c.do(ctx, http.MethodGet, "/job/"+id, nil, &out); err != nil {
+				return 0, fmt.Errorf("admin: publish job %s: %w", id, err)
+			}
+			if !out.Done {
+				continue
+			}
+			if out.Error != "" {
+				return out.Accepted, fmt.Errorf("admin: publish job %s: %s", id, out.Error)
+			}
+			return out.Accepted, nil
+		}
+	}
 }
 
 // Get fetches the winning envelope at a raw 32-byte storage key (POST /get).

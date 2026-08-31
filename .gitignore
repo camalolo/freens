@@ -11,5 +11,8 @@ dist/
 # register artifacts (written to cwd by default)
 *.tld.cbor
 
+# key bundles (`freens backup`) — NEVER commit: anyone holding one owns the names
+freens-backup-*.tar.gz
+
 # agent working notes (private host details)
 AGENTS.md

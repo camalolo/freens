@@ -55,6 +55,13 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 	oldNftTable, oldRedirectProbe := sysStatNftTable, port53RedirectInstalled
 	oldLegacy := pathLegacyUserUnit
 	oldBridgePath, oldBridgeSvc := pathTrustBridgePathUnit, pathTrustBridgeSvcUnit
+	oldOutput := sysOutput
+	// The unit-listing probe never hits a real systemctl from tests: a
+	// deterministic daemon unit (the disable assertion in the uninstall
+	// test relies on it).
+	sysOutput = func(name string, args ...string) (string, error) {
+		return "freens.service loaded active running freens daemon\n", nil
+	}
 
 	sysRun = func(name string, args ...string) error {
 		argv := append([]string{name}, args...)
@@ -98,6 +105,7 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 		sysStatNftTable, port53RedirectInstalled = oldNftTable, oldRedirectProbe
 		pathLegacyUserUnit = oldLegacy
 		pathTrustBridgePathUnit, pathTrustBridgeSvcUnit = oldBridgePath, oldBridgeSvc
+		sysOutput = oldOutput
 	})
 	return rec
 }

@@ -58,6 +58,7 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("POST /publish", s.handlePublish)
+	mux.HandleFunc("GET /job/{id}", s.handleJob)
 	mux.HandleFunc("POST /get", s.handleGet)
 	mux.HandleFunc("POST /resolve", s.handleResolve)
 	mux.HandleFunc("POST /witness", s.handleWitness)
@@ -271,6 +272,11 @@ func (s *Server) storeCounts() (live, history int) {
 type publishRequest struct {
 	Envelope string `json:"envelope"`
 	Claim    bool   `json:"claim"`
+	// Async runs the publish as a background job: the response is 202
+	// {"job": "<id>"} and the caller polls GET /job/{id} for the outcome
+	// (a keyed K_claim put can outlive any sane HTTP budget). Absent
+	// (false) keeps the synchronous contract byte-for-byte.
+	Async bool `json:"async"`
 }
 
 // handlePublish verifies and publishes an envelope through the daemon's node.
@@ -306,29 +312,45 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "envelope signature does not verify")
 		return
 	}
-	ctx, cancel := capped(r)
-	defer cancel()
-
-	// Does the record carry a §7.3 claim in field 11?
-	claim, claimErr := claims.DecodeAliasClaim(env.Record.Claim)
-
+	// Claim-mode pre-check stays synchronous: a malformed request must be
+	// answered as 400 whether or not the publish runs as a job.
 	if req.Claim {
-		// Claim-only mode: PublishClaim semantics, no primary publish.
-		if claimErr != nil {
+		if _, claimErr := claims.DecodeAliasClaim(env.Record.Claim); claimErr != nil {
 			writeErr(w, http.StatusBadRequest, "envelope carries no decodable alias claim (field 11)")
 			return
 		}
-		if err := s.node.PublishClaim(ctx, env); err != nil {
-			writeErr(w, http.StatusBadGateway, "publish-claim failed: "+err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]int{"accepted": 1})
+	}
+	if req.Async {
+		id := s.startPublishJob(env, req.Claim)
+		writeJSON(w, http.StatusAccepted, map[string]string{"job": id})
 		return
 	}
-
-	if err := s.node.Publish(ctx, env); err != nil {
-		writeErr(w, http.StatusBadGateway, "publish failed: "+err.Error())
+	ctx, cancel := capped(r)
+	defer cancel()
+	accepted, err := s.runPublish(ctx, env, req.Claim)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
 		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"accepted": accepted})
+}
+
+// runPublish is handlePublish's publish core, shared by the synchronous
+// path and the async job runner: the primary publish, the local-store
+// install, and the best-effort §7.4/C.1 claim leg. It returns the number
+// of distinct keys at least one peer accepted (mirroring the historical
+// response contract: primary failure is an error; a failed claim leg after
+// a successful primary is only counted down, not failed).
+func (s *Server) runPublish(ctx context.Context, env *wire.SignedEnvelope, claimOnly bool) (int, error) {
+	claim, claimErr := claims.DecodeAliasClaim(env.Record.Claim)
+	if claimOnly {
+		if err := s.node.PublishClaim(ctx, env); err != nil {
+			return 0, fmt.Errorf("publish-claim failed: %s", err.Error())
+		}
+		return 1, nil
+	}
+	if err := s.node.Publish(ctx, env); err != nil {
+		return 0, fmt.Errorf("publish failed: %s", err.Error())
 	}
 	// Local-first consistency: also install the envelope in the DAEMON'S
 	// OWN store (§6.4 winner rule makes it harmless — a better incumbent
@@ -348,7 +370,7 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 			accepted = 2
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"accepted": accepted})
+	return accepted, nil
 }
 
 // storeLocally installs env at every legitimate key (dht.StorageKeys) in the

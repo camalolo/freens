@@ -230,6 +230,20 @@ func (s *EnvelopeStore) PutWithEvidence(key []byte, env *wire.SignedEnvelope, no
 
 	// --- rule 3: winner check vs an alive incumbent (§6.4 step 3) --------
 	if cur, ok := s.entries[k]; ok && s.aliveLocked(cur, now) {
+		// Idempotent republish: an envelope carrying the ALREADY-STORED
+		// record (identical §6.4 H_record — a replica-refresh PUT, or the
+		// same renewal arriving twice) achieves the put's goal, so it is
+		// reported as accepted rather than refused. Refusing it made every
+		// republish loop read "already have it" as failure — found live
+		// 2026-08-31 as endless "accepted by 0 of 7 peers" auto-renew
+		// warnings for records that were in fact fresh on the peers.
+		// RecordHash (not envelope bytes) is the identity: a re-signed
+		// duplicate of the same record is the same stored data.
+		if same, err := sameStoredRecord(env, cur.env); err == nil && same {
+			e := s.entries[k] // aliveLocked above guarantees presence
+			e.lastAccess = now
+			return true, nil
+		}
 		// Alive incumbent: the newcomer must STRICTLY win.
 		if !wire.EnvelopeWins(env, cur.env) {
 			return false, nil
@@ -295,6 +309,26 @@ func (s *EnvelopeStore) PutWithEvidence(key []byte, env *wire.SignedEnvelope, no
 	s.evictExpiredLocked(now)
 	s.enforceCapLocked(now, k)
 	return true, nil
+}
+
+// sameStoredRecord reports whether env carries the same RECORD as the
+// incumbent (identical §6.4 H_record): byte-identical envelopes, and
+// re-signed duplicates of the same record, both qualify. A hash error
+// reports false (the caller then falls through to the normal winner
+// check, which has the same error behavior).
+func sameStoredRecord(env, incumbent *wire.SignedEnvelope) (bool, error) {
+	if env == nil || incumbent == nil || env.Record == nil || incumbent.Record == nil {
+		return false, fmt.Errorf("dht: nil envelope")
+	}
+	nh, err1 := env.RecordHash()
+	oh, err2 := incumbent.RecordHash()
+	if err1 != nil {
+		return false, err1
+	}
+	if err2 != nil {
+		return false, err2
+	}
+	return bytes.Equal(nh, oh), nil
 }
 
 // Get returns the stored envelope for key at time now, or (nil, nil) if no

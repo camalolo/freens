@@ -18,6 +18,12 @@
 //	verify-recovery              Check §8.4 evidence against the previous record's policy.
 //	register                     Claim an alias end-to-end (spec 7): key -> PoW -> W witnesses
 //	                             -> TLD record published at K_tld+K_claim (recovery on by default).
+//	revoke                       Tombstone a name you own (spec 9.5): stops resolving everywhere;
+//	                             un-revoke = publish again (`register`/`name` at a newer sequence).
+//	forget                       `revoke` + key-material deletion in one safe order (tombstone
+//	                             first, prune second); the one-way cleanup button.
+//	uninstall                    One-command removal: stop/disable every freens* service,
+//	                             remove unit files, unwire the OS resolver; -trust/-purge extras.
 //	setup                        Install: config, seeds, systemd system service, OS resolver wiring.
 //	start                        The one-command onboarding: setup (if needed) -> register ->
 //	                             plain-language status. Prompts for the name on a TTY.
@@ -86,7 +92,9 @@ var dispatch = map[string]func([]string) error{
 	"register":        cmdRegister,
 	"renew":           cmdRenew,
 	"revoke":          cmdRevoke,
+	"forget":          cmdForget,
 	"setup":           cmdSetup,
+	"uninstall":       cmdUninstall,
 	"start":           cmdStart,
 	"backup":          cmdBackup,
 	"status":          cmdStatus,
@@ -242,6 +250,11 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "                         co-signatures -> TLD record published at K_tld+K_claim (2-of-3 recovery default)")
 	fmt.Fprintln(w, "  revoke <name>          tombstone a name you own (spec 9.5): stops resolving everywhere;")
 	fmt.Fprintln(w, "                         un-revoke = publish again (`register`/`name` at a newer sequence)")
+	fmt.Fprintln(w, "  forget <name>          the whole cleanup: revoke <name> AND delete its key material (owner +")
+	fmt.Fprintln(w, "                         recovery keys + claim state) — one-way; -keep-keys revokes only; -yes for scripts")
+	fmt.Fprintln(w, "  uninstall              one-command removal: stop/disable every active freens* service, remove the")
+	fmt.Fprintln(w, "                         unit files, unwire the OS resolver; -trust also removes the §9.5 anchors;")
+	fmt.Fprintln(w, "                         -purge also deletes the state dir (keys!) — gated by -yes")
 	fmt.Fprintln(w, "  renew [name…]          extend your names' 24 h leases (sequence+1, fresh window; the")
 	fmt.Fprintln(w, "                         daemon also auto-renews keychain names every 10 min)")
 	fmt.Fprintln(w, "  backup                 bundle every key of your name(s) into one dated file (-restore unpacks it)")

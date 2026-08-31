@@ -125,7 +125,7 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 	// Publish at every legitimate key: the name key, and K_claim when the
 	// record carries an embedded alias claim (register's two-key rule).
 	if tr.daemon() {
-		ctx, cancel := adminCtx()
+		ctx, cancel := publishCtx()
 		defer cancel()
 		if _, err := tr.client.Publish(ctx, env); err != nil {
 			return fmt.Errorf("publish: %w", err)

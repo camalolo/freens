@@ -353,7 +353,15 @@ func setupUninstallWindows(consoleWait bool) error {
 	if !winSvcElevated() {
 		return winRunElevatedGate("setup", "-uninstall")
 	}
+	uninstallWindowsCore()
+	windowsConsoleWait(consoleWait)
+	return nil
+}
 
+// uninstallWindowsCore is the machine-changing heart of the Windows
+// uninstall: service removal, firewall rules, adapter DNS restore. Shared
+// by `setup -uninstall` and `freens uninstall` (both call it elevated).
+func uninstallWindowsCore() {
 	// Service off + removed.
 	fmt.Printf("removing service %q…\n", winsvc.Name)
 	if err := winSvcRemove(); err != nil {
@@ -383,9 +391,6 @@ func setupUninstallWindows(consoleWait bool) error {
 	fmt.Println("uninstalled: service + OS resolver wiring removed.")
 	fmt.Printf("KEPT (your keys, names, and store): %s\n", home.Dir())
 	fmt.Printf("delete everything with: Remove-Item -Recurse -Force %s\n", home.Dir())
-
-	windowsConsoleWait(consoleWait)
-	return nil
 }
 
 // ---------------------------------------------------------------------------

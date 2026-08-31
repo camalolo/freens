@@ -559,21 +559,55 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // Starting stopped units is deliberately out of scope. Returns nil when
 // systemctl is absent (non-systemd box) or nothing matches.
 func activeFreensUnits() []string {
-	out, err := sysOutput("systemctl", "list-units", "freens*", "--type=service", "--no-legend", "--plain")
-	if err != nil {
-		return nil
-	}
-	var units []string
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		// Columns: UNIT LOAD ACTIVE SUB DESCRIPTION.
-		if len(f) > 2 && f[2] == "active" && strings.HasSuffix(f[0], ".service") {
-			units = append(units, f[0])
-		}
-	}
+	units := filterActiveUnits(listSystemdUnits("--type=service"))
 	// The daemon first, the web UI last, anything else between.
 	sort.SliceStable(units, func(i, j int) bool { return unitRestartRank(units[i]) < unitRestartRank(units[j]) })
 	return units
+}
+
+// listFreensTimers lists the ACTIVE freens* timer units (the health check,
+// a DDNS timer, …) — same active-only rule as the services.
+func listFreensTimers() []string {
+	return filterActiveUnits(listSystemdUnits("--type=timer"))
+}
+
+// systemdUnitRow is one listed unit and whether systemd calls it active.
+type systemdUnitRow struct {
+	name   string
+	active bool
+}
+
+// listSystemdUnits raw-lists freens* units of one kind via list-units.
+// sysOutput is the test seam; nil on any error (no systemctl, …).
+func listSystemdUnits(kind string) []systemdUnitRow {
+	out, err := sysOutput("systemctl", "list-units", "freens*", kind, "--no-legend", "--plain")
+	if err != nil {
+		return nil
+	}
+	var units []systemdUnitRow
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		// Columns: UNIT LOAD ACTIVE SUB DESCRIPTION.
+		if len(f) < 3 {
+			continue
+		}
+		if !strings.HasSuffix(f[0], ".service") && !strings.HasSuffix(f[0], ".timer") {
+			continue
+		}
+		units = append(units, systemdUnitRow{name: f[0], active: f[2] == "active"})
+	}
+	return units
+}
+
+// filterActiveUnits projects the listed units to active names only.
+func filterActiveUnits(units []systemdUnitRow) []string {
+	var out []string
+	for _, u := range units {
+		if u.active {
+			out = append(out, u.name)
+		}
+	}
+	return out
 }
 
 func unitRestartRank(u string) int {

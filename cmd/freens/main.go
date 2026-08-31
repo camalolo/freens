@@ -1152,6 +1152,18 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			logger.Warn("auto-renew: publish failed (retry next tick)", "error", err)
 			continue
 		}
+		// The renewal must BELIEVE what it told the network: install the
+		// fresh envelope in the local store too. Without this the next
+		// tick re-reads the stale sequence here, re-signs the SAME
+		// sequence+1 (new timestamps — a different envelope the peers
+		// rightly refuse), and the name's sequence stalls at N+1 until
+		// the local copy ages out — "accepted by 0 of 7 peers" every
+		// ten minutes while the network record slowly starves toward
+		// expiry (found live 2026-08-31 on the seed box; a TLSCA-less
+		// pre-upgrade record renewed this way never gains the binding).
+		for _, k := range keys {
+			_, _ = store.Put(k, fresh, now, false) // signed above
+		}
 		renewed++
 		logger.Info("auto-renewed record", "sequence", fresh.Record.Sequence,
 			"expires", fresh.Record.Expires)

@@ -48,6 +48,18 @@ func adminCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), adminTimeout)
 }
 
+// publishTimeout bounds one admin-mediated publish INCLUDING its daemon-side
+// job (the client polls GET /job/{id} under this budget). The keyed K_claim
+// leg walks its own keyspace and can run for tens of seconds on a busy node
+// — a 15 s budget killed the CLI mid-publish while the daemon-side job
+// completed a minute later (found live 2026-08-31).
+const publishTimeout = 2 * time.Minute
+
+// publishCtx is the context for Publish/PublishClaim round trips.
+func publishCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), publishTimeout)
+}
+
 // adminResolved aliases admin.Resolved (resolved-name answer) for the
 // pretty-printer in dht.go.
 type adminResolved = admin.Resolved

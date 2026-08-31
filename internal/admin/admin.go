@@ -83,6 +83,13 @@ type Server struct {
 	// the daemon wires it shortly after the serve goroutine starts.
 	tlsSnapshot func() any
 
+	// jobsMu/jobs/jobSeq are the async-publish registry (jobs.go): POST
+	// /publish {"async":true} runs the keyed put in the background and
+	// hands the caller an id to poll at GET /job/{id}.
+	jobsMu sync.Mutex
+	jobs   map[string]*adminJob
+	jobSeq uint64
+
 	// mu guards the lifecycle fields below. ListenAndServe fills them once
 	// under mu before serving; Close flips closed and tears down under mu.
 	// Handler goroutines only ever read s.node/s.lookup/s.log/s.version,
@@ -105,7 +112,13 @@ func New(node *dht.Node, lookup *dht.DHTLookup, version string, log Logger) *Ser
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{node: node, lookup: lookup, version: version, log: log}
+	return &Server{
+		node:    node,
+		lookup:  lookup,
+		version: version,
+		log:     log,
+		jobs:    make(map[string]*adminJob),
+	}
 }
 
 // ListenAndServe binds the unix stream socket at sock (creating its parent

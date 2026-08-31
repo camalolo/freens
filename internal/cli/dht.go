@@ -302,7 +302,7 @@ func cmdPublish(args []string) error {
 		return usageErr("publish -evidence requires standalone mode: pass -peers (the admin socket does not carry spec 8.4 recovery evidence)")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
 	defer cancel()
 	var node *dht.Node
 	if !tr.daemon() {

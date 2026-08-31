@@ -90,27 +90,16 @@ func cmdRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Network state: the name's terminal envelope (tombstones included —
+	// revoking an already-revoked name via /resolve would reset to 1 and
+	// lose the winner race; same fix as the web UI's engine).
+	cur, err := discoverEnvelope(tr, nameKey)
+	if err != nil {
+		return err
+	}
 	var seq uint64 = 1
-	var node *dht.Node
-	var nodeCtx context.Context
-	var nodeCancel context.CancelFunc
-	if tr.daemon() {
-		ctx, cancel := adminCtx()
-		if cur, gerr := tr.client.Get(ctx, nameKey); gerr == nil && cur != nil && cur.Record != nil {
-			seq = cur.Record.Sequence + 1
-		}
-		cancel()
-	} else {
-		nodeCtx, nodeCancel = context.WithTimeout(context.Background(), cliTimeout)
-		defer nodeCancel()
-		node, err = startCLINode(nodeCtx, "", "", tr.peers)
-		if err != nil {
-			return err
-		}
-		defer node.Close()
-		if env, err := node.IterativeGet(nodeCtx, nameKey); err == nil && env != nil {
-			seq = env.Record.Sequence + 1
-		}
+	if cur != nil && cur.Record != nil {
+		seq = cur.Record.Sequence + 1
 	}
 
 	if !*yes && sysIsTerminal() {
@@ -121,7 +110,49 @@ func cmdRevoke(args []string) error {
 		}
 	}
 
-	// The §9.5 tombstone: empty RRset + revoke = true at sequence+1.
+	if err := publishRevokedAt(tr, wireName, ownerKP, seq); err != nil {
+		return err
+	}
+
+	fmt.Printf("REVOKED. %s no longer resolves (sequence %d; un-revoke with `%s name %s`)\n",
+		displayName, seq, ProgName, displayName)
+	fmt.Printf("tld_id_b32=%s\n", pin)
+	fmt.Printf("k_name=%s\n", hex.EncodeToString(naming.DHTKeyName(wireName)))
+	return nil
+}
+
+// discoverEnvelope fetches a name's terminal envelope via whichever
+// transport was picked — the daemon's store-first GET, or an iterative
+// walk from a one-shot node. Tombstones included (sequence discovery must
+// see them); nil means nothing is reachable at this key.
+func discoverEnvelope(tr *transport, key []byte) (*wire.SignedEnvelope, error) {
+	if tr.daemon() {
+		ctx, cancel := adminCtx()
+		defer cancel()
+		env, err := tr.client.Get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		return env, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
+	defer cancel()
+	node, err := startCLINode(ctx, "", "", tr.peers)
+	if err != nil {
+		return nil, err
+	}
+	defer node.Close()
+	env, err := node.IterativeGet(ctx, key)
+	if err != nil {
+		return nil, nil // a walk failure is "nothing reachable", same as the daemon's 404
+	}
+	return env, nil
+}
+
+// publishRevokedAt signs the §9.5 tombstone (empty RRset, revoke = true)
+// at the given sequence and publishes it via whichever transport was
+// picked. Shared by `revoke` and `forget`.
+func publishRevokedAt(tr *transport, wireName []byte, ownerKP *crypto.Keypair, seq uint64) error {
 	now := uint64(time.Now().Unix())
 	rec, err := wire.NewRecord(wireName, ownerKP.Public(), seq, now, now+uint64(constants.RecordDefaultTTL))
 	if err != nil {
@@ -136,20 +167,22 @@ func cmdRevoke(args []string) error {
 	}
 
 	if tr.daemon() {
-		ctx, cancel := adminCtx()
+		ctx, cancel := publishCtx()
 		defer cancel()
 		if _, err := tr.client.Publish(ctx, env); err != nil {
 			return fmt.Errorf("publish (daemon): %w", err)
 		}
-	} else {
-		if err := node.Publish(nodeCtx, env); err != nil {
-			return fmt.Errorf("publish: %w", err)
-		}
+		return nil
 	}
-
-	fmt.Printf("REVOKED. %s no longer resolves (sequence %d; un-revoke with `%s name %s`)\n",
-		displayName, seq, ProgName, displayName)
-	fmt.Printf("tld_id_b32=%s\n", pin)
-	fmt.Printf("k_name=%s\n", hex.EncodeToString(naming.DHTKeyName(wireName)))
+	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
+	defer cancel()
+	node, err := startCLINode(ctx, "", "", tr.peers)
+	if err != nil {
+		return err
+	}
+	defer node.Close()
+	if err := node.Publish(ctx, env); err != nil {
+		return fmt.Errorf("publish: %w", err)
+	}
 	return nil
 }

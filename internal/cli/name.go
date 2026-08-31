@@ -156,7 +156,7 @@ func cmdName(args []string) error {
 
 	// --- publish ------------------------------------------------------------
 	if tr.daemon() {
-		ctx, cancel := adminCtx()
+		ctx, cancel := publishCtx()
 		defer cancel()
 		if _, err := tr.client.Publish(ctx, env); err != nil {
 			return fmt.Errorf("publish (daemon): %w", err)
