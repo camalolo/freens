@@ -52,6 +52,14 @@ the two verbs the cleanup runbook was missing:
   `-purge` deletes the ENTIRE state dir (keys!) and is gated by -yes in
   scripts. Windows routes through the SCM uninstall core under one UAC
   gate with the flags preserved through the relaunch.
+- **setup writes the relocated-state env into the unit** (found live
+  during the fleet deploy of this very build): re-running `freens setup`
+  on a XDG-relocated install wrote a freens.service WITHOUT
+  `Environment=FREENS_HOME` (the line had only ever been hand-patched),
+  forking a second daemon at the default ~/.freens — admin socket and
+  keychain scanning (auto-renew) misdirected while the -config path
+  still looked right. setup now emits `Environment=FREENS_HOME=…` into
+  the unit whenever the variable is set at install time.
 
 ## v0.11.0 — Windows 10/11: SCM service + automatic setup
 

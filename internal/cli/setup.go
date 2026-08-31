@@ -597,7 +597,20 @@ func systemdUnit() (path, content string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	unit := fmt.Sprintf(setupUnitTemplate, exe, home.ConfPath(), u.Username)
+	// Relocated installs (FREENS_HOME set — the XDG layout) MUST carry the
+	// variable into the unit: the daemon runs under User=, but a system
+	// unit's environment is NOT the user's shell environment (%h expands
+	// to /root regardless of User=), and an unset FREENS_HOME silently
+	// points the state dir at ~/.freens — admin socket, keychain scanning
+	// (auto-renew!), and TLS state all misdirected while the -config path
+	// still looks right (found live 2026-09-01: re-running setup on the
+	// seed box forked a second daemon at ~/.freens because the unit had
+	// been hand-patched with the line setup never wrote).
+	envLine := ""
+	if fh := os.Getenv("FREENS_HOME"); fh != "" {
+		envLine = "Environment=FREENS_HOME=" + fh + "\n"
+	}
+	unit := fmt.Sprintf(setupUnitTemplate, exe, home.ConfPath(), u.Username, envLine)
 	return dir, unit, nil
 }
 
@@ -672,7 +685,7 @@ Wants=network-online.target
 [Service]
 ExecStart=%s daemon -config %s
 User=%s
-Restart=on-failure
+%sRestart=on-failure
 RestartSec=2
 
 [Install]

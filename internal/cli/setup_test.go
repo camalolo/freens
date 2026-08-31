@@ -377,3 +377,33 @@ func TestSetupSudoFallbackPrintsManualCommands(t *testing.T) {
 		t.Errorf("freens.conf not written: %v", err)
 	}
 }
+
+// TestSetupUnitCarriesFREENSHome: a relocated install (FREENS_HOME set)
+// must write the env into the unit — the daemon's system-unit environment
+// is not the user's shell (found live 2026-09-01: re-setup on the seed box
+// forked a second daemon at ~/.freens). Default home: no env line.
+func TestSetupUnitCarriesFREENSHome(t *testing.T) {
+	tempHome(t)
+	stubSysForTest(t)
+
+	t.Setenv("FREENS_HOME", "/relocated/home")
+	_, unit, err := systemdUnit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(unit, "Environment=FREENS_HOME=/relocated/home\n") {
+		t.Errorf("relocated unit missing the FREENS_HOME env line:\n%s", unit)
+	}
+
+	os.Unsetenv("FREENS_HOME")
+	_, unit, err = systemdUnit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(unit, "Environment=") {
+		t.Errorf("default-home unit carries an env line:\n%s", unit)
+	}
+	if !strings.Contains(unit, "Restart=on-failure") {
+		t.Errorf("unit lost its Restart policy:\n%s", unit)
+	}
+}
