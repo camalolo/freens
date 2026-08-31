@@ -4,6 +4,7 @@
 package webui
 
 import (
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"net/http"
@@ -166,18 +167,36 @@ func (s *Server) Handler() http.Handler {
 // gate's allowlist is logged at startup so the operator sees exactly who
 // can reach the UI.
 func (s *Server) ListenAndServe() error {
+	return s.serve(nil)
+}
+
+// ListenAndServeTLS is ListenAndServe over TLS with the given leaf
+// certificate (§9.5: https://<name>:8090 by default). cert nil = plain HTTP.
+func (s *Server) ListenAndServeTLS(cert *tls.Certificate) error {
+	return s.serve(cert)
+}
+
+func (s *Server) serve(cert *tls.Certificate) error {
 	ln, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return err
+	}
+	scheme := "http"
+	if cert != nil {
+		ln = tls.NewListener(ln, &tls.Config{
+			Certificates: []tls.Certificate{*cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+		scheme = "https"
 	}
 	if s.gateOpen {
 		cidrs := make([]string, 0, len(s.allow))
 		for _, n := range s.allow {
 			cidrs = append(cidrs, n.String())
 		}
-		s.log.Info("webui: serving", "addr", s.cfg.Listen, "allow", cidrs, "home", s.home)
+		s.log.Info("webui: serving", "scheme", scheme, "addr", s.cfg.Listen, "allow", cidrs, "home", s.home)
 	} else {
-		s.log.Info("webui: serving", "addr", s.cfg.Listen, "allow", "ANY (ungated)")
+		s.log.Info("webui: serving", "scheme", scheme, "addr", s.cfg.Listen, "allow", "ANY (ungated)")
 	}
 	srv := &http.Server{
 		Handler:           s.Handler(),

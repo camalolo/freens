@@ -73,6 +73,15 @@ const (
 // Storage.
 const NodeStorageMax = 256 * 1024 * 1024 // per-node envelope storage cap (256 MiB)
 
+// Self-certifying TLS (§9.5).
+const (
+	TLSCADeriveInfo    = "freens-tls-ca-v1" // HKDF info for §9.5.1 owner-CA derivation
+	TLSCAValidityDays  = 3650               // TLS_CA_VALIDITY: owner-CA / local-root cert lifetime (10 y)
+	TLSLeafTTLSec      = 604800             // TLS_LEAF_TTL: max leaf certificate lifetime (7 d)
+	TLSCrossCertTTLSec = 604800             // TLS_CROSSCERT_TTL: max cross-cert lifetime (7 d; ≤ record expiry)
+	TLSCAResponseTTL   = 3600               // rrset TTL carried by the TLSCA RR itself (capped by record expiry)
+)
+
 // Cryptographic primitive sizes (bytes).
 const (
 	Ed25519PublicKeyLen  = 32

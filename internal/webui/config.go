@@ -41,6 +41,8 @@ type Config struct {
 	Allow    string // comma list of CIDRs; "" = auto (private subnets); "any" = no gate (warn)
 	HomeDir  string // freens home ("" = the standard ~/.freens resolution)
 	AuthPath string // where the bcrypt hash lives ("" = <home>/webui/auth)
+	Name     string // alias whose TLS leaf to serve (§9.5; "" = first keychain alias)
+	TLSOff   bool   // [webui] tls = false serves plain HTTP even when a leaf is issuable
 }
 
 // DefaultListen is the out-of-the-box bind address.
@@ -85,6 +87,13 @@ func ParseConfig(text string) (*Config, error) {
 			cfg.HomeDir = val
 		case "auth":
 			cfg.AuthPath = val
+		case "name":
+			cfg.Name = val
+		case "tls":
+			if val != "true" && val != "false" {
+				return nil, fmt.Errorf("[webui] config: tls = %q (want true|false)", val)
+			}
+			cfg.TLSOff = val == "false"
 		default:
 			return nil, fmt.Errorf("[webui] config: unknown key %q", key)
 		}

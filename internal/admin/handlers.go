@@ -64,7 +64,35 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /peers", s.handlePeers)
 	mux.HandleFunc("GET /store", s.handleStore)
 	mux.HandleFunc("GET /difficulty", s.handleDifficulty)
+	mux.HandleFunc("GET /tls", s.handleTLS)
 	return s.logRequests(mux)
+}
+
+// SetTLSProvider wires the §9.5 trust-sync snapshot source (nil disables
+// GET /tls). Mutex-guarded: the daemon may wire it after the serve
+// goroutine is already answering /status.
+func (s *Server) SetTLSProvider(fn func() any) {
+	s.mu.Lock()
+	s.tlsSnapshot = fn
+	s.mu.Unlock()
+}
+
+// tlsSnapshotFn returns the wired provider (or nil).
+func (s *Server) tlsSnapshotFn() func() any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tlsSnapshot
+}
+
+// handleTLS reports the §9.5 trust-sync state: the local root fingerprint
+// and every cross-certified namespace. 503 when trust sync is off.
+func (s *Server) handleTLS(w http.ResponseWriter, r *http.Request) {
+	fn := s.tlsSnapshotFn()
+	if fn == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "tls trust sync disabled"})
+		return
+	}
+	writeJSON(w, http.StatusOK, fn())
 }
 
 // logRequests wraps the mux with a Debug-level access log. Debug (not Info):

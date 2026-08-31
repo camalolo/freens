@@ -77,6 +77,11 @@ type Server struct {
 	version string
 	log     Logger
 
+	// tlsSnapshot is the OPTIONAL §9.5 trust-sync status source wired by the
+	// daemon (SetTLSProvider); nil ⇒ GET /tls answers 503. Guarded by mu:
+	// the daemon wires it shortly after the serve goroutine starts.
+	tlsSnapshot func() any
+
 	// mu guards the lifecycle fields below. ListenAndServe fills them once
 	// under mu before serving; Close flips closed and tears down under mu.
 	// Handler goroutines only ever read s.node/s.lookup/s.log/s.version,

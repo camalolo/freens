@@ -250,6 +250,10 @@ func setupInstall() error {
 	// (e) OS resolver wiring.
 	resolverNote := wireOSResolver()
 
+	// (f) §9.5 TLS trust bridge: the privileged half of trust sync (spool →
+	// system CA bundle). Best-effort like the rest of setup.
+	installTrustBridge()
+
 	// Summary.
 	fmt.Println()
 	fmt.Println("setup complete. Files written:")

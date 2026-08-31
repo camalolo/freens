@@ -25,6 +25,7 @@ import (
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/renewal"
 	"github.com/camalolo/freens/internal/wire"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -215,6 +216,7 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 		return RegisterResult{}, err
 	}
 	rec.Claim = cbor.RawMessage(cb)
+	renewal.EnsureTLSCA(rec, kp, uint64(now)) // §9.5: apex carries the owner-CA binding
 	env, err := wire.SignRecord(rec, kp)
 	if err != nil {
 		return RegisterResult{}, err
@@ -429,6 +431,7 @@ func (e *opsEnv) Renew(ctx context.Context, displayName, passphrase string, forc
 	if len(prev.Record.Claim) > 0 {
 		rec.Claim = prev.Record.Claim
 	}
+	renewal.EnsureTLSCA(rec, kp, now) // §9.5: apexes (re)gain the owner-CA binding on renewal
 	env, err := wire.SignRecord(rec, kp)
 	if err != nil {
 		return 0, err

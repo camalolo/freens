@@ -209,6 +209,25 @@ type Resolver struct {
 	// flightMu (never reassigned afterwards, so release paths may read it
 	// without the lock). nil ⇒ unlimited.
 	resSem chan struct{}
+
+	// TLSSync is the OPTIONAL §9.5.4 trust-sync sink (nil ⇒ disabled). It is
+	// notified — asynchronously, never blocking the answer — whenever a
+	// VERIFIED winning apex record carries a TLSCA RR (OnOwnerCA), and when
+	// an alias is definitely dead (OnAliasDead: no surviving claim, a
+	// tombstoned/expired/missing apex record). Only the SCREENED path
+	// notifies (§4.4 validity + §7.4 claim screening): trust sync must never
+	// learn a CA binding the DNS path would not answer from. Transient
+	// errors (SERVFAIL/degraded) notify nothing.
+	TLSSync TLSTrustSync
+}
+
+// TLSTrustSync is the §9.5.4 visitor-side sink implemented by the daemon's
+// trust-sync engine (internal/trustsync): cross-certify verified owner CAs
+// into the local trust stores; purge what died. tldID nil in OnAliasDead
+// means "the alias has no claim left" (purge regardless of identity).
+type TLSTrustSync interface {
+	OnOwnerCA(alias string, tldID []byte, caDER []byte, recordExpires int64)
+	OnAliasDead(alias string, tldID []byte)
 }
 
 // errResolverBusy is resolveShared's overload refusal: maps to SERVFAIL,
@@ -443,6 +462,7 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 			return nil, dns.RcodeServerFailure, nil
 		}
 		if len(tldID) == 0 {
+			r.notifyAliasDead(alias, nil) // no claim left: purge any trust-sync state
 			return nil, dns.RcodeNameError, nil
 		}
 	}
@@ -468,7 +488,11 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 			return nil, dns.RcodeServerFailure, err
 		}
 		if env == nil {
-			// Missing hop: chain broken → name does not exist in freens.
+			// Missing hop: chain broken → name does not exist in freens. A
+			// missing APEX (k == 0) is a dead alias for §9.5.4 purposes.
+			if k == 0 {
+				r.notifyAliasDead(alias, tldID)
+			}
 			return nil, dns.RcodeNameError, nil
 		}
 		// R2: per-hop temporal validity. VerifyAuthorityChain checks each
@@ -480,6 +504,9 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 		// unresolvable (NXDOMAIN). The terminal hop is re-checked below
 		// (redundantly but cheaply) along with the full chain.
 		if !wire.IsBasicValid(env, uint64(now)) {
+			if k == 0 {
+				r.notifyAliasDead(alias, tldID) // expired/invalid apex: dead
+			}
 			return nil, dns.RcodeNameError, nil
 		}
 		// §8.5 (lines 708-713): a revoked envelope (revoke = true) marks its
@@ -489,6 +516,9 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 		// via a newer sequence; until then the chain through this hop is
 		// dead.)
 		if env.IsRevoked() {
+			if k == 0 {
+				r.notifyAliasDead(alias, tldID) // §8.5 tombstone on the apex
+			}
 			return nil, dns.RcodeNameError, nil
 		}
 		chain = append(chain, env)
@@ -502,6 +532,21 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	}
 	if !r.verifyAuthorityChain(ctx, chain) {
 		return nil, dns.RcodeNameError, nil
+	}
+
+	// §9.5.4: the verified winning apex may carry the owner-CA binding —
+	// hand it to trust sync (asynchronously; never in the answer path). The
+	// bytes are copied: the sink runs concurrently with the shared flight.
+	if r.TLSSync != nil {
+		for _, rr := range chain[0].Record.RRset {
+			if rr != nil && rr.Type == wire.RRTypeTLSCA {
+				caDER := append([]byte(nil), rr.Rdata...)
+				tld := append([]byte(nil), tldID...)
+				expires := int64(chain[0].Record.Expires)
+				go r.TLSSync.OnOwnerCA(alias, tld, caDER, expires)
+				break
+			}
+		}
 	}
 
 	// Step 3d: read the answer RRset for the requested type and map freens RRs
@@ -535,6 +580,17 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 		}
 	}
 	return out, dns.RcodeSuccess, nil
+}
+
+// notifyAliasDead forwards a definite alias death to §9.5.4 trust sync.
+// Asynchronous and nil-safe; never called on transient failures (the
+// SERVFAIL/degraded paths return before reaching a notify point).
+func (r *Resolver) notifyAliasDead(alias string, tldID []byte) {
+	if r.TLSSync == nil {
+		return
+	}
+	tld := append([]byte(nil), tldID...)
+	go r.TLSSync.OnAliasDead(alias, tld)
 }
 
 // verifyAuthorityChain verifies the walked chain per §3.4, additionally

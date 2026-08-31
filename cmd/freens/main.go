@@ -72,6 +72,7 @@ import (
 	"github.com/camalolo/freens/internal/renewal"
 	"github.com/camalolo/freens/internal/resolver"
 	"github.com/camalolo/freens/internal/securekey"
+	"github.com/camalolo/freens/internal/trustsync"
 	"github.com/camalolo/freens/internal/turn"
 	"github.com/camalolo/freens/internal/upnp"
 	"github.com/camalolo/freens/internal/wire"
@@ -270,6 +271,7 @@ func run(args []string) error {
 	var dhtNode *dht.Node
 	var dhtLookup *dht.DHTLookup
 	var adminSrv *admin.Server
+	var tlsSnapshot func() any // §9.5 /tls provider (nil = trust sync off)
 	// upnpMapping is the live router port mapping (released at shutdown);
 	// the renewal goroutine may replace it, and the metrics ticker reads it,
 	// so access goes through upnpMu.
@@ -521,6 +523,38 @@ func run(args []string) error {
 		upstream = &resolver.DoHUpstream{URL: cfg.UpstreamDoH, Fallback: plain}
 	}
 	res := resolver.New(cfg, freens, upstream)
+
+	// §9.5.4 trust sync: cross-certify DHT-verified owner CAs into the local
+	// trust stores (spool for the privileged bridge + direct system store
+	// when writable + NSS user DBs when certutil exists). [tls] trust-sync =
+	// false disables the hook entirely.
+	tlsCfg, err := loadTLSConfig(*configPath)
+	if err != nil {
+		logger.Warn("tls config ignored", "error", err)
+		tlsCfg = &tlsConfig{}
+	}
+	if !tlsCfg.TrustSyncOff {
+		if tsEngine, terr := trustsync.New(trustsync.Options{
+			HomeDir:     home.Dir(),
+			Logger:      logger,
+			NSSInstall:  true,
+			SystemStore: os.Geteuid() == 0,
+		}); terr != nil {
+			logger.Warn("tls trust sync disabled", "error", terr)
+		} else {
+			res.TLSSync = tsEngine
+			tlsSnapshot = func() any {
+				return map[string]any{
+					"root_fingerprint": tsEngine.RootFingerprint(),
+					"cross_certs":      tsEngine.Snapshot(),
+				}
+			}
+			if adminSrv != nil {
+				adminSrv.SetTLSProvider(tlsSnapshot)
+			}
+			logger.Info("tls trust sync enabled (§9.5)", "root_fingerprint", tsEngine.RootFingerprint())
+		}
+	}
 
 	// Operational metrics (hardening part 1): the registry always exists —
 	// counters/gauges are near-free when -metrics is off; only the HTTP

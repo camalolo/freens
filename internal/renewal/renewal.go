@@ -15,8 +15,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/tlsca"
 	"github.com/camalolo/freens/internal/wire"
 )
 
@@ -77,6 +80,7 @@ func RenewEnvelope(prev *wire.SignedEnvelope, kp *crypto.Keypair, now int64) (*w
 	}
 	rec.Recovery = prev.Record.Recovery
 	rec.Claim = prev.Record.Claim
+	EnsureTLSCA(rec, kp, uint64(now))
 	env, err := wire.SignRecord(rec, kp)
 	if err != nil {
 		return nil, err
@@ -85,6 +89,77 @@ func RenewEnvelope(prev *wire.SignedEnvelope, kp *crypto.Keypair, now int64) (*w
 		return nil, fmt.Errorf("renewal: self-check failed")
 	}
 	return env, nil
+}
+
+// EnsureTLSCA implements the §9.5 apex-RRset rule for every publish path:
+// an APEX record (zero-label wire name) carries the owner-CA binding. An
+// existing TLSCA is kept verbatim only when it is the SAME CA the current
+// derivation produces — same public key AND same subject (ECDSA signature
+// randomness makes byte equality impossible, but key+subject identity is
+// deterministic; a template upgrade that changes the subject therefore
+// swaps the binding at the next renewal instead of leaving the record
+// authorizing a cert no server presents). Missing, foreign, or near-expiry
+// bindings are replaced with a fresh §9.5.1 derivation. The alias comes
+// from the record's embedded §7 claim (apexes carry it); no claim, no TLSCA.
+//
+// Best-effort BY CONTRACT: every problem — non-apex name, undecodable
+// claim, derivation failure, rrset at the §4.3 cap — silently leaves the
+// record untouched. The TLS layer must never be the reason a renewal or a
+// registration fails.
+func EnsureTLSCA(rec *wire.Record, kp *crypto.Keypair, now uint64) {
+	if rec == nil || kp == nil || len(rec.Name) == 0 {
+		return
+	}
+	labels, _, err := naming.DecodeWireName(rec.Name)
+	if err != nil || len(labels) != 0 {
+		return // only the apex carries the binding (§9.5.2)
+	}
+	nowT := time.Unix(int64(now), 0)
+	alias := ""
+	if len(rec.Claim) > 0 {
+		if c, derr := claims.DecodeAliasClaim(rec.Claim); derr == nil {
+			alias = c.Alias
+		}
+	}
+	if alias == "" {
+		return
+	}
+	wantDER, _, cerr := tlsca.OwnerCA(kp.Seed(), alias, nowT)
+	if cerr != nil {
+		return
+	}
+	wantCert, perr := tlsca.ParseCertDER(wantDER)
+	if perr != nil {
+		return
+	}
+	kept := false
+	swap := -1
+	for i, rr := range rec.RRset {
+		if rr == nil || rr.Type != wire.RRTypeTLSCA {
+			continue
+		}
+		c, perr := tlsca.ParseCertDER(rr.Rdata)
+		switch {
+		case perr != nil:
+			swap = i // garbage slot: replace
+		case tlsca.SameCA(c, wantCert, nowT):
+			kept = true
+		default:
+			swap = i // a different CA: replace (identity or lifetime)
+		}
+	}
+	if kept || (swap < 0 && len(rec.RRset) >= constants.MaxRRsPerRecord) {
+		return
+	}
+	rr, rerr := wire.NewRR(wire.RRTypeTLSCA, constants.TLSCAResponseTTL, wantDER)
+	if rerr != nil {
+		return
+	}
+	if swap >= 0 {
+		rec.RRset[swap] = rr
+		return
+	}
+	rec.RRset = append(rec.RRset, rr)
 }
 
 // FreshWindow is the human-readable validity a renewal grants.

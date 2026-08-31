@@ -74,6 +74,8 @@ var dispatch = map[string]func([]string) error{
 	"resolve":         cmdResolve,
 	"get":             cmdGet,
 	"name":            cmdName,
+	"cert":            cmdCert,
+	"trust-install":   cmdTrustInstall,
 	"transfer":        cmdTransfer,
 	"rotate":          cmdRotate,
 	"recover":         cmdRecover,
@@ -236,6 +238,9 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  backup                 bundle every key of your name(s) into one dated file (-restore unpacks it)")
 	fmt.Fprintln(w, "                         — the \"never lose your name\" button; store the file off-machine")
 	fmt.Fprintln(w, "  name                   add/update <label>.<alias> (owner key from the keychain; IP inherits the apex A)")
+	fmt.Fprintln(w, "  cert <name>            issue + export a TLS leaf certificate (PEM) for a name you own (spec 9.5;")
+	fmt.Fprintln(w, "                         for nginx/caddy etc.; the daemon issues for itself automatically)")
+	fmt.Fprintln(w, "  trust-install          one-time per device: import your local trust root so https://<name> works (spec 9.5)")
 	fmt.Fprintln(w, "  gen-key                generate an Ed25519 keypair (-out writes a 0600 keyfile)")
 	fmt.Fprintln(w, "  mine-claim             mine an AliasClaim PoW")
 	fmt.Fprintln(w, "  make-record            build + sign a freens record (optional -recovery-* embed a spec 5.4 policy; -out writes the .cbor)")

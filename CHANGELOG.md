@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased — §9.5 self-certifying TLS: spec + implementation (fleet-tested)
+
+HTTPS for freens names in stock browsers, between freens users, with no
+central CA. Spec §9.5 written first (see the design entry further down),
+then implemented and verified on the 3-box LAN fleet.
+
+Implementation (this pass):
+
+- `internal/tlsca`: §9.5.1 owner-CA derivation (P-256 from SK_tld via
+  HKDF, self-signed, CN=alias + OU "freens owner ca"), local roots,
+  constrained cross-certs, leaves. stdlib x509 + x/crypto/hkdf only.
+- `internal/trustsync`: §9.5.4 visitor-side engine wired to the resolver's
+  screened answer path — mint cross-certs on verified TLSCA RRs, install
+  into spool/NSS/system stores, purge on rotation (tld_id change) and
+  §8.5 tombstones. Admin `GET /tls` reports state; `freens doctor` checks
+  it.
+- Resolver: `TLSTrustSync` hook (async, screened-path-only, dead-alias
+  notifications at the apex hop).
+- Renewal: `EnsureTLSCA` — every apex publish/renew/auto-renew carries the
+  binding; same-CA detection compares the full TBS identity (subject, key,
+  serial, validity, constraints) so template upgrades migrate at the next
+  renewal instead of leaving records authorizing certs no server presents.
+- CLI: `freens cert <name>` (leaf+CA PEM export), `freens trust-install`
+  (one-time per-device root import: system bundle + NSS).
+- freens-web: HTTPS by default with the leaf of `[webui] name` (default:
+  first keychain alias), plain-HTTP fallback when no key is issuable;
+  `[webui] tls = false` opts out.
+- Fleet results: server↔minipc↔nanopi HTTPS all verify (ssl_verify 0,
+  cross-namespace included); Chromium + curl + NSS all accept the chain
+  and REJECT a rogue leaf for bank.com signed by the same owner CA
+  (nameConstraints enforced: OpenSSL err 47, NSS -8080). Live purge and
+  re-mint verified via revoke/un-revoke of a test name.
+
+Bugs found live during the fleet test (all fixed):
+
+- Leaf/CA subject collision made OpenSSL treat the leaf as self-signed
+  (leaf now carries no OU).
+- 20-byte serials with the high bit set DER-encode to 21 octets; NSS
+  rejects the cert outright. Serial top bit now masked.
+- Chromium's Chrome-Root-Store verifier ignores NSS non-anchor
+  intermediates — cross-certs install as trusted-but-name-constrained
+  anchors (`certutil -t C,,`).
+- `%h` in systemd unit ExecStart expands to /root regardless of User= —
+  freens-web's `-config %h/...` silently read a nonexistent file;
+  contrib unit fixed (no -config; FREENS_HOME drives it) and deployed.
+- trustsync unit tests could touch the real user NSS DB (installer not
+  gated by options); now isolated.
+
+Known warts (documented in spec): first-visit retry (§9.5.5); the
+resolver's response cache can delay purge/refresh by up to the cached
+TTL; un-revoking an apex needs a same-identity carrier (register
+re-mines and hits the §8.4 reuse window — scratch path proven on the
+fleet, a proper `freens un-revoke` verb is the follow-up; atlantic was
+recovered this way).
+
+## Unreleased — spec: self-certifying TLS (§9.5): HTTPS for freens names in stock browsers
+
+Design addition, no code yet (per decision: spec first, implementation
+follows). Answers the cross-user case: MY browser must trust a FRIEND's
+certificate for HIS machine, transparently, with no per-friend imports.
+
+Mechanism (spec §9.5, + §9.4 stage 2, §10.6, §4.3 RR, Appendix A/D):
+
+- The CA for a namespace is the name OWNER: CA key derived
+  deterministically from SK_tld (HKDF, "freens-tls-ca-v1") — no new
+  secret to back up; transfer/rotate re-keys TLS for free.
+- The CA binding is published INSIDE the signed apex record (new
+  TLSCA RR, type 65280, DER cert) — resolution is the distribution
+  and authentication mechanism.
+- Visitors' daemons cross-certify the owner CA into a name-constrained
+  intermediate (dNSName { alias, *.alias }, lifetime capped by record
+  expiry) under a once-generated local root installed at setup.
+  Stock browsers then verify a normal chain; a stolen owner CA can
+  only misrepresent its own namespace; WebPKI names unreachable.
+- Leaf certs: SNI-issued, ≤ 7 d, P-256, no CRL/OCSP (short-lived +
+  rotation is the revocation story); PEM export for non-daemon TLS
+  endpoints.
+- Known wart, documented: first https:// visit to a never-seen
+  namespace may fail once (trust sync races the handshake); retry
+  succeeds (§9.5.5).
+
+Mechanism details as implemented are in the entry above.
 ## v0.9.2 — DDoS hardening: global pre-verify packet budget + walk caps
 
 From a resilience review of the flood paths (the v0.7.1 audit covered

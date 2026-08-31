@@ -310,6 +310,7 @@ RR = [ type: uint, ttl: uint, rdata: bstr ]
 | SSHFP| 44   | algorithm, fingerprint-type, fingerprint             |
 | TLSA | 52   | usage, selector, matching-type, certificate data     |
 | CAA  | 257  | flags, tag, value                                    |
+| TLSCA| 65280| DER X.509 owner-CA certificate (apex records only; §9.5) |
 
 Unknown/unsupported type codes MUST be preserved verbatim by clients
 (opaque forwarding), as in DNS.
@@ -930,12 +931,162 @@ never silently shadows existing internet names. Users opt into
 ### 9.4 Browser/OS integration path
 
 1. **Today:** local resolver (this section) — zero app changes.
-2. **Near term:** browser extensions resolving freens names; DoH-style
+2. **Today, with §9.5:** self-certifying TLS — `https://<name>.<alias>`
+   works in stock browsers between freens users (§9.5).
+3. **Near term:** browser extensions resolving freens names; DoH-style
    bootstrap (`resolver.freens.example` style well-known endpoints).
-3. **Long term:** native OS/browser recognition of the freens
+   Extensions MAY enforce the TLSA RR (§4.3) directly — native
+   DANE-style validation that supersedes §9.5's local cross-
+   certificates where available.
+4. **Long term:** native OS/browser recognition of the freens
    namespace, at which point freens stops being merely parallel.
 
-This spec normatively defines only stage 1.
+This spec normatively defines stages 1–2.
+
+### 9.5 Self-certifying TLS (HTTPS for freens names)
+
+Stage-1 HTTPS for freens names, in stock browsers, with no central
+CA. WebPKI cannot serve this namespace: CA/Browser Forum Baseline
+Requirements restrict issuance to names under public suffixes, so no
+public CA may ever issue for `blog.bob` — the name form itself is
+excluded. freens replaces the trust anchor instead: **the certificate
+authority for a freens namespace is the name owner**, and the CA
+binding is distributed and authenticated by the same signed records
+that carry the addresses.
+
+The property delivered: when a freens user (running the daemon, §9.1)
+opens `https://blog.bob`, the browser accepts the connection without
+warnings or per-site exceptions, and the assurance is exactly *"this
+server holds a key authorized by the owner of `bob`"* — the same
+proposition resolution itself makes about addresses.
+
+#### 9.5.1 Owner CA (name side)
+
+The owner CA key is **derived**, not generated:
+
+```
+seed_tls = HKDF-SHA256(ikm = SK_tld_seed, salt = ∅,
+                       info = "freens-tls-ca-v1", L = 32)
+CA_key   = P-256 private key from seed_tls
+           (deterministic; if seed_tls ≥ n, append a uint8 counter
+           to info and re-derive — negligible probability)
+```
+
+Consequences (all deliberate):
+
+- No new secret to back up — the CA restores from the name seed
+  (§5.4, §8) alone.
+- Transfer and rotation (§8.3, §8.6) re-key TLS for free: the new
+  owner derives a different CA, and old leaves die with their TTLs.
+- Possession of `SK_tld` already implied total control of the
+  namespace (§3.5); the derived CA grants no new power to the owner.
+
+The CA certificate is self-signed (P-256, BasicConstraints CA=true,
+KeyUsage keyCertSign|cRLSign, Subject CN = alias, validity
+`TLS_CA_VALIDITY`). A self-declared nameConstraint on it is advisory
+only — some verifiers do not apply constraints to anchors; the
+enforcement point is the cross-cert (§9.5.4). P-256 rather than
+Ed25519 because universal client compatibility is the entire point.
+
+#### 9.5.2 Publication: the TLSCA RR
+
+The apex record's rrset carries the CA binding:
+
+```
+TLSCA RR:  type  = 65280 (DNS private-use range)
+           rdata = DER encoding of the X.509 owner-CA certificate
+```
+
+Semantics: *this CA is authorized to issue TLS certificates for this
+alias and every name under it.* Exactly one TLSCA RR per record; a
+TLSCA RR in a non-apex record MUST be ignored by verifiers. Atomic
+RRset replacement (§4.3) governs updates — a sequence bump carrying a
+new TLSCA rotates the CA. Revocation (§8.5) or expiry removes the
+binding entirely (§9.5.4 refuses stale CAs).
+
+#### 9.5.3 Leaf issuance (server side)
+
+Implementations SHOULD issue leaf certificates on demand (SNI) for
+names in the local keychain: SAN = the exact freens name (an apex leaf
+MAY additionally carry `*.<alias>`), EKU serverAuth, lifetime ≤
+`TLS_LEAF_TTL`, P-256, fresh key per leaf. No CRL/OCSP machinery:
+short leaf lifetimes plus CA rotation (§8) are the revocation story.
+Leaves and keys live under the daemon home; implementations MUST
+provide an export verb (PEM) so non-daemon TLS endpoints (nginx, etc.)
+can serve freens names.
+
+#### 9.5.4 Trust sync (visitor side)
+
+Each installation generates **one local root CA** at setup (P-256,
+validity `TLS_CA_VALIDITY`, stored 0600 under the daemon home,
+included in `backup`). It is unconstrained BY DESIGN: the daemon
+already terminates this machine's name resolution (§9.1), so the
+machine + daemon was already the trust boundary — the local root adds
+no new trusted party. It MUST NOT leave the machine except in backups
+(§5.4).
+
+When the resolver answers a freens name through the full screened
+path — §4.4 validity **plus** §7.4 claim screening, i.e. the same path
+the DNS answers ride, never a raw DHT read — and the winning apex
+record carries a TLSCA RR for which no valid cross-cert is cached, the
+daemon cross-certifies the owner CA:
+
+```
+cross-cert, signed by the LOCAL ROOT:
+    subject public key   = owner-CA public key (from the TLSCA RR)
+    nameConstraints      = permittedSubtrees dNSName { <alias>, *.<alias> }
+    NotAfter             = min(record.expires, now + TLS_CROSSCERT_TTL)
+```
+
+and installs it into the OS and browser trust stores. Cross-certs are
+keyed by alias → tld_id; if a different tld_id wins §7.4 screening
+(rotation/transfer), or the record is a tombstone (§8.5), the daemon
+MUST re-issue or purge. The nameConstraint is what makes third-party
+CA import safe: a stolen or malicious owner CA can misrepresent only
+its own namespace — never another freens name, never a WebPKI name.
+
+The browser then verifies a completely standard chain — leaf
+(owner-CA-signed, presented by the server) → constrained intermediate
+(local-root-signed) → local root (anchor) — with no browser
+modification and **no per-friend imports**: the first name resolution
+already delivered and authenticated every CA the visitor will need,
+via the DHT.
+
+#### 9.5.5 First-visit race
+
+Browsers resolve before connecting; trust sync starts on that resolve,
+but a trust-store update can lag the TLS handshake. The FIRST
+`https://` visit to a never-before-seen namespace MAY fail once; a
+retry succeeds. Implementations SHOULD pre-warm where possible (e.g.
+sync when an alias is observed in store/status views) and MUST make
+the one-retry behavior discoverable in user-facing copy. The §10.4
+response cache can likewise delay a purge or refresh until its entry
+expires (≤ RESPONSE_TTL_CAP); the cross-cert's own record-capped
+lifetime bounds any staleness.
+
+#### 9.5.6 Deployment and non-goals
+
+- Trust-store mechanics: Linux — system bundle plus the NSS user DB
+  (covers Chromium and Firefox); installing the local root is
+  privileged (`setup` / `doctor --fix`), cross-cert updates SHOULD be
+  unprivileged where the store allows (NSS user DB is user-writable).
+  Other platforms: implementation-defined, same shape.
+  IMPLEMENTATION NOTE (reference client, fleet-verified): Chromium's
+  Chrome-Root-Store verifier ignores NSS non-anchor intermediates, so
+  cross-certificates install as trusted-but-name-CONSTRAINED anchors
+  (`certutil -t C,,`); constraint enforcement was verified on
+  Chromium, NSS (vfychain), and OpenSSL, and a self-declared
+  constraint on the owner CA (§9.5.1) backstops verifiers that skip
+  anchor constraints.
+- Stock-internet visitors (no daemon) get no automatic trust and see
+  an ordinary self-signed warning. Serving them is stage 3 (§9.4).
+- DANE-capable clients — and the §9.4 stage-3 extension — MAY use the
+  TLSA RR (§4.3) against the record directly; §9.5 is the
+  stock-browser bridge, not a DANE replacement.
+- No protection against a malicious NAME OWNER (same as WebPKI DV);
+  no certificates for IP literals; WebPKI names are unreachable by
+  construction (nameConstraints).
+
 
 ## 10. Security Considerations
 
@@ -1010,6 +1161,23 @@ not by proof of ownership (an alias points *to* ownership; it cannot
   lookups); v1 does not provide it.
 - Record publishing is public-key authenticated; publishers seeking
   pseudonymity must use per-TLD fresh keys and avoid linking metadata.
+
+### 10.6 TLS trust model (§9.5)
+
+Server authentication under §9.5 is exactly as strong as freens
+resolution, no stronger: the CA for a namespace is its owner key, and
+the binding travels inside the signed record. A network attacker
+without `SK_tld` cannot mint an acceptable certificate for the
+namespace. An attacker who can lie to the resolver about records (a
+compromised daemon, a corrupted DHT view) can misdirect TLS as well as
+addresses — the trust boundary is the machine and its daemon,
+unchanged from §9.1. The local root never leaves the machine;
+cross-certificates are name-constrained to a single namespace, so a
+compromised owner CA degrades only that owner's visitors, and WebPKI
+names are unreachable by construction. Revocation is rotation
+(§8.3/§8.6): a new owner key implies a new derived CA, and stale
+cross-certs expire within `TLS_CROSSCERT_TTL`. A first-visit
+TOFU-style latency window is inherent (§9.5.5).
 
 ## 11. Ownership versus Identity
 
@@ -1097,7 +1265,15 @@ of magnitude cheaper to run.
 
 ## 14. Open Questions
 
-1. **Registration ordering under adversarial timestamps.** The
+1. **Un-revoke verb for apexes (found live, fleet test 2026-08-31).**
+   §8.5 says un-revoke = "publish a newer record", but `register`
+   re-mines a claim (new identity → blocked by the §8.4 reuse window)
+   and renewal refuses revoked records. The correct carrier is the
+   SAME claim identity at sequence+1 (the §8.4 v0.9.1 continuity
+   rule); a dedicated `un-revoke` verb (fetch the surviving K_claim
+   carrier, carry its witnesses, restore the RRset, bump sequence)
+   needs specifying and wiring into §8.5.
+2. **Registration ordering under adversarial timestamps.** The
    `(timestamp, pow_hash, tld_id)` order converges, but witness
    quorums near a contested `K_claim` can be Sybil-attacked. Options:
    witness-age weighting, cross-region witness sampling, or accepting
@@ -1155,6 +1331,9 @@ of magnitude cheaper to run.
 | `RESPONSE_TTL_CAP`    | 3600 s   | max TTL emitted by resolver                |
 | `NEG_TTL`             | 60 s     | negative caching                            |
 | `NODE_STORAGE_MAX`    | 256 MiB  | per-node envelope storage cap              |
+| `TLS_CA_VALIDITY`     | 10 y     | owner-CA and local-root cert lifetime (§9.5) |
+| `TLS_LEAF_TTL`        | 604800 s | max leaf certificate lifetime (§9.5)       |
+| `TLS_CROSSCERT_TTL`   | 604800 s | max cross-cert lifetime, ≤ record expiry (§9.5) |
 
 ### A.4 Difficulty retargeting
 
@@ -1290,6 +1469,7 @@ where homegrown code would be dangerous.
 | 4.2 | Deterministic CBOR | `github.com/fxamacker/cbor/v2` | Enable `EncOptions{Canonical: true}` — this is RFC 8949 §4.2 deterministic encoding, which §4.2 makes normative. Map keys MUST encode as the spec's integer keys: use `struct`-based schemas with `keyasint` struct tags, or `cbor.MapKeyEncoder`/integer-keyed maps; verify byte-stability with golden-vector tests (Appendix D.4). |
 | 9 | DNS resolver (UDP+TCP on `127.0.0.1:53`) | `github.com/miekg/dns` | Serves and forwards. `dns.Server` for both protocols, `dns.Client`/`dns.ClientConfig` for upstream fallback (§9.2 step 4), full RR type coverage incl. TLSA/CAA/SSHFP (§4.3), EDNS0 passthrough. This is the killer-feature section and it is almost entirely library assembly. |
 | 9.3 | Resolver config file | stdlib only: `net/netip`, `os`, manual `key = value` parse or `github.com/spf13/viper` (optional) | The `.ini` format in §9.3 is simple enough for a 50-line parser; avoid pulling a config framework unless CLI grows. |
+| 9.5 | TLS owner CA, leaf issuance, trust sync, cross-certs | stdlib `crypto/x509`, `crypto/ecdsa`, plus `golang.org/x/crypto/hkdf` for §9.5.1 derivation | Entirely stdlib-shaped: X.509 create/parse/sign; NSS trust-store sync via optional `certutil` exec (§9.5.6); the screened-resolution hook rides the §9.2 path. |
 | 6 | Kademlia: k-buckets, XOR metric, iterative lookup | hand-written, *patterned on* `github.com/anacrolix/dht` | See D.2 — no off-the-shelf Kademlia speaks the freens wire protocol. |
 | 6.2 | UDP transport, `net.UDPConn`, read/write deadlines | `net` (stdlib) | Goroutine-per-packet or `ReadFromUDP` loop; `SetReadDeadline` implements `RPC_TIMEOUT`. |
 | 6.3 | HMAC write tokens | `crypto/hmac` (stdlib) | `TOKEN_ROTATION` = keep current+previous secret in a small struct guarded by a mutex. |

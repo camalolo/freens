@@ -13,15 +13,20 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/keychain"
+	"github.com/camalolo/freens/internal/tlsca"
 	"github.com/camalolo/freens/internal/webui"
 )
 
@@ -96,8 +101,84 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := srv.ListenAndServe(); err != nil {
+	cert := webtls(cfg, cfgHome, log)
+	if err := srv.ListenAndServeTLS(cert); err != nil {
 		fmt.Fprintf(os.Stderr, "freens-web: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// webtls mints the §9.5 leaf for [webui] name (default: the first keychain
+// alias, sorted) and returns it, or nil with the reason logged when TLS is
+// off, impossible (no/unusable key), or the certificate would not carry the
+// name this instance serves. Best-effort by design: the UI must come up.
+func webtls(cfg *webui.Config, homeDir string, log *slog.Logger) *tls.Certificate {
+	if cfg.TLSOff {
+		log.Info("webui: TLS disabled by config ([webui] tls = false)")
+		return nil
+	}
+	aliases := keychain.Aliases(keychainDir(homeDir))
+	if len(aliases) == 0 {
+		log.Info("webui: TLS off (no names in the keychain yet — plain HTTP until a name is registered)")
+		return nil
+	}
+	alias := cfg.Name
+	switch {
+	case alias != "":
+		found := false
+		for _, a := range aliases {
+			if a == alias {
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Warn("webui: [webui] name not in keychain — TLS off", "name", alias, "keychain", strings.Join(aliases, ","))
+			return nil
+		}
+	default:
+		alias = aliases[0]
+		log.Info("webui: TLS leaf for the first keychain name (set [webui] name to override)", "alias", alias)
+	}
+	kp, err := keychain.Load(keychain.OwnerKeyPath(keychainDir(homeDir), alias), os.Getenv("FREENS_PASSPHRASE"))
+	if err != nil {
+		log.Warn("webui: TLS off (owner key unusable)", "alias", alias, "err", err.Error())
+		return nil
+	}
+	now := time.Now()
+	caDER, caKey, err := tlsca.OwnerCA(kp.Seed(), alias, now)
+	if err != nil {
+		log.Warn("webui: TLS off (CA derivation failed)", "err", err.Error())
+		return nil
+	}
+	leafDER, leafKeyDER, err := tlsca.Leaf(caDER, caKey, []string{alias, "*." + alias}, now)
+	if err != nil {
+		log.Warn("webui: TLS off (leaf issuance failed)", "err", err.Error())
+		return nil
+	}
+	// §9.5.4 chain: present [leaf, owner CA] — visitors anchor via their
+	// constrained cross-cert (in their trust stores) up to their local root.
+	cert, err := tls.X509KeyPair(chainPEM(leafDER, caDER), tlsca.KeyPEM(leafKeyDER))
+	if err != nil {
+		log.Warn("webui: TLS off (leaf pair build failed)", "err", err.Error())
+		return nil
+	}
+	log.Info("webui: TLS enabled (§9.5)", "alias", alias, "leaf_sha256", tlsca.Fingerprint(leafDER))
+	return &cert
+}
+
+// chainPEM concatenates DER certificates into one PEM chain (leaf first).
+func chainPEM(ders ...[]byte) []byte {
+	var out []byte
+	for _, der := range ders {
+		out = append(out, tlsca.CertPEM(der)...)
+	}
+	return out
+}
+
+func keychainDir(homeDir string) string {
+	if homeDir == "" {
+		homeDir = home.Dir()
+	}
+	return filepath.Join(homeDir, "keys")
 }

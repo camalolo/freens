@@ -272,6 +272,35 @@ func cmdDoctor(args []string) error {
 		warn("could not check clock skew (no internet time source reachable)")
 	}
 
+	// 9. §9.5 TLS trust sync: local root present, and (daemon permitting)
+	//    which namespaces are cross-certified.
+	rootPath := filepath.Join(home.Dir(), "tls", "root.crt")
+	rootOK := sysStatExists(rootPath)
+	if !rootOK {
+		check(false, "TLS local trust root missing (%s) — run `freens trust-install`", rootPath)
+	} else if c == nil {
+		warn("TLS local trust root present (daemon down: cross-cert state unknown)")
+	} else {
+		ctx, cancel := adminCtx()
+		fp, cross, terr := c.TLSSnapshot(ctx)
+		cancel()
+		switch {
+		case terr != nil:
+			warn("TLS trust sync state unavailable (older daemon or disabled: %v)", terr)
+		default:
+			check(true, "TLS trust root %s…", fp[:16])
+			if len(cross) == 0 {
+				warn("TLS: no namespaces cross-certified yet — resolve a freens name with a TLSCA record (§9.5.5: first https visit may need one retry)")
+			} else {
+				names := make([]string, 0, len(cross))
+				for _, x := range cross {
+					names = append(names, x.Alias)
+				}
+				fmt.Printf("✔ TLS: %d namespace(s) cross-certified: %s\n", len(cross), strings.Join(names, ", "))
+			}
+		}
+	}
+
 	if failed > 0 {
 		return fmt.Errorf("doctor: %d check(s) failed", failed)
 	}

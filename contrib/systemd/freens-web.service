@@ -17,7 +17,12 @@ After=network-online.target freens.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/freens-web -config %h/.freens/freens.conf
+# NOTE: no -config flag — freens-web defaults to <FREENS_HOME>/freens.conf.
+# (Do NOT use %h here: in system units %h expands to /root regardless of
+# User=, which silently points -config at a nonexistent file.) Set
+# FREENS_HOME to the daemon's home (XDG layout: ~/.local/share/freens).
+Environment=FREENS_HOME=REPLACE_WITH_THE_FREENS_HOME
+ExecStart=/usr/local/bin/freens-web
 User=REPLACE_WITH_THE_FREENS_USER
 Restart=on-failure
 RestartSec=2

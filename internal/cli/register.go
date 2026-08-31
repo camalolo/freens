@@ -42,6 +42,7 @@ import (
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/renewal"
 	"github.com/camalolo/freens/internal/wire"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -339,6 +340,7 @@ func cmdRegister(args []string) error {
 		return err
 	}
 	rec.Claim = cbor.RawMessage(cb)
+	renewal.EnsureTLSCA(rec, kp, now) // §9.5: apex carries the owner-CA binding
 	env, err := wire.SignRecord(rec, kp)
 	if err != nil {
 		return err

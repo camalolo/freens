@@ -54,6 +54,7 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 	oldUnit, oldResolv, oldBackup, oldDrop := pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop
 	oldNftTable, oldRedirectProbe := sysStatNftTable, port53RedirectInstalled
 	oldLegacy := pathLegacyUserUnit
+	oldBridgePath, oldBridgeSvc := pathTrustBridgePathUnit, pathTrustBridgeSvcUnit
 
 	sysRun = func(name string, args ...string) error {
 		argv := append([]string{name}, args...)
@@ -87,12 +88,16 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 	port53RedirectInstalled = func() bool { return false }
 	// Legacy user-unit detection stays inside the temp sandbox too.
 	pathLegacyUserUnit = filepath.Join(dir, "legacy-user-freens.service")
+	// §9.5 trust-bridge units land in the sandbox as well.
+	pathTrustBridgePathUnit = filepath.Join(dir, "freens-trust.path")
+	pathTrustBridgeSvcUnit = filepath.Join(dir, "freens-trust.service")
 
 	t.Cleanup(func() {
 		sysRun, sysWriteEtc = oldRun, oldWriteEtc
 		pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop = oldUnit, oldResolv, oldBackup, oldDrop
 		sysStatNftTable, port53RedirectInstalled = oldNftTable, oldRedirectProbe
 		pathLegacyUserUnit = oldLegacy
+		pathTrustBridgePathUnit, pathTrustBridgeSvcUnit = oldBridgePath, oldBridgeSvc
 	})
 	return rec
 }
@@ -178,8 +183,8 @@ func TestSetupIdempotent(t *testing.T) {
 		"th", "dport", "53", "redirect", "to", ":5300") {
 		t.Errorf("nft redirect rule not installed: %v", rec.cmds)
 	}
-	if len(rec.etcWrites) != 2 {
-		t.Errorf("privileged writes = %d, want 2 (unit + resolv.conf)", len(rec.etcWrites))
+	if len(rec.etcWrites) != 4 {
+		t.Errorf("privileged writes = %d, want 4 (unit + resolv.conf + 2 trust-bridge units)", len(rec.etcWrites))
 	}
 
 	// Second run: no bytes change anywhere.
@@ -194,8 +199,8 @@ func TestSetupIdempotent(t *testing.T) {
 		t.Error("second setup run changed existing files")
 	}
 	// resolv.conf already pointed at the daemon: no new privileged writes.
-	if len(rec.etcWrites) != 2 {
-		t.Errorf("second run performed %d total privileged writes, want still 2", len(rec.etcWrites))
+	if len(rec.etcWrites) != 4 {
+		t.Errorf("second run performed %d total privileged writes, want still 4", len(rec.etcWrites))
 	}
 }
 

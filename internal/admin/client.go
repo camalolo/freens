@@ -306,3 +306,25 @@ func (c *Client) Difficulty(ctx context.Context) (*Difficulty, error) {
 	}
 	return &out, nil
 }
+
+// TLSSnapshot fetches the §9.5 trust-sync state (GET /tls): local root
+// fingerprint plus every cross-certified namespace. 503 ⇒ trust sync off.
+func (c *Client) TLSSnapshot(ctx context.Context) (rootFP string, cross []TLSCross, err error) {
+	var out struct {
+		RootFingerprint string     `json:"root_fingerprint"`
+		CrossCerts      []TLSCross `json:"cross_certs"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, "/tls", nil, &out); err != nil {
+		return "", nil, err
+	}
+	return out.RootFingerprint, out.CrossCerts, nil
+}
+
+// TLSCross is one cross-certified namespace in the /tls snapshot.
+type TLSCross struct {
+	Alias       string `json:"alias"`
+	TldIDB32    string `json:"tld_id_b32"`
+	CASha256    string `json:"ca_sha256"`
+	NotAfter    int64  `json:"not_after"`
+	SystemStore bool   `json:"system_store"`
+}

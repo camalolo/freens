@@ -20,6 +20,8 @@ import (
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/tlsca"
+	"github.com/camalolo/freens/internal/wire"
 )
 
 // TestRegisterEndToEnd: the full flow against 7 live in-process nodes — key
@@ -74,8 +76,18 @@ func TestRegisterEndToEnd(t *testing.T) {
 	if err != nil || env == nil {
 		t.Fatalf("registered record not found on the network: %v %v", env, err)
 	}
-	if env.Record.Sequence != 1 || len(env.Record.RRset) != 1 {
+	if env.Record.Sequence != 1 || len(env.Record.RRset) != 2 {
 		t.Fatalf("unexpected record shape: seq=%d rrset=%d", env.Record.Sequence, len(env.Record.RRset))
+	}
+	// §9.5: the apex carries A + TLSCA (the owner-CA binding).
+	if env.Record.RRset[0].Type != wire.RRTypeA {
+		t.Fatalf("first RR type = %d, want A", env.Record.RRset[0].Type)
+	}
+	if env.Record.RRset[1].Type != wire.RRTypeTLSCA {
+		t.Fatalf("second RR type = %d, want TLSCA (§9.5)", env.Record.RRset[1].Type)
+	}
+	if _, err := tlsca.ParseCertDER(env.Record.RRset[1].Rdata); err != nil {
+		t.Fatalf("TLSCA rdata is not a DER certificate: %v", err)
 	}
 	if len(env.Record.Claim) == 0 {
 		t.Fatal("record carries no embedded claim")

@@ -65,6 +65,12 @@ const (
 	RRTypeSSHFP = 44  // rdata = algorithm, fingerprint-type, fingerprint
 	RRTypeTLSA  = 52  // rdata = usage, selector, matching-type, certificate data
 	RRTypeCAA   = 257 // rdata = flags, tag, value
+
+	// RRTypeTLSCA is the §9.5 owner-CA binding: rdata = DER X.509 certificate
+	// of the namespace's owner CA (DNS private-use range 65280). Apex records
+	// only; verifiers MUST ignore it in non-apex records, and the DNS answer
+	// path never maps it to a wire RR (internal binding, not a DNS type).
+	RRTypeTLSCA = 65280
 )
 
 // KRPC message-type markers (Message field 1, "y").
