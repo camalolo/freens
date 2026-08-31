@@ -103,6 +103,13 @@ with UAC doing what sudo does on Linux.
   route's own miss borrows the bare name, so `desktop.freens` just reads
   as `desktop`.
 
+- **Toolchain note for Windows builds from source**: Go 1.26.0/1.26.1
+  carry a known Windows runtime regression (golang/go#77975, fixed in
+  1.26.2 via #78041) that intermittently hard-faults the claims-verify
+  path during heavy concurrent use — observed during this release's
+  field testing, confirmed against 20 clean runs on 1.26.2. Build with
+  Go 1.25.x (CI/release default) or 1.26.2+; release binaries are
+  unaffected (built on 1.25).
 - **Fixed on the way**: internal/upnp did not compile on Windows at
   all (a raw-fd `IP_MULTICAST_IF` setsockopt with the linux fd type) —
   the multicast interface pinning now has a windows twin using
