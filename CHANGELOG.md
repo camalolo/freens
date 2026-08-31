@@ -1,6 +1,6 @@
 # Changelog
 
-## unreleased — self-healing renewals, async admin publishes, `forget` + `uninstall`
+## v0.12.0 — self-healing renewals, async admin publishes, `forget` + `uninstall`
 
 Four operations findings from the 2026-08-31/09-01 cleanup session, plus
 the two verbs the cleanup runbook was missing:
