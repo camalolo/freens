@@ -1,0 +1,16 @@
+# drives freens-ddns.service every 5 minutes. Persistent=true replays a
+# missed run after downtime; the script itself is drift-only, so extra
+# runs are one cheap read-only API call. Install together with
+# freens-ddns.service (see its header).
+
+[Unit]
+Description=run the freens DDNS update every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

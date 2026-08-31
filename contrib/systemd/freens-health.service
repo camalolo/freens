@@ -8,7 +8,12 @@
 #   systemctl daemon-reload && systemctl enable --now freens-health.timer
 #
 # The service runs as the SAME USER that ran `freens setup` (the one owning
-# ~/.freens and the daemon's admin socket). Replace YOURUSER if needed.
+# the freens state dir and the daemon's admin socket). Replace YOURUSER if
+# needed. State-dir location matters: doctor reads $FREENS_HOME (default
+# ~/.freens). Default installs need no Environment line; installs migrated
+# to the XDG layout (~/.local/share/freens) MUST set it — a systemd SYSTEM
+# unit cannot use %h for this (%h expands to /root regardless of User=),
+# so hardcode the absolute path as shown.
 
 [Unit]
 Description=freens health check (doctor)
@@ -16,6 +21,7 @@ Description=freens health check (doctor)
 [Service]
 Type=oneshot
 User=YOURUSER
+#Environment=FREENS_HOME=/home/YOURUSER/.local/share/freens
 ExecStart=/usr/local/bin/freens doctor
 # doctor exits non-zero when any check fails — OnFailure fires the alert
 # path below. Uncomment and point at your notifier (mail, ntfy, pager):

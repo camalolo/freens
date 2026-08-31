@@ -1,0 +1,32 @@
+# freens DDNS: keep the seed node's Cloudflare A record on this machine's
+# current WAN IP. For dynamic-IP boxes only — a machine with a fixed WAN
+# address has no use for this (set the record once and forget it).
+#
+# Install (as root):
+#   install -m755 ddns-cloudflare.sh /usr/local/bin/
+#   install -m644 freens-ddns.service freens-ddns.timer /etc/systemd/system/
+#   edit the Environment= lines below (zone, record, interface); the API
+#   token is read from the certbot-style ini by default — prefer that over
+#   uncommenting CLOUDFLARE_API_TOKEN here (unit environments are readable
+#   via /proc/<pid>/environ and `systemctl show`, the ini is chmod 600).
+#   Then dry-run once by hand, and only then enable:
+#     /usr/local/bin/ddns-cloudflare.sh --check
+#     systemctl daemon-reload && systemctl enable --now freens-ddns.timer
+#
+# Pair with your OnFailure= alerting if you have it — every drift update
+# (and every failure) lands in the journal under this unit.
+
+[Unit]
+Description=freens DDNS: Cloudflare A record follows this machine's WAN IP
+Documentation=https://github.com/camalolo/freens
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CLOUDFLARE_ZONE=example.com
+Environment=CLOUDFLARE_RECORD=seed.example.com
+Environment=CLOUDFLARE_INTERFACE=ppp0
+#Environment=CLOUDFLARE_INI=/etc/letsencrypt/.secrets/cloudflare.ini
+#Environment=CLOUDFLARE_API_TOKEN=
+ExecStart=/usr/local/bin/ddns-cloudflare.sh
