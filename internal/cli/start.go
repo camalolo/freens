@@ -54,6 +54,8 @@ func cmdStart(args []string) error {
 		}
 		if waitForAdminSocket() {
 			fmt.Println("    ✔ daemon running")
+		} else if goosWindows {
+			fmt.Println("    ✘ daemon still not answering — check `freens doctor` (service: `net start freens`)")
 		} else {
 			fmt.Println("    ✘ daemon still not answering (no systemd user session?) — continuing; `freens doctor --fix` says more")
 		}

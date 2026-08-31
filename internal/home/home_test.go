@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -93,7 +94,10 @@ func TestEnsureSeedsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat seeds.conf: %v", err)
 	}
-	if fi.Mode().Perm() != 0o600 {
+	// POSIX modes are not representable on Windows (os.Chmod maps to the
+	// read-only attribute; 0600-with-owner-write reports 0666) — the ACL
+	// model governs access there, so the mode assertion is unix-only.
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("seeds.conf mode = %o, want 0600", fi.Mode().Perm())
 	}
 

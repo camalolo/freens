@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -29,7 +30,9 @@ func TestSaveReplacesLoosePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	// POSIX-only assertion: Windows maps os.Chmod to the read-only
+	// attribute (0600-with-owner-write reports 0666); ACLs govern access.
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("overwritten keyfile mode = %o, want 0600", st.Mode().Perm())
 	}
 	got, err := Load(p, "")

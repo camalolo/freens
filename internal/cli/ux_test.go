@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -691,8 +692,12 @@ func TestBackupRoundTrip(t *testing.T) {
 		t.Errorf("restored alice.key differs: %v", err)
 	}
 	st, err := os.Stat(filepath.Join(home.KeysDir(), "alice.key"))
-	if err != nil || st.Mode().Perm() != 0o600 {
-		t.Errorf("restored key mode = %v (err %v), want 0600", st, err)
+	if err != nil {
+		t.Errorf("restored key stat: %v", err)
+	}
+	// POSIX-only: Windows maps os.Chmod to the read-only attribute.
+	if runtime.GOOS != "windows" && st != nil && st.Mode().Perm() != 0o600 {
+		t.Errorf("restored key mode = %v, want 0600", st.Mode().Perm())
 	}
 }
 

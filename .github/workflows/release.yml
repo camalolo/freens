@@ -18,14 +18,15 @@ jobs:
         run: |
           set -e
           VER="${GITHUB_REF_NAME}"
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
             goos=${target%/*}; goarch=${target#*/}
             dir="dist/freens-${goos}-${goarch}"
             mkdir -p "$dir"
             LDFLAGS="-s -w -X main.version=$VER -X main.cliVersion=$VER"
-            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens" ./cmd/freens
-            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens-cli" ./cmd/freens-cli
-            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens-web" ./cmd/freens-web
+            ext=""; [ "$goos" = windows ] && ext=".exe"
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens$ext" ./cmd/freens
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens-cli$ext" ./cmd/freens-cli
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens-web$ext" ./cmd/freens-web
             tar -czf "dist/freens-${goos}-${goarch}.tar.gz" -C dist "freens-${goos}-${goarch}"
           done
           ls -la dist/

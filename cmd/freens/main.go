@@ -49,6 +49,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -96,6 +97,12 @@ freens = freens-first
 `
 
 func main() {
+	// Launched by the Windows service manager: enter the SCM control loop
+	// (it runs the daemon; this never returns). Must be the FIRST check —
+	// a service has no usable argv and must answer the SCM promptly.
+	if windowsServiceRequested() {
+		os.Exit(windowsRunService())
+	}
 	// Single-binary front: `freens <verb>` (register, setup, name, doctor,
 	// gen-key, publish, … — the full internal/cli dispatch) runs the CLI;
 	// `freens daemon [flags…]` or bare flags run the resolver daemon
@@ -136,6 +143,24 @@ func daemonArgs(args []string) []string {
 // "dev" marks a locally built binary.
 var version = "dev"
 
+// serviceStop is closed by the Windows service control handler when the
+// SCM asks the service to stop (Always nil elsewhere — a select on a nil
+// channel never fires). run() watches it alongside SIGINT/SIGTERM so the
+// same shutdown sequence serves the console and the service.
+var serviceStop chan struct{}
+
+// daemonLogSink is where the daemon's slog output goes: os.Stderr by
+// default; the Windows service (which has no console at all) points it at
+// <home>/daemon.log before entering the SCM handler.
+var daemonLogSink io.Writer
+
+// systemStoreWritable reports whether the process may install directly
+// into the OS trust store (root on unix). On Windows the plumbing in
+// internal/trustsync degrades to the per-user store by itself, so the
+// attempt is always worth making (the service runs as LocalSystem = the
+// machine store).
+var systemStoreWritable = func() bool { return os.Geteuid() == 0 }
+
 func run(args []string) error {
 	if len(args) > 0 && (args[0] == "version" || args[0] == "-version" || args[0] == "--version") {
 		fmt.Println("freens", version)
@@ -153,6 +178,14 @@ func run(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Unexpected positionals are an ERROR, not an accident to run past:
+	// `freens daemon foo` must never silently start on built-in defaults
+	// (found live: the SCM delivered the service NAME as an argument, the
+	// daemon flag-parsed nothing and ran config-less — DNS up, DHT and
+	// admin socket dead — with no complaint anywhere).
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument(s) after the daemon flags: %s (see -h)", strings.Join(fs.Args(), " "))
+	}
 	configPath, listenAddr, dnsAddr, upstreamCSV, loadDir := f.configPath, f.listenAddr, f.dnsAddr, f.upstreamCSV, f.loadDir
 	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr := f.dhtAddr, f.nodeSeedHex, f.peersCSV, f.peersFile, f.metricsAddr
 	passive, advertiseAddr, stunAddr := f.passive, f.advertiseAddr, f.stunAddr
@@ -165,7 +198,14 @@ func run(args []string) error {
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// The Windows service has no console: slog goes to <home>/daemon.log
+	// (daemonLogSink is set before the SCM handler starts). Everywhere else
+	// this is os.Stderr, as always.
+	sink := io.Writer(os.Stderr)
+	if daemonLogSink != nil {
+		sink = daemonLogSink
+	}
+	logger := slog.New(slog.NewTextHandler(sink, nil))
 	slog.SetDefault(logger)
 
 	// Enable IDNA BEFORE any name parsing: ParseConfig validates [tld-routes]
@@ -538,7 +578,7 @@ func run(args []string) error {
 			HomeDir:     home.Dir(),
 			Logger:      logger,
 			NSSInstall:  true,
-			SystemStore: os.Geteuid() == 0,
+			SystemStore: systemStoreWritable(),
 		}); terr != nil {
 			logger.Warn("tls trust sync disabled", "error", terr)
 		} else {
@@ -725,6 +765,8 @@ func run(args []string) error {
 	case firstErr = <-errCh:
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", "signal", sig)
+	case <-serviceStop: // SCM stop/shutdown (Windows service only)
+		logger.Info("received service stop request, shutting down")
 	}
 
 	if firstErr != nil {

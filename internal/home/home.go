@@ -1,6 +1,7 @@
 // Package home is freens' single state directory (~/.freens by default,
-// $FREENS_HOME to override): node identity, config, seed list, owner
-// keychain, persisted store, learned peerbook, and the admin socket.
+// %ProgramData%\freens on Windows, $FREENS_HOME to override): node
+// identity, config, seed list, owner keychain, persisted store, learned
+// peerbook, and the admin socket.
 //
 // The goal is the zero-configuration daemon: given no flags at all, `freens
 // daemon` finds (or creates) everything here and just runs. Explicit flags
@@ -18,10 +19,20 @@ import (
 	"github.com/camalolo/freens/internal/dht"
 )
 
-// Dir returns the state directory root: $FREENS_HOME, else ~/.freens.
+// Dir returns the state directory root: $FREENS_HOME, else ~/.freens
+// (Windows: %ProgramData%\freens — the daemon is machine infrastructure
+// there: the SCM service runs as LocalSystem while every user's CLI must
+// find the SAME keychain + admin socket, which a per-user profile would
+// split; setup grants the installing user access).
 func Dir() string {
 	if d := os.Getenv("FREENS_HOME"); d != "" {
 		return d
+	}
+	if runtime.GOOS == "windows" {
+		if pd := os.Getenv("ProgramData"); pd != "" {
+			return filepath.Join(pd, "freens")
+		}
+		return `C:\ProgramData\freens` // ProgramData is always defined in practice
 	}
 	hd, err := os.UserHomeDir()
 	if err != nil || hd == "" {
@@ -46,9 +57,9 @@ func PeersDir() string { return filepath.Join(Dir(), "peers") }
 func PeerbookPath() string { return filepath.Join(PeersDir(), "book.json") }
 
 func AdminSock() string {
-	if runtime.GOOS == "windows" { // no unix sockets: named pipe is future work
-		return `\\.\pipe\freens-admin`
-	}
+	// Windows ships AF_UNIX since Windows 10 1803 and Go supports it since
+	// 1.17 — the same <home>/admin.sock filesystem path works on both ends
+	// (daemon + CLI are both Go programs). No named-pipe special case needed.
 	return filepath.Join(Dir(), "admin.sock")
 }
 

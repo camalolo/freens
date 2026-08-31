@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -50,12 +51,13 @@ func TestRegisterEndToEnd(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	// Keyfile: 0600, hex seed, reloads to the same key.
+	// Keyfile: 0600 (POSIX mode; Windows reports 0666 — ACL model), hex
+	// seed, reloads to the same key.
 	st, err := os.Stat(keyPath)
 	if err != nil {
 		t.Fatalf("keyfile: %v", err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("keyfile mode = %o, want 0600", st.Mode().Perm())
 	}
 	kp, err := seedKeypair("@"+keyPath, "-test")

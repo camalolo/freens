@@ -183,6 +183,152 @@ func newResolver(cfg *Config, lookup RecordLookup, up Upstream) *Resolver {
 // FREENS route
 // ---------------------------------------------------------------------------
 
+// TestResolveQuestionSuffixRescue locks the [options] suffix-rescue feature
+// (Windows single-label support): "www.foo.lan" — a freens name the OS
+// resolver suffixed — answers from freens after upstream NXDOMAINs, with the
+// ORIGINAL qname echoed (a stub discards answers owned by another name).
+// Off by default; explicit-route aliases never rescue; a live upstream
+// answer always wins.
+func TestResolveQuestionSuffixRescue(t *testing.T) {
+	w := newFreensWorld(t)
+
+	// Base config: "foo" explicitly routed freens-first, "*" dns-first.
+	mkCfg := func(rescue bool) *Config {
+		cfg, err := ParseConfig(`[tld-routes]
+freens = freens-first
+foo = freens-first
+* = dns-first
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.SuffixRescue = rescue
+		cfg.AliasPins = map[string][]byte{"foo": append([]byte(nil), w.tldID...)}
+		return cfg
+	}
+
+	t.Run("rescued with original qname", func(t *testing.T) {
+		lookup := newFakeLookup()
+		lookup.put(w.tldEnv)
+		lookup.put(w.wwwEnv)
+		up := &fakeUpstream{rcode: dns.RcodeNameError} // upstream NXDOMAINs the suffixed name
+		r := newResolver(mkCfg(true), lookup, up)
+
+		q := dns.Question{Name: "www.foo.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
+		if err != nil {
+			t.Fatalf("ResolveQuestion: %v", err)
+		}
+		if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+			t.Fatalf("rcode=%d len=%d; want a rescued answer", rcode, len(rrs))
+		}
+		a, ok := rrs[0].(*dns.A)
+		if !ok {
+			t.Fatalf("rrs[0] is %T, want *dns.A", rrs[0])
+		}
+		if !a.A.Equal(w.wwwIPv4) {
+			t.Errorf("A.A = %s, want %s", a.A, w.wwwIPv4)
+		}
+		if hdr := a.Header(); hdr.Name != "www.foo.lan." {
+			t.Errorf("owner = %s; want the ORIGINAL qname echoed", hdr.Name)
+		}
+		if !aa {
+			t.Error("aa = false; a rescued answer is freens-authoritative")
+		}
+	})
+
+	t.Run("off by default", func(t *testing.T) {
+		lookup := newFakeLookup()
+		lookup.put(w.tldEnv)
+		lookup.put(w.wwwEnv)
+		up := &fakeUpstream{rcode: dns.RcodeNameError}
+		r := newResolver(mkCfg(false), lookup, up)
+
+		q := dns.Question{Name: "www.foo.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
+		if err != nil {
+			t.Fatalf("ResolveQuestion: %v", err)
+		}
+		if rcode != dns.RcodeNameError {
+			t.Fatalf("rcode = %d; rescue must be opt-in (want NXDOMAIN)", rcode)
+		}
+	})
+
+	t.Run("live upstream answer wins (no rescue)", func(t *testing.T) {
+		lookup := newFakeLookup()
+		lookup.put(w.tldEnv)
+		lookup.put(w.wwwEnv)
+		up := &fakeUpstream{rcode: dns.RcodeSuccess, answer: []dns.RR{
+			&dns.A{Hdr: dns.RR_Header{Name: "www.foo.lan.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30}, A: net.IPv4(203, 0, 113, 99)},
+		}}
+		r := newResolver(mkCfg(true), lookup, up)
+
+		q := dns.Question{Name: "www.foo.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
+		if err != nil {
+			t.Fatalf("ResolveQuestion: %v", err)
+		}
+		if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+			t.Fatalf("rcode=%d len=%d; want the upstream answer", rcode, len(rrs))
+		}
+		if a, ok := rrs[0].(*dns.A); !ok || !a.A.Equal(net.IPv4(203, 0, 113, 99)) {
+			t.Fatalf("answer = %v; want the UPSTREAM address", rrs[0])
+		}
+		if aa {
+			t.Error("aa = true; an upstream-sourced answer is not authoritative")
+		}
+	})
+
+	t.Run("freens-first miss borrows the bare name (.freens suffix)", func(t *testing.T) {
+		// "www.foo.freens": the EXPLICIT community-namespace route misses
+		// (nobody owns the alias "freens"), upstream NXDOMAINs, and the
+		// rescue borrows the bare "www.foo" — the ".freens" connection
+		// suffix reads as the project's own TLD.
+		lookup := newFakeLookup()
+		lookup.put(w.tldEnv)
+		lookup.put(w.wwwEnv)
+		up := &fakeUpstream{rcode: dns.RcodeNameError}
+		r := newResolver(mkCfg(true), lookup, up)
+
+		q := dns.Question{Name: "www.foo.freens.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
+		if err != nil {
+			t.Fatalf("ResolveQuestion: %v", err)
+		}
+		if rcode != dns.RcodeSuccess || len(rrs) != 1 {
+			t.Fatalf("rcode=%d len=%d; want the rescued answer", rcode, len(rrs))
+		}
+		if a, ok := rrs[0].(*dns.A); !ok || !a.A.Equal(w.wwwIPv4) {
+			t.Fatalf("answer = %v; want the freens address", rrs[0])
+		}
+		if hdr := rrs[0].Header(); hdr.Name != "www.foo.freens." {
+			t.Errorf("owner = %s; want the original qname echoed", hdr.Name)
+		}
+		if !aa {
+			t.Error("aa = false; a rescued answer is freens-authoritative")
+		}
+	})
+
+	t.Run("rescue miss propagates NXDOMAIN", func(t *testing.T) {
+		// "nope.lan" → alias "lan" unknown → upstream NXDOMAIN → rescue
+		// "nope" via freens → also a miss → the original NXDOMAIN stands.
+		up := &fakeUpstream{rcode: dns.RcodeNameError}
+		r := newResolver(mkCfg(true), newFakeLookup(), up)
+
+		q := dns.Question{Name: "nope.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
+		if err != nil {
+			t.Fatalf("ResolveQuestion: %v", err)
+		}
+		if rcode != dns.RcodeNameError {
+			t.Fatalf("rcode = %d; want NXDOMAIN on a rescue miss", rcode)
+		}
+		if len(up.seen) == 0 {
+			t.Error("upstream never consulted; rescue must run after the normal route")
+		}
+	})
+}
+
 func TestResolveQuestionFREENSHit(t *testing.T) {
 	w := newFreensWorld(t)
 	lookup := newFakeLookup()

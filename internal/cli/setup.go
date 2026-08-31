@@ -168,6 +168,9 @@ var sysReadFile = os.ReadFile
 func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	uninstall := fs.Bool("uninstall", false, "reverse setup: disable the service and OS resolver wiring (keys and store are KEPT)")
+	// -console-wait: internal — set on the UAC-elevated relaunch so the
+	// child's console window stays open long enough to read the summary.
+	consoleWait := fs.Bool("console-wait", false, "pause before exit (used when setup relaunches itself elevated via UAC)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -175,7 +178,13 @@ func cmdSetup(args []string) error {
 		return usageErr("setup takes no positional arguments")
 	}
 	if *uninstall {
+		if goosWindows {
+			return setupUninstallWindows(*consoleWait)
+		}
 		return setupUninstall()
+	}
+	if goosWindows {
+		return setupInstallWindows(*consoleWait)
 	}
 	return setupInstall()
 }
@@ -286,6 +295,9 @@ func setupInstall() error {
 // gone; resolv.conf is replaced as a PLAIN FILE (not through resolved's
 // stub symlink, which a resolved restart would regenerate).
 func wireOSResolver() string {
+	if goosWindows {
+		return wireOSResolverWindows()
+	}
 	addr := effectiveDNSAddr() // e.g. 127.0.0.1:5300 (the daemon's configured listener)
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil || port == "" || port == "53" {

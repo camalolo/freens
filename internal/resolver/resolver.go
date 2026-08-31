@@ -361,6 +361,50 @@ func (r *Resolver) ResolveQuestion(ctx context.Context, q dns.Question) (rrs []d
 		// §9.2 step 1: an unparseable name has no answer.
 		return nil, dns.RcodeNameError, false, nil
 	}
+
+	// §9.2 suffix rescue ([options] suffix-rescue, Windows single-label
+	// support): for a name whose LAST label resolves to an upstream
+	// NXDOMAIN, the name is almost certainly a freens name the OS resolver
+	// dressed up with a DNS suffix ("desktop.freens" for a user typing
+	// "desktop"; Windows never sends the bare single-label query). Give it
+	// ONE chance: the same name with the suffix label stripped, resolved
+	// through the freens namespace only. Eligible: unknown aliases (the
+	// "*" dns-first crowd) AND the community namespace itself — an
+	// explicit freens-first route whose freens resolution missed may
+	// borrow the bare name, which is what makes the ".freens" connection
+	// suffix work. Custom/pinned routes other than freens-first are
+	// sacrosanct (a private namespace must not silently alias its names
+	// to bare freens ones). Real domains answer upstream before the
+	// rescue can run; a rescue miss returns the original NXDOMAIN. The
+	// stripped identity feeds the lookup; the QUESTION (and therefore the
+	// echoed owner names in the answer) stays the original one — a stub
+	// client would discard answers owned by a different name. aa=true on
+	// a hit — the answer is freens-sourced (freensResolve).
+	if r.Cfg != nil && r.Cfg.SuffixRescue && len(labels) >= 1 {
+		route := RouteFor(r.Cfg, alias)
+		_, explicit := r.Cfg.TLDRoutes[alias]
+		if !explicit || route == RouteFREENSFirst {
+			rrs, rcode, aa, err = r.resolveRouted(ctx, q, labels, alias, now)
+			if err == nil && rcode == dns.RcodeNameError {
+				strippedLabels, strippedAlias, serr := naming.DecomposeName(dns.Fqdn(strings.Join(labels, ".")))
+				if serr == nil {
+					sRRs, sRcode, sErr := r.freensResolve(ctx, strippedLabels, strippedAlias, q, now)
+					if sErr == nil && sRcode == dns.RcodeSuccess && len(sRRs) > 0 {
+						return sRRs, dns.RcodeSuccess, true, nil
+					}
+				}
+			}
+			return rrs, rcode, aa, err
+		}
+	}
+
+	return r.resolveRouted(ctx, q, labels, alias, now)
+}
+
+// resolveRouted is ResolveQuestion's routing switch (§9.2 steps 3-5), split
+// out so the suffix-rescue wrapper can consult the normal route first and
+// only intercede on its NXDOMAIN.
+func (r *Resolver) resolveRouted(ctx context.Context, q dns.Question, labels []string, alias string, now int64) ([]dns.RR, int, bool, error) {
 	route := RouteFor(r.Cfg, alias)
 
 	switch route {

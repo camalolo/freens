@@ -234,10 +234,18 @@ func stageTarball(tarPath, stageDir string) (map[string]string, error) {
 			continue
 		}
 		base := filepath.Base(hdr.Name)
-		if !sliceContains(releaseBinaries, base) || staged[base] != "" {
+		// Windows tarballs ship the binaries with an .exe suffix; match and
+		// stage them under the plain release name so every consumer below
+		// (staged["freens"], installTargetPath) stays GOOS-agnostic.
+		if !sliceContains(releaseBinaries, strings.TrimSuffix(base, ".exe")) || staged[strings.TrimSuffix(base, ".exe")] != "" {
 			continue
 		}
-		dst := filepath.Join(stageDir, base)
+		base = strings.TrimSuffix(base, ".exe")
+		// …but the staged FILE gets the platform's executable name: Windows
+		// CreateProcess appends ".exe" to an extensionless path and would
+		// never find plain "freens" (verifyStaged / upgradeRunMigrate exec
+		// the staged binary before anything is installed).
+		dst := filepath.Join(stageDir, releaseBinaryName(base))
 		// One member at a time, size-capped: a hostile tarball cannot fill
 		// the disk past the 256 MiB gate before we bail.
 		w, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
@@ -276,7 +284,9 @@ func sliceContains(hay []string, needle string) bool {
 // target tag. CI ships no checksums, so this execution test IS the
 // download-integrity check: a truncated/corrupt tarball or a cross-arch
 // build fails here, before a single byte of the live install is touched.
-func verifyStaged(binPath, tag string) error {
+// Var for tests (the e2e test's fake payload is a script — executable only
+// on unixes; windows stubs the exec, linux exercises it for real).
+var verifyStaged = func(binPath, tag string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, binPath, "version").CombinedOutput()
@@ -436,6 +446,11 @@ func installBinary(stagePath, target string) (result string, err error) {
 	base := filepath.Base(target)
 	staging := target + ".freens-new"
 
+	if !writable && runtime.GOOS == "windows" {
+		// No sudo equivalent: an elevated shell is the only way in. The
+		// caller stopped the service first, so nothing is half-swapped.
+		return "", fmt.Errorf("%s is not writable by this user — re-run `upgrade` from an elevated (Run as administrator) shell", filepath.Dir(target))
+	}
 	if writable {
 		if err := copyFile(stagePath, staging, 0o755); err != nil {
 			return "", err
@@ -458,9 +473,22 @@ func installBinary(stagePath, target string) (result string, err error) {
 	}
 	// Replacing OUR OWN image: legal on Linux (the executing inode stays
 	// alive until this process exits); case-preserving rename on macOS.
+	// Windows refuses rename-over a RUNNING image but allows renaming the
+	// running file itself — so on refusal, move the old image aside
+	// (.freens-old; its last lock dies with the old process), put the new
+	// one in place, and drop the aside (best effort: the current process's
+	// own old image lingers until it exits).
 	if writable {
 		if err := os.Rename(staging, target); err != nil {
-			return "", err
+			aside := target + ".freens-old"
+			if moveErr := os.Rename(target, aside); moveErr != nil {
+				return "", err // the original refusal is the interesting one
+			}
+			if err2 := os.Rename(staging, target); err2 != nil {
+				_ = os.Rename(aside, target) // put the old image back
+				return "", err2
+			}
+			_ = os.Remove(aside)
 		}
 	} else if err := sudoRun("installing "+base, "mv", "-f", staging, target); err != nil {
 		return "", err
@@ -575,16 +603,26 @@ func restartFreensUnits(units []string) {
 
 // installTargetPath / installBackupPath report the in-place / rollback
 // paths of a release binary (errors swallowed — they only feed warnings).
+// Windows binaries carry an .exe suffix (matching the release tarball).
 func installTargetPath(bin string) string {
 	dir, err := installDir()
 	if err != nil {
 		return bin
 	}
-	return filepath.Join(dir, bin)
+	return filepath.Join(dir, releaseBinaryName(bin))
 }
 
 func installBackupPath(bin string) string {
 	return installTargetPath(bin) + ".freens-prev"
+}
+
+// releaseBinaryName maps a release binary's plain name to this platform's
+// on-disk name (freens.exe on windows).
+func releaseBinaryName(bin string) string {
+	if runtime.GOOS == "windows" {
+		return bin + ".exe"
+	}
+	return bin
 }
 
 // waitDaemonBack polls the admin socket until the daemon answers status
@@ -604,7 +642,11 @@ func waitDaemonBack(d time.Duration) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	fmt.Fprintf(os.Stderr, "%s: warning: daemon did not answer its admin socket within %s\n", ProgName, d)
-	fmt.Fprintln(os.Stderr, "  check `systemctl status freens` or `freens doctor`; roll back with the *.freens-prev files listed above")
+	if goosWindows {
+		fmt.Fprintln(os.Stderr, "  check `freens doctor` (service: `net start freens`); roll back with the *.freens-prev files listed above")
+	} else {
+		fmt.Fprintln(os.Stderr, "  check `systemctl status freens` or `freens doctor`; roll back with the *.freens-prev files listed above")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -630,8 +672,8 @@ func cmdUpgrade(args []string) error {
 	if len(fs.Args()) != 0 {
 		return usageErr("upgrade takes no positional arguments")
 	}
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		return usageErr("upgrade supports linux and darwin (this is %s)", runtime.GOOS)
+	if platform != "linux" && platform != "darwin" && platform != "windows" {
+		return usageErr("upgrade supports linux, darwin and windows (this is %s)", runtime.GOOS)
 	}
 
 	current := Version
@@ -722,24 +764,55 @@ func cmdUpgrade(args []string) error {
 		return fmt.Errorf("staged freens could not run its config migrations: %w", err)
 	}
 
+	// Windows: the SCM service LOCKS its binary image — stop it before a
+	// byte moves and start it again after. (Linux/darwin rename over the
+	// running image instead, so systemd needs no dance.)
+	winServiceWasRunning := false
+	if goosWindows {
+		winServiceWasRunning = winSvcRunning()
+		if winServiceWasRunning {
+			if !winSvcElevated() {
+				return usageErr("the freens service is running and `upgrade` needs admin rights to restart it — re-run from an elevated (Run as administrator) shell (or `net stop freens` first)")
+			}
+			fmt.Println("stopping service freens (Windows locks a running image)…")
+			if err := winSvcStop(); err != nil {
+				return fmt.Errorf("stopping the freens service: %w", err)
+			}
+		}
+	}
+
 	// Install each binary in place of the running one.
 	fmt.Println("installing:")
+	var installErr error
 	for _, bin := range releaseBinaries {
 		target := installTargetPath(bin)
 		res, err := installBinary(staged[bin], target)
 		if err != nil {
-			return fmt.Errorf("installing %s: %w", target, err)
+			installErr = fmt.Errorf("installing %s: %w", target, err)
+			break
 		}
 		fmt.Printf("  %s: %s\n", target, res)
 	}
+	if installErr != nil {
+		if goosWindows && winServiceWasRunning {
+			// Leave the machine as we found it: the old binaries are all
+			// still in place (or restored), so a plain start succeeds.
+			_ = winSvcStart()
+		}
+		return installErr
+	}
 
 	// Restart the services around the new binaries.
-	units := activeFreensUnits()
-	if len(units) == 0 {
-		fmt.Println("no active freens* systemd units found — restart the daemon yourself (systemctl restart freens.service)")
+	if goosWindows {
+		restartWindowsService(winServiceWasRunning)
 	} else {
-		fmt.Printf("restarting: %s\n", strings.Join(units, ", "))
-		restartFreensUnits(units)
+		units := activeFreensUnits()
+		if len(units) == 0 {
+			fmt.Println("no active freens* systemd units found — restart the daemon yourself (systemctl restart freens.service)")
+		} else {
+			fmt.Printf("restarting: %s\n", strings.Join(units, ", "))
+			restartFreensUnits(units)
+		}
 	}
 
 	if wasAlive {
@@ -749,6 +822,20 @@ func cmdUpgrade(args []string) error {
 
 	fmt.Println("upgrade complete. previous binaries kept as <binary>.freens-prev (copy back + restart to roll back).")
 	return nil
+}
+
+// restartWindowsService brings the SCM service back after an upgrade (or
+// reports how to roll back when it refuses to start).
+func restartWindowsService(wasRunning bool) {
+	if !wasRunning {
+		fmt.Println("service freens was not running — leaving it stopped (start with: net start freens)")
+		return
+	}
+	fmt.Println("starting: service freens")
+	if err := winSvcStart(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: warning: starting the freens service failed (%v)\n", ProgName, err)
+		fmt.Fprintln(os.Stderr, "  start it manually with `net start freens`; roll back with the *.freens-prev files listed above")
+	}
 }
 
 // currentStampLine renders the installed version for prompts/checks.

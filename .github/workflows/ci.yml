@@ -37,6 +37,7 @@ jobs:
           - { goos: linux, goarch: arm64 }
           - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64, ext: .exe }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,9 +50,25 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           VER="${GITHUB_SHA::12}"
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VER -X main.cliVersion=$VER" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens ./cmd/freens
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VER -X main.cliVersion=$VER" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens-cli ./cmd/freens-cli
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VER -X main.cliVersion=$VER" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens${{ matrix.ext }} ./cmd/freens
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$VER -X main.cliVersion=$VER" -o dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/freens-cli${{ matrix.ext }} ./cmd/freens-cli
       - uses: actions/upload-artifact@v4
         with:
           name: freens-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/freens-${{ matrix.goos }}-${{ matrix.goarch }}/
+
+  windows:
+    # The windows goos side of the matrix above only proves it BUILDS; this
+    # job also vets. The unit tests stay linux-only: several suites depend
+    # on unix sockets/paths in ways the windows port deliberately does not
+    # provide (the fleet's windows box exercises the real flows).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...

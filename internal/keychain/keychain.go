@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -165,12 +166,27 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	if err = os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
+	// fsync the directory so the rename itself survives a crash. Windows
+	// has no directory-sync concept: opening the dir succeeds but Sync
+	// fails with ERROR_ACCESS_DENIED (found live on the desktop test box
+	// during the v0.11.0 setup run), so there the rename stays at the
+	// mercy of NTFS metadata journaling — the durable-rename guarantee is
+	// best-effort, the WRITE still succeeded.
 	d, derr := os.Open(dir)
 	if derr != nil {
+		if runtime.GOOS == "windows" {
+			return nil
+		}
 		return derr
 	}
 	defer d.Close()
-	return d.Sync() // make the rename durable
+	if serr := d.Sync(); serr != nil {
+		if runtime.GOOS == "windows" {
+			return nil
+		}
+		return serr
+	}
+	return nil
 }
 
 // IsEncryptedPath reports whether the keyfile at path carries the FREENSK1

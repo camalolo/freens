@@ -60,6 +60,18 @@ type Config struct {
 	// already enabled by the -idna flag; config authors should write A-labels
 	// (xn--) there, as DNS wire traffic does.
 	EnableIDNA bool
+
+	// SuffixRescue mirrors [options] "suffix-rescue = true" (off by
+	// default): for a name that resolves to an upstream NXDOMAIN under an
+	// unknown-alias OR freens-first last label, fall back to a freens
+	// lookup of the name with that last label stripped. This makes
+	// Windows-style suffix-appended queries work ("desktop.freens"
+	// resolves as "desktop") without touching ordinary DNS: real domains
+	// answer upstream before the rescue can run, and explicit routes
+	// other than freens-first never rescue. Setup enables it on Windows,
+	// where the OS resolver otherwise never resolves single-label freens
+	// names at all, and pairs it with a "freens" connection suffix.
+	SuffixRescue bool
 }
 
 // ParseConfig parses a §9.3 INI config string into a *Config.
@@ -161,6 +173,12 @@ func ParseConfig(text string) (*Config, error) {
 					return nil, err
 				}
 				cfg.EnableIDNA = b
+			case "suffix-rescue":
+				b, err := parseConfigBool(value)
+				if err != nil {
+					return nil, err
+				}
+				cfg.SuffixRescue = b
 			}
 		case "alias-pins":
 			// No "*" wildcard for pins; every alias must validate.

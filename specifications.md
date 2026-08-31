@@ -864,7 +864,10 @@ modification**.
 If the OS forbids binding port 53 unprivileged, implementations bind a
 high port and provide documented forwarding recipes (`iptables`,
 systemd socket units, or a small setuid launcher). Implementations
-SHOULD auto-detect and guide the user.
+SHOULD auto-detect and guide the user. (Windows has no privileged-port
+concept: the reference implementation binds `127.0.0.1:53` directly
+there and points the network adapters' DNS at it; the Linux redirect
+recipes do not apply.)
 
 ### 9.2 Resolution algorithm
 

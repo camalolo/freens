@@ -1,5 +1,113 @@
 # Changelog
 
+## v0.11.0 — Windows 10/11: SCM service + automatic setup
+
+Windows goes from "unsupported" to the same one-command story as Linux:
+`freens start <name>` (or `setup` step by step) installs the daemon as a
+real Windows **service**, wires the OS resolver, and survives reboot —
+with UAC doing what sudo does on Linux.
+
+- **State model**: `home.Dir()` on Windows defaults to
+  `%ProgramData%\freens` instead of a per-user profile. The daemon is
+  machine infrastructure there — the SCM service runs as LocalSystem
+  while every user's CLI and freens-web must find the SAME keychain and
+  admin socket, which separate profiles would split. `FREENS_HOME`
+  still overrides for everything.
+- **Admin socket**: the `\\.\pipe\…` placeholder is gone — Windows has
+  AF_UNIX since Windows 10 1803 (and Go supports it since 1.17), so the
+  same `<home>\admin.sock` filesystem path serves daemon + CLI on both
+  ends with zero new code.
+- **`freens setup` (setupwin.go)**: self-elevates via UAC
+  (`Start-Process -Verb RunAs`, `-console-wait` keeps the elevated
+  child's window readable), then: state layout → `freens.conf` with the
+  resolver DIRECTLY on `127.0.0.1:53` (Windows has no privileged-port
+  concept — the whole Linux redirect scheme does not apply) → seeds →
+  SCM service `freens` (LocalSystem, automatic start, restart-on-failure
+  recovery via x/sys `svc/mgr`, internal/winsvc) → program-scoped
+  inbound firewall rule for UDP 15353 (Windows Defender silently drops
+  DHT inbound otherwise) → adapter DNS wiring.
+- **OS resolver wiring**: every adapter that CARRIES DNS servers is
+  pointed at 127.0.0.1 via PowerShell
+  (`Get-DnsClientServerAddress | Set-DnsClientServerAddress` — blank
+  slates are never touched), with the captured per-adapter lists saved
+  to `<home>\dns-backup.json` so `-uninstall` restores exactly what was
+  there (the resolv.conf backup convention, per-adapter). Conventional
+  names forward to the upstream servers captured from those same
+  adapters at setup time (`[upstream]` in freens.conf — public
+  resolvers as fallback). Single-label freens names work through the
+  OS resolver's suffix-devolution: the suffixed query NXDOMAINs at the
+  daemon, the bare-name retry then hits the alias.
+- **Service plumbing** (cmd/freens service_windows.go): when launched
+  by the SCM, the binary answers the service control protocol while the
+  ordinary daemon runs unchanged in a goroutine; Stop/Shutdown close a
+  channel that run()'s signal select treats exactly like SIGTERM (one
+  shutdown sequence for console and service alike). A service has no
+  console, so slog goes to `<home>\daemon.log` (8 MiB rotate-on-start
+  to daemon.log.1).
+- **`freens upgrade` on Windows**: the release asset is
+  freens-windows-amd64.tar.gz with .exe-named binaries (staging
+  normalizes the suffix, so all downstream naming stays GOOS-agnostic);
+  Windows refuses rename-over a RUNNING image but allows renaming it —
+  installBinary moves the old image aside (.freens-old) and slides the
+  new one in; the service is stopped before the swap and restarted
+  after (a non-elevated run refuses early with the reason instead of
+  half-failing on a locked binary).
+- **doctor/status/start** learned the Windows wiring model
+  ("resolver points at daemon" = an adapter carries 127.0.0.1;
+  ":53 path complete" = the daemon's port IS 53) and the `net start
+  freens` fix-it hint.
+- **§9.5 trust on Windows**: `freens trust-install` imports the local
+  root into the WINDOWS certificate store via certutil (machine store
+  when elevated/per-service, per-user fallback), and cross-certs land
+  in the intermediate (CA) store — Chrome/Edge verify against the
+  Windows store, not NSS; Firefox manages its own. trustsync's unix
+  plumbing (system bundle + NSS) moved to store_unix.go, the Windows
+  counterpart lives in store_windows.go.
+- **Release/CI**: release.yml builds windows/amd64 (4→5 platforms);
+  ci.yml adds a windows vet+build job (unit tests stay linux-run:
+  several suites lean on unix sockets/paths the Windows port
+  deliberately does not emulate).
+- **Field fixes from the first live run (desktop, Win11 26200, same day)**:
+  - **SCM arg delivery**: the service manager hands `Execute` the SERVICE
+    NAME, not the ImagePath arguments — the daemon flag-parsed nothing and
+    silently ran config-less (DNS up, DHT + admin socket dead). The handler
+    now takes the real command line from `os.Args`, and `run()` REFUSES
+    unexpected positionals so "started with defaults by accident" can
+    never happen quietly again.
+  - **Windows has no directory-fsync**: keychain writes ended with the
+    Linux durability idiom `open(dir)+Sync()`, which fails with
+    ERROR_ACCESS_DENIED there (first `setup` died writing node.key). The
+    dir-sync is now skipped on windows (the rename's durability falls to
+    NTFS journaling; the write itself was always durable).
+  - **Hardened machines run BlockOutbound** (desktop does, all profiles):
+    every unsigned binary's connect() fails with WSAEACCES while signed
+    tools work — invisible until a real daemon ran. setup now adds a
+    program-scoped OUTBOUND allow rule for the freens binary (upstream
+    DNS, DHT peers, `upgrade` downloads) next to the inbound DHT rule,
+    and netsh rules are delete-then-add so re-runs don't duplicate.
+  - Verified end to end on the box: setup (via UAC-elevated run), service
+    install + SCM stop/start, AF_UNIX admin socket, adapter DNS wiring,
+    conventional-name forwarding, cross-box freens name resolution, and a
+    live `register` (passphrase-protected key, PoW, 5 witnesses) whose
+    name propagates to the Linux fleet boxes.
+- **§9.2 suffix rescue** (`[options] suffix-rescue`, v0.11.0, found
+  necessary live): the Windows resolver NEVER resolves single-label
+  freens names — it appends a DNS suffix ("desktop.lan") and never
+  retries the bare form (NRPT "." rules don't help; traced via the DNS
+  Client operational log). With the option on, a name whose last label
+  has no explicit route that upstream NXDOMAINs falls back to a freens
+  lookup of the name minus that label. Real domains answer upstream
+  before the rescue can run, explicit routes never rescue, and the
+  rescued answer echoes the ORIGINAL qname. Windows setup pairs it with
+  a "freens" connection suffix on every wired adapter — the freens-first
+  route's own miss borrows the bare name, so `desktop.freens` just reads
+  as `desktop`.
+
+- **Fixed on the way**: internal/upnp did not compile on Windows at
+  all (a raw-fd `IP_MULTICAST_IF` setsockopt with the linux fd type) —
+  the multicast interface pinning now has a windows twin using
+  syscall.Handle, keeping the identical {INADDR_ANY, interface} layout.
+
 ## v0.10.0 — `freens upgrade`: one-command self-update from GitHub releases
 
 The fleet's deploy procedure until now was scp-tarball-then-systemctl per

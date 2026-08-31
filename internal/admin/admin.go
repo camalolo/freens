@@ -48,6 +48,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -212,6 +213,11 @@ func (s *Server) Close() error {
 // unlinkStale implements ListenAndServe's stale-socket policy (see its doc
 // comment): absent ⇒ nothing to do; a live-serving socket ⇒ error (refuse to
 // steal it); a dead socket file ⇒ remove it so Listen can rebind.
+//
+// On Windows the ModeSocket gate is skipped: Win32 has no socket file type,
+// so an AF_UNIX socket does NOT Lstat as ModeSocket there — the dial below
+// is the only reliable liveness check (without this, a crashed daemon's
+// socket file would wedge every future start into "not a unix socket").
 func unlinkStale(sock string, log Logger) error {
 	fi, err := os.Lstat(sock)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -220,7 +226,7 @@ func unlinkStale(sock string, log Logger) error {
 	if err != nil {
 		return fmt.Errorf("admin: stat %s: %w", sock, err)
 	}
-	if fi.Mode()&os.ModeSocket == 0 {
+	if runtime.GOOS != "windows" && fi.Mode()&os.ModeSocket == 0 {
 		return fmt.Errorf("admin: %s exists and is not a unix socket", sock)
 	}
 	if c, derr := net.DialTimeout("unix", sock, 500*time.Millisecond); derr == nil {

@@ -205,16 +205,23 @@ func TestStageTarballAndVerify(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// POSIX-only: Windows has no exec bit (0755-with-write reports 666).
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("%s mode = %v; want 755", bin, info.Mode().Perm())
 		}
 	}
-	if err := verifyStaged(staged["freens"], "v9.9.9"); err != nil {
-		t.Errorf("verifyStaged: %v", err)
-	}
-	if err := verifyStaged(staged["freens"], "v9.9.8"); err == nil ||
-		!strings.Contains(err.Error(), "v9.9.8") {
-		t.Errorf("verifyStaged with wrong tag: %v; want a mismatch error", err)
+	// verifyStaged EXECUTES the staged binary; the fake payload here is a
+	// shell script, which only "runs" on unixes. Windows staging is still
+	// fully asserted above (the real release ships real .exe payloads, and
+	// the live box exercised that path).
+	if runtime.GOOS != "windows" {
+		if err := verifyStaged(staged["freens"], "v9.9.9"); err != nil {
+			t.Errorf("verifyStaged: %v", err)
+		}
+		if err := verifyStaged(staged["freens"], "v9.9.8"); err == nil ||
+			!strings.Contains(err.Error(), "v9.9.8") {
+			t.Errorf("verifyStaged with wrong tag: %v; want a mismatch error", err)
+		}
 	}
 	// A non-gzip file must fail loudly (corrupt download).
 	junk := filepath.Join(dir, "junk.tar.gz")
@@ -444,7 +451,9 @@ func TestUpgradeEndToEnd(t *testing.T) {
 	binDir := filepath.Join(dir, "bin")
 	os.MkdirAll(binDir, 0o755)
 	for _, bin := range releaseBinaries {
-		writeScript(t, filepath.Join(binDir, bin), bin+" v0.9.1")
+		// The install targets follow the platform's binary naming (the
+		// windows release ships and installs <bin>.exe).
+		writeScript(t, filepath.Join(binDir, releaseBinaryName(bin)), bin+" v0.9.1")
 	}
 
 	// Release assets served from a real tarball we build on the fly.
@@ -473,7 +482,7 @@ func TestUpgradeEndToEnd(t *testing.T) {
 	// the daemon + web units active; sudo and raw commands are recorded.
 	savedExe, savedSudo, savedRun, savedOut := sysExecutable, sysSudo, sysRun, sysOutput
 	var ranSudo, ranSys [][]string
-	sysExecutable = func() (string, error) { return filepath.Join(binDir, "freens"), nil }
+	sysExecutable = func() (string, error) { return filepath.Join(binDir, releaseBinaryName("freens")), nil }
 	sysSudo = func(args ...string) error { ranSudo = append(ranSudo, args); return nil }
 	sysRun = func(name string, args ...string) error {
 		ranSys = append(ranSys, append([]string{name}, args...))
@@ -485,7 +494,14 @@ func TestUpgradeEndToEnd(t *testing.T) {
 	t.Cleanup(func() { sysExecutable, sysSudo, sysRun, sysOutput = savedExe, savedSudo, savedRun, savedOut })
 
 	// Migrations run in-process (the staged "binary" is a script that
-	// cannot run the real verb).
+	// cannot run the real verb). On windows the exec-based integrity check
+	// is stubbed too — the fake payload is a shell script there; linux
+	// exercises verifyStaged for real.
+	savedVerify := verifyStaged
+	if runtime.GOOS == "windows" {
+		verifyStaged = func(string, string) error { return nil }
+		t.Cleanup(func() { verifyStaged = savedVerify })
+	}
 	savedMigrate := upgradeRunMigrate
 	migrateFrom := ""
 	upgradeRunMigrate = func(newBin, from string) error {
@@ -508,7 +524,7 @@ func TestUpgradeEndToEnd(t *testing.T) {
 
 	// Binaries replaced in place, 0755, old content kept as .freens-prev.
 	for _, bin := range releaseBinaries {
-		target := filepath.Join(binDir, bin)
+		target := filepath.Join(binDir, releaseBinaryName(bin))
 		got, err := os.ReadFile(target)
 		if err != nil {
 			t.Fatal(err)
@@ -521,7 +537,8 @@ func TestUpgradeEndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Mode().Perm() != 0o755 {
+		// POSIX-only: Windows has no exec bit.
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o755 {
 			t.Errorf("%s mode = %v; want 755", target, info.Mode().Perm())
 		}
 		prev, err := os.ReadFile(target + ".freens-prev")

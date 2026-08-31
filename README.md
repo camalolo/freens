@@ -12,8 +12,9 @@
 > no peer lists, no hex, no unit files. Every low-level subcommand remains
 > available (`freens <verb> -h`).
 >
-> **What to expect (friends edition):** Linux works best; macOS installs
-> with a manual step or two. Registering a name needs the network to have
+> **What to expect (friends edition):** Linux works best; Windows 10/11
+> and macOS install with a prompt or two (Windows: [see its
+> section](#windows-1011)). Registering a name needs the network to have
 > ~5 live community nodes — until then you will see an honest "network too
 > small" error (help fix it: [run a node](contrib/seed-node.md), it's one
 > cheap VPS or a Raspberry Pi). Keep your daemon running while you want
@@ -176,6 +177,44 @@ privileged, `contrib/` ships the §9.1 forwarding recipes — see
 - `CAP_NET_BIND_SERVICE` via `setcap` to bind :53 directly.
 
 The daemon logs guidance automatically when binding :53 fails (§9.1).
+
+## Windows 10/11
+
+Windows is a first-class platform too — same verbs, same one-command flow:
+
+```powershell
+tar -xzf freens-windows-amd64.tar.gz     # tar ships with Windows 10 1803+
+.\freens.exe start alice                 # setup (UAC prompt) + register + status
+```
+
+`freens setup` on Windows (self-elevates via UAC; re-run from an elevated
+shell for scripts):
+
+- state lives in `%ProgramData%\freens` (machine-wide, shared by the
+  daemon, the CLI and freens-web — `FREENS_HOME` still overrides);
+- the resolver listens **directly on `127.0.0.1:53`** (Windows has no
+  privileged-port concept — no redirect scheme, no resolv.conf);
+- installs a **Windows service** (`freens`, LocalSystem, automatic start,
+  restart-on-failure) — the analogue of the Linux systemd system unit:
+  the daemon boots with the machine, no login needed;
+- points every network adapter that carries DNS servers at `127.0.0.1`
+  (previous lists saved to `dns-backup.json`; `setup -uninstall` restores
+  them) and adds a program-scoped inbound firewall rule for the DHT port;
+- conventional names forward to the upstream servers captured from your
+  adapters at setup time (`[upstream]` in `freens.conf`).
+
+`freens upgrade` works on Windows too: it stops the service, swaps the
+binaries (old ones kept as `*.freens-prev`), and starts it again — run it
+from an elevated shell. `freens trust-install` imports the §9.5 local
+root into the Windows certificate store (machine store when elevated,
+per-user otherwise) so `https://<name>` works in Chrome/Edge. `setup
+-uninstall` removes service + wiring and KEEPS your keys.
+
+Single-label names (`ping desktop`, `ping www.desktop`) work through the
+OS resolver too: setup sets a `freens` connection suffix (so names read
+naturally as `desktop.freens`) and enables
+`suffix-rescue`, so the resolver answers the suffixed form from the
+freens namespace. Conventional DNS is unaffected.
 
 ## Key design decisions (chosen interpretations; documented in source)
 

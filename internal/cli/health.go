@@ -322,6 +322,8 @@ func runDoctorFixes() {
 		}
 		if waitForAdminSocket() {
 			fmt.Println("fix: ✔ daemon is answering on the admin socket")
+		} else if goosWindows {
+			fmt.Println("fix: ✘ daemon still not answering — start it manually: `net start freens` (elevated) or re-run `freens setup`")
 		} else {
 			fmt.Println("fix: ✘ daemon still not answering — start it manually: sudo systemctl start freens.service")
 		}
@@ -402,13 +404,19 @@ func checkSeeds() bool {
 	return len(peers) > 0
 }
 
-// osResolverPointsAtDaemon reports (points, redirectComplete): whether
-// /etc/resolv.conf sends the OS stub to 127.0.0.1 (the working freens
-// wiring — a bare loopback nameserver; the v0.2.0 "127.0.0.1:5300" form was
-// invalid resolv.conf syntax and is treated as legacy) AND whether the
-// port-53 redirect that carries :53 traffic to the daemon's high port is
-// present in the firewall.
+// osResolverPointsAtDaemon reports (points, redirectComplete): whether the
+// OS resolver sends queries to the daemon AND the :53 traffic path is
+// complete. On Linux that is /etc/resolv.conf -> 127.0.0.1 (the working
+// freens wiring — a bare loopback nameserver; the v0.2.0 "127.0.0.1:5300"
+// form was invalid resolv.conf syntax and is treated as legacy) plus the
+// port-53 redirect in the firewall. On Windows the daemon LISTENS on :53
+// directly (no privileged-port concept, no redirect), so "redirect" just
+// means the daemon's port IS 53 and "points" means an adapter carries the
+// daemon loopback in its DNS server list.
 func osResolverPointsAtDaemon() (points, redirect bool) {
+	if goosWindows {
+		return windowsAdapterDNSWired("127.0.0.1"), portOfAddr(effectiveDNSAddr()) == "53"
+	}
 	data, err := os.ReadFile(pathResolvConf)
 	if err == nil {
 		for _, line := range strings.Split(string(data), "\n") {

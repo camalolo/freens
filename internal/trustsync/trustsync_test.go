@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -68,12 +69,14 @@ func TestLocalRootCreatedOnce(t *testing.T) {
 	if e2.RootFingerprint() != fp1 {
 		t.Fatal("second engine generated a different local root")
 	}
-	// The key file must be 0600.
+	// The key file must be 0600 — POSIX only: Windows maps os.Chmod to the
+	// read-only attribute (0600-with-owner-write reports 0666) and access
+	// is governed by ACLs instead.
 	st, err := os.Stat(filepath.Join(opts.HomeDir, "tls", "root.key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("root.key mode = %04o, want 0600", st.Mode().Perm())
 	}
 }

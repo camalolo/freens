@@ -18,8 +18,13 @@ import (
 // the register end-to-end tests mint fresh owner keys with no terminal
 // attached — the pre-policy behavior they were written against. This is
 // test-harness only; production binaries are unaffected.
+//
+// It also carries the windows safety net (see testmain_test.go): the
+// OS-touching hooks default to inert stubs there, because an elevated ssh
+// token makes every windows branch real on a test box.
 func TestMain(m *testing.M) {
 	os.Setenv(EnvAllowPlaintextKey, "1")
+	stubWindowsOSHooks()
 	os.Exit(m.Run())
 }
 

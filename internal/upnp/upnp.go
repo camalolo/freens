@@ -50,14 +50,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-	"unsafe"
 )
-
-// unsafePointer reinterprets the 8-byte ip_mreq layout for the
-// SetsockoptIPMreq call (avoids importing x/net for one setsockopt).
-func unsafePointer(b *[8]byte) unsafe.Pointer { return unsafe.Pointer(b) }
 
 const (
 	ssdpAddr   = "239.255.255.250:1900"
@@ -199,21 +193,6 @@ func lanInterfaceIPs() []net.IP {
 		}
 	}
 	return out
-}
-
-// setMulticastInterface pins the socket's outgoing multicast interface
-// (IP_MULTICAST_IF) to ip — best-effort via the raw fd; errors are ignored
-// (the multicast send then simply follows the routing table as before).
-func setMulticastInterface(conn *net.UDPConn, ip net.IP) {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = raw.Control(func(fd uintptr) {
-		var mreq [8]byte // struct ip_mreq_n { imr_multiaddr, imr_address }
-		copy(mreq[4:], ip.To4())
-		_ = syscall.SetsockoptIPMreq(int(fd), syscall.IPPROTO_IP, syscall.IP_MULTICAST_IF, (*syscall.IPMreq)(unsafePointer(&mreq)))
-	})
 }
 
 // defaultGateways parses /proc/net/route (Linux) for gateways of default

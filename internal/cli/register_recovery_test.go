@@ -7,6 +7,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/camalolo/freens/internal/constants"
@@ -51,7 +52,9 @@ func TestRegisterRecoveryPlanDefaults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("keyfile %s: %v", p, err)
 		}
-		if st.Mode().Perm() != 0o600 {
+		// POSIX-only: Windows maps os.Chmod to the read-only attribute
+		// (0600-with-owner-write reports 0666); ACLs govern access there.
+		if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 			t.Errorf("keyfile %s mode = %o, want 0600", p, st.Mode().Perm())
 		}
 		// The keyfile reloads to exactly the policy's i-th key.
