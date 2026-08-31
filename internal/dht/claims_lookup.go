@@ -117,6 +117,13 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	if len(shortlist) == 0 {
 		return sortedByRecordHash(collected), nil, nil // island: local copy only.
 	}
+	// Work-amplification cap (as IterativeGetDetailed): the walk holds one
+	// WalkConcurrency slot for its whole run; a saturated budget refuses
+	// with ErrWalkBusy rather than queueing.
+	if !n.acquireWalk() {
+		return nil, nil, ErrWalkBusy
+	}
+	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
 	answered := make(map[string]*NodeContact, len(shortlist)) // reachable nodes
 	probesFailed := 0
@@ -438,21 +445,26 @@ func (l *DHTLookup) CollectClaimsWithWitnesses(ctx context.Context, alias string
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
 	envs, witnessSet, err := l.node.CollectClaims(c, alias)
-	if err != nil && !errors.Is(err, ErrDegradedMiss) {
+	// ErrWalkBusy (overload refusal) is handled exactly like ErrDegradedMiss:
+	// a LOCAL claim still serves (a saturated walk does not invalidate what
+	// this node already holds), only an empty-everywhere overload propagates.
+	degraded := errors.Is(err, ErrDegradedMiss) || errors.Is(err, ErrWalkBusy)
+	if err != nil && !degraded {
 		return nil, nil, err
 	}
 	for _, env := range envs {
 		add(env)
 	}
-	// A degraded walk (ErrDegradedMiss) with a LOCAL claim still serves
-	// the local view; only an empty-everywhere degrade propagates the
-	// sentinel (the resolver retries instead of negative-caching). A
-	// degraded walk also yields no witness set (it could not interrogate
-	// the holders, so it cannot honestly name the WITNESS_SET).
-	if errors.Is(err, ErrDegradedMiss) && len(collected) == 0 {
+	// A degraded walk (ErrDegradedMiss / ErrWalkBusy) with a LOCAL claim
+	// still serves the local view; only an empty-everywhere degrade
+	// propagates the sentinel (the resolver retries instead of
+	// negative-caching). A degraded walk also yields no witness set (it
+	// could not interrogate the holders, so it cannot honestly name the
+	// WITNESS_SET).
+	if degraded && len(collected) == 0 {
 		return nil, nil, err
 	}
-	if errors.Is(err, ErrDegradedMiss) {
+	if degraded {
 		witnessSet = nil
 	}
 	set := sortedByRecordHash(collected)

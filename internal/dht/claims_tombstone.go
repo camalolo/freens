@@ -154,6 +154,7 @@ func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) int64 {
 //     every alias whose owner's renewal arrived one tick late — found live
 //     on the LAN fleet (2026-08-22: whole-namespace NXDOMAIN after the
 //     first in-place renewal generation died in the pools).
+//
 // It returns the refusing window's end time (> 0 ⇒ refuse), or 0.
 func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, now int64) int64 {
 	if n == nil || n.claims == nil {

@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.9.2 — DDoS hardening: global pre-verify packet budget + walk caps
+
+From a resilience review of the flood paths (the v0.7.1 audit covered
+memory bounds and per-source-IP throttling; this pass asked what a
+*DISTRIBUTED* attacker gets). Two structural gaps, both now closed:
+
+1. **Pre-auth CPU exhaustion.** Everything inbound — canonical-CBOR
+   decode and the Ed25519 verify — runs on the single `readLoop`
+   goroutine, and an *invalid* signature costs the same verify as a
+   valid one. The per-source-IP buckets (50 get/s, 10 put/s) bound one
+   source's share, but a botnet or a spoofed-source flood draws a
+   fresh bucket per source: the aggregate was unbounded. A
+   well-formed-CBOR, garbage-signature flood pinned one core at full
+   verify cost with no gate in front of it.
+2. **Work amplification.** Every distinct inbound DNS/DHT question can
+   fan out into a multi-second iterative walk (rounds × ≤K probes).
+   Single-flight collapses *identical* questions, but a distinct-name
+   query flood — always a cache miss by construction — opened unbounded
+   concurrent walks; the inbound packet budget can't see it (each
+   question is one cheap packet).
+
+Changes (all Go-level `NodeConfig`/`Resolver` knobs, defaults far above
+honest traffic; negative disables each):
+
+- **`NodeConfig.PacketRateLimit`/`PacketBurst` (default 1000/s, burst
+  2000)** — one GLOBAL token bucket consulted at the very top of
+  `handle()`, before decode and verify. Excess datagrams drop silently
+  (never answered — answering an unverified source would aid
+  amplification). Two fields behind one mutex; no map, no sweep,
+  nothing an attacker can grow. Bounds the aggregate decode+verify CPU
+  whatever the source distribution.
+- **Stray-response pre-verify filter** — a `y="r"/"e"` message whose
+  txid matches no in-flight `sendQuery` is dropped *before* the
+  Ed25519 verify: one map lookup instead of one signature check.
+  Legitimate replies always pass (`sendQuery` registers the txid
+  before its query leaves the socket); a benign race with a
+  just-timed-out query drops a reply nobody is waiting for.
+- **`NodeConfig.WalkConcurrency` (default 64)** — a non-blocking
+  semaphore held for the whole walk in `IterativeGetDetailed`,
+  `CollectClaims` and the §8.4 evidence walk. A saturated budget
+  refuses immediately with the new `ErrWalkBusy` (never queues —
+  queueing would pile one goroutine per waiting query onto the flood).
+  Islands (empty routing table) never consume a slot;
+  `IterativeFindNode` (the registration client's self-initiated
+  table-population walk) is deliberately not gated.
+- **`ErrWalkBusy` maps to SERVFAIL, never NXDOMAIN, never cached** —
+  on both resolver claim paths (ClaimSetResolver and legacy
+  ClaimResolver), exactly like `ErrDegradedMiss`: an overloaded
+  resolver must not let "busy" masquerade as "does not exist", or a
+  flood would park 60 s negative TTLs on arbitrary names.
+  `DHTLookup.CollectClaimsWithWitnesses` likewise serves a LOCAL claim
+  under `ErrWalkBusy` (a saturated walk does not invalidate what this
+  node already holds); only an empty-everywhere overload propagates.
+- **`Resolver.MaxConcurrentResolutions` (default 64)** — the LEADER of
+  each distinct resolution needs a slot (lazily built semaphore;
+  followers of an in-flight question join free, preserving the
+  v0.7.1 single-flight semantics). Refusal is an immediate
+  SERVFAIL-class error, which `ServeDNS` never caches.
+
+Documented residual: the §8.4 evidence fetch inside the resolver's
+chain verification folds fetch errors into a boolean, so an
+`ErrWalkBusy` there degrades to an ordinary verification failure
+(NXDOMAIN) rather than SERVFAIL — reachable only for recovery-root
+names while simultaneously walk-saturated; the resolver-level cap
+rejects most overload before that walk starts.
+
+Tests: `internal/dht/flood_hardening_test.go` (packet budget caps
+single-source AND 5-source floods at exactly the shared burst, refills,
+disables; stray-response flood ignored with the node provably healthy
+afterwards; walk cap refuses a second walk fast with `ErrWalkBusy`,
+releases the slot on completion, `CollectClaims` shares the budget,
+uncapped negative knob; local claim served under walk refusal) and
+`internal/resolver/overload_test.go` (`ErrWalkBusy` → SERVFAIL on both
+claim paths, uncached through the full `ServeDNS` path; distinct
+questions refused fast while identical followers share the flight;
+disabled cap runs concurrently; capped query SERVFAILs and caches
+nothing).
+
+Remaining hardening backlog from the same review (not in this release):
+negative caching of freens NXDOMAINs (random-name cache-bypass floods),
+a per-source QPS limit on the DNS server sockets themselves,
+source-routability cookies for unknown DHT sources (replay
+amplification, needs a spec note), and the deployment layer — nftables
+`hashlimit` in front of the UDP/DNS ports and systemd `CPUQuota`/
+`MemoryMax` on the freens units.
+
 ## v0.9.1 — §8.4 hotfix: same-identity resurrection is ownership continuity
 
 Found live on the LAN fleet (2026-08-22): every freens name on the

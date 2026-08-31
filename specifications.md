@@ -1063,7 +1063,16 @@ Clients MUST NOT present cryptographic ownership as an identity claim.
   reference client applies one shared per-source-IP token bucket to
   `get`, `find_node` and `witness` alike — the latter being the most
   expensive unauthenticated request to serve: PoW verification plus an
-  Ed25519 signature).
+  Ed25519 signature). Because per-source buckets cannot bound a
+  distributed or spoofed-source flood (every distinct source draws a
+  fresh bucket), implementations SHOULD additionally cap the AGGREGATE
+  inbound packet rate ahead of signature verification, and bound how
+  many concurrent iterative lookups one node runs (v0.9.2: the
+  reference client enforces a single global pre-verify token bucket
+  — excess datagrams are dropped silently, never answered, since
+  answering an unverified source would aid amplification — plus a
+  walk-concurrency semaphore whose refusal is a retryable "busy"
+  error, never a negative answer).
 
 ## 13. Prior Art and Rationale
 

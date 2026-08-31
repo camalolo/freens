@@ -191,7 +191,29 @@ type Resolver struct {
 	// zero-value/embedded Resolvers keep working.
 	flightMu sync.Mutex
 	flights  map[cacheKey]*resFlight
+
+	// MaxConcurrentResolutions bounds simultaneously in-flight DISTINCT
+	// resolutions (v0.9.2 overload cap). Single-flight collapses identical
+	// questions, but a distinct-name query flood — every miss caching its
+	// own cache-bypassing walk — would otherwise open unbounded concurrent
+	// DHT walks (the dht.Node additionally caps walks itself; this bounds
+	// the resolver's own chain-verification and upstream-forward work and
+	// applies even with non-DHT sources). A leader that cannot acquire a
+	// slot answers SERVFAIL immediately (never NXDOMAIN — an overloaded
+	// resolver must not negative-cache names); followers of an already
+	// running flight always share it, whatever this value. Zero ⇒ 64.
+	// Negative ⇒ unlimited.
+	MaxConcurrentResolutions int
+
+	// resSem is the resolution-count semaphore, lazily initialized under
+	// flightMu (never reassigned afterwards, so release paths may read it
+	// without the lock). nil ⇒ unlimited.
+	resSem chan struct{}
 }
+
+// errResolverBusy is resolveShared's overload refusal: maps to SERVFAIL,
+// which ServeDNS never caches, so an honest client transparently retries.
+var errResolverBusy = errors.New("resolver: too many concurrent resolutions")
 
 // resFlight is one in-flight (or just-completed) shared resolution.
 type resFlight struct {
@@ -217,6 +239,12 @@ func New(cfg *Config, freens RecordLookup, upstream Upstream) *Resolver {
 // 60 s TTL boundaries). The leader stores the outcome in Cache (when wired)
 // before waking the followers; followers return the shared result verbatim
 // (identical question ⇒ identical namespace answer at the same instant).
+//
+// Overload cap (v0.9.2): the LEADER additionally needs a resolution slot
+// (MaxConcurrentResolutions, default 64). A distinct-question flood beyond
+// the cap gets an immediate SERVFAIL-class error instead of unbounded
+// concurrent resolutions; followers never consume slots — joining an
+// in-flight resolution is free by design.
 func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKey) ([]dns.RR, int, bool, error) {
 	r.flightMu.Lock()
 	if f, ok := r.flights[ck]; ok {
@@ -224,12 +252,36 @@ func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKe
 		<-f.done
 		return f.rrs, f.rcode, f.aa, f.err
 	}
+	// Leader path: lazily build the semaphore, then acquire a slot
+	// non-blocking (an overloaded resolver REFUSES; it never queues, which
+	// would pile one goroutine per waiting query onto the flood).
+	if r.resSem == nil && r.MaxConcurrentResolutions >= 0 {
+		n := r.MaxConcurrentResolutions
+		if n == 0 {
+			n = 64
+		}
+		r.resSem = make(chan struct{}, n)
+	}
+	if r.resSem != nil {
+		select {
+		case r.resSem <- struct{}{}:
+		default:
+			r.flightMu.Unlock()
+			return nil, dns.RcodeServerFailure, false, errResolverBusy
+		}
+	}
 	f := &resFlight{done: make(chan struct{})}
 	if r.flights == nil {
 		r.flights = make(map[cacheKey]*resFlight)
 	}
 	r.flights[ck] = f
 	r.flightMu.Unlock()
+
+	defer func() {
+		if r.resSem != nil {
+			<-r.resSem
+		}
+	}()
 
 	f.rrs, f.rcode, f.aa, f.err = r.ResolveQuestion(ctx, q)
 	if r.Cache != nil {
@@ -598,7 +650,7 @@ func (r *Resolver) resolveAliasClaim(ctx context.Context, alias string, now int6
 		return nil, false, false // record source is not claim-capable: pins only
 	}
 	env, err := cr.LookupClaim(ctx, alias, now)
-	if errors.Is(err, dht.ErrDegradedMiss) {
+	if errors.Is(err, dht.ErrDegradedMiss) || errors.Is(err, dht.ErrWalkBusy) {
 		return nil, false, true
 	}
 	if err != nil || env == nil || env.Record == nil {
@@ -662,8 +714,8 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	} else {
 		envs, err = csr.CollectClaims(ctx, alias, now)
 	}
-	if errors.Is(err, dht.ErrDegradedMiss) {
-		return nil, false, true // issue #1: retryable, not NXDOMAIN
+	if errors.Is(err, dht.ErrDegradedMiss) || errors.Is(err, dht.ErrWalkBusy) {
+		return nil, false, true // issue #1 / overload: retryable, not NXDOMAIN
 	}
 	if err != nil || len(envs) == 0 {
 		return nil, false, false // transient error / no claim anywhere: a miss

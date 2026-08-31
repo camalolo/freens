@@ -132,6 +132,33 @@ const (
 	defaultPutBurst     = 20   // back-to-back puts per idle source
 )
 
+// Default GLOBAL inbound packet budget (v0.9.2). The per-source-IP buckets
+// above bound one source's share, but a botnet (or a spoofed-source flood)
+// draws a fresh bucket per IP, so they cannot bound the aggregate. Everything
+// inbound — decode (canonical-CBOR parse of up to 64 KiB) and the Ed25519
+// verify in handle — runs on the single readLoop goroutine, and an invalid
+// signature costs the SAME verify as a valid one: a well-formed-CBOR,
+// garbage-signature flood pins one core at ~1000 verifies/s without the
+// budget. 1000 packets/s burst 2000 is ~2 orders of magnitude above honest
+// fleet traffic (a 7-node mesh idles under 10 pps; republish waves land at a
+// few pps per node) while capping the pre-auth CPU at roughly one core-tenth
+// of verify work. Excess packets drop silently in handle() BEFORE decode —
+// the kernel's 1 MiB socket buffer already sheds the rest.
+const (
+	defaultPacketRateLimit = 1000.0 // packets/s across ALL sources
+	defaultPacketBurst     = 2000   // back-to-back packets after idle
+)
+
+// defaultWalkConcurrency bounds simultaneously in-flight OUTBOUND iterative
+// walks (v0.9.2). Every distinct inbound DNS/DHT question fans out into a
+// walk of up to dhtLookupTimeout (6 s) issuing rounds × ≤K probes — a
+// distinct-name query flood is a work-AMPLIFICATION attack that the inbound
+// packet budget cannot see (each question is one cheap packet). 64 concurrent
+// walks is far above honest resolver traffic (single-flight already collapses
+// identical questions; the LAN fleet resolves a handful of distinct names per
+// second) while capping the outbound probe fan-out at 64 × K RPCs.
+const defaultWalkConcurrency = 64
+
 // evictQueueCap bounds the pending §6.2 live-eviction requests. Combined with
 // the per-bucket coalescing (evictPending) it guarantees the maintenance path
 // can never accumulate unbounded work under a contact flood.
@@ -222,6 +249,33 @@ type NodeConfig struct {
 	// PutBurst is the token-bucket burst paired with PutRateLimit. Zero ⇒ 20.
 	// Ignored when PutRateLimit < 0.
 	PutBurst int
+	// PacketRateLimit caps INBOUND packets per second across ALL sources (a
+	// single global token bucket, checked in handle BEFORE the canonical-CBOR
+	// decode and the Ed25519 signature verify — both run on the one readLoop
+	// goroutine, and an invalid signature costs the same verify as a valid
+	// one, so a distributed well-formed-garbage flood pins the core without
+	// this budget; the per-source-IP buckets above cannot bound the aggregate
+	// because every distinct/spoofed source draws a fresh bucket). Zero ⇒
+	// 1000. Negative disables the global budget. Excess packets are dropped
+	// silently (never answered — answering an unverified source would aid
+	// amplification; a busy error is itself a response).
+	PacketRateLimit float64
+	// PacketBurst is the token-bucket burst paired with PacketRateLimit (the
+	// number of packets the node accepts back-to-back after an idle period).
+	// Zero ⇒ 2000. Ignored when PacketRateLimit < 0.
+	PacketBurst int
+	// WalkConcurrency bounds simultaneously in-flight outbound iterative
+	// walks (IterativeGet / CollectClaims / evidence lookups). It is the
+	// work-amplification cap: every distinct inbound question can spawn a
+	// multi-second walk fanning out rounds × ALPHA probes, so a distinct-name
+	// flood must not be able to open unbounded walks. A walk that cannot
+	// acquire a slot fails immediately with ErrWalkBusy (never queues —
+	// queueing would pile up goroutines, and ErrWalkBusy maps to SERVFAIL
+	// upstream, which is never cached, so honest clients transparently
+	// retry). Zero ⇒ 64. Negative disables the cap. IterativeFindNode (the
+	// registration client's table-population walk) is NOT gated: it is
+	// self-initiated, not remotely triggerable.
+	WalkConcurrency int
 	// Advertise is the address peers should dial to reach this node (§6.2
 	// line 422-423: "nodes advertise (ip, port, node_pubkey)"). Empty ⇒
 	// today's behavior (peers learn the OBSERVED UDP source address, which
@@ -276,15 +330,17 @@ type Node struct {
 	bgOnce         sync.Once
 	bgWg           sync.WaitGroup
 
-	store  *EnvelopeStore
-	rt     *RoutingTable
-	tokens *TokenStore
-	claims *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
-	diff   *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
-	getLim *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
-	putLim *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
-	log    *slog.Logger
-	nowFn  func() int64
+	store   *EnvelopeStore
+	rt      *RoutingTable
+	tokens  *TokenStore
+	claims  *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
+	diff    *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
+	getLim  *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
+	putLim  *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
+	pktLim  *packetBudget    // GLOBAL pre-verify inbound packet budget; nil = off
+	walkSem chan struct{}    // outbound walk concurrency cap (nil = uncapped)
+	log     *slog.Logger
+	nowFn   func() int64
 
 	// advertise is the validated §6.2 advertised address ("" ⇒ peers learn
 	// the observed source). Parsed from NodeConfig.Advertise once at Start;
@@ -385,6 +441,42 @@ type LookupStats struct {
 // field-churn showed 60 s NXDOMAIN windows for names whose holders were
 // alive the whole time (issue #1).
 var ErrDegradedMiss = errors.New("dht: degraded miss (probe failures; the network could not be fully interrogated)")
+
+// ErrWalkBusy reports an iterative walk REFUSED because the node's outbound
+// walk budget (NodeConfig.WalkConcurrency) is exhausted — the work-
+// amplification cap against distinct-name query floods. Semantically it is
+// "overloaded, retry", exactly like ErrDegradedMiss: the resolver maps it to
+// SERVFAIL (never NXDOMAIN, never cached), and DHTLookup serves a stale
+// cached envelope where it has one. Residual, documented: the §8.4 evidence
+// fetch inside the resolver's chain verification folds fetch errors into a
+// boolean, so an ErrWalkBusy there degrades to an ordinary verification
+// failure (NXDOMAIN) rather than SERVFAIL — reachable only for recovery-root
+// names while simultaneously walk-saturated; the resolver-level resolution
+// cap rejects most overload before that walk starts.
+var ErrWalkBusy = errors.New("dht: walk budget exhausted (too many concurrent iterative walks)")
+
+// acquireWalk reports whether a caller may start an outbound iterative walk
+// (non-blocking: a saturated budget fails immediately rather than queueing —
+// queueing would pile one goroutine per waiting query onto the flood).
+func (n *Node) acquireWalk() bool {
+	if n.walkSem == nil {
+		return true
+	}
+	select {
+	case n.walkSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseWalk returns one walk slot. No-op when the cap is disabled.
+func (n *Node) releaseWalk() {
+	if n.walkSem == nil {
+		return
+	}
+	<-n.walkSem
+}
 
 // ErrThrottled reports a get probe that was answered with the §12 rate-limit
 // error 301 "throttled": the peer is ALIVE but refused to serve the answer
@@ -498,6 +590,28 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		}
 		putLim = newRateLimiter(rate, burst)
 	}
+	// Global pre-verify packet budget: negative rate ⇒ disabled.
+	var pktLim *packetBudget
+	if cfg.PacketRateLimit >= 0 {
+		rate := cfg.PacketRateLimit
+		if rate == 0 {
+			rate = defaultPacketRateLimit
+		}
+		burst := cfg.PacketBurst
+		if burst <= 0 {
+			burst = defaultPacketBurst
+		}
+		pktLim = newPacketBudget(rate, burst)
+	}
+	// Outbound walk concurrency cap: negative ⇒ uncapped (nil channel).
+	var walkSem chan struct{}
+	if cfg.WalkConcurrency >= 0 {
+		cap := cfg.WalkConcurrency
+		if cap == 0 {
+			cap = defaultWalkConcurrency
+		}
+		walkSem = make(chan struct{}, cap)
+	}
 	return &Node{
 		kp:             cfg.Keypair,
 		id:             id,
@@ -514,6 +628,8 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		diff:           newDifficultyState(now()),
 		getLim:         getLim,
 		putLim:         putLim,
+		pktLim:         pktLim,
+		walkSem:        walkSem,
 		log:            log,
 		nowFn:          now,
 		advertise:      cfg.Advertise,
@@ -821,10 +937,37 @@ func asUDP(a net.Addr) *net.UDPAddr {
 // handle decodes, verifies, and routes one inbound datagram. Malformed or
 // unverified messages are dropped silently (never answered — answering an
 // unverified source would aid amplification).
+//
+// Cost-ordering (v0.9.2 DoS hardening): each step is only reached if the
+// cheaper ones passed, so an attacker pays for the expensive work only after
+// paying for — and being bounded by — the cheap gates:
+//
+//  1. GLOBAL packet budget (pktLim): one token per datagram across ALL
+//     sources, consumed BEFORE anything else. The per-source-IP buckets
+//     cannot bound a distributed flood (every distinct or spoofed source
+//     draws a fresh bucket); this does. Excess drops here, pre-decode.
+//  2. Canonical-CBOR decode + structural validate (DecodeMessage), which
+//     includes the id == SHA-256(pk) identity check — a forged-ID message
+//     dies at one hash, not one verify.
+//  3. Stray-response filter: a y="r"/"e" message whose txid matches no
+//     pending outbound query (sendQuery registers the txid BEFORE the query
+//     leaves, so a legitimate reply always finds its entry) is dropped
+//     WITHOUT the Ed25519 verify — response-flood traffic costs one map
+//     lookup instead of one signature check. The check is a filter, not the
+//     authoritative routing (deliver re-looks-up under n.mu; a benign race
+//     with a just-timed-out sendQuery drops a reply nobody waits for).
+//  4. Ed25519 verify — the expensive step — now only for messages that
+//     cleared 1-3.
 func (n *Node) handle(data []byte, raddr *net.UDPAddr) {
+	if n.pktLim != nil && !n.pktLim.allow() {
+		return // global budget exhausted: cheapest possible drop
+	}
 	m, err := wire.DecodeMessage(data)
 	if err != nil {
 		return
+	}
+	if (m.Y == wire.MsgTypeResponse || m.Y == wire.MsgTypeError) && !n.hasPending(m.T) {
+		return // stray response/error: nobody is waiting on this txid
 	}
 	// Verify: id == SHA-256(pk) (already enforced by DecodeMessage) AND sig
 	// covers [t, id, OUR_id, a] (recipient_id = this node).
@@ -842,6 +985,16 @@ func (n *Node) handle(data []byte, raddr *net.UDPAddr) {
 	case wire.MsgTypeQuery:
 		n.handleQuery(m, raddr)
 	}
+}
+
+// hasPending reports whether some in-flight sendQuery is waiting on txid.
+// It is a pre-verify filter for inbound responses/errors, NOT the routing
+// lookup — deliver remains the authoritative consumer.
+func (n *Node) hasPending(txid []byte) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	_, ok := n.pending[string(txid)]
+	return ok
 }
 
 // deliver routes a response/error to the sendQuery call waiting on its txid.
@@ -1748,6 +1901,12 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 	if len(shortlist) == 0 {
 		return nil, stats, nil // no peers known: an island.
 	}
+	// Work-amplification cap: this walk holds one of WalkConcurrency slots
+	// for its whole run (islands returned above — they hold no slot).
+	if !n.acquireWalk() {
+		return nil, stats, ErrWalkBusy
+	}
+	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
 	var bestEnv *wire.SignedEnvelope
 	batchSize := constants.Alpha
@@ -2849,6 +3008,44 @@ func newRateLimiter(rate float64, burst int) *rateLimiter {
 		burst:   float64(burst),
 		buckets: make(map[string]*tokenBucket),
 	}
+}
+
+// packetBudget is the GLOBAL inbound packet budget (NodeConfig.
+// PacketRateLimit/PacketBurst): one token bucket for ALL sources together,
+// consulted at the very top of handle() — before decode and verify — so a
+// distributed or spoofed flood (which the per-source-IP rateLimiter cannot
+// bound, every distinct source drawing a fresh bucket) hits a hard,
+// dirt-cheap ceiling. State is two fields behind one mutex; no map, no idle
+// sweep, nothing an attacker can grow.
+type packetBudget struct {
+	rate   float64 // tokens/second
+	burst  float64 // capacity
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+}
+
+func newPacketBudget(rate float64, burst int) *packetBudget {
+	return &packetBudget{rate: rate, burst: float64(burst)}
+}
+
+// allow reports whether one more inbound packet fits the global budget,
+// refilling lazily from the elapsed time since the previous packet. The
+// first packet after construction sees a FULL bucket (tokens starts at 0 but
+// last is zero-valued, so the initial refill grants the full burst).
+func (p *packetBudget) allow() bool {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if dt := now.Sub(p.last); dt > 0 {
+		p.tokens = min(p.burst, p.tokens+dt.Seconds()*p.rate)
+	}
+	p.last = now
+	if p.tokens >= 1 {
+		p.tokens--
+		return true
+	}
+	return false
 }
 
 // allow reports whether one request from key fits the bucket, refilling it

@@ -343,6 +343,12 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 	if len(shortlist) == 0 {
 		return nil, nil // no peers known: an island.
 	}
+	// Work-amplification cap (as IterativeGetDetailed): refuse with
+	// ErrWalkBusy when the walk budget is saturated.
+	if !n.acquireWalk() {
+		return nil, ErrWalkBusy
+	}
+	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
 	for round := 0; round < maxLookupRounds; round++ {
 		// Nearest-first so the ALPHA un-queried we pick are the closest.
