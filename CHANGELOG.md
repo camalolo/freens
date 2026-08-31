@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.10.0 — `freens upgrade`: one-command self-update from GitHub releases
+
+The fleet's deploy procedure until now was scp-tarball-then-systemctl per
+box (see the release checklist); this replaces it with the verb the
+daemon has always wanted:
+
+    freens upgrade            # latest release: download, verify, install, restart
+    freens upgrade -check     # read-only comparison against api.github.com
+    freens upgrade -yes       # the non-interactive form (scripts, fleet ssh)
+    freens upgrade -version v0.9.1   # pin a tag (a plain number gets the v)
+
+The flow, end to end on the target machine:
+
+- **Fetch**: `releases/latest` (or `releases/tags/<vX.Y.Z>`) via the REST
+  API; the platform asset is picked by the CI naming scheme
+  (`freens-<goos>-<goarch>.tar.gz`, release.yml). `GITHUB_TOKEN` is
+  honored for the API budget.
+- **Verify before touching anything**: the tarball is unpacked member by
+  member (only the three release binaries, size-capped) into a staging
+  dir, and the staged `freens` is EXECUTED: it must run and report
+  exactly the target tag via `freens version`. CI ships no checksums, so
+  "does the binary identify as the release?" is the download-integrity
+  check — a truncated or cross-arch tarball dies here, before a single
+  byte of the live install changes.
+- **Config migrations run through the NEW binary**: `upgrade` execs
+  `<staged>/freens upgrade-migrate -from <old>` before installing. This
+  ordering is the whole point — a migration for a (v0.9.1 → v0.9.3-tls)
+  transition can only be known by v0.9.3-tls' code, which the running
+  old binary cannot contain. `upgrade-migrate` is a real (internal)
+  dispatch verb, applies the idempotent `configPatches` table, and backs
+  the config up once as `freens.conf.pre-upgrade` (setup's
+  resolv.conf-backup convention). First patch: `webui-name` (since
+  v0.9.3) pins `[webui] name` to the keychain's single owner alias when
+  the section lacks a name — freens-web's alphabetical fallback is the
+  wrong name for multi-alias owners (found live on the v0.9.3-tls
+  deploy; AGENTS.md says SET IT — now the upgrader sets it).
+- **Install in place, atomically**: each binary lands as
+  `<target>.freens-new` in the SAME directory (rename(2), no gap where
+  no binary exists) and renames over the running image — legal on
+  Linux, the open inode keeps executing the old code through the rest
+  of the verb. Privileged install dirs go through setup's
+  sudoRun sequence (passwordless → interactive on a TTY → manual
+  commands printed); user-writable dirs skip sudo entirely. The
+  previous binary is kept as `<target>.freens-prev` — copy back +
+  restart to roll back.
+- **Restart + health**: every ACTIVE `freens*` systemd unit is
+  discovered (`systemctl list-units 'freens*'` — daemon + freens-web +
+  comm chairs), daemon first and webui last, restarted via the same
+  sudo path; if the admin socket answered before the upgrade, the verb
+  polls it for 20 s afterwards and reports the daemon's version and
+  peer count.
+
+Safety rails: `-check` touches nothing; a dev/unstamped build, an
+up-to-date install, or a downgrade each refuse without `-force`; a
+non-TTY run without `-yes` refuses (no surprise rewrites from cron);
+identical binaries (sha256) are skipped. The freens-cli shim now
+stamps its ldflags version into the shared CLI so `freens-cli upgrade`
+compares correctly too.
+
+Tests: version parse/compare (numeric triples, repo-style `-suffix`
+ordering, dev stamps), asset selection, staging + verification against
+a built tarball, the migration table (apply/skip/no-op/idempotence),
+unit discovery ordering (daemon first, web last, failed units
+excluded), and the full download→verify→migrate→install→restart
+flow against a fake GitHub and a fake install dir.
+
 ## v0.9.3-tls — §9.5 self-certifying TLS: spec + implementation (fleet-tested)
 
 HTTPS for freens names in stock browsers, between freens users, with no

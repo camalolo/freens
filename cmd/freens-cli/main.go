@@ -37,5 +37,10 @@ func shimMain(argv []string) int {
 		}
 	}
 	cli.ProgName = "freens-cli"
+	// Expose the shim's own ldflags stamp to the shared CLI (the `upgrade`
+	// verb compares it against GitHub releases; cmd/freens does the same
+	// with its main.version). The `version` verb is still intercepted
+	// above, so this changes nothing about its output.
+	cli.Version = cliVersion
 	return cli.Main(argv[1:])
 }

@@ -26,6 +26,9 @@
 //	status                       Plain-language health (daemon, name -> IP); -v adds raw fields.
 //	doctor                       Health checks (admin socket, DNS path, peers, seeds, OS
 //	                             resolver); --fix repairs daemon/resolver-wiring first.
+//	upgrade                      Fetch the latest GitHub release, install its binaries
+//	                             in place, migrate freens.conf, restart the services
+//	                             (-check compares only; -yes for scripts).
 //	demo                         Self-contained end-to-end showcase (the headline demo).
 //
 // Exit codes: 0 success, 1 usage/error, 2 crypto/validation failure.
@@ -88,6 +91,8 @@ var dispatch = map[string]func([]string) error{
 	"backup":          cmdBackup,
 	"status":          cmdStatus,
 	"doctor":          cmdDoctor,
+	"upgrade":         cmdUpgrade,
+	"upgrade-migrate": cmdUpgradeMigrate,
 	"demo":            cmdDemo,
 	"version":         cmdVersion,
 }
@@ -229,6 +234,10 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  status                 plain-language health: daemon + name -> IP (-v adds raw daemon fields)")
 	fmt.Fprintln(w, "  doctor                 health checks: admin socket, DNS path, aliases, peers, seeds, OS resolver")
 	fmt.Fprintln(w, "                         (--fix repairs: starts the daemon, wires the OS resolver)")
+	fmt.Fprintln(w, "  upgrade                self-update: fetch the latest GitHub release, verify + install its binaries in")
+	fmt.Fprintln(w, "                         place, patch freens.conf, restart the freens* services (-check compares only;")
+	fmt.Fprintln(w, "                         -version <tag> pins; -yes for scripts; old binaries kept as *.freens-prev)")
+	fmt.Fprintln(w, "  upgrade-migrate        internal: the config-migration half of `upgrade`, run through the NEW binary")
 	fmt.Fprintln(w, "  register <alias>       claim an alias end-to-end (spec 7): key -> PoW -> W live witness")
 	fmt.Fprintln(w, "                         co-signatures -> TLD record published at K_tld+K_claim (2-of-3 recovery default)")
 	fmt.Fprintln(w, "  revoke <name>          tombstone a name you own (spec 9.5): stops resolving everywhere;")
