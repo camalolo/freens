@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — §9.5 self-certifying TLS: spec + implementation (fleet-tested)
+## v0.9.3-tls — §9.5 self-certifying TLS: spec + implementation (fleet-tested)
 
 HTTPS for freens names in stock browsers, between freens users, with no
 central CA. Spec §9.5 written first (see the design entry further down),
@@ -55,7 +55,7 @@ re-mines and hits the §8.4 reuse window — scratch path proven on the
 fleet, a proper `freens un-revoke` verb is the follow-up; atlantic was
 recovered this way).
 
-## Unreleased — spec: self-certifying TLS (§9.5): HTTPS for freens names in stock browsers
+## v0.9.3-tls (spec design entry) — self-certifying TLS: HTTPS for freens names in stock browsers
 
 Design addition, no code yet (per decision: spec first, implementation
 follows). Answers the cross-user case: MY browser must trust a FRIEND's
