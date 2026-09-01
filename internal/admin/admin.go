@@ -27,6 +27,10 @@
 //	POST /resolve  {name[, tld_id_b32]} — display name → Resolved record
 //	POST /witness  {alias, tld_id_hex, claimant_hex, ts} — §7.4 steps 3-4
 //	GET  /peers    routing-table contacts (CLI standalone-fallback bootstrap)
+//	GET  /tls      §9.5 trust-sync snapshot (root fingerprint + cross-certs)
+//	POST /dns-query  raw DNS wire query → wire answer (the webui's DoH face
+//	                 relays here; v0.14.0 §9.6)
+//	POST /reload   re-read freens.conf, hot-apply the [upstream] forwarder
 //
 // When the daemon runs WITHOUT a DHT node (node == nil — a resolver-only
 // process), every network endpoint answers 503 {"error":"no dht node"} while
@@ -40,6 +44,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -82,6 +87,13 @@ type Server struct {
 	// daemon (SetTLSProvider); nil ⇒ GET /tls answers 503. Guarded by mu:
 	// the daemon wires it shortly after the serve goroutine starts.
 	tlsSnapshot func() any
+
+	// dnsResolve/reloadConf are the OPTIONAL v0.14.0 DoH relay endpoints
+	// (dns.go, SetDNSHandler/SetReloader); nil ⇒ the endpoint answers 503.
+	// Same late-wiring idiom as tlsSnapshot (the resolver exists only after
+	// the admin server is already serving).
+	dnsResolve func(ctx context.Context, query []byte) ([]byte, error)
+	reloadConf func() (string, error)
 
 	// jobsMu/jobs/jobSeq are the async-publish registry (jobs.go): POST
 	// /publish {"async":true} runs the keyed put in the background and

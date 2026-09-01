@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/certmgr"
 )
 
@@ -35,6 +36,13 @@ type Server struct {
 	// nginx is the certmgr toolchain the Certificates page deploys with
 	// (nil = discover lazily; tests substitute a fixture tree).
 	nginx *certmgr.NginxEnv
+
+	// doh is the §9.6 serve-face state (doh.go): the cached [upstream]/[doh]
+	// conf view. dnsClient is the admin-socket client the /dns-query relay
+	// forwards wire queries through (independent of d, whose 30 s budget
+	// fits walks but not a DoH request).
+	doh       dohConfState
+	dnsClient *admin.Client
 
 	mux *http.ServeMux
 
@@ -84,18 +92,19 @@ func New(cfg *Config, sockPath string, log *slog.Logger) (*Server, error) {
 		authPath = filepath.Join(home, "webui", "auth")
 	}
 	s := &Server{
-		cfg:      cfg,
-		home:     home,
-		keysDir:  filepath.Join(home, "keys"),
-		sock:     sockPath,
-		d:        NewDaemonClient(sockPath),
-		log:      log,
-		gateOpen: gated,
-		allow:    allow,
-		auth:     newAuthStore(authPath),
-		jobs:     map[string]*job{},
-		ready:    make(chan struct{}),
-		oneshots: map[*oneShotListener]struct{}{},
+		cfg:       cfg,
+		home:      home,
+		keysDir:   filepath.Join(home, "keys"),
+		sock:      sockPath,
+		d:         NewDaemonClient(sockPath),
+		dnsClient: &admin.Client{Sock: sockPath, Timeout: 10 * time.Second},
+		log:       log,
+		gateOpen:  gated,
+		allow:     allow,
+		auth:      newAuthStore(authPath),
+		jobs:      map[string]*job{},
+		ready:     make(chan struct{}),
+		oneshots:  map[*oneShotListener]struct{}{},
 	}
 	if gated && len(allow) == 0 {
 		return nil, errNoAllowlist
@@ -129,6 +138,17 @@ func (s *Server) routes() {
 		http.Error(w, "no icon", http.StatusNoContent)
 	})
 
+	// §9.6 DoH face (doh.go): machine-facing, so NOT behind requireAuth or
+	// the CSRF header — a resolver client is not a logged-in browser. The
+	// CIDR gate still applies (it wraps the whole mux), and [doh] serve
+	// gates each request (404 when off, read through the short conf cache
+	// so `freens doh serve on` lands without a UI restart).
+	s.mux.HandleFunc("GET /dns-query", s.handleDoHQuery)
+	s.mux.HandleFunc("POST /dns-query", s.handleDoHQuery)
+	// The owner CA for client devices to import (public material; gate
+	// applies, auth does not — a phone importing the cert has no session).
+	s.mux.HandleFunc("GET /api/doh/root.pem", s.handleDoHRootPEM)
+
 	// Auth pages: the auth flow itself — NOT behind requireAuth (wrapping
 	// /login in the session check made an unauthenticated GET /login
 	// redirect to itself: the original "too many redirects" bug, found live
@@ -159,6 +179,7 @@ func (s *Server) routes() {
 	page("GET /api/dash/checks", s.handleDashChecks)
 	page("GET /keys", s.handleKeysPage)
 	page("GET /certs", s.handleCertsPage)
+	page("GET /settings", s.handleSettingsPage)
 
 	// Mutations (auth + gate + CSRF header).
 	mut := func(pattern string, h http.HandlerFunc) {
@@ -176,6 +197,8 @@ func (s *Server) routes() {
 	mut("POST /api/cert/renew", s.handleCertRenew)
 	mut("POST /api/cert/nginx", s.handleCertNginxInstall)
 	mut("POST /api/cert/nginx/reload", s.handleCertNginxReload)
+	mut("POST /api/settings/doh", s.handleSettingsDoHPost)
+	mut("POST /api/doh/test", s.handleDoHTestPost)
 }
 
 // page wraps a handler with gate + logging + auth.

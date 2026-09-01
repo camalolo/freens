@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/camalolo/freens/internal/metrics"
@@ -130,18 +131,29 @@ func (s *Server) Shutdown() error {
 }
 
 // ServeDNS implements dns.Handler so a *Resolver can be served directly by a
-// dns.Server (no Server wrapper required). It builds a response Msg with the
-// echoed question, the answer RRs from ResolveQuestion, and the matching
-// rcode/AA flags.
+// dns.Server (no Server wrapper required). It resolves via ResolveMsg and
+// writes the response with the datagram framing rules (UDP truncation, see
+// writeReply).
 func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
+	writeReply(w, r.ResolveMsg(context.Background(), m))
+}
+
+// ResolveMsg answers one DNS query message and returns the response message
+// (never nil; the echoed question + rcode/answers/AA per §9.2). It is the
+// message-level twin of ServeDNS for transports that are NOT miekg/dns
+// listeners: the RFC 8484 DoH handler (doh.go) and the admin socket's
+// /dns-query relay (which fronts the webui's DoH face). Every semantic —
+// the §10.4 cache, serve-stale, single-flight, the overload cap, AA
+// marking — is byte-for-byte the UDP/TCP path's; only the transport framing
+// differs (UDP truncation stays with writeReply; HTTPS needs none).
+func (r *Resolver) ResolveMsg(ctx context.Context, m *dns.Msg) *dns.Msg {
 	resp := new(dns.Msg)
 	resp.SetReply(m)
 	resp.RecursionAvailable = r.Upstream != nil || r.Freens != nil
 
 	if len(m.Question) == 0 {
 		resp.Rcode = dns.RcodeFormatError
-		_ = w.WriteMsg(resp)
-		return
+		return resp
 	}
 
 	q := m.Question[0]
@@ -175,26 +187,23 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 			resp.Rcode = rcode
 			resp.Answer = rrs
 			resp.Authoritative = aa
-			writeReply(w, resp)
-			return
+			return resp
 		case cacheStale:
 			r.kickRefresh(q, ck)
 			resp.Rcode = rcode
 			resp.Answer = rrs
 			resp.Authoritative = aa
-			writeReply(w, resp)
-			return
+			return resp
 		}
 	}
 
 	// resolveShared: single-flight the resolution (concurrent identical
 	// queries share one DHT walk; the leader caches the outcome per §10.4 —
 	// which is why the old putFreens call moved inside it).
-	rrs, rcode, aa, err := r.resolveShared(context.Background(), q, ck)
+	rrs, rcode, aa, err := r.resolveShared(ctx, q, ck)
 	if err != nil {
 		resp.Rcode = dns.RcodeServerFailure
-		writeReply(w, resp)
-		return
+		return resp
 	}
 	resp.Rcode = rcode
 	resp.Answer = rrs
@@ -204,7 +213,7 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 	// is meaningful for any rcode that an authoritative server would emit
 	// (including NXDOMAIN/NODATA), so we set it verbatim from the resolver.
 	resp.Authoritative = aa
-	writeReply(w, resp)
+	return resp
 }
 
 // writeReply sends resp, truncating UDP responses that exceed the classic
@@ -312,12 +321,40 @@ func ensureDNSPort(srv string) string {
 // when DoH fails (network, 4xx/5xx, malformed response) the query is
 // retried over conventional DNS rather than erroring out, so wiring DoH
 // never reduces availability. A nil Fallback makes DoH the only path.
+//
+// Bootstrap loop (v0.14.0): the DoH endpoint's own HOSTNAME is resolved via
+// the plaintext Fallback servers — never the OS resolver. With the fleet's
+// standard wiring (resolv.conf → 127.0.0.1) the OS resolver IS this daemon,
+// so an OS-resolved dial of "dns.example.com" would route the bootstrap
+// lookup straight back into RouteDNS → this very DoHUpstream → another
+// OS-resolved dial: a self-deadlock that SERVFAILed every forwarded name
+// (single-flight deduplicates the loop into one wedged flight). IP-form
+// endpoint URLs (the shipped presets use https://9.9.9.9/dns-query and
+// https://1.1.1.1/dns-query) never need bootstrapping at all; hostname URLs
+// get Fallback-resolved IPs pinned onto the dialer (SNI + certificate
+// verification still use the URL's hostname — only the TCP dial is pinned).
+// When the Fallback cannot answer (no servers, all down), dialing degrades
+// to the OS resolver — correct on boxes whose resolv.conf does NOT point
+// here, and merely slow (bounded by the request timeout) on boxes that do.
 type DoHUpstream struct {
 	URL      string        // the DoH endpoint (e.g. https://dns.example/dns-query)
 	Timeout  time.Duration // per-request timeout; default 5 s
-	Client   *http.Client  // default: a client with Timeout applied
+	Client   *http.Client  // default: a client whose dialer bootstraps via Fallback
 	Fallback *DNSUpstream  // optional plaintext fallback (tried after DoH fails)
+
+	// Bootstrap state: the endpoint host's pinned IPs and when they were
+	// resolved. Guarded by bootMu; refreshed lazily after bootstrapRefresh
+	// (and re-pinned only on success — a failed re-resolve keeps serving on
+	// the last known-good IPs rather than going dark).
+	bootMu  sync.Mutex
+	bootIPs []net.IP
+	bootAt  time.Time
 }
+
+// bootstrapRefresh is how long a pinned DoH-endpoint IP stays trusted before
+// the next connection attempt re-resolves it (DoH endpoints are anycast and
+// near-immortal; this bounds staleness without per-request DNS chatter).
+const bootstrapRefresh = 5 * time.Minute
 
 // Forward implements Upstream: one DoH POST of the packed query; on success
 // (HTTP 200 with a decodable DNS message) the response is returned as-is.
@@ -329,10 +366,7 @@ func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	client := u.Client
-	if client == nil {
-		client = &http.Client{Timeout: timeout}
-	}
+	client := u.httpClient(timeout)
 	payload, err := q.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("resolver: pack query for DoH: %w", err)
@@ -360,6 +394,111 @@ func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH response unpack: %w", err))
 	}
 	return out, nil
+}
+
+// httpClient builds the request client. A caller-supplied Client (the test
+// seam, or an embedder with special transport needs) wins untouched;
+// otherwise the client gets a transport whose dialer pins the endpoint host
+// to Fallback-resolved IPs (see the bootstrap-loop note on DoHUpstream).
+func (u *DoHUpstream) httpClient(timeout time.Duration) *http.Client {
+	if u.Client != nil {
+		return u.Client
+	}
+	t := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		DialContext:           u.dialContext,
+	}
+	return &http.Client{Timeout: timeout, Transport: t}
+}
+
+// dialContext is the transport's connection dialer: the DoH endpoint's
+// hostname (if any) is resolved through the plaintext Fallback servers and
+// the IP pinned onto the TCP dial. TLS is NOT affected — the http.Transport
+// wraps the conn itself, verifying the certificate against the URL's
+// hostname (ServerName), so a pinned IP can never silently redirect trust.
+func (u *DoHUpstream) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not host:port — dial verbatim and let the failure speak.
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+	if net.ParseIP(host) == nil {
+		if ips, ierr := u.bootstrapIPs(ctx, host); ierr == nil && len(ips) > 0 {
+			addr = net.JoinHostPort(ips[0].String(), port)
+		}
+		// Bootstrap failed → OS resolver. On the standard wiring that is
+		// this daemon and the lookup SERVFAILs quickly (its own upstream
+		// attempt is the outer call); the dial error then falls through to
+		// fallbackOr, which is exactly the plaintext path we want anyway.
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
+
+// bootstrapIPs returns pinned IPs for host, resolving (re-pinning) them via
+// the Fallback servers when the cache is empty or stale.
+func (u *DoHUpstream) bootstrapIPs(ctx context.Context, host string) ([]net.IP, error) {
+	u.bootMu.Lock()
+	defer u.bootMu.Unlock()
+	if len(u.bootIPs) > 0 && time.Since(u.bootAt) < bootstrapRefresh {
+		return u.bootIPs, nil
+	}
+	ips, err := u.resolveViaFallback(ctx, host)
+	if err != nil || len(ips) == 0 {
+		if len(u.bootIPs) > 0 {
+			return u.bootIPs, nil // stale beats dark
+		}
+		if err == nil {
+			err = errors.New("resolver: no bootstrap answer for " + host)
+		}
+		return nil, err
+	}
+	u.bootIPs = ips
+	u.bootAt = time.Now()
+	return ips, nil
+}
+
+// resolveViaFallback asks the plaintext servers for host's A records (AAAA
+// as a fallback when no A exists) using the same exchange seam as the plain
+// forwarder, so tests can stand in for the network.
+func (u *DoHUpstream) resolveViaFallback(ctx context.Context, host string) ([]net.IP, error) {
+	if u.Fallback == nil || len(u.Fallback.Servers) == 0 {
+		return nil, errors.New("resolver: no plaintext fallback servers to bootstrap the DoH endpoint")
+	}
+	timeout := u.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		q := new(dns.Msg)
+		q.SetQuestion(dns.Fqdn(host), qtype)
+		q.RecursionDesired = true
+		for _, srv := range u.Fallback.Servers {
+			resp, err := exchangeWith(ctx, q, ensureDNSPort(srv), "udp", timeout)
+			if err != nil || resp == nil || resp.Rcode != dns.RcodeSuccess {
+				continue
+			}
+			var ips []net.IP
+			for _, rr := range resp.Answer {
+				switch r := rr.(type) {
+				case *dns.A:
+					ips = append(ips, r.A)
+				case *dns.AAAA:
+					ips = append(ips, r.AAAA)
+				}
+			}
+			if len(ips) > 0 {
+				return ips, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 // fallbackOr retries q over the plaintext Fallback (if any) after a DoH

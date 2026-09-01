@@ -188,7 +188,7 @@ func cmdDoctor(args []string) error {
 		fmt.Printf("%s %s\n", mark, fmt.Sprintf(format, args...))
 	}
 	warn := func(format string, args ...any) {
-		fmt.Printf("✱ %s\n", fmt.Sprintf(format, args...))
+		doctorWarn(format, args...)
 	}
 
 	// 1. admin socket.
@@ -344,14 +344,18 @@ func cmdDoctor(args []string) error {
 		}
 	}
 
+	// 11. §9.6 DoH (warn-only, v0.14.0): when the box actually uses DoH —
+	//     as upstream or serve — prove the configured pieces still answer.
+	//     Silent otherwise; never paints the health unit red (the upstream
+	//     has a plaintext fallback, the serve face is LAN-only).
+	doctorDoH(c)
+
 	if failed > 0 {
 		return fmt.Errorf("doctor: %d check(s) failed", failed)
 	}
 	fmt.Println("doctor: all checks passed")
 	return nil
-}
-
-// runDoctorFixes is doctor --fix: repair the two things a user can't fix
+} // runDoctorFixes is doctor --fix: repair the two things a user can't fix
 // wrong — the daemon not running (re-run setup: idempotent, ends with
 // systemctl enable --now) and the OS resolver not pointing at the daemon
 // (the same wiring setup performs, interactive sudo on a TTY). Everything

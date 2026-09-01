@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.14.0 — DoH both ways: encrypted upstream + serving /dns-query (spec §9.6)
+
+DNS-over-HTTPS as a first-class switch in each direction, each one line
+of config (or one webui toggle), both default OFF:
+
+- **Encrypted upstream** (`[upstream] doh = …`): RFC 8484 POSTs to the
+  configured endpoint with the plain `servers` list kept as fallback —
+  a DoH outage degrades to exactly today's behavior, never to errors.
+  The `[upstream] doh` key existed since pre-v0.7.1 but was parsed and
+  never wired; it is now the real thing.
+- **Bootstrap-loop fix (the bug under the feature)**: with the standard
+  wiring (`resolv.conf → 127.0.0.1`) a HOSTNAME DoH URL deadlock-looped
+  through this very daemon — the endpoint's name resolved via the OS
+  resolver, which is us, which resolves it via DoH, which needs the
+  endpoint's name … Now the endpoint hostname is resolved via the
+  plaintext servers and pinned onto the dialer (TLS still verifies the
+  URL hostname), and the shipped presets are IP-form URLs
+  (`https://9.9.9.9/dns-query`, `https://1.1.1.1/dns-query`) that need
+  no bootstrap at all.
+- **Serving DoH** (`[doh] serve = true`): the freens-web listener
+  answers `/dns-query` for LAN devices — same §9.5 certificate, same
+  CIDR gate, same port, no new firewall rules. The HTTPS face relays to
+  the daemon's resolver over the admin socket (`POST /dns-query`), and
+  a down daemon answers SERVFAIL as a DNS message, never a bare HTTP
+  error. `GET /api/doh/root.pem` serves the owner CA for one-click
+  device import.
+- **Applied live, not at restart**: `POST admin /reload` hot-swaps the
+  upstream (a `resolver.UpstreamRef`; in-flight queries finish on the
+  upstream they started with). `freens doh upstream quad9` or the
+  webui Settings page save + apply in one step; the `[doh] serve` face
+  re-reads its switch with a ~2 s cache, so toggling costs nothing.
+  The reload re-applies the implicit `9.9.9.9, 1.1.1.1` fallback fill —
+  the first fleet run skipped it and silently downgraded the fallback
+  to "no servers" on confs (like the fleet's own) that never spell one
+  out; the reload response's trailing "fallback )" was the tell.
+- **freens-web's home default now matches the platform** (found live on
+  the desktop box in the same test): the UI resolved its default home as
+  `~/.freens` while the Windows platform default is
+  `%ProgramData%\freens` — under LocalSystem that meant the UI read a
+  stale keychain, a nonexistent admin socket, and the WRONG freens.conf,
+  so its `/dns-query` stayed 404 no matter what the conf said. The
+  default is `internal/home.Dir()` now, same as every other component.
+- **The controls**: new Settings page in the webui (upstream preset
+  picker + serve toggle + device client-URL + self-Test button), new
+  `freens doh` verb (`status` / `upstream <preset|URL|off>` / `serve
+  on|off` / `test [name]`), and warn-only `doctor` checks (a DoH
+  problem never fails the health unit). Config edits go through the new
+  `internal/confedit`: comment-preserving line surgery, atomic rename,
+  original mode kept, one `.pre-doh` undo generation.
+
+Fleet-verified (server, laurent-minipc, nanopi, desktop): tcpdump shows
+upstream traffic is TLS-only (:443) with DoH on; GET+POST DoH queries
+verified against the fetched owner CA work from Linux and Windows
+clients to Linux and Windows servers; serve off → 404 and back on
+without restarting anything; the switch survives daemon restarts.
+
 ## v0.13.16 — a slow upstream stops being fatal (upstream retries, upgrade retries, refresh-failure visibility)
 
 Field report from camalolo-box (a fresh box's very first `freens

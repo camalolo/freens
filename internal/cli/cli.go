@@ -85,6 +85,7 @@ var dispatch = map[string]func([]string) error{
 	"name":            cmdName,
 	"cert":            cmdCert,
 	"trust-install":   cmdTrustInstall,
+	"doh":             cmdDoh,
 	"transfer":        cmdTransfer,
 	"rotate":          cmdRotate,
 	"recover":         cmdRecover,
@@ -266,6 +267,9 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "                         `cert nginx <name>` wires an existing server block (backup -> edit ->")
 	fmt.Fprintln(w, "                         nginx -t -> reload), `cert list` / `cert forget` manage the tracked table")
 	fmt.Fprintln(w, "  trust-install          one-time per device: import your local trust root so https://<name> works (spec 9.5)")
+	fmt.Fprintln(w, "  doh                    DNS-over-HTTPS (spec 9.6): `doh` shows state, `doh upstream <quad9|cloudflare|")
+	fmt.Fprintln(w, "                         google|URL|off>` encrypts upstream forwarding (applied live), `doh serve <on|off>`")
+	fmt.Fprintln(w, "                         exposes https://<this-box>:8090/dns-query, `doh test [name]` self-checks")
 	fmt.Fprintln(w, "  gen-key                generate an Ed25519 keypair (-out writes a 0600 keyfile)")
 	fmt.Fprintln(w, "  mine-claim             mine an AliasClaim PoW")
 	fmt.Fprintln(w, "  make-record            build + sign a freens record (optional -recovery-* embed a spec 5.4 policy; -out writes the .cbor)")

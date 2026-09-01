@@ -67,6 +67,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /store", s.handleStore)
 	mux.HandleFunc("GET /difficulty", s.handleDifficulty)
 	mux.HandleFunc("GET /tls", s.handleTLS)
+	mux.HandleFunc("POST /dns-query", s.handleDNSQuery)
+	mux.HandleFunc("POST /reload", s.handleReload)
 	return s.logRequests(mux)
 }
 

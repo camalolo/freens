@@ -1,0 +1,70 @@
+{{define "content"}}
+<div class="page-head">
+  <div><h1>Settings</h1>
+    <div class="subtitle">DNS-over-HTTPS (§9.6) — encrypt this box's upstream, serve DoH to the LAN</div></div>
+</div>
+
+<div class="card">
+  <div class="card-title">DNS over HTTPS</div>
+  <form hx-post="/api/settings/doh" hx-swap="none">
+    <div class="mt">
+      <label for="upstream_mode"><strong>Encrypted upstream</strong> — forward conventional names over DoH
+        (plain servers stay as fallback)</label>
+      <div class="row mt">
+        <select name="upstream_mode" id="upstream_mode">
+          <option value="off" {{if not .UpstreamURL}}selected{{end}}>Off — plain DNS</option>
+          <option value="quad9" {{if eq .UpstreamURL "https://9.9.9.9/dns-query"}}selected{{end}}>Quad9 (9.9.9.9)</option>
+          <option value="cloudflare" {{if eq .UpstreamURL "https://1.1.1.1/dns-query"}}selected{{end}}>Cloudflare (1.1.1.1)</option>
+          <option value="google" {{if eq .UpstreamURL "https://dns.google/dns-query"}}selected{{end}}>Google (dns.google)</option>
+          <option value="custom" {{if and .UpstreamURL (ne .UpstreamURL "https://9.9.9.9/dns-query") (ne .UpstreamURL "https://1.1.1.1/dns-query") (ne .UpstreamURL "https://dns.google/dns-query")}}selected{{end}}>Custom URL…</option>
+        </select>
+        <input type="text" name="upstream_url" placeholder="https://dns.example/dns-query" value="{{.UpstreamURL}}" autocomplete="off">
+      </div>
+      <div class="muted mt">Applied live on a running daemon — no restart needed.</div>
+    </div>
+
+    <div class="mt">
+      <label><input type="checkbox" name="serve" {{if .Serve}}checked{{end}}>
+        <strong>Serve DoH</strong> — answer <span class="mono">/dns-query</span> on this UI's HTTPS listener
+        (LAN CIDR gate applies)</label>
+    </div>
+
+    <div class="row mt">
+      <button class="btn primary" type="submit">Save</button>
+    </div>
+  </form>
+
+  {{if .Serve}}
+  <div class="mt card-inner">
+    {{if .ClientURL}}
+    <div>Point a device here:</div>
+    <div class="mono">{{.ClientURL}}</div>
+    <div class="muted mt">The device must trust this box's root first:
+      <a href="/api/doh/root.pem">download it</a> (import into the device's user/system CA store), then test:</div>
+    <form class="row mt" hx-post="/api/doh/test" hx-swap="none">
+      <input type="text" name="name" placeholder="example.com" autocomplete="off">
+      <button class="btn small" type="submit">Test</button>
+    </form>
+    {{else}}
+    <div class="muted">No keychain name yet — register one to get a verifiable DoH URL.</div>
+    {{end}}
+  </div>
+  {{else if not .HasKeychain}}
+  <div class="mt muted">No keychain name yet — registering a name gives this box a verifiable
+    <span class="mono">https://&lt;name&gt;:8090/dns-query</span> URL for clients.</div>
+  {{end}}
+</div>
+
+<div class="card mt">
+  <div class="card-title">Notes</div>
+  <div class="muted">
+    <div>• Upstream DoH never reduces availability: if the endpoint fails, the query falls back to the
+      plain servers from <span class="mono">[upstream] servers</span>.</div>
+    <div>• Serving is LAN-only by the gate; widening it (<span class="mono">[webui] allow = any</span>) turns this box
+      into a public resolver — think before you do.</div>
+    <div>• Same switches on the terminal: <span class="mono">freens doh</span> (status),
+      <span class="mono">freens doh upstream quad9</span>, <span class="mono">freens doh serve on</span>,
+      <span class="mono">freens doh test</span>.</div>
+  </div>
+</div>
+{{end}}

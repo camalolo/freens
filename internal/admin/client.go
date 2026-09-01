@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -386,4 +387,49 @@ type TLSCross struct {
 	CASha256    string `json:"ca_sha256"`
 	NotAfter    int64  `json:"not_after"`
 	SystemStore bool   `json:"system_store"`
+}
+
+// DNSQuery relays one raw DNS wire query to the daemon's resolver
+// (POST /dns-query — the transport behind the webui's DoH face). The only
+// non-JSON call: the request body IS the RFC 8484-style wire query and the
+// response body the wire answer. A 502 (the daemon's resolver refused the
+// payload) and a 503 (old daemon without the endpoint) both surface as
+// errors.
+func (c *Client) DNSQuery(ctx context.Context, wireQuery []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://admin/dns-query",
+		bytes.NewReader(wireQuery))
+	if err != nil {
+		return nil, fmt.Errorf("admin: build dns-query request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("admin: dial %s: %w", c.Sock, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		msg := resp.Status
+		if json.NewDecoder(resp.Body).Decode(&e) == nil && e.Error != "" {
+			msg = e.Error
+		}
+		return nil, fmt.Errorf("admin: dns-query: %s", msg)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, maxDNSQueryBytes))
+}
+
+// Reload asks the daemon to re-read freens.conf and hot-apply what is safe
+// (the [upstream] forwarder; v0.14.0 §9.6). Returns the daemon's summary of
+// what changed. An old daemon (no endpoint) errors with "reload not
+// available" — callers fall back to "restart the daemon to apply".
+func (c *Client) Reload(ctx context.Context) (string, error) {
+	var out struct {
+		Reloaded string `json:"reloaded"`
+	}
+	if _, err := c.do(ctx, http.MethodPost, "/reload", nil, &out); err != nil {
+		return "", err
+	}
+	return out.Reloaded, nil
 }

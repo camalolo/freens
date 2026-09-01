@@ -32,6 +32,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"github.com/camalolo/freens/internal/home"
 )
 
 // Config is the [webui] section of freens.conf (or the built-in defaults).
@@ -234,6 +236,15 @@ func containsAny(nets []*net.IPNet, ip net.IP) bool {
 }
 
 // homeDir resolves the freens home: explicit config > FREENS_HOME > ~/.freens.
+// homeDir resolves the freens home the UI reads (keychain, admin socket,
+// freens.conf): the [webui] home key, then $FREENS_HOME, then the PLATFORM
+// default (internal/home.Dir: %ProgramData%\freens on Windows, ~/.freens
+// elsewhere). The old default here was os.UserHomeDir()+"/.freens" — which
+// on Windows under LocalSystem (the freens-web SCM service) is
+// systemprofile\.freens while the DAEMON runs in %ProgramData%\freens, so
+// the UI silently read a different keychain and a nonexistent admin socket
+// (found live in the v0.14.0 fleet test: the desktop's /dns-query stayed
+// 404 because the UI was reading the WRONG freens.conf's [doh] serve).
 func homeDir(configured string) string {
 	if configured != "" {
 		return configured
@@ -241,9 +252,5 @@ func homeDir(configured string) string {
 	if v := os.Getenv("FREENS_HOME"); v != "" {
 		return v
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".freens"
-	}
-	return home + "/.freens"
+	return home.Dir()
 }

@@ -77,6 +77,7 @@ import (
 	"github.com/camalolo/freens/internal/turn"
 	"github.com/camalolo/freens/internal/upnp"
 	"github.com/camalolo/freens/internal/wire"
+	"github.com/miekg/dns"
 )
 
 // builtinDefaultConfig is used when -config is absent: a safe "* = dns-first"
@@ -265,9 +266,7 @@ func run(args []string) error {
 	if *upstreamCSV != "" {
 		cfg.UpstreamServers = splitCSV(*upstreamCSV)
 	}
-	if len(cfg.UpstreamServers) == 0 {
-		cfg.UpstreamServers = []string{"9.9.9.9", "1.1.1.1"}
-	}
+	applyUpstreamDefault(cfg)
 
 	logger.Info("freens daemon starting",
 		"listen_udp", cfg.ListenUDP,
@@ -565,13 +564,17 @@ func run(args []string) error {
 
 	// Upstream wiring: plaintext UDP/TCP to the configured servers, or —
 	// when [upstream] doh is set — RFC 8484 DoH with the plaintext servers
-	// as fallback (the doh key was parsed-but-ignored before v0.7.1).
+	// as fallback (the doh key was parsed-but-ignored before v0.7.1). The
+	// value goes into an UpstreamRef so POST admin /reload can hot-swap it
+	// (v0.14.0 §9.6: `freens doh upstream …` / the webui Settings page apply
+	// without a daemon restart).
 	plain := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
 	var upstream resolver.Upstream = plain
 	if cfg.UpstreamDoH != "" {
 		upstream = &resolver.DoHUpstream{URL: cfg.UpstreamDoH, Fallback: plain}
 	}
-	res := resolver.New(cfg, freens, upstream)
+	upRef := resolver.NewUpstreamRef(upstream)
+	res := resolver.New(cfg, freens, upRef)
 
 	// §9.5.4 trust sync: cross-certify DHT-verified owner CAs into the local
 	// trust stores (spool for the privileged bridge + direct system store
@@ -603,6 +606,54 @@ func run(args []string) error {
 			}
 			logger.Info("tls trust sync enabled (§9.5)", "root_fingerprint", tsEngine.RootFingerprint())
 		}
+	}
+
+	// §9.6 DoH wiring (v0.14.0): the admin socket gains the wire-DNS relay
+	// the webui's DoH face forwards to, plus the config hot-reload the
+	// `freens doh` verb and the Settings page use to apply an upstream
+	// change without a restart. Late-wired like the TLS provider above:
+	// adminSrv (and its goroutine) exist only under -dht, and the resolver
+	// was built after them. Both endpoints 503 until this block runs.
+	if adminSrv != nil {
+		adminSrv.SetDNSHandler(func(ctx context.Context, query []byte) ([]byte, error) {
+			q := new(dns.Msg)
+			if err := q.Unpack(query); err != nil {
+				return nil, fmt.Errorf("bad DNS query: %w", err)
+			}
+			resp := res.ResolveMsg(ctx, q)
+			return resp.Pack()
+		})
+		adminSrv.SetReloader(func() (string, error) {
+			cfg2, err := loadConfig(*configPath)
+			if err != nil {
+				return "", fmt.Errorf("config re-read failed: %w", err)
+			}
+			// Flags keep their priority on a reload: the -upstream override
+			// won the initial wiring, so it wins here too. And the empty-list
+			// default MUST apply again — the reload that skips it silently
+			// downgrades the fallback to "no servers" on confs (like this
+			// fleet's own) that never spell one out (found live in the
+			// v0.14.0 fleet test: "applied live: … fallback )" was the tell).
+			if *upstreamCSV != "" {
+				cfg2.UpstreamServers = splitCSV(*upstreamCSV)
+			}
+			applyUpstreamDefault(cfg2)
+			plain2 := &resolver.DNSUpstream{Servers: cfg2.UpstreamServers}
+			var up2 resolver.Upstream = plain2
+			if cfg2.UpstreamDoH != "" {
+				up2 = &resolver.DoHUpstream{URL: cfg2.UpstreamDoH, Fallback: plain2}
+			}
+			upRef.Set(up2)
+			if cfg2.UpstreamDoH != "" {
+				logger.Info("config reloaded: upstream is now DoH", "url", cfg2.UpstreamDoH,
+					"fallback", strings.Join(cfg2.UpstreamServers, ","))
+				return "upstream: DoH " + cfg2.UpstreamDoH + " (fallback " +
+					strings.Join(cfg2.UpstreamServers, ",") + ")", nil
+			}
+			logger.Info("config reloaded: upstream is now plain DNS",
+				"servers", strings.Join(cfg2.UpstreamServers, ","))
+			return "upstream: plain " + strings.Join(cfg2.UpstreamServers, ","), nil
+		})
 	}
 
 	// Operational metrics (hardening part 1): the registry always exists —
@@ -1428,6 +1479,16 @@ func defineFlags(fs *flag.FlagSet) *flags {
 
 // loadConfig parses the config file at path, or the built-in default if path is
 // empty.
+// applyUpstreamDefault fills an empty upstream server list with the §9.1
+// defaults (9.9.9.9, 1.1.1.1). BOTH the initial wiring and the /reload
+// re-read go through this — a reload that skips it would downgrade the
+// DoH fallback to an empty list on confs that never spell one out.
+func applyUpstreamDefault(cfg *resolver.Config) {
+	if len(cfg.UpstreamServers) == 0 {
+		cfg.UpstreamServers = resolver.DefaultUpstreamServers
+	}
+}
+
 func loadConfig(path string) (*resolver.Config, error) {
 	if path == "" {
 		return resolver.ParseConfig(builtinDefaultConfig)

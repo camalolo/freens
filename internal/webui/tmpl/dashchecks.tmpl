@@ -10,6 +10,9 @@
     {{end}}
     <span class="{{if .PeersOK}}done{{else}}current{{end}}">{{if .PeersOK}}✓{{else}}✗{{end}} at least one peer{{if .Warming}} (warming up){{end}}</span>
     <span class="{{if .ClockOK}}done{{else}}current{{end}}">{{if .ClockOK}}✓{{else}}?{{end}} clock sane</span>
+    {{if or .DoHUpstreamURL .DoHServe}}
+    <span class="done">✓ DoH{{if .DoHUpstreamURL}} upstream <span class="mono">{{.DoHUpstreamURL}}</span>{{end}}{{if .DoHServe}} · serving /dns-query{{end}}</span>
+    {{end}}
   </div>
 </div>
 {{end}}

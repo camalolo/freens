@@ -47,6 +47,7 @@ func mustParseTemplates() {
 		"network":    "tmpl/network.tmpl",
 		"keys":       "tmpl/keys.tmpl",
 		"certs":      "tmpl/certs.tmpl",
+		"settings":   "tmpl/settings.tmpl",
 		"login":      "tmpl/login.tmpl",
 		"bootstrap":  "tmpl/bootstrap.tmpl",
 		"storeentry": "tmpl/storeentry.tmpl",
@@ -168,6 +169,9 @@ type dashData struct {
 	Warming       bool
 	Names         []dashName
 	RecentJobs    []recentJob
+	// §9.6 DoH (dash checks fragment): upstream mode + serve state.
+	DoHUpstreamURL string
+	DoHServe       bool
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -510,6 +514,7 @@ func (s *Server) handleDashChecks(w http.ResponseWriter, r *http.Request) {
 			d.DNSOK = res.Found
 		}
 	}
+	d.DoHUpstreamURL, d.DoHServe = s.dohState()
 	s.fragment(w, "dashchecks", d)
 }
 

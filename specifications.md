@@ -1090,6 +1090,94 @@ lifetime bounds any staleness.
   no certificates for IP literals; WebPKI names are unreachable by
   construction (nameConstraints).
 
+### 9.6 DNS over HTTPS (DoH)
+
+RFC 8484 support in BOTH directions, introduced v0.14.0. Each
+direction is an independent one-line switch in `freens.conf`; both
+default OFF so an upgrade changes nothing until the operator asks.
+
+#### 9.6.1 Encrypted upstream
+
+```
+  [upstream]
+  servers = 9.9.9.9, 1.1.1.1          ; stays configured as the fallback
+  doh = https://9.9.9.9/dns-query     ; when set, upstreams are DoH-first
+```
+
+When `doh` is set, every §9.2 step-4 forward goes out as one RFC 8484
+POST (`application/dns-message`); on ANY DoH failure (network, HTTP
+4xx/5xx, malformed reply) the query is retried over the `servers`
+list — enabling DoH MUST NOT reduce availability. freens names never
+ride this path (§9.2 keeps them on the DHT); DoH here only protects
+the conventional-DNS traffic from passive observers on the local
+segment and at the recursive resolver.
+
+BOOTSTRAP RULE (normative): the DoH endpoint's own hostname, when the
+endpoint is not an IP literal, MUST be resolved via the plaintext
+`servers` — never via the OS resolver. Rationale: the standard wiring
+points `resolv.conf` at this very daemon, so an OS-resolved bootstrap
+dial loops back into the forwarder (self-deadlock, every forwarded
+name SERVFAILs). Resolved addresses are pinned onto the connection
+dialer; TLS verification continues to use the URL's hostname (SNI and
+name check are unaffected by the pinned IP). Shipped presets are
+IP-form URLs (`https://9.9.9.9/dns-query`, `https://1.1.1.1/dns-query`)
+so the default configuration has nothing to bootstrap at all.
+
+#### 9.6.2 Serving DoH (downstream)
+
+```
+  [doh]
+  serve = true
+```
+
+When enabled, the local resolver answers RFC 8484 requests at
+`https://<name>:8090/dns-query` — hosted on the freens-web listener
+rather than a new port. The UI's existing infrastructure is the
+feature: the §9.5 self-certifying leaf (a device trusts the box's
+owner CA once, via `GET /api/doh/root.pem` or `freens trust-install`),
+HTTP/2 via ALPN, and the LAN CIDR gate. Consequences:
+
+  - The gate's default (the machine's private subnets) makes every
+    install a LAN-scoped resolver by construction. Widening the gate
+    (`allow = any`) widens DoH with it — an operator choosing that
+    becomes a public resolver and inherits open-resolver etiquette.
+  - `/dns-query` and `/api/doh/root.pem` are machine-facing: they are
+    exempt from UI session auth and the CSRF header, never from the
+    gate.
+  - The HTTPS face relays raw DNS wire messages to the daemon's
+    resolver over the admin socket; a down daemon answers SERVFAIL
+    (a well-formed DNS message), never a bare HTTP error, so stub
+    resolvers fail over honestly.
+  - `[doh] serve` is re-read with a short cache: the switch (CLI or
+    UI) takes effect without restarting either process.
+
+GET (`?dns=` base64url) and POST are both served; the smallest answer
+TTL drives `Cache-Control: max-age=`; bodies are capped at 64 KiB
+(RFC 8484 §4.1 lets the server choose). DoH-served answers pass the
+identical §9.2 resolution and §10.4 caching as the UDP/TCP faces —
+DoH is a transport, not a different authority.
+
+#### 9.6.3 Control surface
+
+```
+  freens doh                              # status
+  freens doh upstream <quad9|cloudflare|google|URL|off>
+  freens doh serve <on|off>
+  freens doh test [name]                  # through the daemon relay
+```
+
+Both switches are lines in `freens.conf`; editors (CLI, webui Settings
+page) MUST modify it by comment-preserving line surgery with an atomic
+replace and a one-generation backup — never by regenerating the file
+(operators keep notes in it). An upstream change applies to a running
+daemon via the admin socket's `POST /reload` (hot upstream swap) so
+"enable/disable" never costs a restart; daemons without the endpoint
+fall back to "restart to apply".
+
+Doctor treats both switches as warn-only checks (the upstream has its
+plaintext fallback; the serve face is gate-bounded) — a DoH problem
+MUST NOT paint the health unit red.
+
 
 ## 10. Security Considerations
 
