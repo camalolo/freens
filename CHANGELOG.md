@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.13.5 — the seed's first answer carries the whole fleet
+
+Operator idea, prompted by a friend's lab box reporting itself an
+"offline island" with the seed "down" (the seed was fine — the lab's
+probes never left its own network — but the report exposed the real
+weakness): `{nodes}` advertisements now carry **one entry per known
+address** per peer, not one entry per peer.
+
+A newcomer's very first `find_node` against the seed therefore returns
+the entire community at LAN+WAN: every peer's every address. Concretely:
+
+- **Wire format unchanged** — same `[ip, port, nodeID, pk]` CBOR
+  entries, just more of them. v0.13.3+ receivers merge same-NodeID
+  entries into one multi-homed contact (their v0.13.3 `Alts`);
+  pre-v0.13.3 receivers re-learn them the old overwrite way (transient).
+- **No single point of failure**: the seed dying an hour after bootstrap
+  strands nobody — every node a newcomer ever talked to is a redundant
+  anchor with every address it knows, and each newcomer forwards the
+  same richness to the next.
+- **The anti-ghost invariant holds**: advertisement never confirms —
+  learned addresses still need a direct verified exchange before they
+  count as alive (pinned by test).
+
 ## v0.13.4 — the UI can no longer lie about its own version
 
 Two hardening fixes straight out of the desktop box's stale-UI ghost
