@@ -2,6 +2,29 @@
 
 # Changelog
 
+## v0.13.8 — register's two post-success papercuts (one was real)
+
+Found live 2026-09-01 immediately after the fresh VPS's successful
+`lucasvps` registration.
+
+- **REAL: recovery keyfiles were regenerated on every register
+  invocation.** Retries re-invoke the recovery plan, and each invocation
+  minted fresh keypairs over `<alias>.rec1-3.key` — silently invalidating
+  any backup made from an earlier attempt while the banner kept saying
+  "keyfiles generated". The plan now **reuses existing keyfiles** (same
+  policy, banner: "reused — your earlier backups are still valid"),
+  **refuses loudly on a partial set** (restore from backup or delete all
+  to start a new set), and generates only on a clean slate.
+- **COSMETIC-BUT-SCARY: the K_claim publish poll reported failure for a
+  completed publish.** The async replication job can outlive the CLI's
+  poll deadline (it grinds through replicas unreachable from this
+  vantage while enough others accept). Publish failures now verify
+  before failing — four resolve attempts through the daemon; if the name
+  is found and not revoked, register prints "publish complete" and exits
+  zero.
+
+# Changelog
+
 ## v0.13.7 — the witness cooldown stops punishing re-registrations
 
 The final defect in the fresh-VPS bootstrap saga (2026-09-01): the §7.3
