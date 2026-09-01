@@ -25,7 +25,7 @@ func TestRegisterRecoveryPlanDefaults(t *testing.T) {
 	}
 	keysDir := home.KeysDir()
 
-	paths, pol, err := recoveryPlan(false, keysDir, "alice", "")
+	paths, pol, _, err := recoveryPlan(false, keysDir, "alice", "")
 	if err != nil {
 		t.Fatalf("recoveryPlan: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestRegisterRecoveryOptOut(t *testing.T) {
 	if err := home.Ensure(); err != nil {
 		t.Fatal(err)
 	}
-	paths, pol, err := recoveryPlan(true, home.KeysDir(), "alice", "")
+	paths, pol, _, err := recoveryPlan(true, home.KeysDir(), "alice", "")
 	if err != nil {
 		t.Fatalf("recoveryPlan(opt-out): %v", err)
 	}

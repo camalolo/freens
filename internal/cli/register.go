@@ -175,13 +175,18 @@ func cmdRegister(args []string) error {
 	fmt.Printf("alias=%s tld_id_b32=%s\n", *alias, pin)
 
 	// --- default-on recovery (spec 5.4; user decision) ---------------------
-	recPaths, recPolicy, err := recoveryPlan(*noRecovery, home.KeysDir(), *alias, keyPassphrase)
+	recPaths, recPolicy, recReused, err := recoveryPlan(*noRecovery, home.KeysDir(), *alias, keyPassphrase)
 	if err != nil {
 		return err
 	}
 	if recPolicy != nil {
-		fmt.Printf("recovery: %d-of-%d keyfiles generated (0600), %d s timelock embedded in the apex record (spec 5.4)\n",
-			recPolicy.Threshold, len(recPolicy.Keys), recPolicy.Timelock)
+		if recReused {
+			fmt.Printf("recovery: existing %d-of-%d keyfiles reused (0600) — your earlier backups of these files are still valid; %d s timelock embedded in the apex record (spec 5.4)\n",
+				recPolicy.Threshold, len(recPolicy.Keys), recPolicy.Timelock)
+		} else {
+			fmt.Printf("recovery: %d-of-%d keyfiles generated (0600), %d s timelock embedded in the apex record (spec 5.4)\n",
+				recPolicy.Threshold, len(recPolicy.Keys), recPolicy.Timelock)
+		}
 		fmt.Println("*** BACK THESE UP on separate media — any", recPolicy.Threshold, "of", len(recPolicy.Keys), "recover the name if the owner key is lost; losing them all loses the name FOREVER:")
 		for _, p := range recPaths {
 			fmt.Printf("    %s\n", p)
@@ -357,8 +362,32 @@ func cmdRegister(args []string) error {
 		if _, err := tr.client.Publish(ctx, env); err != nil {
 			return fmt.Errorf("publish (K_tld, daemon): %w", err)
 		}
-		if err := tr.client.PublishClaim(ctx, env); err != nil {
-			return fmt.Errorf("publish (K_claim, daemon): %w", err)
+		if perr := tr.client.PublishClaim(ctx, env); perr != nil {
+			// The async publish job can complete AFTER the caller's poll
+			// deadline — the walk grinds through replicas that may be
+			// unreachable from this vantage while enough others accept
+			// (found live 2026-09-01: a fresh VPS's CLI printed a timeout
+			// for a claim that was already live and resolving). Never fail
+			// on a poll deadline without asking the daemon whether the
+			// name actually resolves.
+			verify := func() bool {
+				for attempt := 0; attempt < 4; attempt++ {
+					if attempt > 0 {
+						time.Sleep(2 * time.Second)
+					}
+					vctx, vcancel := context.WithTimeout(ctx, 5*time.Second)
+					res, rerr := tr.client.Resolve(vctx, *alias)
+					vcancel()
+					if rerr == nil && res != nil && res.Found && !res.Revoked {
+						return true
+					}
+				}
+				return false
+			}
+			if !verify() {
+				return fmt.Errorf("publish (K_claim, daemon): %w", perr)
+			}
+			fmt.Printf("publish: the replication job was still running at the poll deadline, but %s resolves via the daemon — publish complete\n", *alias)
 		}
 	} else {
 		// Walk toward K_tld first so the R closest storers are in the routing
@@ -431,8 +460,9 @@ func outboundIPv4() (net.IP, error) {
 // Split out so the defaults are unit-testable without a live network.
 // recoveryPlan generates this alias's default-on spec 5.4 recovery policy
 // (3 keys, threshold 2) — delegated to internal/keychain, shared with the
-// web UI.
-func recoveryPlan(noRecovery bool, keysDir, alias, passphrase string) ([]string, *wire.RecoveryPolicyWire, error) {
+// web UI. reused reports that existing recovery keyfiles were loaded rather
+// than generated (retry semantics — see keychain.RecoveryPlan).
+func recoveryPlan(noRecovery bool, keysDir, alias, passphrase string) ([]string, *wire.RecoveryPolicyWire, bool, error) {
 	return keychain.RecoveryPlan(noRecovery, keysDir, alias, passphrase,
 		recoveryKeyfileCount, recoveryThreshold, constants.RecoveryTimelock)
 }

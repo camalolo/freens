@@ -333,32 +333,66 @@ func BuildBackup(w io.Writer, keysDir string) ([]string, error) {
 // (passphrase "" = plaintext files) and returns their paths plus the wire
 // policy embedding their public keys at the given threshold. noRecovery
 // short-circuits to (nil, nil, nil).
-func RecoveryPlan(noRecovery bool, keysDir, alias, passphrase string, count, threshold int, timelock uint64) ([]string, *wire.RecoveryPolicyWire, error) {
+func RecoveryPlan(noRecovery bool, keysDir, alias, passphrase string, count, threshold int, timelock uint64) ([]string, *wire.RecoveryPolicyWire, bool, error) {
 	if noRecovery {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	if count <= 0 || threshold <= 0 || threshold > count {
-		return nil, nil, fmt.Errorf("keychain: recovery plan needs 0 < threshold <= count (got %d/%d)", threshold, count)
+		return nil, nil, false, fmt.Errorf("keychain: recovery plan needs 0 < threshold <= count (got %d/%d)", threshold, count)
+	}
+	// Reuse-if-present (found live 2026-09-01): register re-invokes the plan
+	// on every retry, and regenerating would silently overwrite the
+	// keyfiles — invalidating any backups made from an earlier attempt
+	// while the banner still said "keyfiles generated". All present → load
+	// them (the policy is identical: same threshold/timelock, same count);
+	// none present → generate; partially present → refuse loudly rather
+	// than clobber whichever half the user still has.
+	present := 0
+	for i := 1; i <= count; i++ {
+		if _, err := os.Stat(filepath.Join(keysDir, fmt.Sprintf("%s.rec%d.key", alias, i))); err == nil {
+			present++
+		}
 	}
 	paths := make([]string, 0, count)
 	pks := make([][]byte, 0, count)
+	switch {
+	case present == count:
+		for i := 1; i <= count; i++ {
+			p := filepath.Join(keysDir, fmt.Sprintf("%s.rec%d.key", alias, i))
+			rkp, err := Load(p, passphrase)
+			if err != nil {
+				return nil, nil, false, fmt.Errorf("reading existing recovery keyfile %s: %w", p, err)
+			}
+			paths = append(paths, p)
+			pks = append(pks, rkp.Public())
+		}
+		pol, err := wire.NewRecoveryPolicyWire(uint64(threshold), pks, timelock)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return paths, pol, true, nil
+	case present > 0:
+		return nil, nil, false, fmt.Errorf(
+			"keychain: recovery keyfiles for %q are partially present (%d of %d) — refusing to overwrite: restore the missing ones from backup, or delete ALL %s.rec*.key and re-register to start a new recovery set",
+			alias, present, count, alias)
+	}
 	for i := 1; i <= count; i++ {
 		rkp, err := crypto.Generate()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		p := filepath.Join(keysDir, fmt.Sprintf("%s.rec%d.key", alias, i))
 		if err := Save(p, rkp, passphrase); err != nil {
-			return nil, nil, fmt.Errorf("writing recovery keyfile: %w", err)
+			return nil, nil, false, fmt.Errorf("writing recovery keyfile: %w", err)
 		}
 		paths = append(paths, p)
 		pks = append(pks, rkp.Public())
 	}
 	pol, err := wire.NewRecoveryPolicyWire(uint64(threshold), pks, timelock)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	return paths, pol, nil
+	return paths, pol, false, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -145,7 +145,7 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	var recPaths []string
 	var recPol *wire.RecoveryPolicyWire
 	if !in.NoRecovery {
-		recPaths, recPol, err = keychain.RecoveryPlan(false, e.keysDir, alias, in.Passphrase,
+		recPaths, recPol, _, err = keychain.RecoveryPlan(false, e.keysDir, alias, in.Passphrase,
 			3, 2, constants.RecoveryTimelock)
 		if err != nil {
 			return RegisterResult{}, userErr("generating recovery keys: %v", err)

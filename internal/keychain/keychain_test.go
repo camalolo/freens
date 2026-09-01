@@ -108,12 +108,15 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 
 func TestRecoveryPlan(t *testing.T) {
 	dir := t.TempDir()
-	if paths, pol, _ := RecoveryPlan(true, dir, "alice", "", 3, 2, 3600); paths != nil || pol != nil {
+	if paths, pol, _, err := RecoveryPlan(true, dir, "alice", "", 3, 2, 3600); err != nil || paths != nil || pol != nil {
 		t.Error("noRecovery must short-circuit to nil")
 	}
-	paths, pol, err := RecoveryPlan(false, dir, "alice", "", 3, 2, 3600)
+	paths, pol, reused, err := RecoveryPlan(false, dir, "alice", "", 3, 2, 3600)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if reused {
+		t.Fatal("first plan on an empty dir reported reused=true")
 	}
 	if len(paths) != 3 {
 		t.Fatalf("paths = %d, want 3", len(paths))
@@ -126,7 +129,7 @@ func TestRecoveryPlan(t *testing.T) {
 	if pol == nil || pol.Threshold != 2 || len(pol.Keys) != 3 {
 		t.Fatalf("policy = %+v, want threshold 2 over 3 keys", pol)
 	}
-	if _, _, err := RecoveryPlan(false, dir, "alice", "", 2, 3, 3600); err == nil {
+	if _, _, _, err := RecoveryPlan(false, dir, "alice", "", 2, 3, 3600); err == nil {
 		t.Error("threshold > count must error")
 	}
 }
@@ -235,3 +238,51 @@ func TestBuildBackup(t *testing.T) {
 
 // Compile-time: wire.RecoveryPolicyWire is the policy type register embeds.
 var _ *wire.RecoveryPolicyWire = nil
+
+// TestRecoveryPlanReuseNotRegenerate (found live 2026-09-01, fresh-VPS
+// registration): register re-invokes RecoveryPlan on every retry, and the
+// old behavior GENERATED fresh keypairs each time — silently overwriting
+// the .rec*.key files and invalidating any backup made from an earlier
+// attempt while the banner still said "keyfiles generated". Re-invocation
+// must LOAD the existing files (same policy, reused=true), refuse loudly on
+// a partial set, and never overwrite.
+func TestRecoveryPlanReuseNotRegenerate(t *testing.T) {
+	dir := t.TempDir()
+	paths1, pol1, reused1, err := RecoveryPlan(false, dir, "bob", "", 3, 2, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused1 {
+		t.Fatal("first plan reported reused=true")
+	}
+
+	paths2, pol2, reused2, err := RecoveryPlan(false, dir, "bob", "", 3, 2, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reused2 {
+		t.Fatal("second plan on existing keyfiles reported reused=false")
+	}
+	for i := range paths1 {
+		if paths1[i] != paths2[i] {
+			t.Fatalf("path changed between plans: %q -> %q", paths1[i], paths2[i])
+		}
+	}
+	if pol2.Threshold != pol1.Threshold || len(pol2.Keys) != len(pol1.Keys) {
+		t.Fatalf("policy changed between plans: %+v vs %+v", pol2, pol1)
+	}
+	for i := range pol1.Keys {
+		if string(pol1.Keys[i]) != string(pol2.Keys[i]) {
+			t.Fatal("reused plan carries DIFFERENT recovery keys — the old files were regenerated")
+		}
+	}
+
+	// Partial set: refuse loudly instead of overwriting whichever half
+	// the user still holds.
+	if err := os.Remove(filepath.Join(dir, "bob.rec2.key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := RecoveryPlan(false, dir, "bob", "", 3, 2, 3600); err == nil {
+		t.Fatal("partial recovery set was silently regenerated/overwritten")
+	}
+}
