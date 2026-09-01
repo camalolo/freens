@@ -96,7 +96,7 @@ it to work by itself over the internet").
 Tests: learned contacts get probed and confirmed end-to-end; the
 dead-preferred + reachable-alternate shape fails over and confirms.
 
-## Unreleased — certmgr: letsencrypt-like certificate management, nginx included
+## v0.13.10 — certmgr: letsencrypt-like certificate management, nginx included
 
 The §9.5 layer proved the trust model works (fleet-tested since
 v0.9.3-tls); what it lacked was the certbot half: certificates were
