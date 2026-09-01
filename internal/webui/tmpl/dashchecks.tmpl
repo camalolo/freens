@@ -1,0 +1,15 @@
+{{define "dashchecks"}}
+<div class="card" id="dashchecks" hx-get="/api/dash/checks" hx-trigger="every 30s" hx-swap="outerHTML">
+  <div class="card-title">Checks</div>
+  <div class="steps">
+    <span class="{{if .DaemonUp}}done{{else}}current{{end}}">{{if .DaemonUp}}✓{{else}}✗{{end}} daemon answering on the admin socket</span>
+    {{if .Warming}}
+    <span class="current">✱ resolver warming up (peers not confirmed yet — a moment after a restart)</span>
+    {{else}}
+    <span class="{{if .DNSOK}}done{{else}}current{{end}}">{{if .DNSOK}}✓{{else}}✗{{end}} resolver answers a freens name</span>
+    {{end}}
+    <span class="{{if .PeersOK}}done{{else}}current{{end}}">{{if .PeersOK}}✓{{else}}✗{{end}} at least one peer{{if .Warming}} (warming up){{end}}</span>
+    <span class="{{if .ClockOK}}done{{else}}current{{end}}">{{if .ClockOK}}✓{{else}}?{{end}} clock sane</span>
+  </div>
+</div>
+{{end}}

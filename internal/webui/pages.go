@@ -32,7 +32,7 @@ func init() { mustParseTemplates() }
 
 func mustParseTemplates() {
 	base := template.New("base")
-	for _, frag := range []string{"tmpl/layout.tmpl", "tmpl/jobfragment.tmpl", "tmpl/networkpeers.tmpl"} {
+	for _, frag := range []string{"tmpl/layout.tmpl", "tmpl/jobfragment.tmpl", "tmpl/networkpeers.tmpl", "tmpl/dashchecks.tmpl"} {
 		if _, err := base.ParseFS(tmplFS, frag); err != nil {
 			panic("webui: " + err.Error())
 		}
@@ -54,6 +54,9 @@ func mustParseTemplates() {
 		// the network page) and registered standalone for the /api polling
 		// endpoint (the peers table refreshes itself every 30s).
 		"networkpeers": "tmpl/networkpeers.tmpl",
+		// dashchecks: the Dashboard health card — same polling pattern
+		// (every 30s), so a warm-up or failure state clears itself.
+		"dashchecks": "tmpl/dashchecks.tmpl",
 		// jobfragment is also parsed into the base clone (inline use by the
 		// register page); registered standalone so /api/job/{id} polling can
 		// execute it on its own (v0.6.1: the missing registration made the
@@ -152,6 +155,7 @@ type dashData struct {
 	WitnessQuorum int
 	DNSOK         bool
 	ClockOK       bool
+	Warming       bool
 	Names         []dashName
 	RecentJobs    []recentJob
 }
@@ -167,6 +171,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		d.DaemonVersion = st.Version
 		d.Peers = st.Peers
 		d.PeersOK = st.Peers > 0
+		d.Warming = st.Peers > 0 && st.ConfirmedPeers == 0
 		d.NodeID = st.NodeID
 		d.StoreEnvs = st.StoreEnvs
 		d.HistoryEnvs = st.HistoryEnvs
@@ -472,6 +477,29 @@ func (s *Server) handleNetworkPeers(w http.ResponseWriter, r *http.Request) {
 		p.Peers, p.PeerRows = peerRows(peers, time.Now().Unix())
 	}
 	s.fragment(w, "networkpeers", p)
+}
+
+// handleDashChecks is the polling endpoint behind the Dashboard health
+// card (htmx every-30s): the checks card, freshly measured. While the
+// daemon is WARMING UP (peerbook loaded, no contact confirmed yet — the
+// seconds after a restart) the resolver line says so instead of showing a
+// misleading ✗ (found live 2026-09-01 on the desktop box).
+func (s *Server) handleDashChecks(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	d := dashData{basePage: s.base("Dashboard", "dashboard"), ClockOK: true}
+	if st, err := s.d.Status(ctx); err == nil && st != nil {
+		d.DaemonUp = st.Running
+		d.Peers = st.Peers
+		d.PeersOK = st.Peers > 0
+		d.Warming = st.Peers > 0 && st.ConfirmedPeers == 0
+	}
+	if aliases := keychain.Aliases(s.keysDir); len(aliases) > 0 {
+		if res, err := s.d.Resolve(ctx, aliases[0]); err == nil && res != nil {
+			d.DNSOK = res.Found
+		}
+	}
+	s.fragment(w, "dashchecks", d)
 }
 
 // peerRows converts the daemon's peer list into render rows (the confirmed

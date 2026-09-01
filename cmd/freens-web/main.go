@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base32"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/tlsca"
@@ -128,8 +130,9 @@ func consoleRun(args []string, stop <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
+	daemon := webui.NewDaemonClient(sockPath)
 
-	cert := webtls(cfg, cfgHome, log)
+	cert := webtls(cfg, cfgHome, log, daemon)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.ListenAndServeTLS(cert) }()
 
@@ -152,7 +155,14 @@ func consoleRun(args []string, stop <-chan struct{}) error {
 // alias, sorted) and returns it, or nil with the reason logged when TLS is
 // off, impossible (no/unusable key), or the certificate would not carry the
 // name this instance serves. Best-effort by design: the UI must come up.
-func webtls(cfg *webui.Config, homeDir string, log *slog.Logger) *tls.Certificate {
+//
+// The SAN list covers every PUBLISHED subname of the alias (fetched from
+// the daemon's store), not just the wildcard: Windows clients (schannel
+// AND Chromium) refuse `*.alias` coverage for `<sub>.alias` when `alias`
+// is an unknown TLD — `lan.camalolo` under `*.camalolo` verified fine on
+// Linux curl and failed WRONG_PRINCIPAL on the desktop box. Explicit SANs
+// need no wildcard semantics at all.
+func webtls(cfg *webui.Config, homeDir string, log *slog.Logger, daemon webui.Daemon) *tls.Certificate {
 	if cfg.TLSOff {
 		log.Info("webui: TLS disabled by config ([webui] tls = false)")
 		return nil
@@ -191,7 +201,7 @@ func webtls(cfg *webui.Config, homeDir string, log *slog.Logger) *tls.Certificat
 		log.Warn("webui: TLS off (CA derivation failed)", "err", err.Error())
 		return nil
 	}
-	leafDER, leafKeyDER, err := tlsca.Leaf(caDER, caKey, []string{alias, "*." + alias}, now)
+	leafDER, leafKeyDER, err := tlsca.Leaf(caDER, caKey, leafSANs(daemon, kp, alias, log), now)
 	if err != nil {
 		log.Warn("webui: TLS off (leaf issuance failed)", "err", err.Error())
 		return nil
@@ -214,6 +224,37 @@ func chainPEM(ders ...[]byte) []byte {
 		out = append(out, tlsca.CertPEM(der)...)
 	}
 	return out
+}
+
+// leafSANs builds the leaf's SAN list for alias: the apex, the wildcard,
+// and — the part Windows clients need — every PUBLISHED subname of the
+// namespace, because schannel and Chromium refuse `*.alias` coverage for
+// `<sub>.alias` when `alias` is an unknown TLD. Subnames come from the
+// daemon's store (the same records a resolver would serve); a store miss
+// degrades to apex+wildcard. Best-effort like everything here.
+func leafSANs(daemon webui.Daemon, kp *crypto.Keypair, alias string, log *slog.Logger) []string {
+	sans := []string{alias, "*." + alias}
+	if daemon == nil {
+		return sans
+	}
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		return sans
+	}
+	want := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sr, err := daemon.Store(ctx)
+	if err != nil {
+		return sans
+	}
+	for _, e := range sr.Entries {
+		if len(e.Labels) > 0 && e.TldIDB32 == want {
+			sans = append(sans, strings.Join(e.Labels, ".")+"."+alias)
+		}
+	}
+	log.Info("webui: leaf SANs", "count", len(sans), "sans", strings.Join(sans, ", "))
+	return sans
 }
 
 func keychainDir(homeDir string) string {

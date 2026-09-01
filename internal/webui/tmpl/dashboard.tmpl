@@ -50,15 +50,7 @@
 
 <h2 class="mt">Health</h2>
 <div class="grid cols-2">
-  <div class="card">
-    <div class="card-title">Checks</div>
-    <div class="steps">
-      <span class="{{if .DaemonUp}}done{{else}}current{{end}}">{{if .DaemonUp}}✓{{else}}✗{{end}} daemon answering on the admin socket</span>
-      <span class="{{if .DNSOK}}done{{else}}current{{end}}">{{if .DNSOK}}✓{{else}}✗{{end}} resolver answers a freens name</span>
-      <span class="{{if .PeersOK}}done{{else}}current{{end}}">{{if .PeersOK}}✓{{else}}✗{{end}} at least one peer</span>
-      <span class="{{if .ClockOK}}done{{else}}current{{end}}">{{if .ClockOK}}✓{{else}}?{{end}} clock sane</span>
-    </div>
-  </div>
+  {{template "dashchecks" .}}
   <div class="card">
     <div class="card-title">Recent actions</div>
     {{if .RecentJobs}}<div class="steps">{{range .RecentJobs}}<span>{{.When}} — {{.Label}}: {{.State}}</span>{{end}}</div>

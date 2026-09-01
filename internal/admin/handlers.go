@@ -117,18 +117,22 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 // try the network?" heuristics. Hex/base32 fields are empty when not
 // applicable (e.g. node == nil), never zero-padded placeholders.
 type Status struct {
-	Running       bool   `json:"running"`
-	Version       string `json:"version"`
-	NodeID        string `json:"node_id,omitempty"` // hex(SHA-256(node_pk))
-	NodePK        string `json:"node_pk,omitempty"` // hex(node_pk)
-	DHTListen     string `json:"dht_listen,omitempty"`
-	Advertise     string `json:"advertise,omitempty"` // best-known §6.2 address ("" = observed source)
-	Peers         int    `json:"peers"`               // routing-table contacts
-	StoreEnvs     int    `json:"store_envelopes"`     // live store entries
-	HistoryEnvs   int    `json:"history_envelopes"`   // §8.3 audit-history entries
-	RelayMode     bool   `json:"relay_mode"`          // TURN-routed transport
-	TURNAllocs    int    `json:"turn_allocs"`         // co-located TURN server allocations
-	NetworkClaims bool   `json:"network_claims"`      // this node co-signs §7.3 witness requests
+	Running   bool   `json:"running"`
+	Version   string `json:"version"`
+	NodeID    string `json:"node_id,omitempty"` // hex(SHA-256(node_pk))
+	NodePK    string `json:"node_pk,omitempty"` // hex(node_pk)
+	DHTListen string `json:"dht_listen,omitempty"`
+	Advertise string `json:"advertise,omitempty"` // best-known §6.2 address ("" = observed source)
+	Peers     int    `json:"peers"`               // routing-table contacts
+	// ConfirmedPeers counts contacts with a successful round trip
+	// (ConfirmedAt > 0). A fresh daemon reports peers > 0 (persisted
+	// peerbook) with confirmed_peers = 0 — the "warming up" signal.
+	ConfirmedPeers int  `json:"confirmed_peers,omitempty"`
+	StoreEnvs      int  `json:"store_envelopes"`   // live store entries
+	HistoryEnvs    int  `json:"history_envelopes"` // §8.3 audit-history entries
+	RelayMode      bool `json:"relay_mode"`        // TURN-routed transport
+	TURNAllocs     int  `json:"turn_allocs"`       // co-located TURN server allocations
+	NetworkClaims  bool `json:"network_claims"`    // this node co-signs §7.3 witness requests
 }
 
 // Resolved is the POST /resolve response: the winning record for a display
@@ -219,6 +223,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		st.Advertise = s.advertisedAddr()
 		st.Peers = n.RoutingTable().Size()
+		// Confirmed contacts only: a freshly (re)started daemon loads its
+		// peerbook instantly, so Peers > 0 means nothing about reachability
+		// (found live 2026-09-01: an upgrade health check reported 7 peers
+		// while the box was talking to no one). Consumers distinguish
+		// "warming up" from "broken" with this.
+		for _, ct := range n.RoutingTable().AllContacts() {
+			if ct.ConfirmedAt > 0 {
+				st.ConfirmedPeers++
+			}
+		}
 		st.StoreEnvs, st.HistoryEnvs = s.storeCounts()
 		st.RelayMode = n.RelayedMode()
 		if ts := n.TURNServer(); ts != nil {

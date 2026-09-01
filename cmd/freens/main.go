@@ -507,6 +507,15 @@ func run(args []string) error {
 			}
 			if len(peers) > 0 {
 				node.Bootstrap(context.Background(), peers)
+				// Warm-up sweep: ping the learned contacts RIGHT NOW
+				// instead of waiting for the first refresh tick. Without
+				// this a restart has a minutes-long window where the
+				// peerbook is loaded but nothing is confirmed — every
+				// freens-name lookup degrades, doctor's resolution check
+				// fails, and the dashboard shows a red resolver (found
+				// live 2026-09-01 on the desktop box after its overnight
+				// sleep + upgrade restart).
+				go warmupPingSweep(node, book, logger)
 			}
 		}
 	}
@@ -1064,6 +1073,29 @@ func renewLoop(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, st
 			return
 		}
 	}
+}
+
+// warmupPingSweep pings the learned peerbook contacts right after boot so
+// the routing table carries CONFIRMED contacts within seconds, not after
+// the first bucket-refresh tick. Per-peer timeout is short on purpose:
+// a peer that cannot answer a ping in 2 s is not useful for the first
+// lookup anyway; the normal refresh/repair machinery takes over from
+// there. Best-effort — failures are just logged at debug level.
+func warmupPingSweep(node *dht.Node, book []dht.Peer, logger *slog.Logger) {
+	var wg sync.WaitGroup
+	for _, p := range book {
+		wg.Add(1)
+		go func(p dht.Peer) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := node.Ping(ctx, p); err != nil {
+				logger.Debug("warmup ping failed", "peer", p.Addr, "error", err)
+			}
+		}(p)
+	}
+	wg.Wait()
+	logger.Info("warmup ping sweep complete", "contacts", len(book))
 }
 
 // renewOnce is one auto-renewal pass (split out so a future -renew-now flag

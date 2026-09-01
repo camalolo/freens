@@ -3,6 +3,8 @@
 // timestamp since the issue-#2 machinery, but the admin client decoded
 // only addr+pk — every admin-socket consumer (the webui peers table)
 // rendered "never confirmed" for live, ping-verified peers, forever.
+// /status now also separates table size (confirmed_peers) so consumers
+// can tell "warming up" from "broken".
 package admin
 
 import (
@@ -13,9 +15,10 @@ import (
 	"github.com/camalolo/freens/internal/dht"
 )
 
-// TestClientPeersCarriesConfirmed: after a confirmed ping, the client
-// must surface the confirmed timestamp (not a permanent zero).
-func TestClientPeersCarriesConfirmed(t *testing.T) {
+// TestPeersAndStatusCarryConfirmed: after a confirming ping, BOTH /peers
+// entries and /status carry the confirmed state (the client used to drop
+// it entirely).
+func TestPeersAndStatusCarryConfirmed(t *testing.T) {
 	a, b, _, c := adminPair(t, "test")
 
 	pa, err := a.LocalAddr()
@@ -41,9 +44,18 @@ func TestClientPeersCarriesConfirmed(t *testing.T) {
 			confirmed++
 		}
 	}
-	// The regression: the client used to decode only addr+pk, leaving
-	// Confirmed permanently 0 even for ping-verified contacts.
 	if confirmed == 0 {
 		t.Fatalf("no peer carries a confirmed timestamp — the client dropped the field again: %+v", peers)
+	}
+
+	st, err := c.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Peers == 0 {
+		t.Fatal("status peers = 0")
+	}
+	if st.ConfirmedPeers == 0 {
+		t.Fatalf("status confirmed_peers = 0 with %d peers (field dropped?)", st.Peers)
 	}
 }

@@ -197,6 +197,7 @@ func cmdDoctor(args []string) error {
 
 	// 2. daemon version (needs the socket).
 	var peers int
+	var confirmedPeers int
 	if c != nil {
 		ctx, cancel := adminCtx()
 		st, err := c.Status(ctx)
@@ -206,6 +207,7 @@ func cmdDoctor(args []string) error {
 		} else {
 			check(true, "daemon version %v", st.Version)
 			peers = int(st.Peers)
+			confirmedPeers = int(st.ConfirmedPeers)
 		}
 	} else {
 		check(false, "daemon version: no daemon (start one with: freens setup)")
@@ -218,6 +220,11 @@ func cmdDoctor(args []string) error {
 	check(checkDNSFallback(dnsAddr), "DNS: example.com resolves via %s (fallback path)", dnsAddr)
 
 	// 4. freens path: each keychain alias's apex resolves via the daemon.
+	// While the daemon is WARMING UP (peerbook loaded, no contact confirmed
+	// yet) resolution legitimately fails — the hint keeps that from being
+	// mistaken for a broken install (found live 2026-09-01: post-upgrade
+	// restarts looked broken for their first minutes).
+	warming := peers > 0 && confirmedPeers == 0
 	aliases := keychainAliases()
 	if len(aliases) == 0 {
 		warn("no keychain aliases (~/.freens/keys) — nothing to resolve; register one")
@@ -227,7 +234,11 @@ func cmdDoctor(args []string) error {
 			r, err := c.Resolve(ctx, a)
 			switch {
 			case err != nil:
-				check(false, "alias %s resolves (apex): %v", a, err)
+				if warming {
+					check(false, "alias %s resolves (apex): %v — still warming up", a, err)
+				} else {
+					check(false, "alias %s resolves (apex): %v", a, err)
+				}
 			case r != nil && r.Revoked:
 				warn("alias %s is REVOKED (deliberate; un-revoke with register/name or drop the key)", a)
 			default:
@@ -237,9 +248,18 @@ func cmdDoctor(args []string) error {
 		cancel()
 	}
 
-	// 5. peers.
+	// 5. peers. Confirmed contacts are the honest signal: the table fills
+	// from the persisted peerbook instantly, but until a contact answers a
+	// ping the node cannot resolve anything.
 	if c != nil {
-		check(peers > 0, "DHT peers connected (%d)", peers)
+		switch {
+		case confirmedPeers > 0:
+			check(true, "DHT peers connected (%d, %d confirmed)", peers, confirmedPeers)
+		case warming:
+			warn("DHT peers known (%d) — WARMING UP (none confirmed yet; lookups may fail for a few moments)", peers)
+		default:
+			check(false, "DHT peers connected (0)")
+		}
 	}
 
 	// 6. seeds.conf parses.
