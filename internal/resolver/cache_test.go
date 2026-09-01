@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
-	"time"
 	"testing"
+	"time"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/wire"

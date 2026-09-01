@@ -47,15 +47,15 @@ func mapCertErr(err error) error {
 // ---------------------------------------------------------------------------
 
 type certRow struct {
-	Name       string
-	Alias      string
-	Tracked    bool
-	CertPath   string
-	NotAfter   string // "in 6d" / "expired 2d ago"
+	Name        string
+	Alias       string
+	Tracked     bool
+	CertPath    string
+	NotAfter    string // "in 6d" / "expired 2d ago"
 	NotAfterAbs string // absolute ("2026-09-08 10:01 UTC")
-	Due        bool
-	InNginx    bool
-	Encrypted  bool
+	Due         bool
+	InNginx     bool
+	Encrypted   bool
 }
 
 type nginxRow struct {
