@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.13.6 — a newcomer's bootstrap works by itself, over the internet
+
+Three coordinated defects kept a fresh node at "8 known / 0 confirmed
+peers" with a registration that could never collect its 5 witnesses
+(found live 2026-09-01 on a brand-new VPS with nothing but the built-in
+seed line; the operator's call: fix the code, no hand-patching — "I want
+it to work by itself over the internet").
+
+- **Confirm-on-learn**: nothing probed what a newcomer learned. The
+  seed's multi-addr advertisement taught it the whole fleet, but
+  confirmation only happened if some walk happened to touch a contact —
+  so the table sat LAN-preferred (the seed's vantage) and unconfirmed
+  forever. Now `learnContact` fires an async probe for every newly
+  learned, never-confirmed contact: preferred address first, then recent
+  alternates, **promoting the first alternate when the preferred
+  misses** — the stored address follows to wherever the peer is actually
+  reachable (the seed's table said the LAN address; the internet says
+  the WAN mapping; both are learned, the probe settles it).
+- **Witness collection survives its client**: `/witness` ran on the
+  request's context — the CLI's 15 s admin timeout fired before the
+  endpoint's 30 s server cap and the disconnect *cancelled the walk
+  mid-flight*. Every retry re-died at the same 15 s mark while the fleet
+  was actively witnessing each attempt (the seed's journal shows
+  co-signatures landing for all three failed tries). The collection now
+  runs detached (own 30 s budget) and the finished quorum is memoized —
+  a retry returns it instantly.
+- **The CLI's witness call carries its own 45 s timeout** with headroom
+  over the server cap, instead of inheriting the shared 15 s.
+
+Tests: learned contacts get probed and confirmed end-to-end; the
+dead-preferred + reachable-alternate shape fails over and confirms.
+
 ## v0.13.5 — the seed's first answer carries the whole fleet
 
 Operator idea, prompted by a friend's lab box reporting itself an
