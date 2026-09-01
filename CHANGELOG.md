@@ -1,10 +1,23 @@
 # Changelog
 
-## unreleased — the web UI is always there: freens-web as a service on every OS
+## v0.13.0 — the web UI is always there (service on every OS) + automatic http→https
 
 "Setup installs the daemon but the UI needs hand-standing-up" was true on
 one platform and half-true on the rest. Now setup keeps the LAN management
-UI running everywhere:
+UI running everywhere — and the one UI port speaks both dialects: typing
+`http://<name>:8090` gets a 308 upgrade to the encrypted UI instead of a
+connection reset (found live on the desktop box, where a plain-typing
+visitor saw ERR_CONNECTION_RESET with zero guidance). The auto-upgrade is
+the Caddy trick: each accepted connection is sniffed on its first byte
+(0x16 = TLS ClientHello, ASCII = plaintext HTTP), TLS serves the UI as
+before, plaintext gets `308 → https://<typed-host>:8090/…` with HSTS set
+so the browser upgrades itself from then on. No-leaf installs keep the
+plain-HTTP fallback unchanged (nothing to upgrade to). Shutdown drains
+both dialects (accept loop, TLS server, redirect server, per-conn
+one-shot listeners) — tested against a real §9.5-minted leaf on ephemeral
+ports via the new `BoundAddr` accessor.
+
+Service story, per platform:
 
 - **Windows**: freens-web gains the SCM service handler the daemon has
   (v0.11.0 pattern — the SCM hands Execute the service name; the real
