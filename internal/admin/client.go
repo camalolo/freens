@@ -319,6 +319,13 @@ func (c *Client) Peers(ctx context.Context) ([]dht.Peer, error) {
 		Peers []struct {
 			Addr string `json:"addr"`
 			PK   string `json:"pk"`
+			// Confirmed rides along since the handler gained it (issue #2
+			// machinery) but the client dropped it for years — every
+			// admin-socket consumer (the webui peers table) rendered
+			// "never confirmed" for live, confirmed peers (found live
+			// 2026-09-01 on the desktop box right after its first
+			// post-wake self-upgrade).
+			Confirmed int64 `json:"confirmed"`
 		} `json:"peers"`
 	}
 	if _, err := c.do(ctx, http.MethodGet, "/peers", nil, &out); err != nil {
@@ -330,7 +337,7 @@ func (c *Client) Peers(ctx context.Context) ([]dht.Peer, error) {
 		if err != nil || len(pk) != 32 || p.Addr == "" {
 			continue // defensive: skip a malformed entry, not the whole set
 		}
-		peers = append(peers, dht.Peer{Addr: p.Addr, PublicKey: pk})
+		peers = append(peers, dht.Peer{Addr: p.Addr, PublicKey: pk, Confirmed: p.Confirmed})
 	}
 	return peers, nil
 }

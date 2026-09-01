@@ -147,6 +147,7 @@ func (s *Server) routes() {
 	page("GET /store", s.handleStorePage)
 	page("GET /lookup", s.handleLookupPage)
 	page("GET /network", s.handleNetwork)
+	page("GET /api/network/peers", s.handleNetworkPeers)
 	page("GET /keys", s.handleKeysPage)
 
 	// Mutations (auth + gate + CSRF header).

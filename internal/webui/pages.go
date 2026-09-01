@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/camalolo/freens/internal/admin"
+	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/keychain"
 )
 
@@ -31,7 +32,7 @@ func init() { mustParseTemplates() }
 
 func mustParseTemplates() {
 	base := template.New("base")
-	for _, frag := range []string{"tmpl/layout.tmpl", "tmpl/jobfragment.tmpl"} {
+	for _, frag := range []string{"tmpl/layout.tmpl", "tmpl/jobfragment.tmpl", "tmpl/networkpeers.tmpl"} {
 		if _, err := base.ParseFS(tmplFS, frag); err != nil {
 			panic("webui: " + err.Error())
 		}
@@ -49,6 +50,10 @@ func mustParseTemplates() {
 		"bootstrap":  "tmpl/bootstrap.tmpl",
 		"storeentry": "tmpl/storeentry.tmpl",
 		"lookupout":  "tmpl/lookupout.tmpl",
+		// networkpeers is also parsed into the base clone (inline use by
+		// the network page) and registered standalone for the /api polling
+		// endpoint (the peers table refreshes itself every 30s).
+		"networkpeers": "tmpl/networkpeers.tmpl",
 		// jobfragment is also parsed into the base clone (inline use by the
 		// register page); registered standalone so /api/job/{id} polling can
 		// execute it on its own (v0.6.1: the missing registration made the
@@ -449,22 +454,43 @@ func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
 		p.RetargetBlock = diff.RetargetBlock
 	}
 	if peers, err := s.d.Peers(r.Context()); err == nil {
-		p.Peers = len(peers)
-		for _, pr := range peers {
-			row := peerRow{Addr: pr.Addr, PK: fmt.Sprintf("%x", pr.PublicKey), Confirmed: pr.Confirmed}
-			if pr.Confirmed > 0 && now-pr.Confirmed < 3600 {
-				row.ConfirmedAgo = true
-				row.ConfirmedText = fmt.Sprintf("%dm ago", (now-pr.Confirmed)/60)
-			} else if pr.Confirmed > 0 {
-				row.ConfirmedText = time.Unix(pr.Confirmed, 0).UTC().Format("2006-01-02 15:04")
-			} else {
-				row.ConfirmedText = "never"
-			}
-			p.PeerRows = append(p.PeerRows, row)
-		}
+		p.Peers, p.PeerRows = peerRows(peers, now)
 	}
 	p.Seeds = readSeeds(filepath.Join(s.home, "seeds.conf"))
 	s.render(w, http.StatusOK, "network", p)
+}
+
+// handleNetworkPeers is the polling endpoint behind the Network page's
+// peers table (htmx every-30s): just the table fragment, freshly fetched.
+func (s *Server) handleNetworkPeers(w http.ResponseWriter, r *http.Request) {
+	type frag struct {
+		Peers    int
+		PeerRows []peerRow
+	}
+	p := frag{}
+	if peers, err := s.d.Peers(r.Context()); err == nil {
+		p.Peers, p.PeerRows = peerRows(peers, time.Now().Unix())
+	}
+	s.fragment(w, "networkpeers", p)
+}
+
+// peerRows converts the daemon's peer list into render rows (the confirmed
+// badge + "last direct exchange" text).
+func peerRows(peers []dht.Peer, now int64) (int, []peerRow) {
+	rows := make([]peerRow, 0, len(peers))
+	for _, pr := range peers {
+		row := peerRow{Addr: pr.Addr, PK: fmt.Sprintf("%x", pr.PublicKey), Confirmed: pr.Confirmed}
+		if pr.Confirmed > 0 && now-pr.Confirmed < 3600 {
+			row.ConfirmedAgo = true
+			row.ConfirmedText = fmt.Sprintf("%dm ago", (now-pr.Confirmed)/60)
+		} else if pr.Confirmed > 0 {
+			row.ConfirmedText = time.Unix(pr.Confirmed, 0).UTC().Format("2006-01-02 15:04")
+		} else {
+			row.ConfirmedText = "never"
+		}
+		rows = append(rows, row)
+	}
+	return len(peers), rows
 }
 
 type keyRow = keychain.KeyInfo
