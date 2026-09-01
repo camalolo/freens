@@ -16,3 +16,8 @@ freens-backup-*.tar.gz
 
 # agent working notes (private host details)
 AGENTS.md
+
+# windows build artifacts
+freens.exe
+freens-cli.exe
+freens-web.exe
