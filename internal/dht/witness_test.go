@@ -491,3 +491,64 @@ func TestDHTLookupClaimFetchAndCache(t *testing.T) {
 		t.Errorf("LookupClaim(unknown) = (%v, %v), want (nil, nil)", got, err)
 	}
 }
+
+// TestWitnessCooldownExemptsSameClaimant: a claimant re-mining their OWN
+// pending registration (new ts → new prefix hash, same claimant key) is not
+// a COMPETING claim — the §7.3 cooldown must not refuse it. Found live
+// 2026-09-01 on a fresh VPS: register mints a fresh claim timestamp whenever
+// an attempt's present-window lapses or the daemon restarts, and under the
+// alias-wide cooldown every witness that signed an earlier attempt refused
+// the next one — the quorum shuffled 3 → 2 → 0 across attempts and the
+// registration could never converge. Different-claimant competition stays
+// refused (TestWitnessCooldownRefusesDifferentClaim covers it: its
+// "different claim" identity is a different keypair).
+func TestWitnessCooldownExemptsSameClaimant(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	const alias = "remined"
+	now := uint64(time.Now().Unix())
+	id1 := newWitnessIdentity(t, now)
+	id2 := &witnessIdentity{claimantKP: id1.claimantKP, tldID: id1.tldID, ts: now - 60} // same claimant, re-mined 60s earlier (inside the present window)
+	addr, err := b.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// First claim for `alias`: accepted.
+	resp, err := a.sendQuery(ctx, addr, b.ID(), "witness", witnessArgs(t, alias, id1))
+	if err != nil {
+		t.Fatalf("witness #1: %v", err)
+	}
+	if resp.Y != wire.MsgTypeResponse {
+		t.Fatalf("witness #1: expected response, got %q (args %v)", resp.Y, resp.A)
+	}
+
+	// The SAME claimant re-mining their own registration (new ts ⇒ new
+	// prefix hash, same claimant key): accepted — this is register's
+	// present-window lapse, not a competing claim.
+	resp, err = a.sendQuery(ctx, addr, b.ID(), "witness", witnessArgs(t, alias, id2))
+	if err != nil {
+		t.Fatalf("witness #2 (same claimant re-mine): %v", err)
+	}
+	if resp.Y != wire.MsgTypeResponse {
+		t.Fatalf("witness #2 (same claimant re-mine): expected response, got 301-style refusal (code %v msg %q)",
+			resp.A["code"], resp.A["msg"])
+	}
+
+	// A genuinely different claimant for the alias is still refused.
+	id3 := newWitnessIdentity(t, now)
+	resp, err = a.sendQuery(ctx, addr, b.ID(), "witness", witnessArgs(t, alias, id3))
+	if err != nil {
+		t.Fatalf("witness #3 (competing claimant): %v", err)
+	}
+	if resp.Y != wire.MsgTypeError {
+		t.Fatalf("witness #3 (competing claimant): expected error, got %q", resp.Y)
+	}
+	if code, _ := asUint64(resp.A["code"]); code != 301 {
+		t.Errorf("witness #3 error code = %v, want 301 (cooldown)", code)
+	}
+}

@@ -498,9 +498,10 @@ var ErrThrottled = errors.New("dht: peer throttled get (§12 rate limit)")
 // witnessSigned records one witnessed claim for the WITNESS_COOLDOWN check:
 // the SHA-256 of the claim's §7.3 PoW prefix (which binds alias, tld_id,
 // timestamp, and claimant_pk — two different claims for the same alias never
-// share it) and the unix second the node signed.
+// share it), the claimant's public key, and the unix second the node signed.
 type witnessSigned struct {
 	prefixHash []byte
+	claimant   []byte
 	at         int64
 }
 
@@ -1746,10 +1747,23 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	last, seen := n.witnessLast[aliasN]
 	cooling := seen &&
 		now-last.at < int64(constants.WitnessCooldown) &&
-		!bytes.Equal(last.prefixHash, prefixHash)
+		!bytes.Equal(last.prefixHash, prefixHash) &&
+		// Same-claimant exemption (2026-09-01): the cooldown exists to stop
+		// COMPETING claims — a second claimant racing for the same alias
+		// within the window. A claimant re-mining their OWN pending
+		// registration is not competition: register mints a fresh claim
+		// timestamp whenever an attempt's present-window lapses (or the
+		// daemon restarts), and under the alias-wide cooldown every witness
+		// that signed an earlier attempt then REFUSED the next one — the
+		// quorum shuffled itself below 5 forever (found live 2026-09-01: a
+		// fresh VPS's lucasvps registration collected 3, then 2, then 0
+		// witnesses as each attempt poisoned the previous signers for an
+		// hour). Same claimant = the same registration, still honest.
+		!bytes.Equal(last.claimant, claimant)
 	if !cooling {
 		n.witnessLast[aliasN] = witnessSigned{
 			prefixHash: append([]byte(nil), prefixHash...),
+			claimant:   append([]byte(nil), claimant...),
 			at:         now,
 		}
 	}
