@@ -106,6 +106,7 @@ func consoleRun(args []string, stop <-chan struct{}) error {
 	if *listen != "" {
 		cfg.Listen = *listen
 	}
+	cfg.SelfVersion = cliVersion // /healthz reports THIS binary's stamp
 	if *allow != "" {
 		cfg.Allow = *allow
 	}

@@ -43,6 +43,14 @@ type Config struct {
 	AuthPath string // where the bcrypt hash lives ("" = <home>/webui/auth)
 	Name     string // alias whose TLS leaf to serve (§9.5; "" = first keychain alias)
 	TLSOff   bool   // [webui] tls = false serves plain HTTP even when a leaf is issuable
+
+	// SelfVersion is THIS webui binary's own build stamp, reported by
+	// /healthz. The footer version comes from the daemon's admin socket,
+	// so it can never expose a stale UI process (found live 2026-09-01:
+	// the desktop's freens-web served pre-upgrade templates through two
+	// "successful" upgrades while every version surface showed the
+	// daemon's fresh stamp).
+	SelfVersion string
 }
 
 // DefaultListen is the out-of-the-box bind address.

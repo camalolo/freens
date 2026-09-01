@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -114,8 +115,9 @@ func (s *Server) routes() {
 	// Static + health: no auth (login page needs CSS; health is for probes).
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", staticHandler()))
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%q}\n", s.cfg.SelfVersion)
 	})
 	s.mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "no icon", http.StatusNoContent)

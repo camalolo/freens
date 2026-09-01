@@ -34,15 +34,18 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,6 +54,7 @@ import (
 	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/keychain"
+	"github.com/camalolo/freens/internal/webui"
 )
 
 // githubOwnerRepo is the release source for self-upgrade. Everything else
@@ -683,6 +687,54 @@ func waitDaemonBack(d time.Duration) {
 	}
 }
 
+// waitWebUIBack polls the webui's own /healthz until it reports the freshly
+// installed version. The daemon's version says nothing about the UI process
+// (the footer even renders the DAEMON's stamp), so a webui left running a
+// renamed-aside pre-upgrade image looks completely healthy from every
+// version surface — it took a peer-table heading drawn twice to notice
+// (found live 2026-09-01 on the desktop box: the UI served v0.13.1-pre
+// templates through two successful upgrades). Best-effort like the daemon
+// check: prints and warns, never fails the upgrade.
+func waitWebUIBack(d time.Duration, want string) {
+	port := "8090" // DefaultListen
+	if b, err := os.ReadFile(home.ConfPath()); err == nil {
+		if cfg, perr := webui.ParseConfig(string(b)); perr == nil && cfg != nil && cfg.Listen != "" {
+			if _, p, err := net.SplitHostPort(cfg.Listen); err == nil && p != "" {
+				port = p
+			}
+		}
+	}
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		// The one-port listener upgrades plaintext to https (308); the
+		// §9.5 chain is self-certified, so verification is not the point
+		// here — reaching the process is.
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
+		if err == nil {
+			var body struct {
+				Status  string `json:"status"`
+				Version string `json:"version"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&body)
+			resp.Body.Close()
+			if err == nil && body.Version != "" {
+				if want == "" || body.Version == want {
+					fmt.Printf("webui back: version %s\n", body.Version)
+					return
+				}
+				fmt.Fprintf(os.Stderr, "%s: WARNING: the webui on :%s reports version %s, want %s — it is serving PRE-UPGRADE code (stale service image). Restart the freens-web service.\n", ProgName, port, body.Version, want)
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Fprintf(os.Stderr, "%s: warning: the webui on :%s did not answer /healthz within %s — check the freens-web service/unit\n", ProgName, port, d)
+}
+
 // ---------------------------------------------------------------------------
 // upgrade
 // ---------------------------------------------------------------------------
@@ -856,7 +908,9 @@ func cmdUpgrade(args []string) error {
 	}
 
 	// Restart the services around the new binaries.
+	webWasUp := false
 	if goosWindows {
+		webWasUp = winWebWasRunning
 		restartWindowsService(winServiceWasRunning, winWebWasRunning)
 	} else {
 		units := activeFreensUnits()
@@ -865,12 +919,21 @@ func cmdUpgrade(args []string) error {
 		} else {
 			fmt.Printf("restarting: %s\n", strings.Join(units, ", "))
 			restartFreensUnits(units)
+			webWasUp = slices.Contains(units, "freens-web.service")
 		}
 	}
 
 	if wasAlive {
 		fmt.Println("health check:")
 		waitDaemonBack(20 * time.Second)
+		if webWasUp {
+			// The daemon's version says nothing about the UI process:
+			// a webui serving a renamed-aside old image survived two
+			// "successful" upgrades (found live 2026-09-01 on the desktop
+			// box — the footer version comes from the daemon, so nothing
+			// surfaced it). Ask the UI itself for its stamp.
+			waitWebUIBack(10 * time.Second, tag)
+		}
 	}
 
 	fmt.Println("upgrade complete. previous binaries kept as <binary>.freens-prev (copy back + restart to roll back).")

@@ -6,8 +6,12 @@ package webui
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -141,5 +145,47 @@ func TestNetworkPageSingleHeading(t *testing.T) {
 	}
 	if n := strings.Count(string(fbody), "Peers ("); n != 1 {
 		t.Errorf("peers fragment renders the heading %d times, want 1:\n%s", n, fbody)
+	}
+}
+
+// TestHealthzReportsSelfVersion: /healthz must carry THIS webui binary's
+// own stamp — the page footer renders the daemon's version, so nothing
+// else can expose a stale UI process (found live 2026-09-01: the desktop's
+// freens-web served pre-upgrade templates through two "successful"
+// upgrades while every version surface showed the daemon's fresh stamp).
+func TestHealthzReportsSelfVersion(t *testing.T) {
+	dir := t.TempDir()
+	homeDirPath := filepath.Join(dir, "freens")
+	if err := os.MkdirAll(filepath.Join(homeDirPath, "keys"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(&Config{HomeDir: homeDirPath, Allow: "127.0.0.0/8", SelfVersion: "v9.9.9-test"}, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/healthz status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("/healthz body is not JSON: %s", body)
+	}
+	if out.Status != "ok" || out.Version != "v9.9.9-test" {
+		t.Fatalf("/healthz = %s, want status ok + version v9.9.9-test", body)
 	}
 }
