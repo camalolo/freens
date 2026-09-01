@@ -256,3 +256,72 @@ func TestStatePersists(t *testing.T) {
 		t.Fatalf("restored state = %+v", snap)
 	}
 }
+
+// TestSweepSpoolRemovesExpired: an expired cross-cert (and an unparsable
+// file) in the spool must disappear on engine start and on any OnOwnerCA
+// notification, while fresh entries (this alias's own) stay. The expired
+// copy in the system store is what poisoned minipc's self-visit (found
+// live 2026-09-01) — the spool is the bridge's source of truth, so THIS is
+// where the staleness has to die.
+func TestSweepSpoolRemovesExpired(t *testing.T) {
+	// CrossCert refuses to mint an already-expired cert (rightly), so the
+	// "expired" entries are minted against a clock that then moves forward:
+	// the engine's Now is a var, so the sweep sees them as expired exactly
+	// the way a real box does after 24 h of not resolving a namespace.
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	seed := ownerSeed(t, 9)
+
+	// Mint three cross-certs the way OnOwnerCA would: fresh, soon-to-expire,
+	// and garbage. Only the fresh one may survive the sweep.
+	now := clock
+	mk := func(alias string, notAfter time.Time) []byte {
+		der, err := tlsca.CrossCert(e.rootDER, e.rootKey, mustCA(t, seed, alias, now), alias, notAfter, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tlsca.CertPEM(der)
+	}
+	writeSpool := func(alias string, pem []byte) {
+		if err := os.WriteFile(e.spoolPath(alias), pem, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSpool("fresh", mk("fresh", now.Add(time.Hour)))
+	writeSpool("stale", mk("stale", now.Add(50*time.Millisecond)))
+	writeSpool("junk", []byte("not a pem at all"))
+	clock = clock.Add(time.Minute) // a day passes for the sweep
+
+	// The sweep runs inside OnOwnerCA — a (deduped) notification is the
+	// realistic trigger.
+	caDER, _ := ownerCA(t, seed, "fresh", now)
+	e.OnOwnerCA("fresh", []byte{1}, caDER, now.Add(24*time.Hour).Unix())
+
+	if _, err := os.Stat(e.spoolPath("fresh")); err != nil {
+		t.Errorf("fresh entry was swept: %v", err)
+	}
+	if _, err := os.Stat(e.spoolPath("stale")); !os.IsNotExist(err) {
+		t.Errorf("expired entry survived the sweep (err=%v)", err)
+	}
+	if _, err := os.Stat(e.spoolPath("junk")); !os.IsNotExist(err) {
+		t.Errorf("unparsable entry survived the sweep (err=%v)", err)
+	}
+
+	// And at engine start: a stale entry written behind a running engine's
+	// back is cleaned by the NEXT engine (every daemon restart).
+	writeSpool("stale2", mk("stale2", now.Add(50*time.Millisecond)))
+	clock = clock.Add(time.Hour)
+	e2 := mustEngine(t, opts)
+	if _, err := os.Stat(e2.spoolPath("stale2")); !os.IsNotExist(err) {
+		t.Errorf("start-time sweep left an expired entry (err=%v)", err)
+	}
+}
+
+// mustCA derives just the CA bytes.
+func mustCA(t *testing.T, seed []byte, alias string, now time.Time) []byte {
+	t.Helper()
+	der, _ := ownerCA(t, seed, alias, now)
+	return der
+}

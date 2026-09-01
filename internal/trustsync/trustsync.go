@@ -114,6 +114,7 @@ func New(opts Options) (*Engine, error) {
 	}
 	e.rootDER, e.rootKey = rootDER, rootKey
 	e.loadState()
+	e.sweepSpool()
 	return e, nil
 }
 
@@ -244,6 +245,7 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 	now := e.opts.Now()
 	caHash := tlsca.Fingerprint(caDER)
 	tldB32 := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
+	e.sweepSpool()
 
 	e.mu.Lock()
 	if st, ok := e.state[alias]; ok && st.TldIDB32 == tldB32 && st.CASha256 == caHash {
@@ -289,6 +291,45 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 	e.log.Info("tls: cross-certified namespace", "alias", alias,
 		"ca", caHash[:16], "not_after", cross.NotAfter.Format(time.RFC3339),
 		"system", sysOK, "spool", spool)
+}
+
+// sweepSpool deletes spool cross-certs whose notAfter has passed (or that
+// cannot be parsed). The spool is the privileged bridge's source of truth,
+// so an expired entry there lands in the system CA store — and because a
+// cross-cert shares its owner CA's subject AND its (deterministic) key, a
+// stale copy POISONS the verification of an otherwise-fresh chain: OpenSSL
+// selects the expired same-subject anchor and reports the whole chain
+// expired (found live 2026-09-01: minipc curled its own webui and got
+// "certificate expired" while every cert in the presented chain was valid;
+// the expired Aug-31 spool copy sitting in the system store was the
+// culprit). Cross-certs are lifetime-capped by the apex RECORD's expiry (a
+// 24 h lease), so entries for namespaces a box stops resolving go stale
+// within a day — the sweep is what makes the spool converge to exactly the
+// live set. Cheap (a directory of small certs): called at engine start and
+// on every OnOwnerCA notification, including the dedup fast-path, so
+// expiry cleanup never waits for a re-mint.
+func (e *Engine) sweepSpool() {
+	entries, err := os.ReadDir(e.spoolDir())
+	if err != nil {
+		return
+	}
+	now := e.opts.Now()
+	for _, ent := range entries {
+		name := ent.Name()
+		if !strings.HasPrefix(name, "freens-cross-") || !strings.HasSuffix(name, ".crt") {
+			continue
+		}
+		path := filepath.Join(e.spoolDir(), name)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		cert, perr := tlsca.ParseCertPEM(b)
+		if perr != nil || !cert.NotAfter.After(now) {
+			_ = os.Remove(path)
+			e.log.Info("tls: swept expired spool cross-cert", "file", name)
+		}
+	}
 }
 
 // OnAliasDead purges everything the engine installed for alias. A stale

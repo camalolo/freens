@@ -52,6 +52,17 @@ func cmdTrustInstall(args []string) error {
 	if blk, _ := pem.Decode(rootPEM); blk == nil {
 		return fmt.Errorf("internal: root PEM unreadable")
 	}
+	// §9.5.4 privileged bridge (systemd boxes): the cross-cert spool ages
+	// out of the system CA store within hours unless something re-syncs it
+	// — the bridge is that something, and its units (or their start-limit
+	// relief) may predate the fix. Ensure them here too, not just in setup:
+	// a user re-running trust-install is exactly the person debugging TLS
+	// trust. Non-systemd boxes: installTrustBridge prints the manual recipe
+	// or no-ops (it never blocks the root install below).
+	goosLinux := !goosWindows && !goosDarwin
+	if goosLinux {
+		installTrustBridge()
+	}
 	fmt.Println("installing (idempotent):")
 	for _, line := range engine.InstallRoot() {
 		fmt.Println("  " + line)

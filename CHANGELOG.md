@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.14.1 — the seed could not resolve the names it witnessed (witness-set starvation) + the §9.5.4 trust chain stops aging out
+
+Two fleet-found fixes, both "the system works until it has been running
+long enough to matter":
+
+- **dht: the converged witness set now includes the walking node's own
+  ID.** §7.3 membership ("the witness is among the WITNESS_SET = 8
+  closest nodes to K_claim as the verifier's converged lookup observed
+  them") was built from the walk's REACHED contacts — and a walk never
+  reaches itself. Consequence found live fleet-wide: the seed node had
+  witnessed every registration in the community, so every claim except
+  its own carried its attestation — which counted 0/5 forever. Once the
+  seed's routing table grew past 8 contacts (membership enforcement
+  switched on), it NXDOMAINed every other name while `admin /resolve`
+  (which skips §7.4 screening) still found them, and the same claims
+  verified fine from every other box. minipc/nanopi resolving their own
+  neighborhood worked because the seed was in THEIR tables. The fix is
+  one line of accuracy: self's ID joins the candidate set (self is
+  definitionally reachable — it is running the walk — and its offer
+  already joins the collection merge). Regression tests encode the
+  incident math (self completes the set; sparse views still yield nil;
+  a far-away self never displaces real members).
+- **cli/trustsync: the §9.5.4 system-trust chain stops silently aging
+  out.** Three compounding defects, all found on the fleet the same
+  day:
+  1. the trust bridge's systemd oneshot tripped the default start
+     limit (5 starts / 10 s) because the daemon touches the spool on
+     every TLSCA re-verification — the path unit went `failed
+     (start-limit-hit)` and stayed dead, so the system CA store froze
+     while the spool moved on. The unit now sets
+     `StartLimitIntervalSec=0` and caps triggers instead.
+  2. `trust-install`/setup skipped installing the bridge whenever the
+     unit files already existed — the boxes with the BROKEN units were
+     exactly the boxes that could never receive the fix. Install is
+     repair-shaped now: write when content differs, reset-failed +
+     restart a tripped bridge, and `trust-install` ensures the bridge
+     too (not just setup).
+  3. the spool held expired cross-certs (they are lifetime-capped by
+     the apex RECORD's 24 h lease, and namespaces a box stops
+     resolving simply go stale there). An expired copy in the system
+     store POISONS verification: it shares its owner CA's subject and
+     deterministic key with the live one, so OpenSSL selects it as the
+     anchor and reports "certificate expired" for a name whose entire
+     presented chain was valid (found live: minipc curling its own
+     webui). The daemon now sweeps expired/unparsable spool entries at
+     startup and on every cross-cert notification, and the bridge only
+     copies certs that pass `openssl x509 -checkend 0`.
+
 ## v0.14.0 — DoH both ways: encrypted upstream + serving /dns-query (spec §9.6)
 
 DNS-over-HTTPS as a first-class switch in each direction, each one line

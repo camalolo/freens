@@ -71,11 +71,14 @@ import (
 // least constants.WitnessSet (8) distinct reachable nodes, it is the
 // hex(NodeID) set of the 8 closest REACHED contacts to K_claim — the same set
 // a converged Kademlia walk names on any honest node, and what a verifier
-// restricts the §7.3 quorum to (claims.HasQuorum). A sparse view (< 8
-// reachable nodes — e.g. the small beta fleet) yields nil: the membership
-// check is silently NOT enforced rather than enforced against a set an
-// eclipse or a young table would skew. See DHTLookup.CollectClaimsWithWitnesses
-// for the resolver-side plumbing.
+// restricts the §7.3 quorum to (claims.HasQuorum). The LOCAL NODE counts as
+// reached (v0.14.1: its own ID joins the candidate set — a walk-from-self
+// otherwise omits exactly self, and every claim this node witnessed could
+// then never pass membership from this node; see convergedWitnessSet). A
+// sparse view (< 8 reachable nodes — e.g. the small beta fleet) yields nil:
+// the membership check is silently NOT enforced rather than enforced against
+// a set an eclipse or a young table would skew. See
+// DHTLookup.CollectClaimsWithWitnesses for the resolver-side plumbing.
 //
 // Full §7.4 filtering (structural validity, PoW, witness quorum, ordering,
 // winner selection) is the RESOLVER's job (§6.5: the DHT does not adjudicate);
@@ -274,22 +277,43 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	if len(collected) == 0 && (probesFailed > 0 || probesThrottled > 0) {
 		return nil, nil, ErrDegradedMiss
 	}
-	return sortedByRecordHash(collected), convergedWitnessSet(answered, key), nil
+	return sortedByRecordHash(collected), convergedWitnessSet(answered, key, n.ID()), nil
 }
 
 // convergedWitnessSet names the §7.3 WITNESS_SET (the WitnessSet = 8 closest
 // nodes to K_claim) as this converged walk saw it: answered is every REACHED
-// contact (replies + §12-throttled-but-alive), key is K_claim. Fewer than
-// WitnessSet reachable contacts yields nil — the set would say more about
-// table sparsity (or an eclipse) than about the network, and the resolver
-// treats nil as "membership unenforced" rather than rejecting everything.
-func convergedWitnessSet(answered map[string]*NodeContact, key []byte) map[string]bool {
-	if len(answered) < constants.WitnessSet {
-		return nil
-	}
-	reached := make([]*NodeContact, 0, len(answered))
+// contact (replies + §12-throttled-but-alive), key is K_claim, and selfID is
+// THIS node's own ID.
+//
+// SELF-INCLUSION (v0.14.1) — the fix for witness-set starvation: the local
+// node is a full member of the network's closest-8 to K_claim whenever its
+// ID is close enough (every OTHER node's converged walk sees it there), but
+// a walk never reaches ITSELF — answered only holds contacts. Excluding self
+// shifted the membership window by one and made the §7.3 check
+// unsatisfiable for any claim THIS node witnessed: its own attestation
+// counted 0/5 forever. Found live 2026-09-01 fleet-wide — the seed node
+// (which witnessed every registration in the community) NXDOMAINed every
+// name except its own the moment its table grew past WitnessSet contacts;
+// the same claim verified fine from every other box whose view still held
+// all five witnesses. Self's "reachability" is not an assumption here: the
+// node is definitionally up (it is running the walk) and its offer already
+// joins the merge above — mirroring that in the set is strictly more
+// accurate, not more trusting.
+//
+// Fewer than WitnessSet reachable contacts (self included) yields nil — the
+// set would say more about table sparsity (or an eclipse) than about the
+// network, and the resolver treats nil as "membership unenforced" rather
+// than rejecting everything.
+func convergedWitnessSet(answered map[string]*NodeContact, key []byte, selfID []byte) map[string]bool {
+	reached := make([]*NodeContact, 0, len(answered)+1)
 	for _, c := range answered {
 		reached = append(reached, c)
+	}
+	if len(selfID) == constants.NodeIDLen {
+		reached = append(reached, &NodeContact{NodeID: append([]byte(nil), selfID...)})
+	}
+	if len(reached) < constants.WitnessSet {
+		return nil
 	}
 	sort.SliceStable(reached, func(i, j int) bool {
 		return CompareDistance(key, reached[i].NodeID, reached[j].NodeID) < 0
