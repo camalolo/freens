@@ -320,7 +320,12 @@ func TestResponseCachePolicy(t *testing.T) {
 // lookups (the walk runs in a goroutine; tests need a deterministic join).
 func waitForRefresh(t *testing.T, counter *int32, before int32) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// 10 s: this only ever costs time on a GENUINE failure, and the
+	// background goroutine has to be scheduled behind every parallel test
+	// binary on the machine — the windows CI runner tripped the old 3 s
+	// budget under load while the identical code passed on linux
+	// (2026-09-02, v0.14.1 CI).
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if atomic.LoadInt32(counter) > before {
 			return
