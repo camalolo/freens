@@ -22,7 +22,12 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test
-        run: go test ./... -count=1 -race -timeout 15m
+        # -p 1: the packages run sequentially. In parallel, the 4-minute
+        # cli -race suite starves the resolver's background-refresh timing
+        # tests (AGENTS.md: the full-suite -race run oversubscribes the
+        # CPU; flakes verified on unmodified master). Sequential keeps the
+        # total inside the timeout and the timing tests honest.
+        run: go test ./... -count=1 -race -timeout 15m -p 1
       - name: build
         run: |
           go build ./...

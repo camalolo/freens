@@ -335,6 +335,29 @@ func waitForRefresh(t *testing.T, counter *int32, before int32) {
 	t.Fatalf("background refresh never ran (lookups stuck at %d)", before)
 }
 
+// waitForRefreshQuiesce waits for the background refresh to START and then
+// go QUIET — the counter must stop moving for a short window. A two-hop
+// freens refresh (alias claim + name record) performs TWO Lookup calls, and
+// under a loaded scheduler they can land seconds apart: asserting between
+// them (waitForRefresh only proves the FIRST happened) saw the second
+// lookup counted against the caller's "the next serve must not walk"
+// assertion (windows CI, full-suite -race, 2026-09-01). Success costs
+// ~50 ms; the budget only spends on genuine breakage.
+func waitForRefreshQuiesce(t *testing.T, counter *int32, before int32) {
+	t.Helper()
+	waitForRefresh(t, counter, before)
+	deadline := time.Now().Add(10 * time.Second)
+	var last int32
+	for time.Now().Before(deadline) {
+		last = atomic.LoadInt32(counter)
+		time.Sleep(50 * time.Millisecond)
+		if atomic.LoadInt32(counter) == last && last > before {
+			return
+		}
+	}
+	t.Fatalf("background refresh never went quiet (lookups still moving: %d)", last)
+}
+
 // failingLookup makes the TRANSPORT fail on demand (the real outage shape:
 // DHT unreachable) without changing what the namespace knows. attempts
 // counts every Lookup call INCLUDING the failing ones (inner.calls only
@@ -649,8 +672,11 @@ func TestServeDNSPrefetchKeepsHotNamesWarm(t *testing.T) {
 	if first.Rcode != dns.RcodeSuccess || first.Answer[0].Header().Ttl != 50 {
 		t.Fatalf("first = rcode %d ttl %d", first.Rcode, first.Answer[0].Header().Ttl)
 	}
-	// The ≤60 s remaining hit must kick the background refresh.
-	waitForRefresh(t, &lookup.calls, base)
+	// The ≤60 s remaining hit must kick the background refresh — and it
+	// must have FINISHED (gone quiet) before the no-rewalk assertion: a
+	// two-hop refresh's second lookup landing mid-assertion is the
+	// scheduler's business, not the cache's.
+	waitForRefreshQuiesce(t, &lookup.calls, base)
 	// After the refresh the entry is fresh again: the next answer is a
 	// cache hit with the full (short) TTL and NO additional walk.
 	before := atomic.LoadInt32(&lookup.calls)
