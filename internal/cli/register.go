@@ -252,8 +252,15 @@ func cmdRegister(args []string) error {
 	var node *dht.Node
 	if tr.daemon() {
 		fmt.Printf("witnesses: collecting %d co-signatures via the running daemon (admin socket)\n", constants.W)
+		// The witness walk is capped at 30s server-side; the shared admin
+		// client's 15s timeout used to kill the request first — and with
+		// it (pre-detached-collection) the walk itself, so every retry
+		// re-died at the same mark (found live 2026-09-01 on a fresh VPS).
+		// Give this one call headroom over the server cap.
+		wc := *tr.client
+		wc.Timeout = witnessAdminTimeout
 		atts, err = collectWitnessesRetried(constants.W, func(int) ([]*claims.WitnessAttestation, error) {
-			return collectWitnessesViaAdmin(ctx, tr.client, *alias, tldID, kp.Public(), claim.Timestamp, claim.Nonce, claim.PowHash)
+			return collectWitnessesViaAdmin(ctx, &wc, *alias, tldID, kp.Public(), claim.Timestamp, claim.Nonce, claim.PowHash)
 		})
 		if err != nil {
 			return err
@@ -437,6 +444,12 @@ func recoveryPlan(noRecovery bool, keysDir, alias, passphrase string) ([]string,
 var (
 	witnessRetryAttempts = 3
 	witnessRetrySleep    = 10 * time.Second
+
+	// witnessAdminTimeout bounds the CLI's /witness admin call: it must
+	// outlive the daemon's 30s server-side collection cap (adminTimeout's
+	// 15s used to fire first, cancelling the walk before convergence —
+	// found live 2026-09-01, fresh-VPS registration).
+	witnessAdminTimeout = 45 * time.Second
 )
 
 // collectWitnessesRetried wraps one witness-collection attempt (a closure

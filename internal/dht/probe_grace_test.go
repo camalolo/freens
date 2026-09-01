@@ -349,3 +349,70 @@ func TestNewcomerAccumulatesFleetAddressesFromSeed(t *testing.T) {
 		t.Fatal("advertisement must not confirm (anti-ghost invariant)")
 	}
 }
+
+// ---- confirm-on-learn (2026-09-01) ----
+// Learning a contact now carries its own liveness check: a newly learned,
+// never-confirmed contact is probed immediately (preferred address first,
+// then alternates with failover). Found live on a fresh VPS: it learned all
+// 8 fleet contacts from the seed's multi-addr advertisement and sat at
+// "8 known / 0 confirmed" until its registration's witness collection
+// timed out — nothing ever probed what it learned.
+
+func TestLearnContactProbesAndConfirms(t *testing.T) {
+	a := mkWalkProbeNode(t)
+	b, _ := startTestNode(t, nil)
+	defer b.Close()
+	bAddr, err := b.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nc, err := NewNodeContact(b.ID(), b.PublicKey(), bAddr.String(), a.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.learnContact(nc) // unconfirmed learning — must trigger the probe
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if live := a.rt.Get(b.ID()); live != nil && live.ConfirmedAt > 0 {
+			return // the async probe answered; learnPeer confirmed
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("newly learned contact was never probed/confirmed")
+}
+
+func TestConfirmContactFailsOverToReachableAlternate(t *testing.T) {
+	a := mkWalkProbeNode(t)
+	b, _ := startTestNode(t, nil)
+	defer b.Close()
+	bAddr, err := b.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The peer is known at a dead preferred address (black-holed TEST-NET)
+	// and at its real one as an alternate — the fresh-VPS shape, where the
+	// seed's advertisement leads with addresses unreachable from outside.
+	nc, err := NewNodeContact(b.ID(), b.PublicKey(), "192.0.2.77:15353", a.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.learn(nc)
+	alt := *nc
+	alt.Addr = bAddr.String()
+	alt.LastSeen = a.now()
+	a.learnContact(&alt)
+
+	a.confirmContact(nc)
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		live := a.rt.Get(b.ID())
+		if live != nil && live.ConfirmedAt > 0 && live.Addr == bAddr.String() {
+			return // failed-over to the reachable alternate and confirmed
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("no failover to the reachable alternate: %+v", a.rt.Get(b.ID()))
+}

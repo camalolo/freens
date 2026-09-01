@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
@@ -727,19 +728,37 @@ func (s *Server) handleWitness(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad pow_hash hex: "+err.Error())
 		return
 	}
-	ctx, cancel := capped(r)
-	defer cancel()
+
+	// §7.3 witness collections run DETACHED from the calling connection and
+	// are memoized. The collection used to ride the request's context: the
+	// CLI's admin timeout (15s) fires before this endpoint's 30s server cap,
+	// and the disconnect CANCELLED the walk mid-flight — so every retry
+	// re-died at the same 15s mark while the fleet was actively witnessing
+	// each attempt, and the quorum never accumulated (found live
+	// 2026-09-01: a fresh VPS's registration failed three times; the seed's
+	// journal shows co-signatures landing for every single attempt). Now
+	// the walk runs on its own clock: a timed-out CLI leaves it running to
+	// completion, and the finished quorum is cached — the next call (the
+	// CLI's retry loop, or the user typing the command again) returns it
+	// instantly.
+	cacheKey := fmt.Sprintf("%s|%s|%s|%d|%s|%s", req.Alias, req.TldID, req.Claimant, req.TS, req.Nonce, req.PowHash)
+	if v, ok := witnessCache.Load(cacheKey); ok {
+		writeJSON(w, http.StatusOK, v)
+		return
+	}
 
 	// §7.4 step 3, first half: walk toward K_claim so Closest(K_claim, W)
 	// selects from a table that actually covers the witness region.
+	wctx, wcancel := context.WithTimeout(context.Background(), requestCap)
+	defer wcancel()
 	kClaim, err := dht.KeyForClaim(alias)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad alias: "+err.Error())
 		return
 	}
-	s.node.IterativeFindNode(ctx, kClaim, constants.WitnessSet)
+	s.node.IterativeFindNode(wctx, kClaim, constants.WitnessSet)
 
-	atts, err := s.node.CollectWitnesses(ctx, alias, tldID, claimant, req.TS, nonce, powHash, constants.WitnessSet)
+	atts, err := s.node.CollectWitnesses(wctx, alias, tldID, claimant, req.TS, nonce, powHash, constants.WitnessSet)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "witness collection failed: "+err.Error())
 		return
@@ -752,8 +771,16 @@ func (s *Server) handleWitness(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Attestations = append(out.Attestations, base64.StdEncoding.EncodeToString(b))
 	}
+	witnessCache.Store(cacheKey, out)
 	writeJSON(w, http.StatusOK, out)
 }
+
+// witnessCache memoizes completed §7.3 witness collections keyed by
+// "<alias>|<tld>|<claimant>|<ts>|<nonce>|<pow>" (see handleWitness). Entries
+// live for the daemon's lifetime — a claim's witness set is immutable once
+// quorum-signed, and re-collection is exactly what the cache exists to
+// spare the network.
+var witnessCache sync.Map
 
 // ---------------------------------------------------------------------------
 // GET /peers

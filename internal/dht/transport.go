@@ -2259,9 +2259,68 @@ func (n *Node) learnContact(c *NodeContact) {
 		return
 	}
 	c.LastSeen = n.now()
+	isNew := n.rt.Get(c.NodeID) == nil
 	// c.ConfirmedAt is left as the caller set it (0 from {nodes} parsing);
 	// AddOrRefresh keeps the stored entry's confirmation untouched.
 	n.learn(c)
+	if isNew && c.ConfirmedAt == 0 {
+		// Confirm-on-learn (2026-09-01): a newly learned, never-confirmed
+		// contact is probed right away. The newcomer bootstrap path taught
+		// the hard lesson: the seed's first answer hands a fresh node the
+		// whole fleet (multi-addr advertisement), but NOTHING probed those
+		// contacts until some walk happened to touch them — a fresh VPS
+		// sat with 8 known / 0 confirmed peers and a witness collection
+		// that could not find a quorum. Learning now carries its own
+		// liveness check; the reply path confirms via learnPeer.
+		go n.confirmContact(c.clone())
+	}
+}
+
+// confirmInflight dedups concurrent confirmation pings per NodeID (see
+// confirmContact).
+var confirmInflight sync.Map
+
+// confirmContact probes a newly-learned contact: the preferred address
+// first, then its known alternates — promoting the first alternate when the
+// preferred misses, so the stored address follows to wherever the peer is
+// actually reachable. Best-effort: the reply path (learnPeer) does the
+// confirming; a total miss just leaves the contact to the idle sweep.
+func (n *Node) confirmContact(c *NodeContact) {
+	if _, busy := confirmInflight.LoadOrStore(string(c.NodeID), struct{}{}); busy {
+		return
+	}
+	defer confirmInflight.Delete(string(c.NodeID))
+
+	cands := []string{c.Addr}
+	if live := n.rt.Get(c.NodeID); live != nil {
+		for _, a := range live.OtherAddrs() {
+			recent := true
+			if n.contactIdleTTL > 0 {
+				recent = n.now()-a.LastSeen <= int64(n.contactIdleTTL/time.Second)
+			}
+			if recent && a.Addr != c.Addr {
+				cands = append(cands, a.Addr)
+			}
+		}
+	}
+	for i, addr := range cands {
+		a, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			continue
+		}
+		pctx, cancel := context.WithTimeout(context.Background(), lookupProbeTimeout)
+		resp, err := n.sendQuery(pctx, a, c.NodeID, "ping", map[string]any{})
+		cancel()
+		if err == nil && resp != nil {
+			return // answered: the read loop confirmed the contact
+		}
+		if i == 0 && len(cands) > 1 {
+			// the preferred address missed: follow the table to the next
+			// candidate (clears the missed address's confirmation stamp per
+			// the anti-ghost invariant — advertisement recency is not life)
+			n.rt.PromoteAlt(c.NodeID, cands[1])
+		}
+	}
 }
 
 // sweepIdleContacts evicts contacts whose last DIRECT confirmation (or, for
