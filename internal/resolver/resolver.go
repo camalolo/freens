@@ -1309,3 +1309,68 @@ func dnsNameFromRdata(b []byte) (string, bool) {
 	}
 	return dns.Fqdn(s), true
 }
+
+// ---------------------------------------------------------------------------
+// Proactive refresh sweeper (§10.4 amended, second leg): the query-driven
+// kicks (prefetch + stale-serve) only revalidate names a client is ASKING
+// about; a name whose hits stop for longer than the stale window ages out
+// and its next query walks cold (~seconds, found live on the desktop box).
+// The sweeper closes that: every tick it revalidates the WARM SET —
+// positive entries hit within the last refreshSweepHorizon whose data is
+// (nearly) expired — so any name in recurring use is answered from cache
+// forever, and each entry's data is re-verified continuously even with no
+// client queries (a revocation or address change is learned proactively,
+// not at the next client query).
+// ---------------------------------------------------------------------------
+
+const (
+	// refreshSweepEvery is the sweeper tick.
+	refreshSweepEvery = time.Minute
+	// refreshSweepHorizon is the warm-set membership: entries hit within
+	// this window keep being refreshed; older ones age out (their next
+	// query walks once, then they're warm again).
+	refreshSweepHorizon = 24 * 3600
+	// refreshSweepBatch bounds refreshes kicked per tick so a large warm
+	// set cannot stampede the DHT; the stale path keeps those answers
+	// instant while the backlog drains.
+	refreshSweepBatch = 16
+)
+
+// SweepRefreshes kicks the background refresh for every warm-set entry
+// that needs one, returning how many kicks were issued. Exposed for tests;
+// RunRefreshSweeper is the daemon-facing loop.
+func (r *Resolver) SweepRefreshes(now int64) int {
+	if r.Cache == nil {
+		return 0
+	}
+	keys := r.Cache.SweepCandidates(now, refreshSweepHorizon, refreshSweepBatch)
+	kicked := 0
+	for _, k := range keys {
+		r.kickRefresh(dns.Question{Name: k.name, Qtype: k.qtype, Qclass: k.qclass}, k)
+		kicked++
+	}
+	return kicked
+}
+
+// RunRefreshSweeper runs SweepRefreshes every refreshSweepEvery until stop
+// closes. Daemon-facing wiring (bgStop); a resolver without a cache is a
+// no-op.
+func (r *Resolver) RunRefreshSweeper(stop <-chan struct{}) {
+	if r.Cache == nil {
+		return
+	}
+	t := time.NewTicker(refreshSweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			nowFn := r.Now
+			if nowFn == nil {
+				nowFn = func() int64 { return time.Now().Unix() }
+			}
+			r.SweepRefreshes(nowFn())
+		}
+	}
+}

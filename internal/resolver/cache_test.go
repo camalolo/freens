@@ -654,3 +654,120 @@ func TestServeDNSPrefetchKeepsHotNamesWarm(t *testing.T) {
 		t.Fatalf("post-prefetch hit re-walked (%d → %d) — it must come from cache", before, got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Proactive refresh sweeper: the warm set (entries hit within the horizon)
+// is revalidated BEFORE the stale window runs out, so a name in recurring
+// use is answered from cache forever. Refreshes do NOT count as hits — an
+// abandoned name's warm membership decays and its next query walks once
+// (the GC).
+// ---------------------------------------------------------------------------
+
+func TestResponseCacheSweepCandidates(t *testing.T) {
+	now := int64(1_000_000)
+	c := NewResponseCache(0, func() int64 { return now })
+	// The sweep runs LATER than the puts: entries cached at `now` with a
+	// 300 s TTL are expired by now+400, which is when lastHit membership
+	// decides who gets revalidated.
+	sweepAt := now + 400
+	mk := func(name string, ttl int64) cacheKey {
+		return cacheKey{name, dns.TypeA, dns.ClassINET}
+	}
+	put := func(name string, ttl int64, hitAt int64) {
+		ck := mk(name, ttl)
+		c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)},
+			A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
+		// age the entry's lastHit to hitAt by direct surgery (putFreens
+		// stamps now; the sweep contract is about lastHit, not creation)
+		c.mu.Lock()
+		c.entries[ck].lastHit = hitAt
+		c.mu.Unlock()
+	}
+	put("hot.foo.", 300, sweepAt-60)                                // recently hit, expired → sweep
+	put("warm.foo.", 300, sweepAt-3600)                             // hit an hour ago, expired → sweep
+	put("cold.foo.", 300, sweepAt-100_000)                          // hit >24h ago → NOT in the warm set
+	put("fresh.foo.", 3000, sweepAt-60)                             // still fresh → prefetch covers it
+	c.putFreens(mk("dead.foo.", 60), nil, dns.RcodeNameError, true) // negative → never
+
+	got := c.SweepCandidates(sweepAt, 24*3600, 100)
+	names := map[string]bool{}
+	for _, k := range got {
+		names[k.name] = true
+	}
+	if !names["hot.foo."] || !names["warm.foo."] {
+		t.Fatalf("warm expired entries missing from the sweep: %v", names)
+	}
+	for _, banned := range []string{"cold.foo.", "fresh.foo.", "dead.foo."} {
+		if names[banned] {
+			t.Fatalf("%s must not be swept (warm-set/fresh/negative rules): %v", banned, names)
+		}
+	}
+
+	// Batch limit: most-recently-hit first.
+	limited := c.SweepCandidates(sweepAt, 24*3600, 1)
+	if len(limited) != 1 || limited[0].name != "hot.foo." {
+		t.Fatalf("batch limit picked %v, want [hot.foo.]", limited)
+	}
+}
+
+func TestSweepRefreshesRevalidatesWarmSetWithoutQueries(t *testing.T) {
+	w := newFreensWorld(t)
+	lookup := &countingLookup{fakeLookup: newFakeLookup()}
+	lookup.put(w.tldEnv)
+	lookup.put(w.wwwEnv)
+
+	var clock atomic.Int64
+	clock.Store(int64(fixedNow))
+	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
+	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
+	r.Now = func() int64 { return clock.Load() }
+
+	// One client query, then SILENCE: no further client queries happen.
+	serveOnce(t, r, "www.foo.", dns.TypeA)
+	base := atomic.LoadInt32(&lookup.calls)
+
+	// The entry ages past its TTL inside the stale window. With zero
+	// client queries, the sweeper revalidates it anyway.
+	clock.Store(clock.Load() + 601)
+	if kicked := r.SweepRefreshes(clock.Load()); kicked != 1 {
+		t.Fatalf("sweep kicked %d, want 1", kicked)
+	}
+	waitForRefresh(t, &lookup.calls, base)
+
+	// The revalidated entry is fresh again: the next client query after a
+	// long idle gap is a cache hit, not a walk.
+	clock.Store(clock.Load() + 120)
+	before := atomic.LoadInt32(&lookup.calls)
+	ans := serveOnce(t, r, "www.foo.", dns.TypeA)
+	// Fresh-from-cache proof: NOT a stale serve (that would carry ttl ≤ 30)
+	// and no walk (asserted above). The exact TTL just reflects the time
+	// since the sweeper's refresh.
+	if ans.Rcode != dns.RcodeSuccess || ans.Answer[0].Header().Ttl <= 30 {
+		t.Fatalf("post-sweep answer = rcode %d ttl %d, want a fresh cache hit", ans.Rcode, ans.Answer[0].Header().Ttl)
+	}
+	if got := atomic.LoadInt32(&lookup.calls); got != before {
+		t.Fatalf("client query after the sweep walked (%d → %d) — the warm set must keep it cached", before, got)
+	}
+}
+
+func TestSweepRefreshesLeavesColdEntriesAlone(t *testing.T) {
+	w := newFreensWorld(t)
+	lookup := &countingLookup{fakeLookup: newFakeLookup()}
+	lookup.put(w.tldEnv)
+	lookup.put(w.wwwEnv)
+
+	var clock atomic.Int64
+	clock.Store(int64(fixedNow))
+	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
+	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
+	r.Now = func() int64 { return clock.Load() }
+
+	serveOnce(t, r, "www.foo.", dns.TypeA)
+
+	// More than the warm horizon since the only hit: the entry is outside
+	// the warm set — the sweeper must NOT keep it alive forever.
+	clock.Store(clock.Load() + 601 + int64(refreshSweepHorizon) + 10)
+	if kicked := r.SweepRefreshes(clock.Load()); kicked != 0 {
+		t.Fatalf("sweep kicked %d for a cold entry, want 0 (abandoned names must age out)", kicked)
+	}
+}

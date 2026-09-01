@@ -692,6 +692,12 @@ func run(args []string) error {
 	// bgStop ends the background goroutines (gauge refresh, SIGHUP reload)
 	// during shutdown so no reload ever races the teardown below.
 	bgStop := make(chan struct{})
+	// Proactive refresh sweeper: names hit in the last 24 h keep being
+	// revalidated in the background even with zero client queries — from
+	// the client POV a name in recurring use is answered from cache
+	// forever (restarts covered by the persisted cache, idle gaps by the
+	// §10.4 stale window, and this closes the gap beyond both).
+	go res.RunRefreshSweeper(bgStop)
 	// UPnP renewal: routers forget mappings across reboots/resets, and
 	// external addresses change (dynamic PPPoE). Probe every 5 minutes,
 	// re-map when the entry vanished, follow address changes — the node's

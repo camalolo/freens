@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -72,6 +73,7 @@ type cacheEntry struct {
 	rcode     int
 	aa        bool
 	expiresAt int64
+	lastHit   int64  // last CLIENT hit (fresh or stale serve) — the sweeper's warm-set membership; refreshes do NOT count, so abandoned names age out
 	stamp     uint64 // insertion order, monotonically increasing
 }
 
@@ -200,6 +202,7 @@ func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, st
 	}
 	now := c.now()
 	if now < e.expiresAt {
+		e.lastHit = now
 		remaining := uint32(e.expiresAt - now)
 		out := make([]dns.RR, len(e.rrs))
 		for i, rr := range e.rrs {
@@ -215,6 +218,7 @@ func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, st
 	// Expired: positive answers may serve stale (bounded); negatives and
 	// anything past the stale window are dropped for a real re-resolve.
 	if len(e.rrs) > 0 && now < e.expiresAt+int64(constants.StaleServeSecs) {
+		e.lastHit = now
 		remaining := uint32(e.expiresAt + int64(constants.StaleServeSecs) - now)
 		if remaining > staleTTL {
 			remaining = staleTTL
@@ -274,10 +278,10 @@ func (c *ResponseCache) putFreens(key cacheKey, rrs []dns.RR, rcode int, aa bool
 		for i, rr := range rrs {
 			stored[i] = dns.Copy(rr)
 		}
-		e = &cacheEntry{rrs: stored, rcode: rcode, aa: aa, expiresAt: now + ttl}
+		e = &cacheEntry{rrs: stored, rcode: rcode, aa: aa, expiresAt: now + ttl, lastHit: now}
 	case rcode == dns.RcodeNameError || (rcode == dns.RcodeSuccess && len(rrs) == 0):
 		// §9.2 step 3: NXDOMAIN/NODATA negative-cached 60 s (§10.4 line 852).
-		e = &cacheEntry{rrs: nil, rcode: rcode, aa: aa, expiresAt: now + int64(constants.NegTTL)}
+		e = &cacheEntry{rrs: nil, rcode: rcode, aa: aa, expiresAt: now + int64(constants.NegTTL), lastHit: now}
 	default:
 		return // REFUSED / SERVFAIL are transient; never cached.
 	}
@@ -420,7 +424,7 @@ func (c *ResponseCache) LoadFrom(path string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, pe := range pc.Entries {
-		e := &cacheEntry{rcode: pe.Rcode, aa: pe.AA, expiresAt: pe.ExpiresAt}
+		e := &cacheEntry{rcode: pe.Rcode, aa: pe.AA, expiresAt: pe.ExpiresAt, lastHit: pc.SavedAt}
 		for _, wire := range pe.RRs {
 			rr, _, err := dns.UnpackRR(wire, 0)
 			if err != nil {
@@ -438,6 +442,44 @@ func (c *ResponseCache) LoadFrom(path string) error {
 		restored++
 	}
 	return nil
+}
+
+// SweepCandidates returns the keys the proactive refresher should
+// revalidate now: POSITIVE entries whose client hits are inside the warm
+// horizon (recently used — a name abandoned for the horizon ages out and
+// its next query simply walks, the pre-sweeper behavior) and whose data is
+// expired or about to expire (within the prefetch window). Most-recently-
+// hit first, bounded to limit so a big warm set degrades gracefully (the
+// stale path keeps those answers instant while the backlog drains).
+func (c *ResponseCache) SweepCandidates(now, horizonSecs int64, limit int) []cacheKey {
+	type cand struct {
+		key    cacheKey
+		lastHi int64
+	}
+	var out []cand
+	c.mu.Lock()
+	for k, e := range c.entries {
+		if len(e.rrs) == 0 {
+			continue // negatives never refresh proactively
+		}
+		if now-e.lastHit > horizonSecs {
+			continue // outside the warm set
+		}
+		if e.expiresAt >= now+prefetchWindow {
+			continue // still fresh — prefetch-on-hit covers it
+		}
+		out = append(out, cand{k, e.lastHit})
+	}
+	c.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].lastHi > out[j].lastHi })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	keys := make([]cacheKey, len(out))
+	for i, c := range out {
+		keys[i] = c.key
+	}
+	return keys
 }
 
 // writePersisted replaces path atomically (same scheme as the daemon's

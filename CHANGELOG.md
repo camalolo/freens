@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.13.15 — the warm set: names in recurring use are cached forever
+
+Operator question, and they were right: "could the daemon look up in
+the background all the hosts approaching the window and re-cache them,
+so from a client perspective it's always fresh?" The one nuance is
+that the background sweep must do REAL revalidations through the
+screened path — resetting a timer would serve un-revalidated data
+indefinitely and never learn revocations. With real lookups, always-
+cached and always-true arrive together:
+
+- **Proactive refresh sweeper**: every 60 s the daemon revalidates the
+  WARM SET — positive entries whose last CLIENT hit is within 24 h and
+  whose data is expired or about to expire (≤60 s). Any name queried
+  at least once a day is answered from cache forever: daemon restarts
+  (v0.13.13 persistence), idle gaps (6 h stale window), and now the
+  gap beyond both. Each warm entry costs ~one walk per TTL (300 s
+  default), batched to ≤16 kicks/tick with most-recently-hit priority.
+- **Refreshes do NOT count as hits**: a name abandoned for 24 h drops
+  out of the warm set and ages out within the stale window — its next
+  query walks once (the pre-sweeper behavior) and it is warm again.
+  No ghost set grows forever.
+- A side benefit: warm names are re-verified continuously even with no
+  client queries, so a revocation or address change is learned
+  proactively within minutes rather than at the next client query.
+
 ## v0.13.13 — the cache survives restarts; active names never go cold
 
 Field report (desktop, the box this fleet upgrades most): first browse
