@@ -164,6 +164,14 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 		rrs, rcode, aa, status := r.Cache.get2(ck)
 		switch status {
 		case cacheFresh:
+			// Prefetch (unbound-style): a fresh answer with ≤60 s of TTL
+			// left refreshes in the background NOW, so a name in active use
+			// never reaches expiry at all — the stale path stays reserved
+			// for genuinely idle names and outages. Same throttle/single-
+			// flight rules as the stale refresh, so this is bounded.
+			if len(rrs) > 0 && rrs[0].Header().Ttl <= prefetchWindow {
+				r.kickRefresh(q, ck)
+			}
 			resp.Rcode = rcode
 			resp.Answer = rrs
 			resp.Authoritative = aa
@@ -352,3 +360,9 @@ func (u *DoHUpstream) fallbackOr(ctx context.Context, q *dns.Msg, dohErr error) 
 	}
 	return resp, nil
 }
+
+// prefetchWindow is how little TTL a FRESH cache answer may have left
+// before its next hit triggers a background refresh (serve-stale §10.4,
+// prefetch leg): names in active use are refreshed BEFORE they expire, so
+// the answering path never leaves the cache for them.
+const prefetchWindow = 60

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -526,5 +528,129 @@ func TestServeDNSStaleSurvivesFailedRefresh(t *testing.T) {
 	if recovered.Rcode != dns.RcodeSuccess || recovered.Answer[0].Header().Ttl != 600 {
 		t.Fatalf("post-recovery = rcode %d ttl %d, want fresh NOERROR ttl 600",
 			recovered.Rcode, recovered.Answer[0].Header().Ttl)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Persistence: the cache holds §10.4 validation results, so a restart
+// restores them (same trust as memory); expired-positives restore too —
+// the stale path serves them while the refresh revalidates, which is what
+// makes a daemon restart invisible to clients.
+// ---------------------------------------------------------------------------
+
+func TestResponseCachePersistRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dns-cache.json")
+	c := NewResponseCache(0, func() int64 { return 1_000 })
+	ck := cacheKeyFor(dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
+		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
+	nk := cacheKeyFor(dns.Question{Name: "gone.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	c.putFreens(nk, nil, dns.RcodeNameError, true)
+
+	if saved, err := c.SaveIfDirty(path); err != nil || !saved {
+		t.Fatalf("save = %v, %v", saved, err)
+	}
+	// Clean cache: second save is a no-op (dirty flag cleared).
+	if saved, err := c.SaveIfDirty(path); err != nil || saved {
+		t.Fatalf("clean save = %v, %v — dirty flag must clear", saved, err)
+	}
+
+	// A fresh cache (new process) restores everything, including the
+	// negative entry and the ORIGINAL TTLs.
+	c2 := NewResponseCache(0, func() int64 { return 1_000 })
+	if err := c2.LoadFrom(path); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if rrs, rcode, _, ok := c2.get(ck); !ok || rcode != dns.RcodeSuccess ||
+		len(rrs) != 1 || !rrs[0].(*dns.A).A.Equal(net.IPv4(203, 0, 113, 9)) || rrs[0].Header().Ttl != 600 {
+		t.Fatalf("restored positive = ok %v rcode %d rrs %v", ok, rcode, rrs)
+	}
+	if _, rcode, _, status := c2.get2(nk); status != cacheFresh || rcode != dns.RcodeNameError {
+		t.Fatalf("restored negative = status %v rcode %d", status, rcode)
+	}
+
+	// Restart invisibility: an entry that EXPIRED while the daemon was down
+	// restores into the stale window (serve stale, refresh revalidates).
+	c3 := NewResponseCache(0, func() int64 { return 1_000 + 700 })
+	if err := c3.LoadFrom(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, status := c3.get2(ck); status != cacheStale {
+		t.Fatalf("restored expired positive = %v, want cacheStale (restart must not cold-walk the first client query)", status)
+	}
+	// Negatives do NOT get the stale crutch.
+	if _, _, _, status := c3.get2(nk); status != cacheMiss {
+		t.Fatalf("restored expired negative = %v, want cacheMiss", status)
+	}
+}
+
+func TestResponseCacheLoadCorruptIgnored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dns-cache.json")
+	if err := os.WriteFile(path, []byte("{\"entries\": [broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewResponseCache(0, func() int64 { return 1_000 })
+	if err := c.LoadFrom(path); err == nil {
+		t.Fatal("corrupt load should error")
+	}
+	// The cache stays fully usable after a failed load.
+	ck := cacheKeyFor(dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
+	if _, _, _, ok := c.get(ck); !ok {
+		t.Fatal("cache unusable after a corrupt load")
+	}
+	if err := os.WriteFile(path, []byte("not a cache at all"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.LoadFrom(path); err == nil {
+		t.Fatal("garbage load should error")
+	}
+}
+
+func TestServeDNSPrefetchKeepsHotNamesWarm(t *testing.T) {
+	w := newFreensWorld(t)
+	lookup := &countingLookup{fakeLookup: newFakeLookup()}
+	lookup.put(w.tldEnv)
+	// A 50-second-TTL A record: every fresh hit is inside the prefetch
+	// window, so the entry is refreshed BEFORE it can ever expire.
+	shortRR, err := wire.A([]byte{203, 0, 113, 42}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwRec, err := wire.NewRecord(w.wwwEnv.Record.Name, w.wwwEnv.Record.Owner,
+		w.wwwEnv.Record.Sequence, w.wwwEnv.Record.Created, w.wwwEnv.Record.Expires)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwRec.RRset = []*wire.RR{shortRR}
+	shortEnv, err := wire.SignRecord(wwwRec, w.tldKP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup.put(shortEnv)
+
+	var clock atomic.Int64
+	clock.Store(int64(fixedNow))
+	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
+	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
+	r.Now = func() int64 { return clock.Load() }
+
+	base := atomic.LoadInt32(&lookup.calls)
+	first := serveOnce(t, r, "www.foo.", dns.TypeA)
+	if first.Rcode != dns.RcodeSuccess || first.Answer[0].Header().Ttl != 50 {
+		t.Fatalf("first = rcode %d ttl %d", first.Rcode, first.Answer[0].Header().Ttl)
+	}
+	// The ≤60 s remaining hit must kick the background refresh.
+	waitForRefresh(t, &lookup.calls, base)
+	// After the refresh the entry is fresh again: the next answer is a
+	// cache hit with the full (short) TTL and NO additional walk.
+	before := atomic.LoadInt32(&lookup.calls)
+	second := serveOnce(t, r, "www.foo.", dns.TypeA)
+	if second.Answer[0].Header().Ttl > 50 {
+		t.Fatalf("post-prefetch ttl = %d, want ≤ 50 (fresh from cache)", second.Answer[0].Header().Ttl)
+	}
+	if got := atomic.LoadInt32(&lookup.calls); got != before {
+		t.Fatalf("post-prefetch hit re-walked (%d → %d) — it must come from cache", before, got)
 	}
 }

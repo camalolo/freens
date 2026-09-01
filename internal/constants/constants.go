@@ -76,8 +76,9 @@ const (
 	// TTL), and a successful refresh replaces the entry immediately, so the
 	// window only ever matters when the namespace is UNREACHABLE — where
 	// answering with the last known good address beats an outage. Negative
-	// answers never serve stale.
-	StaleServeSecs = 1800
+	// answers never serve stale. 6 h (found live: 30 min still left the
+	// first query after an idle evening walking cold on the client).
+	StaleServeSecs = 6 * 3600
 )
 
 // Storage.

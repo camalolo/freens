@@ -1153,7 +1153,10 @@ not by proof of ownership (an alias points *to* ownership; it cannot
 - Positive answers MAY additionally be served STALE past that horizon —
   same bounds as serve-stale-while-revalidate in classical DNS — while a
   background refresh revalidates the entry, for at most a bounded window
-  past expiry (reference implementation: 30 min). The stale copy carries
+  past expiry (reference implementation: 6 h — long enough that evening-
+  to-morning idle gaps never cost the client a walk; the window only
+  ever matters while the namespace is unreachable, where the last known
+  good address beats none). The stale copy carries
   exactly the validation the fresh one had (it went through the same
   screened path when fetched) and a short TTL so clients re-ask soon.
   This is a latency guarantee, not a weaker trust model: the walk cost

@@ -629,10 +629,25 @@ func run(args []string) error {
 
 	// The §10.4 response cache: enabled here (it only short-circuits the DNS
 	// server path; direct ResolveQuestion callers are unaffected) so the
-	// cache metrics are live from the first query.
+	// cache metrics are live from the first query. State persists across
+	// restarts (dns-cache.json): the entries are §10.4 VALIDATION RESULTS,
+	// so restoring one carries the same trust as keeping it in memory — and
+	// a daemon restart (every upgrade!) stops being a cold-cache walk for
+	// the first client query afterwards.
 	cache := resolver.NewResponseCache(0, nil)
 	cache.SetMetrics(reg)
 	res.Cache = cache
+	if persistEffective != "" {
+		dnsCachePath := filepath.Join(persistEffective, "dns-cache.json")
+		if err := cache.LoadFrom(dnsCachePath); err != nil {
+			if !os.IsNotExist(err) {
+				logger.Warn("dns cache restore skipped", "error", err)
+			}
+		} else if cache.Len() > 0 {
+			logger.Info("dns cache restored", "entries", cache.Len())
+		}
+		go persistDNSCacheLoop(cache, dnsCachePath, logger)
+	}
 
 	udpSrv := resolver.NewServer(cfg.ListenUDP, "udp", res)
 	tcpSrv := resolver.NewServer(cfg.ListenTCP, "tcp", res)
@@ -1564,4 +1579,24 @@ func splitCSV(s string) []string {
 // spec §9.1 privileged-port guidance on bind failure).
 func isPort53(addr string) bool {
 	return strings.HasSuffix(addr, ":53") || addr == ":53"
+}
+
+// persistDNSCacheLoop saves the response cache every 60 s (dirty caches
+// only) until the process exits — the same cadence and never-fatal shape as
+// the envelope/peerbook persist loops. Restored at boot by LoadFrom, this
+// is what makes daemon restarts (upgrades, the 05:00 pppd dance, crash
+// recovery) invisible to DNS clients: the first query after a restart is
+// answered from the restored validation results while the background
+// refresh revalidates.
+func persistDNSCacheLoop(cache *resolver.ResponseCache, path string, logger *slog.Logger) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		saved, err := cache.SaveIfDirty(path)
+		if err != nil {
+			logger.Error("dns cache persist failed", "error", err)
+		} else if saved {
+			logger.Info("persisted dns cache", "path", path)
+		}
+	}
 }

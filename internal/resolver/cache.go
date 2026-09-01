@@ -28,6 +28,10 @@ package resolver
 // period — never raw envelopes.
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -80,7 +84,8 @@ type ResponseCache struct {
 	maxEntries int
 	now        func() int64 // wall-clock seconds
 	nextStamp  uint64
-	sinceSweep int // inserts since the last full expired-sweep (cadence: cacheSweepEvery)
+	sinceSweep int  // inserts since the last full expired-sweep (cadence: cacheSweepEvery)
+	dirty      bool // unseen state since the last SaveIfDirty (persistence)
 	// hits/misses/staleServes optionally count get2() outcomes; nil (the
 	// default, or a SetMetrics(nil) call) leaves the cache uninstrumented.
 	hits   *metrics.Counter
@@ -292,6 +297,7 @@ func (c *ResponseCache) putFreens(key cacheKey, rrs []dns.RR, rcode int, aa bool
 		c.evictOldestLocked()
 	}
 	c.entries[key] = e
+	c.dirty = true
 }
 
 // sweepExpiredLocked drops every entry past its expiry. Caller holds c.mu.
@@ -318,4 +324,152 @@ func (c *ResponseCache) evictOldestLocked() {
 	if found {
 		delete(c.entries, oldestKey)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Persistence (restart resilience): the cache holds §10.4 VALIDATION
+// RESULTS from the screened path — restoring one after a daemon restart is
+// the same trust as keeping it in memory, and it makes upgrades/restarts
+// invisible to clients (found live the hard way: the first browse after the
+// v0.13.12 fleet upgrade walked cold through a warming daemon while the
+// retry hit the cache — "first time didn't resolve, second worked").
+// ---------------------------------------------------------------------------
+
+// persistedEntry is the on-disk form of one entry (dns-cache.json). RRs are
+// stored in wire format with their ORIGINAL TTLs (decay to remaining happens
+// on retrieval, exactly as for in-memory entries).
+type persistedEntry struct {
+	Name      string   `json:"name"`
+	Qtype     uint16   `json:"qtype"`
+	Qclass    uint16   `json:"qclass"`
+	Rcode     int      `json:"rcode"`
+	AA        bool     `json:"aa"`
+	ExpiresAt int64    `json:"expires_at"`
+	RRs       [][]byte `json:"rrs"`
+}
+
+type persistedCache struct {
+	SavedAt int64            `json:"saved_at"`
+	Entries []persistedEntry `json:"entries"`
+}
+
+// markDirty flags the cache as having unseen state (putFreens). The save
+// loop persists only dirty caches.
+func (c *ResponseCache) markDirty() {
+	c.mu.Lock()
+	c.dirty = true
+	c.mu.Unlock()
+}
+
+// SaveIfDirty writes the cache to path atomically (0600) when its state
+// changed since the last save; reports whether a save happened.
+func (c *ResponseCache) SaveIfDirty(path string) (bool, error) {
+	c.mu.Lock()
+	if !c.dirty {
+		c.mu.Unlock()
+		return false, nil
+	}
+	c.dirty = false
+	saved := c.snapshotLocked()
+	c.mu.Unlock()
+	if err := writePersisted(path, saved); err != nil {
+		c.markDirty() // the state is still unsaved — retry next tick
+		return false, err
+	}
+	return true, nil
+}
+
+// snapshotLocked freezes the entries for serialization. Caller holds c.mu.
+func (c *ResponseCache) snapshotLocked() *persistedCache {
+	pc := &persistedCache{SavedAt: c.now(), Entries: make([]persistedEntry, 0, len(c.entries))}
+	for k, e := range c.entries {
+		pe := persistedEntry{
+			Name: k.name, Qtype: k.qtype, Qclass: k.qclass,
+			Rcode: e.rcode, AA: e.aa, ExpiresAt: e.expiresAt,
+			RRs: make([][]byte, 0, len(e.rrs)),
+		}
+		for _, rr := range e.rrs {
+			buf := make([]byte, 65535)
+			n, err := dns.PackRR(rr, buf, 0, nil, false)
+			if err != nil || n <= 0 {
+				continue // one unparsable RR must not drop the entry
+			}
+			pe.RRs = append(pe.RRs, buf[:n])
+		}
+		pc.Entries = append(pc.Entries, pe)
+	}
+	return pc
+}
+
+// LoadFrom restores entries saved by SaveIfDirty. Entries already past their
+// expiry ARE restored: an expired positive inside the §10.4 serve-stale
+// window is exactly the validated answer the stale path serves while a
+// background refresh revalidates — so a restart is invisible. Entries past
+// the window (and negatives past NegTTL) simply miss on first use, as in
+// memory. A corrupt/truncated file is ignored (start empty).
+func (c *ResponseCache) LoadFrom(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var pc persistedCache
+	if err := json.Unmarshal(b, &pc); err != nil {
+		return fmt.Errorf("dns cache: %v", err)
+	}
+	restored := 0
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, pe := range pc.Entries {
+		e := &cacheEntry{rcode: pe.Rcode, aa: pe.AA, expiresAt: pe.ExpiresAt}
+		for _, wire := range pe.RRs {
+			rr, _, err := dns.UnpackRR(wire, 0)
+			if err != nil {
+				e = nil
+				break
+			}
+			e.rrs = append(e.rrs, rr)
+		}
+		if e == nil || (pe.AA && pe.Rcode == dns.RcodeSuccess && len(e.rrs) == 0) {
+			continue // unparsable entry: skip, never fail the whole load
+		}
+		c.nextStamp++
+		e.stamp = c.nextStamp
+		c.entries[cacheKey{name: pe.Name, qtype: pe.Qtype, qclass: pe.Qclass}] = e
+		restored++
+	}
+	return nil
+}
+
+// writePersisted replaces path atomically (same scheme as the daemon's
+// other state files: temp in the same dir, rename over).
+func writePersisted(path string, pc *persistedCache) error {
+	b, err := json.MarshalIndent(pc, "", " ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".dns-cache-*.tmp")
+	if err != nil {
+		return err
+	}
+	if _, err = tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err = os.Chmod(tmp.Name(), 0o600); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
 }

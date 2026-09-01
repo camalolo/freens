@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.13.13 — the cache survives restarts; active names never go cold
+
+Field report (desktop, the box this fleet upgrades most): first browse
+to `desktop:8090` after the v0.13.12 restart failed, the retry worked —
+from the client POV "no caching". Three real gaps, three fixes:
+
+- **The response cache now persists across daemon restarts**
+  (`<persist>/dns-cache.json`, saved every 60 s when dirty, restored at
+  boot). The entries are §10.4 VALIDATION RESULTS — restoring one
+  carries exactly the trust of keeping it in memory — so the restarts
+  every upgrade performs stop being a cold-cache walk for the first
+  client query afterwards. Entries that EXPIRED while the daemon was
+  down restore into the §10.4 stale window (served stale while the
+  background refresh revalidates — restart invisible); negatives
+  restore but never serve stale, unchanged.
+- **The stale window is 6 h** (was 30 min — found live: an idle evening
+  still cost the first morning query a walk). The window only ever
+  matters while the namespace is unreachable, where the last known
+  good address beats none; reachable namespaces self-correct within
+  one refresh regardless of window size. Spec §10.4 reference updated.
+- **Prefetch (unbound-style)**: a fresh cache hit with ≤60 s of TTL
+  left refreshes in the background on THAT hit, so a name in active
+  use never reaches expiry at all — the stale path stays reserved for
+  genuinely idle names and outages.
+
 ## v0.13.9 — setup fixes the nsswitch shadowing (the last mile of first contact)
 
 The closing fix of the fresh-VPS bootstrap saga: on a stock
