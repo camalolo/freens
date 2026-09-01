@@ -1,5 +1,24 @@
 # Changelog
 
+# Changelog
+
+## v0.13.7 — the witness cooldown stops punishing re-registrations
+
+The final defect in the fresh-VPS bootstrap saga (2026-09-01): the §7.3
+`WITNESS_COOLDOWN` keyed on the **alias alone** — one signature per alias
+per hour unless the claim hash was byte-identical. But `register` mints a
+fresh claim timestamp whenever an attempt's 5-minute present-window lapses
+or the daemon restarts, and a new timestamp means a new claim hash — so
+**every witness that signed an earlier attempt refused the next one**.
+The quorum shuffled itself 3 → 2 → 0 across the friend's retries while
+the seed's journal proved the network was answering fine each time.
+
+The cooldown now records the **claimant key** and refuses only when the
+claimant *differs*: a claimant re-mining their own pending registration
+is not a competing claim — the anti-fraud purpose (a second claimant
+racing for the same alias within the hour) is unchanged, and the
+existing different-claimant refusal test passes untouched.
+
 ## v0.13.6 — a newcomer's bootstrap works by itself, over the internet
 
 Three coordinated defects kept a fresh node at "8 known / 0 confirmed
