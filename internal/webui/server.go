@@ -6,6 +6,8 @@ package webui
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -31,9 +33,17 @@ type Server struct {
 
 	// httpSrv is the server serve() is running (set just before Serve);
 	// ready closes when it is set. Shutdown waits on it so a stop request
-	// that arrives during the listen race still drains correctly.
-	httpSrv *http.Server
-	ready   chan struct{}
+	// that arrives during the listen race still drains correctly. The
+	// https variant also owns the plaintext redirect server and the master
+	// listener, plus the one-shot listeners its dispatch hands out.
+	httpSrv      *http.Server
+	httpSrvPlain *http.Server
+	masterLn     net.Listener
+	boundAddr    string
+	ready        chan struct{}
+	shutMu       sync.Mutex
+	shuttingDown bool
+	oneshots     map[*oneShotListener]struct{}
 
 	// jobs: at most a handful; keyed by id. The register job is the only
 	// long-running one (PoW + witnesses can take ~1 min).
@@ -78,6 +88,7 @@ func New(cfg *Config, sockPath string, log *slog.Logger) (*Server, error) {
 		auth:     newAuthStore(authPath),
 		jobs:     map[string]*job{},
 		ready:    make(chan struct{}),
+		oneshots: map[*oneShotListener]struct{}{},
 	}
 	if gated && len(allow) == 0 {
 		return nil, errNoAllowlist
@@ -189,33 +200,174 @@ func (s *Server) serve(cert *tls.Certificate) error {
 	if err != nil {
 		return err
 	}
-	scheme := "http"
-	if cert != nil {
-		ln = tls.NewListener(ln, &tls.Config{
-			Certificates: []tls.Certificate{*cert},
-			MinVersion:   tls.VersionTLS12,
-		})
-		scheme = "https"
+
+	// No issuable leaf: plain HTTP exactly as before (there is no https to
+	// upgrade to — the redirect below needs a certificate to exist).
+	if cert == nil {
+		srv := &http.Server{
+			Handler:           s.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		s.httpSrv = srv
+		s.boundAddr = ln.Addr().String()
+		close(s.ready)
+		scheme := "http"
+		if s.gateOpen {
+			cidrs := make([]string, 0, len(s.allow))
+			for _, n := range s.allow {
+				cidrs = append(cidrs, n.String())
+			}
+			s.log.Info("webui: serving", "scheme", scheme, "addr", s.cfg.Listen, "allow", cidrs, "home", s.home)
+		} else {
+			s.log.Info("webui: serving", "scheme", scheme, "addr", s.cfg.Listen, "allow", "ANY (ungated)")
+		}
+		return srv.Serve(ln)
 	}
+
+	// TLS-capable install: ONE port speaks both dialects. Each connection
+	// is sniffed on its first byte — 0x16 is a TLS ClientHello, everything
+	// else is a plaintext HTTP request — so http:// gets a 308 upgrade
+	// (plus HSTS) instead of a connection reset, and https:// is served
+	// normally. Same pattern as Caddy's auto-HTTPS.
+	tlsSrv := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	plainSrv := &http.Server{
+		Handler:           http.HandlerFunc(s.redirectToTLS),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	s.httpSrv, s.httpSrvPlain, s.masterLn = tlsSrv, plainSrv, ln
+	s.boundAddr = ln.Addr().String()
 	if s.gateOpen {
 		cidrs := make([]string, 0, len(s.allow))
 		for _, n := range s.allow {
 			cidrs = append(cidrs, n.String())
 		}
-		s.log.Info("webui: serving", "scheme", scheme, "addr", s.cfg.Listen, "allow", cidrs, "home", s.home)
+		s.log.Info("webui: serving", "scheme", "https (http redirects)", "addr", s.cfg.Listen, "allow", cidrs, "home", s.home)
 	} else {
-		s.log.Info("webui: serving", "scheme", scheme, "addr", s.cfg.Listen, "allow", "ANY (ungated)")
+		s.log.Info("webui: serving", "scheme", "https (http redirects)", "addr", s.cfg.Listen, "allow", "ANY (ungated)")
 	}
-	srv := &http.Server{
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	s.httpSrv = srv
 	close(s.ready)
-	return srv.Serve(ln)
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			if s.isShuttingDown() {
+				return nil
+			}
+			return err
+		}
+		go s.routeConn(tlsSrv, plainSrv, tlsConf, c)
+	}
 }
 
-// Shutdown stops the listener and drains open requests up to the ctx.
+// isShuttingDown reports whether Shutdown has closed the master listener.
+func (s *Server) isShuttingDown() bool {
+	s.shutMu.Lock()
+	defer s.shutMu.Unlock()
+	return s.shuttingDown
+}
+
+// redirectToTLS answers plaintext HTTP with a 308 to the same URL over
+// https (the Host header the visitor typed is preserved), with HSTS set
+// so the browser upgrades itself from then on. The response closes the
+// connection — a redirect has nothing to keep alive.
+func (s *Server) redirectToTLS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+	w.Header().Set("Connection", "close")
+	target := "https://" + r.Host + r.URL.RequestURI()
+	http.Redirect(w, r, target, http.StatusPermanentRedirect)
+}
+
+// routeConn sniffs one accepted connection and hands it to the right
+// server through a one-shot listener (each http.Server keeps its normal
+// Serve machinery; the per-conn goroutine dies with the connection).
+func (s *Server) routeConn(tlsSrv, plainSrv *http.Server, tlsConf *tls.Config, c net.Conn) {
+	first := make([]byte, 1)
+	c.SetReadDeadline(time.Now().Add(5 * time.Second)) // sniff bound: no slow-loris on Accept
+	_, err := io.ReadFull(c, first)
+	c.SetReadDeadline(time.Time{}) // back to unlimited for the real request
+	if err != nil {
+		c.Close()
+		return
+	}
+	l := &oneShotListener{conn: &replayConn{Conn: c, first: first[0], prefix: true}, quit: make(chan struct{})}
+	s.shutMu.Lock()
+	s.oneshots[l] = struct{}{}
+	shutting := s.shuttingDown
+	s.shutMu.Unlock()
+	if shutting {
+		l.Close()
+		c.Close()
+		return
+	}
+	if first[0] == 0x16 {
+		tlsSrv.Serve(tls.NewListener(l, tlsConf))
+		return
+	}
+	plainSrv.Serve(l)
+}
+
+// replayConn replays the sniffed first byte before the real stream (the
+// TLS handshake and the HTTP request both need it).
+type replayConn struct {
+	net.Conn
+	first  byte
+	prefix bool
+	readMu sync.Mutex
+}
+
+func (c *replayConn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.prefix {
+		c.prefix = false
+		p[0] = c.first
+		return 1, nil
+	}
+	return c.Conn.Read(p)
+}
+
+// oneShotListener yields exactly one connection to an http.Server, then
+// parks until Close (server Shutdown) so no Serve goroutine leaks.
+type oneShotListener struct {
+	conn  net.Conn
+	quit  chan struct{}
+	mu    sync.Mutex
+	given bool
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if !l.given {
+		l.given = true
+		l.mu.Unlock()
+		return l.conn, nil
+	}
+	l.mu.Unlock()
+	<-l.quit
+	return nil, errors.New("webui: one-shot listener closed")
+}
+
+func (l *oneShotListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.quit:
+	default:
+		close(l.quit)
+	}
+	return nil
+}
+
+func (l *oneShotListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+// Shutdown stops the listener(s) and drains open requests up to the ctx.
 // Safe to call while serve is still racing through its listen setup: it
 // waits for the server to be up (or the ctx to expire) first, so an SCM
 // stop that lands during startup cannot leave the socket serving.
@@ -225,7 +377,41 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return s.httpSrv.Shutdown(ctx)
+	s.shutMu.Lock()
+	if s.shuttingDown {
+		s.shutMu.Unlock()
+		return nil
+	}
+	s.shuttingDown = true
+	ones := s.oneshots
+	s.oneshots = map[*oneShotListener]struct{}{}
+	s.shutMu.Unlock()
+	for l := range ones {
+		l.Close() // unblocks the parked Serve goroutines
+	}
+	if s.masterLn != nil {
+		_ = s.masterLn.Close() // unblocks the accept loop
+	}
+	errs := []error{}
+	if s.httpSrv != nil {
+		errs = append(errs, s.httpSrv.Shutdown(ctx))
+	}
+	if s.httpSrvPlain != nil {
+		errs = append(errs, s.httpSrvPlain.Shutdown(ctx))
+	}
+	return errors.Join(errs...)
+}
+
+// BoundAddr reports the address serve actually bound ("127.0.0.1:0"
+// resolves here); empty until ready. Tests and tools use it instead of
+// guessing the configured port.
+func (s *Server) BoundAddr() string {
+	select {
+	case <-s.ready:
+		return s.boundAddr
+	default:
+		return ""
+	}
 }
 
 // cacheHeaders pins static asset caching (defined in assets.go).
