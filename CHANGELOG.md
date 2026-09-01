@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.13.2 — one missed probe no longer evicts a confirmed peer
+
+Found live on the desktop box (2026-09-01): its only non-LAN anchor — the
+community seed, reachable solely through a NAT'd public path — was being
+hard-evicted from the routing table whenever a single 2 s lookup probe
+tripped (NAT mapping churn / PPPoE jitter), the 30 s dead penalty then
+suppressed re-probing, and the peers table showed the seed gone until some
+walk happened to re-learn and re-confirm it. Visible in the UI as the
+seed's address "coming and going", and in the daemon log as a `dht:
+bootstrapped peer` line at every re-add.
+
+All four walk failure paths (iterative get, find_node round, claims
+lookup, evidence walk) now share one `probeFailed` handler: a contact
+with a direct confirmation on record **keeps its slot**, demoted back to
+probation (`ConfirmedAt` cleared — the peers surface shows it as
+advertised until the next successful exchange re-stamps it, typically
+within one 30 s dead-penalty window). A never-confirmed contact — or one
+already demoted by an earlier miss — is still removed exactly as before,
+so genuinely dead peers converge within a probe round rather than
+zombie-ing for the full idle TTL. Bucket-pressure eviction (§6.4 step 3)
+and the idle sweep are untouched.
+
+Also: the Network page no longer renders its "Peers (N)" heading twice
+(the static page and the polling fragment each drew one).
+
 ## v0.13.1 — honest warm-up states + the peers-table fix
 
 Three fixes for the post-restart window where a freshly booted daemon has
