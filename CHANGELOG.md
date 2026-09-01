@@ -2,6 +2,28 @@
 
 # Changelog
 
+## v0.13.9 — setup fixes the nsswitch shadowing (the last mile of first contact)
+
+The closing fix of the fresh-VPS bootstrap saga: on a stock
+systemd-resolved system, `/etc/nsswitch.conf`'s hosts line — `files
+myhostname resolve [!UNAVAIL=return] dns` — lets systemd-resolved answer
+single-label lookups with NXDOMAIN and TERMINATE the glibc chain before
+`dns` is ever consulted. resolv.conf and the port-53 redirect were
+perfect; `dig <name>` worked; `ping <name>` said "Name or service not
+known". The user's verdict was the product requirement: "absolutely
+terrible experience — they would probably give up before getting it to
+work."
+
+`setup` now runs the fix on every path (including the already-wired
+early return): the hosts line drops `resolve` and its attached action
+and gains `dns`, the original is backed up to
+`/etc/nsswitch.conf.freens-pre`, and a failed privileged write prints
+the manual sed with a loud warning instead of a green checkbox over an
+armed trap. `uninstall` restores the original. Idempotent; no-op
+without nsswitch.conf or without `resolve`.
+
+# Changelog
+
 ## v0.13.8 — register's two post-success papercuts (one was real)
 
 Found live 2026-09-01 immediately after the fresh VPS's successful
