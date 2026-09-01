@@ -178,6 +178,7 @@ func (s *Server) fragment(w http.ResponseWriter, name string, data any) {
 		http.Error(w, "no such fragment", http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store") // see render(): stale HTML lies
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := t.ExecuteTemplate(w, name, data); err != nil {
 		s.log.Error("webui: fragment", "tpl", name, "err", err)

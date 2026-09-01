@@ -89,6 +89,15 @@ func (s *Server) render(w http.ResponseWriter, status int, page string, data any
 		http.Error(w, "render error", http.StatusInternalServerError)
 		return
 	}
+	// HTML is always fresh-or-nothing: a page cached by the browser across
+	// an upgrade renders the OLD template set around NEW polling fragments
+	// — the peers heading drew twice exactly this way (found live
+	// 2026-09-01: a tab opened before the v0.13.2 template fix survived
+	// sleep/wake, its 30s htmx polls kept the rows fresh, and the stale
+	// static heading from the pre-fix page load sat above them looking
+	// like a server bug). no-store, not no-cache: nothing about a state
+	// page is worth revalidating either.
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = buf.WriteTo(w)

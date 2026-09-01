@@ -105,3 +105,41 @@ func (d *warmingDaemon) Peers(ctx context.Context) ([]dht.Peer, error) {
 	}
 	return []dht.Peer{{Addr: "10.0.0.9:15353", PublicKey: kp.Public()}}, nil
 }
+
+// TestNetworkPageSingleHeading: the peers heading must render exactly ONCE
+// per page (and once per fragment) — "Peers (N)Peers (N)" shipped to the
+// desktop in the v0.13.1-pre..v0.13.2 era and survived two releases before
+// being caught by eye (found live 2026-09-01, reported with a paste from
+// desktop:8090).
+func TestNetworkPageSingleHeading(t *testing.T) {
+	_, ts := newTestServer(t, &confirmedPeersDaemon{fakeDaemon: *newFakeDaemon()})
+	c := newUClient(t)
+	c.bootstrap(ts.URL)
+
+	resp, err := c.http.Get(ts.URL + "/network")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(body), "Peers ("); n != 1 {
+		t.Errorf("network page renders the peers heading %d times, want 1:\n%s", n, body)
+	}
+
+	// And the polling fragment the same way.
+	fresp, err := c.http.Get(ts.URL + "/api/network/peers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresp.Body.Close()
+	fbody, err := io.ReadAll(fresp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(fbody), "Peers ("); n != 1 {
+		t.Errorf("peers fragment renders the heading %d times, want 1:\n%s", n, fbody)
+	}
+}
