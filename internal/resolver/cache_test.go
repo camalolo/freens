@@ -9,9 +9,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -770,4 +773,30 @@ func TestSweepRefreshesLeavesColdEntriesAlone(t *testing.T) {
 	if kicked := r.SweepRefreshes(clock.Load()); kicked != 0 {
 		t.Fatalf("sweep kicked %d for a cold entry, want 0 (abandoned names must age out)", kicked)
 	}
+}
+
+// syncWriter is a mutex-guarded io.Writer: the refresh-failure transition
+// tests read the buffer on the test goroutine while background refresh
+// goroutines log into it.
+type syncWriter struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// testLogger writes slog text records into w (the refresh-failure
+// transition tests assert on level/name counts).
+func testLogger(w *syncWriter) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }

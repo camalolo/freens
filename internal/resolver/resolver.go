@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -199,6 +200,14 @@ type Resolver struct {
 	// refreshKickEvery per name, never blocking the answering path.
 	refreshes map[cacheKey]int64
 
+	// Logger, when set, reports background-refresh state TRANSITIONS only
+	// (fail-start / recover — never every failure, an outage would spam):
+	// "answering from cache but blind" is the one operator-visible gap the
+	// stale-serving design has, and it should be loud exactly once.
+	Logger *slog.Logger
+
+	refreshFailing map[cacheKey]bool
+
 	// MaxConcurrentResolutions bounds simultaneously in-flight DISTINCT
 	// resolutions (v0.9.2 overload cap). Single-flight collapses identical
 	// questions, but a distinct-name query flood — every miss caching its
@@ -277,6 +286,9 @@ func (r *Resolver) kickRefresh(q dns.Question, ck cacheKey) {
 	if r.refreshes == nil {
 		r.refreshes = make(map[cacheKey]int64)
 	}
+	if r.refreshFailing == nil {
+		r.refreshFailing = make(map[cacheKey]bool)
+	}
 	if last, seen := r.refreshes[ck]; seen && now-last < refreshKickEvery {
 		r.flightMu.Unlock()
 		return
@@ -286,7 +298,28 @@ func (r *Resolver) kickRefresh(q dns.Question, ck cacheKey) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 		defer cancel()
-		_, _, _, _ = r.resolveShared(ctx, q, ck)
+		_, rcode, _, err := r.resolveShared(ctx, q, ck)
+		failed := err != nil || rcode == dns.RcodeServerFailure
+		r.flightMu.Lock()
+		was := r.refreshFailing[ck]
+		switch {
+		case failed && !was:
+			r.refreshFailing[ck] = true
+			if r.Logger != nil {
+				reason := "unreachable"
+				if err != nil {
+					reason = err.Error()
+				}
+				r.Logger.Warn("namespace refresh failed — names not re-verifiable are answered from cache (stale) until it recovers",
+					"name", strings.TrimSuffix(q.Name, "."), "err", reason)
+			}
+		case !failed && was:
+			delete(r.refreshFailing, ck)
+			if r.Logger != nil {
+				r.Logger.Info("namespace refresh recovered", "name", strings.TrimSuffix(q.Name, "."))
+			}
+		}
+		r.flightMu.Unlock()
 	}()
 }
 

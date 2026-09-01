@@ -230,11 +230,20 @@ type DNSUpstream struct {
 	Servers []string      // host or host:port
 	Net     string        // "udp" (default) or "tcp"
 	Timeout time.Duration // per-attempt timeout; default 5s
+	// Attempts is the per-server retry count (default 2, glibc-style).
+	// ONE attempt per server made a single slow cache-miss at a cold
+	// upstream fatal to the whole box: the daemon SERVFAILed, every app
+	// saw "server misbehaving", and the upstream — which HAD received the
+	// query and cached the answer — was never asked again (found live on
+	// camalolo-box: `freens upgrade` died three times on github.com before
+	// the upstream warmed). The retry lands on the warmed answer.
+	Attempts int
 }
 
-// Forward implements Upstream. It tries each server in order; the first
-// non-error, non-nil response wins. A truncated UDP response triggers a single
-// TCP retry against the same server.
+// Forward implements Upstream. It tries each server in order, retrying
+// each server up to Attempts times before moving on; the first non-error,
+// non-nil response wins. A truncated UDP response triggers a single TCP
+// retry against the same server.
 func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 	if u == nil || len(u.Servers) == 0 {
 		return nil, errors.New("resolver: no upstream servers configured")
@@ -247,25 +256,31 @@ func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	attempts := u.Attempts
+	if attempts <= 0 {
+		attempts = 2
+	}
 	var lastErr error
 	for _, srv := range u.Servers {
 		addr := ensureDNSPort(srv)
-		resp, err := exchangeWith(ctx, q, addr, net0, timeout)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp == nil {
-			lastErr = errors.New("resolver: upstream returned no response")
-			continue
-		}
-		// TC bit on UDP → retry over TCP against the same server.
-		if resp.Truncated && net0 == "udp" {
-			if r2, err := exchangeWith(ctx, q, addr, "tcp", timeout); err == nil && r2 != nil {
-				return r2, nil
+		for attempt := 0; attempt < attempts; attempt++ {
+			resp, err := exchangeWith(ctx, q, addr, net0, timeout)
+			if err != nil {
+				lastErr = err
+				continue
 			}
+			if resp == nil {
+				lastErr = errors.New("resolver: upstream returned no response")
+				continue
+			}
+			// TC bit on UDP → retry over TCP against the same server.
+			if resp.Truncated && net0 == "udp" {
+				if r2, err := exchangeWith(ctx, q, addr, "tcp", timeout); err == nil && r2 != nil {
+					return r2, nil
+				}
+			}
+			return resp, nil
 		}
-		return resp, nil
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("resolver: all upstreams failed: %w", lastErr)
@@ -274,7 +289,7 @@ func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 }
 
 // exchangeWith wraps dns.Client.ExchangeContext so tests can substitute it.
-func exchangeWith(ctx context.Context, q *dns.Msg, addr, network string, timeout time.Duration) (*dns.Msg, error) {
+var exchangeWith = func(ctx context.Context, q *dns.Msg, addr, network string, timeout time.Duration) (*dns.Msg, error) {
 	c := &dns.Client{Net: network, Timeout: timeout}
 	resp, _, err := c.ExchangeContext(ctx, q, addr)
 	return resp, err

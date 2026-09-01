@@ -114,22 +114,50 @@ func fetchRelease(tag string) (*ghRelease, error) {
 	return rel, nil
 }
 
+// upgradeHTTPGet GETs url with ONE automatic retry on a TRANSPORT error —
+// dial/DNS/timeout, the fresh-box cold-upstream SERVFAIL class (found live
+// on camalolo-box: its first `freens upgrade` died three times in a row on
+// github.com lookups while the upstream resolver warmed; every manual
+// retry was the user doing what the verb should have). HTTP-level errors
+// are returned WITHOUT retrying — a 404 is an answer, not a hiccup.
+func upgradeHTTPGet(ctx context.Context, url, accept string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return nil, lastErr
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		// Optional token raises the unauthenticated 60 req/h API budget; also
+		// the polite thing for release CDNs behind GitHub's rate limits.
+		if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
 // upgradeFetchRelease GETs one GitHub releases endpoint and decodes the
 // subset of the object we use. Swapped by tests.
 var upgradeFetchRelease = func(url string) (*ghRelease, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	// Optional token raises the unauthenticated 60 req/h API budget; also
-	// the polite thing for release CDNs behind GitHub's rate limits.
-	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := upgradeHTTPGet(ctx, url, "application/vnd.github+json")
 	if err != nil {
 		return nil, fmt.Errorf("github api: %w", err)
 	}
@@ -177,11 +205,7 @@ func assetFor(rel *ghRelease) (*ghAsset, error) {
 var upgradeDownload = func(url, dir string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := upgradeHTTPGet(ctx, url, "")
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}

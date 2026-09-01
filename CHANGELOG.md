@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.13.16 — a slow upstream stops being fatal (upstream retries, upgrade retries, refresh-failure visibility)
+
+Field report from camalolo-box (a fresh box's very first `freens
+upgrade`): `lookup github.com on 127.0.0.1:53: server misbehaving` —
+three times in a row; the fourth attempt worked. The per-name pattern
+(each name failed exactly once, its first-ever query) pinned it: a
+COLD upstream resolver took longer than one attempt's budget on a
+cache miss, the daemon SERVFAILed the whole box, and the upstream —
+which had received the query and cached the answer — was never asked
+again. The user's three manual retries were doing what the software
+should have.
+
+- **DNSUpstream retries each server (2 attempts, glibc-style) before
+  moving to the next** — the retry lands on the upstream's now-warm
+  answer. One packet lost or one slow cache-miss no longer SERVFAILs
+  every lookup on the machine.
+- **`freens upgrade` retries its GitHub fetches once on transport
+  errors** (dial/DNS/timeout) — the release API call and the tarball
+  download both. HTTP-level errors (404 etc.) stay un-retried: an
+  answer is not a hiccup.
+- **Namespace refresh failures are now VISIBLE** (the operator-facing
+  gap in the stale-serving design): a background refresh that starts
+  failing logs ONE WARN ("names not re-verifiable are answered from
+  cache until it recovers") and its recovery logs one INFO — transitions
+  only, never per kick, so an outage is a single line instead of log
+  spam. This also documents the deliberate choice: an UNREACHABLE
+  namespace keeps stale answers flowing (better an old address than
+  none); only an AUTHORITATIVE negative flushes the address.
+
 ## v0.13.15 — the warm set: names in recurring use are cached forever
 
 Operator question, and they were right: "could the daemon look up in

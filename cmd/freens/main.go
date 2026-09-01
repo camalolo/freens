@@ -634,6 +634,7 @@ func run(args []string) error {
 	// so restoring one carries the same trust as keeping it in memory — and
 	// a daemon restart (every upgrade!) stops being a cold-cache walk for
 	// the first client query afterwards.
+	res.Logger = logger
 	cache := resolver.NewResponseCache(0, nil)
 	cache.SetMetrics(reg)
 	res.Cache = cache
