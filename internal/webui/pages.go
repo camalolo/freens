@@ -46,6 +46,7 @@ func mustParseTemplates() {
 		"lookup":     "tmpl/lookup.tmpl",
 		"network":    "tmpl/network.tmpl",
 		"keys":       "tmpl/keys.tmpl",
+		"certs":      "tmpl/certs.tmpl",
 		"login":      "tmpl/login.tmpl",
 		"bootstrap":  "tmpl/bootstrap.tmpl",
 		"storeentry": "tmpl/storeentry.tmpl",

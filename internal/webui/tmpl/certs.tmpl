@@ -1,0 +1,112 @@
+{{define "content"}}
+<div class="page-head">
+  <div><h1>Certificates</h1>
+    <div class="subtitle">§9.5 TLS leaves for your names — issue, renew, deploy to nginx</div></div>
+  <form hx-post="/api/cert/renew" hx-swap="none">
+    <input type="hidden" name="name" value="*">
+    <button class="btn primary" type="submit">Renew all due</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">Names</div>
+  {{if .Rows}}
+  <table>
+    <tr><th>name</th><th>certificate</th><th>expires</th><th></th></tr>
+    {{$home := .Home}}
+    {{range .Rows}}
+    <tr>
+      <td class="mono">{{.Name}}
+        {{if .Encrypted}}<span class="badge">encrypted key</span>{{end}}</td>
+      <td>{{if .Tracked}}
+            <span class="mono">{{.CertPath}}</span>
+            {{if .InNginx}}<span class="badge ok">in nginx</span>{{end}}
+          {{else}}<span class="muted">not issued</span>{{end}}</td>
+      <td>{{if .Tracked}}{{if .Due}}<span class="badge warn">{{.NotAfter}} — due</span>{{else}}{{.NotAfter}}{{end}}{{else}}—{{end}}</td>
+      <td>
+        {{if .Tracked}}
+        <form class="row" hx-post="/api/cert/renew" hx-swap="none">
+          <input type="hidden" name="name" value="{{.Name}}">
+          {{if .Encrypted}}<input type="password" name="passphrase" placeholder="passphrase" autocomplete="new-password">{{end}}
+          <button class="btn small" type="submit">Renew</button>
+        </form>
+        {{else}}
+        <form class="row" hx-post="/api/cert/issue" hx-swap="none">
+          <input type="hidden" name="name" value="{{.Name}}">
+          {{if .Encrypted}}<input type="password" name="passphrase" placeholder="passphrase" autocomplete="new-password">{{end}}
+          <button class="btn small primary" type="submit">Issue</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+  <div class="muted">No names on this machine yet — register one first.</div>
+  {{end}}
+</div>
+
+<div class="card mt">
+  <div class="card-title">nginx</div>
+  {{if .NginxOK}}
+  <div class="muted mono">config: {{.NginxConf}}</div>
+  {{if .NginxRows}}
+  <table class="mt">
+    <tr><th>server_name</th><th>tls</th><th>file</th><th></th></tr>
+    {{$names := .Rows}}
+    {{range .NginxRows}}
+    {{$match := .FreensName}}
+    {{$clone := .CloneSource}}
+    <tr>
+      <td class="mono">{{.ServerNames}}</td>
+      <td>{{if .SSL}}{{if .CertPath}}<span class="mono">{{.CertPath}}</span>{{else}}<span class="badge ok">ssl</span>{{end}}{{else}}<span class="muted">http only</span>{{end}}</td>
+      <td class="mono">{{.File}}</td>
+      <td>
+        {{if $match}}
+        <form class="row" hx-post="/api/cert/nginx" hx-swap="none">
+          <input type="hidden" name="server" value="{{$match}}">
+          <select name="name">
+            {{range $names}}<option value="{{.Name}}" {{if eq .Name $match}}selected{{end}}>{{.Name}}</option>{{end}}
+          </select>
+          <button class="btn small" type="submit">Use this certificate</button>
+        </form>
+        {{else if $clone}}
+        <form class="row" hx-post="/api/cert/nginx" hx-swap="none">
+          <input type="hidden" name="clone_source" value="{{$clone}}">
+          <select name="name">
+            {{range $names}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+          </select>
+          <button class="btn small" type="submit">Clone this vhost for a freens name</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+  <div class="muted mt">No server blocks found in the nginx config tree.</div>
+  {{end}}
+  <div class="row mt">
+    <form hx-post="/api/cert/nginx/reload" hx-swap="none">
+      <button class="btn small" type="submit">Validate &amp; reload nginx</button>
+    </form>
+    <span class="muted">Installs back up the file (<span class="mono">*.freens-pre</span>), run <span class="mono">nginx&nbsp;-t</span> first, and restore it if the test fails. Root-owned configs are written through passwordless sudo when available. "Clone this vhost" creates a NEW file serving the same site under the freens name — vhosts with their own valid certificate (e.g. Let's Encrypt) are never modified.</span>
+  </div>
+  {{else}}
+  <div class="muted">{{.NginxError}} — the Certificates section still works for issuing and renewing.</div>
+  {{end}}
+</div>
+
+<div class="card mt">
+  <div class="card-title">Renewal automation</div>
+  <div class="muted">
+    Leaves live 7 days by design (§9.5.3 — short lifetime IS the revocation
+    story), so renewal must be automatic. The daily timer
+    (<span class="mono">contrib/systemd/freens-cert-renew.timer</span>) runs
+    <span class="mono">freens cert renew -quiet</span>: every certificate with
+    less than 48 h left is re-minted in place, deployed servers are reloaded,
+    and per-certificate deploy hooks run. A lapsed certificate shows up in
+    <span class="mono">freens doctor</span> as a warning.
+  </div>
+</div>
+{{end}}

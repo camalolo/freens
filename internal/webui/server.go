@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/camalolo/freens/internal/certmgr"
 )
 
 // Server is the freens-web server.
@@ -29,6 +31,10 @@ type Server struct {
 	gateOpen bool
 	allow    []*net.IPNet
 	auth     *authStore
+
+	// nginx is the certmgr toolchain the Certificates page deploys with
+	// (nil = discover lazily; tests substitute a fixture tree).
+	nginx *certmgr.NginxEnv
 
 	mux *http.ServeMux
 
@@ -152,6 +158,7 @@ func (s *Server) routes() {
 	page("GET /api/network/peers", s.handleNetworkPeers)
 	page("GET /api/dash/checks", s.handleDashChecks)
 	page("GET /keys", s.handleKeysPage)
+	page("GET /certs", s.handleCertsPage)
 
 	// Mutations (auth + gate + CSRF header).
 	mut := func(pattern string, h http.HandlerFunc) {
@@ -165,6 +172,10 @@ func (s *Server) routes() {
 	mut("GET /api/backup", s.handleBackup)
 	mut("GET /api/store/{key}", s.handleStoreEntry)
 	mut("GET /api/dns", s.handleDNSProbe)
+	mut("POST /api/cert/issue", s.handleCertIssue)
+	mut("POST /api/cert/renew", s.handleCertRenew)
+	mut("POST /api/cert/nginx", s.handleCertNginxInstall)
+	mut("POST /api/cert/nginx/reload", s.handleCertNginxReload)
 }
 
 // page wraps a handler with gate + logging + auth.

@@ -24,13 +24,14 @@ import (
 
 // fakeDaemon answers everything the pages ask, deterministically.
 type fakeDaemon struct {
-	mu      sync.Mutex
-	status  admin.Status
-	resolve map[string]*admin.Resolved
-	get     map[string]*wire.SignedEnvelope
-	pubs    []*wire.SignedEnvelope
-	witness int
-	failOn  string // method name to fail ("Resolve", "Store", …)
+	mu           sync.Mutex
+	status       admin.Status
+	resolve      map[string]*admin.Resolved
+	get          map[string]*wire.SignedEnvelope
+	pubs         []*wire.SignedEnvelope
+	witness      int
+	failOn       string             // method name to fail ("Resolve", "Store", …)
+	storeEntries []admin.StoreEntry // optional override for Store (nil = legacy fixed row)
 }
 
 func newFakeDaemon() *fakeDaemon {
@@ -100,6 +101,11 @@ func (f *fakeDaemon) Witness(ctx context.Context, alias string, tldID, claimant 
 func (f *fakeDaemon) Store(ctx context.Context) (*admin.StoreResponse, error) {
 	if err := f.fail("Store"); err != nil {
 		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.storeEntries != nil {
+		return &admin.StoreResponse{Count: len(f.storeEntries), Entries: f.storeEntries}, nil
 	}
 	return &admin.StoreResponse{Count: 1, Entries: []admin.StoreEntry{{
 		Key: "aabb", Labels: []string{"www"}, TldIDB32: "tld", Alias: "alice",

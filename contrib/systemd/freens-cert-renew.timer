@@ -1,0 +1,10 @@
+[Unit]
+Description=renew freens TLS certificates daily
+
+[Timer]
+OnBootSec=10min
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

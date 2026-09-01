@@ -1,0 +1,33 @@
+# freens certificate renewal: a systemd timer running `freens cert renew`
+# daily. Every tracked §9.5 certificate (see `freens cert list`) with less
+# than 48 h left is re-minted IN PLACE (same file paths), nginx is
+# reloaded for deployed certificates, and per-certificate deploy hooks run.
+# A lapsed certificate surfaces as a warning in `freens doctor`.
+#
+# Install (as root):
+#   install -m644 freens-cert-renew.service freens-cert-renew.timer /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now freens-cert-renew.timer
+#
+# Runs as the SAME USER that owns the freens state dir (the keychain holds
+# the owner keys the leaves are derived from). Default installs (~/.freens)
+# need no Environment line; XDG-layout installs (~/.local/share/freens)
+# MUST set it — a systemd SYSTEM unit cannot use %h for this (%h expands
+# to /root regardless of User=), so hardcode the absolute path as shown.
+
+[Unit]
+Description=freens TLS certificate renewal (certmgr)
+# Renewals touch the keychain and (for deployed certs) reload nginx —
+# keep them off a half-configured boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=YOURUSER
+#Environment=FREENS_HOME=/home/YOURUSER/.local/share/freens
+# -quiet prints only failures; the exit code is non-zero when any renewal
+# failed, so the journal shows it like doctor's failures do.
+ExecStart=/usr/local/bin/freens cert renew -quiet
+# Optional per-host deploy hook for everything NOT covered by tracked
+# nginx deployments (caddy, haproxy, a sync to another box):
+#ExecStartPost=/bin/sh -c 'echo post-renewal hook'

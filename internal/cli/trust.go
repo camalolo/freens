@@ -1,25 +1,34 @@
 // trust.go — the §9.5 TLS verbs:
 //
-//	freens trust-install   one-time per-device bootstrap: generate (once) the
-//	                       local trust root and import it into the system
-//	                       bundle and NSS user DBs (Chromium/Firefox)
-//	freens cert <name>     issue + export a leaf certificate (PEM) for any
-//	                       name under an owned alias — for nginx/caddy etc.
+//	freens trust-install     one-time per-device bootstrap: generate (once)
+//	                         the local trust root and import it into the
+//	                         system bundle and NSS user DBs (Chromium/Firefox)
+//	freens cert <name>       issue + export a leaf certificate (PEM) for any
+//	                         name under an owned alias — for nginx/caddy etc.
+//	freens cert renew        renew tracked certificates (all due, or the
+//	                         named ones) — cron/timer entry point
+//	freens cert list         tracked certificates: paths, expiry, deployment
+//	freens cert nginx <name> wire an existing nginx server block to the
+//	                         name's certificate (backup → edit → nginx -t →
+//	                         reload, restoring the backup if -t fails)
+//	freens cert forget       stop tracking a certificate (files are kept)
 //
-// Both are local-only operations: no daemon, no network.
+// All are local-only operations: no daemon, no network.
 package cli
 
 import (
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/camalolo/freens/internal/certmgr"
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/naming"
-	"github.com/camalolo/freens/internal/tlsca"
 	"github.com/camalolo/freens/internal/trustsync"
 )
 
@@ -58,69 +67,95 @@ func rootPathOf(homeDir string) string {
 }
 
 func cmdCert(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "renew":
+			return cmdCertRenew(args[1:])
+		case "list":
+			return cmdCertList(args[1:])
+		case "nginx":
+			return cmdCertNginx(args[1:])
+		case "forget":
+			return cmdCertForget(args[1:])
+		}
+	}
+	return cmdCertIssue(args)
+}
+
+func cmdCertIssue(args []string) error {
 	fs := flag.NewFlagSet("cert", flag.ContinueOnError)
 	outDir := fs.String("out-dir", ".", "directory for <name>.crt / <name>.key")
 	days := fs.Int("days", 7, "leaf validity in days (capped by the §9.5.3 7-day ceiling for daemon-issued certs)")
+	noTrack := fs.Bool("no-track", false, "skip renewal tracking (one-shot export; `cert renew` will not know this cert)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 1 {
-		return usageErr("cert takes exactly one name: <name> or <label>.<alias> (e.g. www.alice)")
+		return usageErr("cert takes exactly one name: <name> or <label>.<alias> (e.g. www.alice)\n" +
+			"  subcommands: cert renew [name…] · cert list · cert nginx <name> · cert forget <name>")
 	}
 	displayName := fs.Args()[0]
-	labels, alias, err := naming.DecomposeName(displayName)
-	if err != nil {
+	if _, _, err := naming.DecomposeName(displayName); err != nil {
 		return usageErr("invalid name %q: %v", displayName, err)
-	}
-
-	keyPath := ownerKeyPath(alias)
-	kp, err := seedKeypair("@"+keyPath, "-owner")
-	if err != nil {
-		if os.IsNotExist(err) {
-			return usageErr("no owner key for alias %q (looked for %s)", alias, keyPath)
-		}
-		return err
-	}
-
-	now := time.Now()
-	caDER, caKey, err := tlsca.OwnerCA(kp.Seed(), alias, now)
-	if err != nil {
-		return err
-	}
-	sans := []string{displayName}
-	if len(labels) == 0 {
-		sans = append(sans, "*."+alias)
-	}
-	leafDER, leafKeyDER, err := tlsca.Leaf(caDER, caKey, sans, now)
-	if err != nil {
-		return err
 	}
 	_ = days // validity is fixed at the §9.5.3 ceiling inside tlsca.Leaf
 
-	if err := os.MkdirAll(*outDir, 0o700); err != nil {
+	out := *outDir
+	if out != "" {
+		if abs, aerr := filepath.Abs(out); aerr == nil {
+			out = abs
+		}
+	}
+	now := time.Now()
+	var iss *certmgr.Issued
+	// Encrypted owner keys: certmgr surfaces the sentinel; unlock here the
+	// way every other verb does (FREENS_PASSPHRASE or the terminal prompt).
+	if err := resolveCertPass(func(pass string) error {
+		if *noTrack {
+			var ierr error
+			iss, ierr = certmgr.Issue(home.KeysDir(), displayName, out, pass, now)
+			return ierr
+		}
+		r, issued, ierr := certmgr.TrackIssue(home.Dir(), home.KeysDir(), displayName, out, pass, "", now)
+		if ierr == nil {
+			iss = issued
+			if r.DeployHook != "" {
+				fmt.Printf("deploy hook: %s\n", r.DeployHook)
+			}
+		}
+		return ierr
+	}); err != nil {
 		return err
 	}
-	crtPath := filepath.Join(*outDir, displayName+".crt")
-	keyPathOut := filepath.Join(*outDir, displayName+".key")
-	// <name>.crt is the SERVING CHAIN: leaf + owner CA (§9.5.4 — visitors
-	// anchor the chain at their constrained cross-cert / local root).
-	if err := os.WriteFile(crtPath, chainPEM(leafDER, caDER), 0o644); err != nil {
-		return err
+	printIssued(iss)
+	if !*noTrack {
+		fmt.Printf("tracked: renews with `%s cert renew` (or the daily timer)\n", ProgName)
 	}
-	if err := os.WriteFile(keyPathOut, tlsca.KeyPEM(leafKeyDER), 0o600); err != nil {
-		return err
-	}
-	leaf, err := tlsca.ParseCertDER(leafDER)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("name=%s\n", displayName)
-	fmt.Printf("sans=%s\n", joinSans(sans))
-	fmt.Printf("not_after=%s\n", leaf.NotAfter.UTC().Format(time.RFC3339))
-	fmt.Printf("leaf_sha256=%s\n", tlsca.Fingerprint(leafDER))
-	fmt.Printf("cert=%s\nkey=%s (0600)\n", crtPath, keyPathOut)
-	fmt.Println("Chain for clients: leaf -> <alias> owner CA (TLSCA in the apex record) -> their trust root (§9.5).")
 	return nil
+}
+
+func printIssued(iss *certmgr.Issued) {
+	fmt.Printf("name=%s\n", iss.Name)
+	fmt.Printf("sans=%s\n", joinSans(iss.SANs))
+	fmt.Printf("not_after=%s\n", iss.NotAfter.UTC().Format(time.RFC3339))
+	fmt.Printf("cert=%s\nkey=%s (0600)\n", iss.CertPath, iss.KeyPath)
+	fmt.Println("Chain for clients: leaf -> <alias> owner CA (TLSCA in the apex record) -> their trust root (§9.5).")
+}
+
+// resolveCertPass runs attempt("") first; when the owner key is encrypted,
+// it unlocks via the standard passphrase path and retries. attempt must be
+// side-effect-free on the failure path (certmgr.Issue fails at the keyfile
+// read, before any file is written).
+func resolveCertPass(attempt func(pass string) error) error {
+	err := attempt("")
+	if err == nil || !errors.Is(err, keychain.ErrNeedsPassphrase) {
+		return err
+	}
+	pass, perr := passphraseForUnlock()
+	if perr != nil {
+		return perr
+	}
+	return attempt(pass)
 }
 
 func joinSans(sans []string) string {
@@ -130,15 +165,6 @@ func joinSans(sans []string) string {
 			out += ", "
 		}
 		out += s
-	}
-	return out
-}
-
-// chainPEM concatenates DER certificates into one PEM bundle (leaf first).
-func chainPEM(ders ...[]byte) []byte {
-	var out []byte
-	for _, der := range ders {
-		out = append(out, tlsca.CertPEM(der)...)
 	}
 	return out
 }

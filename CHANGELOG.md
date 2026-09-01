@@ -96,6 +96,78 @@ it to work by itself over the internet").
 Tests: learned contacts get probed and confirmed end-to-end; the
 dead-preferred + reachable-alternate shape fails over and confirms.
 
+## Unreleased — certmgr: letsencrypt-like certificate management, nginx included
+
+The §9.5 layer proved the trust model works (fleet-tested since
+v0.9.3-tls); what it lacked was the certbot half: certificates were
+issued once by hand, expired silently after their 7-day TTL, and
+non-daemon servers (nginx!) had no path from "here is a PEM" to "this
+vhost serves it". `internal/certmgr` closes that gap — issuance,
+renewal state, nginx deployment, reload — as ONE package so the CLI and
+the web UI cannot drift (the keychain lesson, applied to certs).
+
+- **Renewal tracking** (`<home>/tls/renewal/<name>.json`): every
+  `freens cert <name>` now records its file paths + expiry + deployment
+  targets (one-shot exports opt out with `-no-track`). `freens cert
+  renew [name…]` re-mints every certificate with < 48 h left IN PLACE
+  (same paths, fresh key per §9.5.3 — atomic renames, servers never see
+  a half-written file), reloads nginx for deployed certs, and runs
+  per-cert deploy hooks (`-deploy-hook`). Exit code non-zero on any
+  failure — cron/timer friendly with `-quiet`.
+- **`freens cert nginx <name>`** (the certbot --nginx shape): scans the
+  config tree (conf.d, sites-enabled, symlinks resolved so a vhost is
+  seen exactly once; backup litter like `*.freens-pre`/`*.dpkg-*` never
+  matches), finds the server block by server_name, backs the file up as
+  `*.freens-pre`, injects `listen 443 ssl` + the certificate pair at the
+  block's own indentation (or REPLACES a foreign certificate with
+  `-force`), validates with `nginx -t` — restoring the backup if the
+  test fails — and only then reloads. `cert list` / `cert forget` round
+  out the table management.
+- **`-clone <existing-server-name>`** (the case the edit path can't
+  serve): the site already lives at a vhost with its own VALID
+  certificate (camalolo.com under Let's Encrypt) — editing that block
+  would swap a perfectly good third-party cert. Clone instead: every
+  block mentioning the source name is copied into a NEW
+  `freens-<name>` file (sites-available + enabled symlink on Debian,
+  sibling `*.conf` in conf.d trees), with server_name → the freens
+  name, the certificate pair → ours, and the non-transferables stripped
+  (`default_server` would collide; `ssl_stapling(_verify)` expects an
+  OCSP endpoint a §9.5 leaf deliberately lacks). Everything else —
+  locations, proxies, PHP, includes, even `return 301
+  https://$server_name…` redirects, which resolve to the new name —
+  passes through byte-for-byte, and the SOURCE file is never opened for
+  writing. A failed `nginx -t` removes the clone, leaving the tree
+  byte-identical. The webui's nginx table grew the same affordance:
+  blocks that already serve a freens name get "Use this certificate",
+  foreign ones get "Clone this vhost for a freens name".
+- **nginx discovery now finds /usr/sbin/nginx** (found on this very
+  box: the binary lives outside a normal user's PATH, so every
+  discovery call from the user-owned CLI and daemon-user webui failed
+  before ever reaching `nginx -V` — PATH is tried first, then the sbin
+  candidates).
+- **The Certificates page in freens-web** (`/certs`): every owned name
+  (apexes + the store's sub-names) with cert status/expiry, Issue and
+  Renew buttons (passphrase field appears when the owner key is
+  encrypted), "Renew all due", and the nginx half: every server block
+  on the box with its TLS state and a "Use this certificate" button.
+  Same code path as the CLI (certmgr), including the automatic
+  passwordless-`sudo -n` fallback for root-owned config dirs (never
+  interactive — a web handler cannot hang on a prompt).
+- **doctor** grew a tracked-certificate section (warn-only by design:
+  the daily timer self-heals a lagging cert, so "due" must not paint
+  the health unit red — EXPIRED and file-missing are loud warnings).
+- **`contrib/systemd/freens-cert-renew.{service,timer}`**: the daily
+  `freens cert renew -quiet` unit, freens-health's shape (hardcode
+  FREENS_HOME on XDG-layout installs — the %h gotcha again).
+
+Trust is NOT part of this: visitors still validate through the TLSCA
+RR + cross-cert chain exactly as before (§9.5.4). certmgr only answers
+"which certificates exist, where do they live, when do they expire,
+and which server blocks serve them". WebPKI comparison note: LE's
+domain-validation challenge exists because the CA doesn't own the
+namespace — freens' owner key IS the authorization, so issuance needs
+no network at all.
+
 ## v0.13.5 — the seed's first answer carries the whole fleet
 
 Operator idea, prompted by a friend's lab box reporting itself an

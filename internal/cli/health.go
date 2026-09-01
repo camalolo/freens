@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/camalolo/freens/internal/certmgr"
 	"github.com/camalolo/freens/internal/home"
 )
 
@@ -317,6 +318,28 @@ func cmdDoctor(args []string) error {
 					names = append(names, x.Alias)
 				}
 				fmt.Printf("✔ TLS: %d namespace(s) cross-certified: %s\n", len(cross), strings.Join(names, ", "))
+			}
+		}
+	}
+
+	// 10. Tracked certificates (certmgr): served files present and not
+	//     (nearly) expired. Warn-only BY DESIGN: the daily renewal timer
+	//     self-heals a lagging cert, so a "due" state must not paint the
+	//     health unit red — but a silent gap between expiry and the next
+	//     timer run deserves an operator-visible line.
+	if states, serr := certmgr.ListState(home.Dir()); serr == nil && len(states) > 0 {
+		now := time.Now()
+		for _, s := range states {
+			na := time.Unix(s.NotAfter, 0)
+			switch {
+			case !sysStatExists(s.CertPath):
+				warn("TLS cert %s: file missing (%s) — re-issue with `freens cert %s`", s.Name, s.CertPath, s.Name)
+			case na.Before(now):
+				warn("TLS cert %s EXPIRED %s ago — run `freens cert renew` (and check the renewal timer)", s.Name, now.Sub(na).Round(time.Hour))
+			case certmgr.IsDue(s, now):
+				warn("TLS cert %s expires in %s — renewal due (`freens cert renew`; is the daily timer installed?)", s.Name, na.Sub(now).Round(time.Hour))
+			default:
+				fmt.Printf("✔ TLS cert %s valid %s more\n", s.Name, na.Sub(now).Round(24*time.Hour))
 			}
 		}
 	}
