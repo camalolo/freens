@@ -96,6 +96,14 @@ it to work by itself over the internet").
 Tests: learned contacts get probed and confirmed end-to-end; the
 dead-preferred + reachable-alternate shape fails over and confirms.
 
+## v0.13.11 — certmgr CI hotfix (hermetic binary-resolution test)
+
+One line on top of v0.13.10, no behavior change: the
+TestResolveBinarySbinCandidates added with certmgr assumed nginx is
+never on PATH, but GitHub's Ubuntu runner images preinstall it — the
+test now stubs the LookPath seam so it passes on any image. Everything
+below is v0.13.10 verbatim.
+
 ## v0.13.10 — certmgr: letsencrypt-like certificate management, nginx included
 
 The §9.5 layer proved the trust model works (fleet-tested since

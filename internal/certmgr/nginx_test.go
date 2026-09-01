@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -500,15 +501,21 @@ func TestInstallCloneDryRunAndMissingSource(t *testing.T) {
 }
 
 func TestResolveBinarySbinCandidates(t *testing.T) {
+	// Hermetic by force: GitHub's Ubuntu runner images PREINSTALL nginx on
+	// PATH (found live in the v0.13.10 CI — resolveBinary rightly returned
+	// the PATH binary there), so the test stubs the LookPath seam to
+	// simulate the "off PATH" box the sbin candidates exist for.
+	oldLook, oldCands := execLookPath, nginxBinaryCandidates
+	defer func() { execLookPath, nginxBinaryCandidates = oldLook, oldCands }()
+	execLookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+
 	// nginx off PATH but present as /usr/sbin-style candidate: found.
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "nginx")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	old := nginxBinaryCandidates
 	nginxBinaryCandidates = []string{"/nonexistent/nginx", fake}
-	defer func() { nginxBinaryCandidates = old }()
 	if got := resolveBinary(); got != fake {
 		t.Fatalf("resolveBinary = %q, want %q", got, fake)
 	}
