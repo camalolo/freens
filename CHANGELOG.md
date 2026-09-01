@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.13.1 — honest warm-up states + the peers-table fix
+
+Three fixes for the post-restart window where a freshly booted daemon has
+a loaded peerbook but zero *confirmed* contacts, so lookups fail and every
+surface showed a misleading ✗ (found live three times on 2026-09-01: the
+post-wake upgrade restart on the desktop box). Plus the one-line decode
+bug behind the webui's eternal "never confirmed":
+
+- **Startup ping sweep**: the daemon pings every learned peerbook contact
+  immediately at boot (2 s budget each, parallel) instead of waiting for
+  the first refresh tick — the routing table carries CONFIRMED contacts
+  within seconds of a restart.
+- **`/status` gained `confirmed_peers`**: routing-table size says nothing
+  about reachability (the peerbook fills it instantly); consumers can now
+  distinguish "warming up" from "broken".
+- **Doctor**: the peer check reports the confirmed count, and the
+  no-contacts-yet state renders as the ✱ warning "WARMING UP" instead of
+  a bare count; alias-resolution failures during warm-up say "still
+  warming up".
+- **Webui peers table fix** (the one-line decode bug): the /peers handler
+  has emitted each contact's confirmed-since timestamp since the issue-#2
+  machinery, but the admin client decoded only addr+pk — so every webui
+  peers table rendered "never confirmed" + the "advertised" badge for
+  LIVE, ping-verified peers, on every platform, forever. The client now
+  decodes and propagates the field; the table also polls every 30 s and
+  the Dashboard health card shows "✱ resolver warming up (peers not
+  confirmed yet — a moment after a restart)" during the window, with
+  auto-refresh so states clear themselves.
+
 ## v0.13.0 — the web UI is always there (service on every OS) + automatic http→https
 
 "Setup installs the daemon but the UI needs hand-standing-up" was true on
