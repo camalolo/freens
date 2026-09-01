@@ -1154,6 +1154,38 @@ func (n *Node) evictionLoop(ctx context.Context) {
 //
 // The ping runs on the maintenance goroutine, so its response is delivered by
 // the still-running readLoop — no self-deadlock with sendQuery.
+// probeFailed implements §6.2 probe-failure handling with a grace for
+// directly-confirmed contacts. The probe budget is 2s (lookupProbeTimeout)
+// on a real network — NAT mapping churn, PPPoE jitter, a busy peer — and
+// one missed probe must not disconnect a peer we exchanged with directly
+// moments ago, least of all a community seed reachable only via such a
+// path. Found live on the desktop box (2026-09-01): its only non-LAN
+// anchor was hard-evicted whenever a single lookup probe tripped, and the
+// peers table showed the seed gone until some walk happened to re-learn
+// and re-confirm it.
+//
+// A contact with a confirmation on record keeps its slot, demoted back to
+// probation (ConfirmedAt cleared — the peers surface shows "advertised");
+// the caller-applied 30s dead penalty keeps walks off it briefly, and the
+// next successful exchange re-confirms it. A never-confirmed contact — or
+// one already demoted by an earlier miss — is removed exactly as before,
+// so genuinely dead peers still converge within a probe round (or the
+// idle sweep), not the full TTL.
+func (n *Node) probeFailed(c *NodeContact) {
+	if live := n.rt.Get(c.NodeID); live != nil && live.ConfirmedAt > 0 {
+		n.rt.Demote(c.NodeID)
+		n.log.Debug("dht: probe missed, demoted confirmed contact", "addr", c.Addr)
+		return
+	}
+	n.rt.Remove(c.NodeID)
+	n.log.Debug("dht: evicted unresponsive contact", "addr", c.Addr)
+}
+
+// evictCandidate implements §6.4 step 3: a newcomer arrived at a full
+// bucket; quiz the oldest incumbent and swap them out if it fails to
+// answer a PING. The ping runs on the maintenance goroutine, so its
+// response is delivered by the still-running readLoop — no self-deadlock
+// with sendQuery.
 func (n *Node) evictCandidate(ctx context.Context, c *NodeContact) {
 	if ctx.Err() != nil || n.conn == nil {
 		return
@@ -1984,9 +2016,8 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 			// corpse in their {nodes} lists until they probe it themselves.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
 				stats.ProbesFailed++
-				n.rt.Remove(batch[i].NodeID)
+				n.probeFailed(batch[i])
 				n.markDead(batch[i].NodeID, n.now())
-				n.log.Debug("dht: evicted unresponsive contact", "addr", batch[i].Addr, "err", r.err)
 			} else if r.err == nil {
 				roundAnswered++
 			}
@@ -2073,7 +2104,7 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		wg.Wait()
 		for i, r := range results {
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
-				n.rt.Remove(batch[i].NodeID)
+				n.probeFailed(batch[i])
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)
@@ -2087,7 +2118,8 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		// and stopping then would starve the walk of the live nodes deeper
 		// in the list — IterativeGet (which runs to convergence) has no such
 		// break for exactly this reason. The loop naturally ends when every
-		// candidate has been queried; dead probes evict their contacts, so
+		// candidate has been queried; dead probes demote or evict their
+		// contacts (either way the walk's `queried` map makes progress), so
 		// each round makes progress. maxLookupRounds (256) × ALPHA bounds
 		// the worst case.
 	}

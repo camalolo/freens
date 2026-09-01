@@ -8,7 +8,6 @@
   <div class="card"><div class="card-title">Difficulty</div><div class="big">{{.Difficulty}}</div>
     <div class="muted">bits · retarget every {{.RetargetBlock}} claims</div></div>
 </div>
-<h2>Peers ({{.Peers}})</h2>
 <div id="peerstable" hx-get="/api/network/peers" hx-trigger="every 30s" hx-swap="innerHTML">
 {{template "networkpeers" .}}
 </div>

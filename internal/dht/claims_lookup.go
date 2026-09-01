@@ -192,9 +192,8 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 			// penalize it for deadPenaltyWindow so later walks skip it.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
 				probesFailed++
-				n.rt.Remove(batch[i].NodeID)
+				n.probeFailed(batch[i])
 				n.markDead(batch[i].NodeID, n.now())
-				n.log.Debug("dht: claims lookup evicted unresponsive contact", "addr", batch[i].Addr, "err", r.err)
 				continue
 			}
 			if r.err == nil {

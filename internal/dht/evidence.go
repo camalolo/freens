@@ -391,8 +391,7 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 		for i, r := range results {
 			// Kademlia failure handling (§6.2), as in IterativeGet.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
-				n.rt.Remove(batch[i].NodeID)
-				n.log.Debug("dht: evicted unresponsive contact", "addr", batch[i].Addr, "err", r.err)
+				n.probeFailed(batch[i])
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)

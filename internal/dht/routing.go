@@ -120,6 +120,19 @@ func (b *KBucket) Remove(nodeID []byte) bool {
 	return false
 }
 
+// Demote clears the stored contact's ConfirmedAt in place, returning it to
+// probation while keeping the table slot (address and learn history stay).
+// Returns true if the contact was present. See RoutingTable.Demote.
+func (b *KBucket) Demote(nodeID []byte) bool {
+	for _, c := range b.Nodes {
+		if bytes.Equal(c.NodeID, nodeID) {
+			c.ConfirmedAt = 0
+			return true
+		}
+	}
+	return false
+}
+
 // AddOrRefresh performs the Kademlia bucket update and returns the eviction
 // candidate (or nil):
 //
@@ -245,6 +258,24 @@ func (rt *RoutingTable) Remove(nodeID []byte) bool {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	return bucket.Remove(nodeID)
+}
+
+// Demote clears a contact's direct-confirmation stamp (ConfirmedAt → 0)
+// without dropping the table slot, returning it to probation: the peers
+// surface shows it as advertised rather than confirmed until the next
+// successful exchange re-stamps it. Returns true if the contact was present.
+// Used by the §6.2 probe-failure path so a single missed probe cannot
+// disconnect a peer we exchanged with directly moments ago — the idle sweep
+// (contactIdleTTL) remains the judge of whether it is truly gone. Safe for
+// concurrent use.
+func (rt *RoutingTable) Demote(nodeID []byte) bool {
+	bucket, err := rt.BucketFor(nodeID)
+	if err != nil {
+		return false
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return bucket.Demote(nodeID)
 }
 
 // Get looks up a contact by nodeID across the appropriate bucket. Returns nil
