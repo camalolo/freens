@@ -246,6 +246,12 @@ func TestSetupInstallWindowsFlow(t *testing.T) {
 		installedSvc = &opts
 		return nil
 	}
+	var installedWebSvc *winsvc.InstallOptions
+	winSvcWebInstall = func(opts winsvc.InstallOptions) error {
+		installedWebSvc = &opts
+		return nil
+	}
+	winSvcWebRemove = func() error { return nil }
 	winPowerShell = func(script string) (string, error) {
 		switch {
 		case strings.Contains(script, "Get-DnsClientServerAddress | Select"):
@@ -262,9 +268,19 @@ func TestSetupInstallWindowsFlow(t *testing.T) {
 	t.Cleanup(func() {
 		winSvcElevated = func() bool { return false }
 		winSvcInstall = winsvc.Install
+		winSvcWebInstall = winsvc.InstallWeb
+		winSvcWebRemove = winsvc.RemoveWeb
 		windowsRelay = func(args ...string) error { return exec.Command(args[0], args[1:]...).Run() }
 		winPowerShell = func(string) (string, error) { return "", errFakeWindowsShell }
 	})
+
+	// The freens-web binary sits next to this executable (the release
+	// layout): the web UI service install is part of the flow now.
+	webBin := filepath.Join(filepath.Dir(os.Args[0]), "freens-web.exe")
+	if err := os.WriteFile(webBin, []byte("fake"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(webBin) })
 
 	if err := setupInstallWindows(false); err != nil {
 		t.Fatal(err)
@@ -298,13 +314,21 @@ func TestSetupInstallWindowsFlow(t *testing.T) {
 		// freens.exe. Either way the service must point at THIS binary.
 		t.Logf("service binary = %s", installedSvc.Binary)
 	}
-	// Firewall: delete-then-add for both rules (idempotent re-runs).
-	if len(firewallCmds) != 4 || firewallCmds[0][0] != "netsh" ||
-		!strings.Contains(strings.Join(firewallCmds[2], " "), "15353") {
-		t.Fatalf("firewall commands = %v; want delete+add pairs for inbound and outbound", firewallCmds)
+	// Firewall: delete-then-add for all three rules (idempotent re-runs).
+	if len(firewallCmds) != 6 || firewallCmds[0][0] != "netsh" ||
+		!strings.Contains(strings.Join(firewallCmds[3], " "), "15353") {
+		t.Fatalf("firewall commands = %v; want 3 delete + 3 add (DHT, outbound, web UI)", firewallCmds)
 	}
-	if !strings.Contains(strings.Join(firewallCmds[3], " "), "dir=out") {
-		t.Fatalf("second add rule = %v; want the outbound allow", firewallCmds[3])
+	if !strings.Contains(strings.Join(firewallCmds[4], " "), "dir=out") {
+		t.Fatalf("second add rule = %v; want the outbound allow", firewallCmds[4])
+	}
+	if !strings.Contains(strings.Join(firewallCmds[5], " "), "8090") ||
+		!strings.Contains(strings.Join(firewallCmds[5], " "), "dir=in") {
+		t.Fatalf("third add rule = %v; want the web UI inbound allow on :8090", firewallCmds[5])
+	}
+	// Web UI service: installed with the freens-web binary next to the exe.
+	if installedWebSvc == nil || !strings.HasSuffix(installedWebSvc.Binary, "freens-web.exe") {
+		t.Fatalf("web UI service = %+v; want an install pointing at freens-web.exe", installedWebSvc)
 	}
 	// DNS wiring: the loopback set + backup saved.
 	if _, err := os.Stat(filepath.Join(dir, "dns-backup.json")); err != nil {

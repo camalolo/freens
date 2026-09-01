@@ -27,6 +27,16 @@ const Description = "freens resolver + DHT daemon (self-certifying DNS, spec §9
 	"Installs the machine-wide state in %ProgramData%\\freens and serves the OS " +
 	"resolver on 127.0.0.1:53. Manage with `freens setup -uninstall` or services.msc."
 
+// The freens-web service (the LAN management UI) — same model, own SCM
+// identity so the daemon's availability never depends on the UI.
+const (
+	WebName        = "freens-web"
+	WebDisplayName = "freens web UI"
+	WebDescription = "freens LAN management web UI (port 8090). Reads the same " +
+		"machine-wide state (%ProgramData%\\freens) as the freens daemon. " +
+		"Manage with `freens uninstall` or services.msc."
+)
+
 // InstallOptions describes one service (re)install.
 type InstallOptions struct {
 	// Binary is the absolute path of the executable the service runs.

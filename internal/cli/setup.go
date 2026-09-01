@@ -181,10 +181,17 @@ func cmdSetup(args []string) error {
 		if goosWindows {
 			return setupUninstallWindows(*consoleWait)
 		}
+		if goosDarwin {
+			uninstallWebUIDarwin()
+			return nil
+		}
 		return setupUninstall()
 	}
 	if goosWindows {
 		return setupInstallWindows(*consoleWait)
+	}
+	if goosDarwin {
+		return setupWebUIDarwin(*consoleWait)
 	}
 	return setupInstall()
 }
@@ -254,6 +261,15 @@ func setupInstall() error {
 		if err := sudoRun("enabling freens.service (starts the daemon now, at boot, no login needed)", "systemctl", "enable", "--now", "freens.service"); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: warning: could not enable freens.service (%v); start it manually:\n    sudo systemctl start freens.service\n", ProgName, err)
 		}
+	}
+
+	// (d2) freens-web systemd unit — the LAN management UI boots with the
+	// machine too. Only when the binary is next to this one (the release
+	// tarballs ship all three; a hand-built freens without freens-web is
+	// not an error). An existing unit is left alone (idempotent like the
+	// daemon unit — hand-tuned fleet units survive re-setups).
+	if err := installWebUIUnit(&written); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: warning: freens-web unit not installed (%v) — the daemon is unaffected\n", ProgName, err)
 	}
 
 	// (e) OS resolver wiring.
@@ -597,21 +613,67 @@ func systemdUnit() (path, content string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	// Relocated installs (FREENS_HOME set — the XDG layout) MUST carry the
-	// variable into the unit: the daemon runs under User=, but a system
-	// unit's environment is NOT the user's shell environment (%h expands
-	// to /root regardless of User=), and an unset FREENS_HOME silently
-	// points the state dir at ~/.freens — admin socket, keychain scanning
-	// (auto-renew!), and TLS state all misdirected while the -config path
-	// still looks right (found live 2026-09-01: re-running setup on the
-	// seed box forked a second daemon at ~/.freens because the unit had
-	// been hand-patched with the line setup never wrote).
-	envLine := ""
-	if fh := os.Getenv("FREENS_HOME"); fh != "" {
-		envLine = "Environment=FREENS_HOME=" + fh + "\n"
-	}
-	unit := fmt.Sprintf(setupUnitTemplate, exe, home.ConfPath(), u.Username, envLine)
+	unit := fmt.Sprintf(setupUnitTemplate, exe, home.ConfPath(), u.Username, unitEnvLine())
 	return dir, unit, nil
+}
+
+// unitEnvLine is the FREENS_HOME Environment line for systemd units —
+// relocated installs (FREENS_HOME set — the XDG layout) MUST carry the
+// variable into the unit: the daemon runs under User=, but a system
+// unit's environment is NOT the user's shell environment (%h expands
+// to /root regardless of User=), and an unset FREENS_HOME silently
+// points the state dir at ~/.freens — admin socket, keychain scanning
+// (auto-renew!), and TLS state all misdirected while the -config path
+// still looks right (found live 2026-09-01: re-running setup on the
+// seed box forked a second daemon at ~/.freens because the unit had
+// been hand-patched with the line setup never wrote). Empty string for
+// the default home.
+func unitEnvLine() string {
+	if fh := os.Getenv("FREENS_HOME"); fh != "" {
+		return "Environment=FREENS_HOME=" + fh + "\n"
+	}
+	return ""
+}
+
+// installWebUIUnit writes and enables the freens-web.service systemd unit
+// ("the UI should be always there"): ExecStart at the freens-web binary
+// next to this executable, same user + env conventions as the daemon
+// unit. An existing unit is left untouched; a missing freens-web binary
+// is a silent no-op (the CLI works fine without the UI).
+func installWebUIUnit(written *[]string) error {
+	exe, err := sysExecutable()
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	webBin := filepath.Join(filepath.Dir(exe), "freens-web")
+	if !sysStatExists(webBin) {
+		return nil
+	}
+	u, err := user.Current()
+	if err != nil {
+		return err
+	}
+	unit := fmt.Sprintf(webuiUnitTemplate, webBin, u.Username, unitEnvLine())
+	unitPath := filepath.Join(sysUnitDir(), "freens-web.service")
+	if !sysStatExists(unitPath) {
+		if err := sysWriteEtc(unitPath, []byte(unit), 0o644); err != nil {
+			printManualCommands("webui unit", []string{
+				"sudo cp <freens-web-unit> " + unitPath + "   (unit content below)",
+				"---\n" + unit + "---",
+				"sudo systemctl daemon-reload && sudo systemctl enable --now freens-web.service",
+			})
+			return nil // manual-command path: setup continues
+		}
+		*written = append(*written, unitPath)
+	}
+	fmt.Println("running: systemctl enable --now freens-web.service")
+	if err := sudoRun("enabling freens-web.service (starts the LAN management UI now, at boot)", "systemctl", "enable", "--now", "freens-web.service"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // legacyUserUnitPath is the pre-v0.3.0 `--user` unit location (~/.config/
@@ -684,6 +746,25 @@ Wants=network-online.target
 
 [Service]
 ExecStart=%s daemon -config %s
+User=%s
+%sRestart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// webuiUnitTemplate is the freens-web.service setup writes: the LAN
+// management UI boots with the machine, as the same user/state-dir rules
+// as the daemon unit (the UI reads the keychain and the admin socket).
+const webuiUnitTemplate = `[Unit]
+Description=freens web UI (LAN management)
+Documentation=https://github.com/camalolo/freens
+After=network-online.target freens.service
+Wants=network-online.target
+
+[Service]
+ExecStart=%s
 User=%s
 %sRestart=on-failure
 RestartSec=2

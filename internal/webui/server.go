@@ -4,6 +4,7 @@
 package webui
 
 import (
+	"context"
 	"crypto/tls"
 	"log/slog"
 	"net"
@@ -27,6 +28,12 @@ type Server struct {
 	auth     *authStore
 
 	mux *http.ServeMux
+
+	// httpSrv is the server serve() is running (set just before Serve);
+	// ready closes when it is set. Shutdown waits on it so a stop request
+	// that arrives during the listen race still drains correctly.
+	httpSrv *http.Server
+	ready   chan struct{}
 
 	// jobs: at most a handful; keyed by id. The register job is the only
 	// long-running one (PoW + witnesses can take ~1 min).
@@ -70,6 +77,7 @@ func New(cfg *Config, sockPath string, log *slog.Logger) (*Server, error) {
 		allow:    allow,
 		auth:     newAuthStore(authPath),
 		jobs:     map[string]*job{},
+		ready:    make(chan struct{}),
 	}
 	if gated && len(allow) == 0 {
 		return nil, errNoAllowlist
@@ -202,7 +210,22 @@ func (s *Server) serve(cert *tls.Certificate) error {
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	s.httpSrv = srv
+	close(s.ready)
 	return srv.Serve(ln)
+}
+
+// Shutdown stops the listener and drains open requests up to the ctx.
+// Safe to call while serve is still racing through its listen setup: it
+// waits for the server to be up (or the ctx to expire) first, so an SCM
+// stop that lands during startup cannot leave the socket serving.
+func (s *Server) Shutdown(ctx context.Context) error {
+	select {
+	case <-s.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.httpSrv.Shutdown(ctx)
 }
 
 // cacheHeaders pins static asset caching (defined in assets.go).

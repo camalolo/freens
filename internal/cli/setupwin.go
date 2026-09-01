@@ -50,6 +50,10 @@ const windowsFirewallRuleName = "freens DHT"
 // daemon must reach upstream resolvers, DHT peers and GitHub.
 const windowsFirewallOutboundRuleName = "freens outbound"
 
+// windowsFirewallWebUIRuleName is the inbound rule for the freens-web LAN
+// management UI (TCP 8090; port-scoped — the UI binary may be moved).
+const windowsFirewallWebUIRuleName = "freens-web UI"
+
 // winRunElevatedGate var-gates the elevation relaunch for tests.
 var winRunElevatedGate = windowsRunElevated
 
@@ -57,12 +61,14 @@ var winRunElevatedGate = windowsRunElevated
 // run the whole orchestration with stubs (the real SCM calls only exist
 // on windows).
 var (
-	winSvcInstall  = winsvc.Install
-	winSvcRemove   = winsvc.Remove
-	winSvcElevated = winsvc.IsElevated
-	winSvcRunning  = winsvc.Running
-	winSvcStop     = winsvc.Stop
-	winSvcStart    = winsvc.Start
+	winSvcInstall    = winsvc.Install
+	winSvcRemove     = winsvc.Remove
+	winSvcWebInstall = winsvc.InstallWeb
+	winSvcWebRemove  = winsvc.RemoveWeb
+	winSvcElevated   = winsvc.IsElevated
+	winSvcRunning    = winsvc.Running
+	winSvcStop       = winsvc.Stop
+	winSvcStart      = winsvc.Start
 )
 
 // platform is the effective platform for dispatch decisions (testable:
@@ -74,6 +80,88 @@ var platform = runtime.GOOS
 // goosWindows routes setup's platform dispatch (var so tests can force the
 // windows branch on linux).
 var goosWindows = platform == "windows"
+
+// goosDarwin routes the web UI LaunchAgent dispatch (var so tests can
+// force the darwin branch on linux).
+var goosDarwin = platform == "darwin"
+
+// webuiAgentLabel is the launchd label of the freens-web LaunchAgent
+// ("the UI should be always there" — KeepAlive keeps it running, RunAtLoad
+// starts it at login).
+const webuiAgentLabel = "com.freens.webui"
+
+// webuiAgentPath is where the LaunchAgent plist lives.
+func webuiAgentPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join("Library", "LaunchAgents", webuiAgentLabel+".plist")
+	}
+	return filepath.Join(home, "Library", "LaunchAgents", webuiAgentLabel+".plist")
+}
+
+// setupWebUIDarwin installs the freens-web LaunchAgent and starts it. The
+// full daemon story on macOS stays manual (no launchd unit for it yet) —
+// the UI is what setup can promise today.
+func setupWebUIDarwin(consoleWait bool) error {
+	exe, err := sysExecutable()
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	webBin := filepath.Join(filepath.Dir(exe), "freens-web")
+	if !sysStatExists(webBin) {
+		return fmt.Errorf("no freens-web binary next to %s (the release tarballs ship it)", exe)
+	}
+	envDict := ""
+	if fh := os.Getenv("FREENS_HOME"); fh != "" {
+		envDict = "    <key>EnvironmentVariables</key>\n    <dict>\n      <key>FREENS_HOME</key>\n      <string>" + fh + "</string>\n    </dict>\n"
+	}
+	plist := fmt.Sprintf(webuiAgentPlistTemplate, webuiAgentLabel, webBin, envDict)
+	agentPath := webuiAgentPath()
+	if err := os.MkdirAll(filepath.Dir(agentPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(agentPath, []byte(plist), 0o644); err != nil {
+		return err
+	}
+	_ = sysRun("launchctl", "unload", agentPath) // reload-over-old, best effort
+	if err := sysRun("launchctl", "load", agentPath); err != nil {
+		return fmt.Errorf("launchctl load: %w", err)
+	}
+	fmt.Println("setup complete (macOS): freens-web LaunchAgent installed and loaded")
+	fmt.Println("  agent: " + agentPath)
+	fmt.Println("  the UI serves on :8090 (LAN-gated; https://<name>:8090 once a name exists)")
+	fmt.Println("  note: the freens DAEMON on macOS is still a manual run (no launchd unit yet):")
+	fmt.Println("    freens daemon -config <home>/freens.conf")
+	windowsConsoleWait(consoleWait)
+	return nil
+}
+
+// uninstallWebUIDarwin unloads and removes the freens-web LaunchAgent.
+func uninstallWebUIDarwin() {
+	agentPath := webuiAgentPath()
+	_ = sysRun("launchctl", "unload", agentPath)
+	if err := os.Remove(agentPath); err == nil {
+		fmt.Println("removed: " + agentPath)
+	}
+}
+
+const webuiAgentPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>%s</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>%s</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+%s</dict>
+</plist>
+`
 
 // windowsRelay relays a command line through the PowerShell indirection
 // (netsh etc.). Swapped by tests.
@@ -153,14 +241,27 @@ func setupInstallWindows(consoleWait bool) error {
 	}
 	written = append(written, "service "+winsvc.Name+" (LocalSystem, automatic start, restart-on-failure)")
 
+	// (d2) the freens-web UI service — the LAN management UI boots with the
+	// machine, same model as the daemon. The UI is optional: a failed
+	// install warns and setup continues (the daemon is the product).
+	webBin := filepath.Join(filepath.Dir(exe), "freens-web.exe")
+	if sysStatExists(webBin) {
+		fmt.Printf("installing service %q (%s)…\n", winsvc.WebName, webBin)
+		if err := winSvcWebInstall(winsvc.InstallOptions{Binary: webBin}); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: web UI service install failed (%v) — the daemon is unaffected\n", ProgName, err)
+		} else {
+			written = append(written, "service "+winsvc.WebName+" (LAN management UI on :8090, automatic start)")
+		}
+	}
+
 	// (e1) firewall: a program-scoped inbound rule for the DHT port so the
 	// node is reachable (UDP inbound is silently dropped by Windows
 	// Defender otherwise — the node would gossip out but never hear
 	// answers).
 	if err := windowsFirewallRule("add", exe); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: warning: could not add the inbound firewall rule (%v) — the DHT may be unreachable (outbound still works)\n", ProgName, err)
+		fmt.Fprintf(os.Stderr, "%s: warning: could not add the inbound firewall rules (%v) — the DHT/UI may be unreachable (outbound still works)\n", ProgName, err)
 	} else {
-		fmt.Printf("firewall: inbound UDP 15353 + outbound (both scoped to %s) allowed\n", exe)
+		fmt.Println("firewall: inbound UDP 15353 + inbound :8090 (UI) + outbound (scoped) allowed")
 	}
 
 	// (e2) OS resolver wiring (capture + backup first).
@@ -222,6 +323,8 @@ func wireOSResolverWindows() string {
 //
 //	inbound  "freens DHT"      — UDP 15353 to this binary (Defender
 //	                             silently drops DHT inbound otherwise)
+//	inbound  "freens-web UI"   — TCP 8090, the LAN management UI served
+//	                             by the freens-web service
 //	outbound "freens outbound" — all traffic FROM this binary (upstream
 //	                             DNS, DHT peers, `upgrade` downloads).
 //	                             Hardened machines ship BlockOutbound by
@@ -240,7 +343,7 @@ func windowsFirewallRule(addOrDelete, exe string) error {
 		// Delete-then-add: netsh "add" happily creates DUPLICATE rules on a
 		// setup re-run (same name), so make every install idempotent the
 		// same way the systemd unit write is.
-		for _, name := range []string{windowsFirewallRuleName, windowsFirewallOutboundRuleName} {
+		for _, name := range []string{windowsFirewallRuleName, windowsFirewallOutboundRuleName, windowsFirewallWebUIRuleName} {
 			_ = windowsRelay("netsh", "advfirewall", "firewall", "delete", "rule", "name="+name)
 		}
 		ruleSets = [][]string{
@@ -255,6 +358,11 @@ func windowsFirewallRule(addOrDelete, exe string) error {
 				"dir=out", "action=allow",
 				"program=" + exe,
 				"profile=any"},
+			{"netsh", "advfirewall", "firewall", "add", "rule",
+				"name=" + windowsFirewallWebUIRuleName,
+				"dir=in", "action=allow",
+				"protocol=tcp", "localport=8090",
+				"profile=any"},
 		}
 	} else {
 		ruleSets = [][]string{
@@ -262,6 +370,8 @@ func windowsFirewallRule(addOrDelete, exe string) error {
 				"name=" + windowsFirewallRuleName},
 			{"netsh", "advfirewall", "firewall", "delete", "rule",
 				"name=" + windowsFirewallOutboundRuleName},
+			{"netsh", "advfirewall", "firewall", "delete", "rule",
+				"name=" + windowsFirewallWebUIRuleName},
 		}
 	}
 	var errs []string
@@ -362,19 +472,25 @@ func setupUninstallWindows(consoleWait bool) error {
 // uninstall: service removal, firewall rules, adapter DNS restore. Shared
 // by `setup -uninstall` and `freens uninstall` (both call it elevated).
 func uninstallWindowsCore() {
-	// Service off + removed.
+	// Services off + removed (daemon and the web UI — the UI is optional
+	// and its removal is best-effort like its install).
 	fmt.Printf("removing service %q…\n", winsvc.Name)
 	if err := winSvcRemove(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: service removal failed (%v)\n", ProgName, err)
 	} else {
 		fmt.Println("removed: service " + winsvc.Name)
 	}
+	if err := winSvcWebRemove(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: warning: web UI service removal failed (%v)\n", ProgName, err)
+	} else {
+		fmt.Println("removed: service " + winsvc.WebName)
+	}
 
-	// Firewall rule.
+	// Firewall rules (daemon DHT/outbound + the UI port rule).
 	if err := windowsFirewallRule("delete", ""); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: firewall rule removal failed (%v)\n", ProgName, err)
 	} else {
-		fmt.Printf("removed: firewall rule %q\n", windowsFirewallRuleName)
+		fmt.Println("removed: firewall rules (freens DHT / freens outbound / freens-web UI)")
 	}
 
 	// Adapter DNS restore (captured lists; best effort).

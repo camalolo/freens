@@ -43,6 +43,11 @@ func cmdUninstall(args []string) error {
 	if goosWindows {
 		return uninstallWindows(*purge, *trust, *yes, *consoleWait)
 	}
+	if goosDarwin {
+		uninstallWebUIDarwin()
+		fmt.Println("note: the freens DAEMON on macOS is a manual process — stop it if it runs.")
+		return nil
+	}
 	return uninstallUnix(*purge, *trust, *yes)
 }
 

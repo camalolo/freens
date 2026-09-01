@@ -40,44 +40,54 @@ func IsElevated() bool {
 // recovery, and started. Starting an already-running service is not an
 // error (the SCM returns ERROR_SERVICE_ALREADY_RUNNING for the race).
 func Install(opts InstallOptions) error {
+	return installService(Name, DisplayName, Description, opts)
+}
+
+// InstallWeb (re)creates the freens-web UI service (same model as the
+// daemon's: automatic start, restart-on-failure) and starts it.
+func InstallWeb(opts InstallOptions) error {
+	return installService(WebName, WebDisplayName, WebDescription, opts)
+}
+
+func installService(name, display, desc string, opts InstallOptions) error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connecting to the service manager: %w", err)
 	}
 	defer m.Disconnect()
 
-	if s, err := m.OpenService(Name); err == nil {
+	if s, err := m.OpenService(name); err == nil {
 		// Replace: stop (best effort — it may be stopped already) and
 		// delete; the SCM removes a marked service once its last handle
 		// closes, so close ours before creating the replacement.
 		_ = stopAndWait(s, 15*time.Second)
 		if err := s.Delete(); err != nil {
 			s.Close()
-			return fmt.Errorf("deleting the previous %s service: %w", Name, err)
+			return fmt.Errorf("deleting the previous %s service: %w", name, err)
 		}
 		s.Close()
 		// A service freshly marked for deletion cannot be re-created until
 		// the SCM finishes processing it; poll briefly.
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			if _, err := m.OpenService(Name); err != nil {
+			if _, err := m.OpenService(name); err != nil {
 				break // gone — the common case
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
 	}
 
-	s, err := m.CreateService(Name, opts.Binary, mgr.Config{
+	s, err := m.CreateService(name, opts.Binary, mgr.Config{
 		StartType:   mgr.StartAutomatic,
-		DisplayName: DisplayName,
-		Description: Description,
+		DisplayName: display,
+		Description: desc,
 		// Recovery: a crashed daemon comes back in 2 s, then 5 s; after
 		// that the SCM leaves it down (a config error restart-looping
 		// forever is worse than down-and-diagnosable via doctor). The
 		// failure counter resets after a day of quiet.
 	}, opts.Args...)
 	if err != nil {
-		return fmt.Errorf("creating the %s service: %w", Name, err)
+		return fmt.Errorf("creating the %s service: %w", name, err)
 	}
 	defer s.Close()
 
@@ -92,7 +102,7 @@ func Install(opts InstallOptions) error {
 		// started by someone else mid-install) is success, not failure.
 		var errno syscall.Errno
 		if !errors.As(err, &errno) || errno != 1056 /* ERROR_SERVICE_ALREADY_RUNNING */ {
-			return fmt.Errorf("starting the %s service: %w", Name, err)
+			return fmt.Errorf("starting the %s service: %w", name, err)
 		}
 	}
 	return nil
@@ -101,26 +111,41 @@ func Install(opts InstallOptions) error {
 // Remove stops the service (best effort) and deletes it. A missing service
 // is success (uninstall is idempotent).
 func Remove() error {
+	return removeService(Name)
+}
+
+// RemoveWeb stops and deletes the freens-web UI service. A missing service
+// is success (uninstall is idempotent).
+func RemoveWeb() error {
+	return removeService(WebName)
+}
+
+func removeService(name string) error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connecting to the service manager: %w", err)
 	}
 	defer m.Disconnect()
-	s, err := m.OpenService(Name)
+	s, err := m.OpenService(name)
 	if err != nil {
 		return nil // not installed — nothing to do
 	}
 	defer s.Close()
 	_ = stopAndWait(s, 15*time.Second)
 	if err := s.Delete(); err != nil {
-		return fmt.Errorf("deleting the %s service: %w", Name, err)
+		return fmt.Errorf("deleting the %s service: %w", name, err)
 	}
 	return nil
 }
 
 // Start starts the service (idempotent: already-running is success).
-func Start() error {
-	s, err := openRunning()
+func Start() error { return startService(Name) }
+
+// StartWeb starts the freens-web UI service (idempotent).
+func StartWeb() error { return startService(WebName) }
+
+func startService(name string) error {
+	s, err := openRunningNamed(name)
 	if err != nil {
 		return err
 	}
@@ -138,8 +163,13 @@ func Start() error {
 // Stop stops the service (idempotent: a stopped/missing service is
 // success). Used by upgrade before swapping the binary — Windows locks a
 // running image against replace.
-func Stop() error {
-	s, err := openRunning()
+func Stop() error { return stopService(Name) }
+
+// StopWeb stops the freens-web UI service (idempotent).
+func StopWeb() error { return stopService(WebName) }
+
+func stopService(name string) error {
+	s, err := openRunningNamed(name)
 	if err != nil {
 		if errors.Is(err, errNotInstalled) {
 			return nil
@@ -151,8 +181,13 @@ func Stop() error {
 }
 
 // Running reports whether the service exists and is in the RUNNING state.
-func Running() bool {
-	s, err := openRunning()
+func Running() bool { return runningService(Name) }
+
+// RunningWeb reports whether the freens-web UI service exists and runs.
+func RunningWeb() bool { return runningService(WebName) }
+
+func runningService(name string) bool {
+	s, err := openRunningNamed(name)
 	if err != nil {
 		return false
 	}
@@ -164,13 +199,19 @@ func Running() bool {
 // errNotInstalled reports the service does not exist.
 var errNotInstalled = errors.New("service not installed")
 
-// openRunning connects to the manager and opens the service in one go.
+// openRunning connects to the manager and opens the default daemon
+// service in one go.
 func openRunning() (*mgr.Service, error) {
+	return openRunningNamed(Name)
+}
+
+// openRunningNamed connects to the manager and opens the named service.
+func openRunningNamed(name string) (*mgr.Service, error) {
 	m, err := mgr.Connect()
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the service manager: %w", err)
 	}
-	s, err := m.OpenService(Name)
+	s, err := m.OpenService(name)
 	if err != nil {
 		m.Disconnect()
 		return nil, errNotInstalled
@@ -192,7 +233,7 @@ func stopAndWait(s *mgr.Service, d time.Duration) error {
 	if _, err := s.Control(svc.Stop); err != nil {
 		// Already stopping is fine.
 		if st.State != svc.StopPending {
-			return fmt.Errorf("stopping the %s service: %w", Name, err)
+			return fmt.Errorf("stopping the %s service: %w", s.Name, err)
 		}
 	}
 	deadline := time.Now().Add(d)

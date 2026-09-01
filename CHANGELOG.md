@@ -1,5 +1,34 @@
 # Changelog
 
+## unreleased — the web UI is always there: freens-web as a service on every OS
+
+"Setup installs the daemon but the UI needs hand-standing-up" was true on
+one platform and half-true on the rest. Now setup keeps the LAN management
+UI running everywhere:
+
+- **Windows**: freens-web gains the SCM service handler the daemon has
+  (v0.11.0 pattern — the SCM hands Execute the service name; the real
+  command line is os.Args; Stop drains the server bounded, then Stopped;
+  service logs to <home>\webui.log with 8 MiB rotate). setup installs it
+  as the second service "freens-web" (automatic start, restart-on-
+  failure, same recovery ladder) and adds the inbound firewall rule
+  "freens-web UI" (TCP 8090, port-scoped); `freens uninstall` (and
+  `setup -uninstall`) remove both. webui.Server grew a real Shutdown
+  (the SCM stop path waits for the listener race, then drains) — the
+  console binary's SIGTERM handling now uses the same graceful path
+  instead of os.Exit.
+- **Linux**: setup writes and enables freens-web.service next to the
+  daemon unit (same user + FREENS_HOME env conventions, Restart=on-
+  failure, After=freens.service). Idempotent: an existing unit is left
+  untouched (hand-tuned fleet units survive re-setups); a hand-built
+  freens without a freens-web binary beside it silently skips the UI.
+  `freens uninstall` already removed the unit — now setup is its mirror.
+- **macOS**: setup (darwin branch) installs the com.freens.webui
+  LaunchAgent (RunAtLoad + KeepAlive, FREENS_HOME carried) and loads it;
+  `freens uninstall` unloads+removes it. Flagged fleet-untested (no mac
+  in the 3-box LAN fleet); the daemon story on macOS remains a manual
+  run and setup says so.
+
 ## v0.12.0 — self-healing renewals, async admin publishes, `forget` + `uninstall`
 
 Four operations findings from the 2026-08-31/09-01 cleanup session, plus

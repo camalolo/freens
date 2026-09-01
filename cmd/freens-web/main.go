@@ -9,14 +9,19 @@
 //	           [-home <dir>] [-sock <admin.sock path>] [-version]
 //
 // Run it as the daemon user (it reads the keychain and the admin socket).
-// See contrib/systemd/freens-web.service for the recommended unit.
+// Linux/macOS: setup installs the service/agent that keeps it running
+// (freens-web.service / com.freens.webui LaunchAgent). Windows: setup
+// installs it as the "freens-web" SCM service next to the daemon.
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,7 +38,36 @@ import (
 // cliVersion is stamped at build time like the daemon's version.
 var cliVersion = "dev"
 
+// logSink is the process-wide slog writer the windows service mode
+// installs (webui.log); console mode leaves it nil (stderr). Declared
+// untagged so both platform halves of the service seam can touch it.
+var logSink *os.File
+
 func main() {
+	// Windows: the SCM launched us as the freens-web service — answer its
+	// control protocol while the ordinary UI runs unchanged in a goroutine.
+	if windowsServiceRequested() {
+		os.Exit(windowsRunService())
+	}
+
+	// Console mode: SIGINT/SIGTERM close the stop channel (one shutdown
+	// sequence for console and service alike).
+	stop := make(chan struct{})
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		close(stop)
+	}()
+	if err := consoleRun(os.Args[1:], stop); err != nil {
+		fmt.Fprintf(os.Stderr, "freens-web: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// consoleRun is the whole UI: parse args, resolve config, build the
+// server, serve until stop closes (or the listener fails).
+func consoleRun(args []string, stop <-chan struct{}) error {
 	fs := flag.NewFlagSet("freens-web", flag.ContinueOnError)
 	configPath := fs.String("config", "", "freens.conf to read the [webui] section from (default: <home>/freens.conf)")
 	listen := fs.String("listen", "", "listen address (default 0.0.0.0:8090)")
@@ -41,12 +75,12 @@ func main() {
 	homeDirFlag := fs.String("home", "", "freens home (default ~/.freens)")
 	sock := fs.String("sock", "", "daemon admin socket (default <home>/admin.sock)")
 	showVersion := fs.Bool("version", false, "print version and exit")
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		os.Exit(2)
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 	if *showVersion {
 		fmt.Println("freens-web", cliVersion)
-		return
+		return nil
 	}
 
 	// Home first (flag > FREENS_HOME > ~/.freens), then config file inside it.
@@ -62,8 +96,7 @@ func main() {
 	if b, err := os.ReadFile(cfgFile); err == nil {
 		parsed, perr := webui.ParseConfig(string(b))
 		if perr != nil {
-			fmt.Fprintf(os.Stderr, "freens-web: %s: %v\n", cfgFile, perr)
-			os.Exit(1)
+			return fmt.Errorf("%s: %w", cfgFile, perr)
 		}
 		cfg = parsed
 	}
@@ -86,25 +119,32 @@ func main() {
 		sockPath = home.AdminSock()
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	w := os.Stderr
+	if logSink != nil {
+		w = logSink // service mode: no console, log to <home>\webui.log
+	}
+	log := slog.New(slog.NewTextHandler(w, nil))
 	srv, err := webui.New(cfg, sockPath, log)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "freens-web: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
-	// Graceful shutdown on SIGINT/SIGTERM.
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		os.Exit(0)
-	}()
-
 	cert := webtls(cfg, cfgHome, log)
-	if err := srv.ListenAndServeTLS(cert); err != nil {
-		fmt.Fprintf(os.Stderr, "freens-web: %v\n", err)
-		os.Exit(1)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServeTLS(cert) }()
+
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-stop:
+		// Drain open requests (bounded) and exit cleanly — the SCM path
+		// reports Stopped only after this returns.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(ctx)
 	}
 }
 
