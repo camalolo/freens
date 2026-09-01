@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.13.3 — multi-homed contacts + the Windows webui-service restart fix
+
+Diagnosed by the operator, found live on the desktop box (2026-09-01):
+"maybe the same id for 2 IPs is the issue? camalolo is actually on LAN and
+WAN at the same time." Exactly. The routing table kept one slot per node
+and **overwrote the address** on every re-learn, so a node reachable at
+two addresses (the seed: public IP on ppp0 + the operator's LAN) made the
+stored address flip-flop between them depending on who taught us last —
+and a probe timeout against whichever was stored at the moment evicted the
+node whole. The peers table then showed the seed's address "coming and
+going".
+
+- **Routing table**: `NodeContact` now carries `Alts` — other known
+  addresses with their own last-seen/confirmed stamps, LRU-capped (4 per
+  node). A re-learn at a different address accumulates instead of
+  clobbering. The preferred address is the freshest *confirmed* one
+  (strict comparison, so same-second ties keep the incumbent — no
+  ping-pong).
+- **Probe failure failover**: a missed probe first switches the preferred
+  address to a recent alternate (clearing the failed address's
+  confirmation per the anti-ghost invariant) before demoting the node;
+  the §6.2 bucket-pressure quiz also pings the alternates and promotes
+  the answering one. A node is only "dead" when **every** known address
+  is — and a laptop that leaves the LAN fails over to the WAN address on
+  its own.
+- **Surfaces**: admin `/peers` and the webui peers table carry and render
+  the alternates ("also <addr>" under the preferred).
+- **Snapshots**: the persisted peerbook gains an optional `alts` field —
+  old binaries ignore it, new binaries read old snapshots.
+- **Windows upgrade fix**: the upgrade stopped/restarted only the `freens`
+  SCM service around the binary swap, so `freens-web` kept running its
+  renamed-aside image — the UI reported the old version and served old
+  embedded templates (the doubled "Peers (N)" heading) until a manual
+  restart. The upgrade now stops both services first and restarts both
+  after (absent web service on pre-v0.13.0 installs handled).
+
 ## v0.13.2 — one missed probe no longer evicts a confirmed peer
 
 Found live on the desktop box (2026-09-01): its only non-LAN anchor — the
