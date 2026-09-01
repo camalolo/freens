@@ -192,6 +192,13 @@ type Resolver struct {
 	flightMu sync.Mutex
 	flights  map[cacheKey]*resFlight
 
+	// Serve-stale-while-revalidate bookkeeping (§10.4 amended): the unix
+	// second of the last background refresh KICK per cache key. Throttles
+	// goroutine spawns while an entry keeps being served stale (e.g. the
+	// namespace is unreachable and every refresh errors) — one attempt per
+	// refreshKickEvery per name, never blocking the answering path.
+	refreshes map[cacheKey]int64
+
 	// MaxConcurrentResolutions bounds simultaneously in-flight DISTINCT
 	// resolutions (v0.9.2 overload cap). Single-flight collapses identical
 	// questions, but a distinct-name query flood — every miss caching its
@@ -241,6 +248,46 @@ type resFlight struct {
 	rcode int
 	aa    bool
 	err   error
+}
+
+// refreshKickEvery is the minimum spacing between background refresh kicks
+// for one cache key (serve-stale revalidation, §10.4 amended): during an
+// outage every stale serve would otherwise spawn a walk attempt; one try
+// per interval keeps the revalidation effort bounded while the answering
+// path never blocks on it.
+const refreshKickEvery = 5
+
+// refreshTimeout bounds ONE background revalidation walk (the answering
+// path already returned; this only decides when the goroutine gives up).
+const refreshTimeout = 60 * time.Second
+
+// kickRefresh revalidates a stale cache entry in the background: the
+// caller has already ANSWERED the query from the stale copy, so this is
+// best-effort by construction. resolveShared provides the single-flight
+// (concurrent identical refreshes join the leader's walk), the resolution
+// semaphore (bounded like any other walk), and the re-cache — whose fresh
+// outcome, positive OR negative, replaces the stale entry.
+func (r *Resolver) kickRefresh(q dns.Question, ck cacheKey) {
+	nowFn := r.Now
+	if nowFn == nil {
+		nowFn = func() int64 { return time.Now().Unix() }
+	}
+	now := nowFn()
+	r.flightMu.Lock()
+	if r.refreshes == nil {
+		r.refreshes = make(map[cacheKey]int64)
+	}
+	if last, seen := r.refreshes[ck]; seen && now-last < refreshKickEvery {
+		r.flightMu.Unlock()
+		return
+	}
+	r.refreshes[ck] = now
+	r.flightMu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+		defer cancel()
+		_, _, _, _ = r.resolveShared(ctx, q, ck)
+	}()
 }
 
 // New builds a Resolver with a default clock. Cfg, Freens, and Upstream may be

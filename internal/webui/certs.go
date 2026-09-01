@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,20 +47,22 @@ func mapCertErr(err error) error {
 // ---------------------------------------------------------------------------
 
 type certRow struct {
-	Name      string
-	Alias     string
-	Tracked   bool
-	CertPath  string
-	NotAfter  string // "in 6d" / "expired 2d ago" / raw when far
-	Due       bool
-	InNginx   bool
-	Encrypted bool
+	Name       string
+	Alias      string
+	Tracked    bool
+	CertPath   string
+	NotAfter   string // "in 6d" / "expired 2d ago"
+	NotAfterAbs string // absolute ("2026-09-08 10:01 UTC")
+	Due        bool
+	InNginx    bool
+	Encrypted  bool
 }
 
 type nginxRow struct {
 	File        string
 	ServerNames string
 	CloneSource string // first server_name — the clone-vhost form's handle
+	Managed     bool   // a freens-<name> clone file (our own output)
 	SSL         bool
 	CertPath    string
 	FreensName  string // a known name matching one of the server_names ("" = none)
@@ -104,7 +107,9 @@ func (s *Server) handleCertsPage(w http.ResponseWriter, r *http.Request) {
 			row.CertPath = st.CertPath
 			row.InNginx = len(st.NginxFiles) > 0
 			row.Due = certmgr.IsDue(st, now)
-			left := time.Until(time.Unix(st.NotAfter, 0))
+			na := time.Unix(st.NotAfter, 0)
+			row.NotAfterAbs = na.UTC().Format("2006-01-02 15:04 UTC")
+			left := time.Until(na)
 			switch {
 			case left < 0:
 				row.NotAfter = "expired " + left.Round(24*time.Hour).Abs().String() + " ago"
@@ -134,6 +139,7 @@ func (s *Server) handleCertsPage(w http.ResponseWriter, r *http.Request) {
 				SSL:         b.ListensSSL,
 				Block:       i,
 			}
+			nr.Managed = strings.HasPrefix(filepath.Base(b.File), "freens-")
 			if len(b.ServerNames) > 0 {
 				nr.CloneSource = b.ServerNames[0]
 			}

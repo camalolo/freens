@@ -13,6 +13,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/metrics"
 	"github.com/miekg/dns"
 )
@@ -155,16 +156,23 @@ func TestResponseCacheMetrics(t *testing.T) {
 	if _, _, _, ok := c.get(key); !ok {
 		t.Fatal("second get should hit")
 	}
-	// Expired entry counts as a miss.
+	// An expired POSITIVE entry inside the §10.4 serve-stale window is
+	// served stale (its own counter) — it is NOT a miss and NOT a hit.
 	now += 61
+	if _, _, _, status := c.get2(key); status != cacheStale {
+		t.Fatalf("expired positive inside the window should serve stale, got %v", status)
+	}
+	// Past the stale window it is finally a miss (and the entry drops).
+	now += int64(constants.StaleServeSecs)
 	if _, _, _, ok := c.get(key); ok {
-		t.Fatal("expired get should miss")
+		t.Fatal("get past the stale window should miss")
 	}
 
 	got := exposition(t, reg)
 	for _, want := range []string{
 		"# TYPE freens_resolver_cache_hits_total counter\nfreens_resolver_cache_hits_total 1",
 		"# TYPE freens_resolver_cache_misses_total counter\nfreens_resolver_cache_misses_total 2",
+		"# TYPE freens_resolver_cache_stale_total counter\nfreens_resolver_cache_stale_total 1",
 	} {
 		if !bytes.Contains([]byte(got), []byte(want)) {
 			t.Errorf("exposition missing %q:\n%s", want, got)

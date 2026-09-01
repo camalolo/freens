@@ -15,10 +15,13 @@ package resolver
 //
 // The cache is keyed on (qname, qtype, qclass), bounded to a configurable
 // entry count (default 4096), and evicts the OLDEST entry when full. Entries
-// also expire by TTL; a Get past the expiry is a miss (the entry is dropped
-// and the resolver re-consults the namespace). Cached RRs are deep-copied on
-// retrieval with their TTLs decayed to the remaining validity, so callers
-// never share mutable RR pointers with the cache.
+// also expire by TTL; a Get past the expiry is a MISS for negative entries
+// and for positives past the serve-stale window (§10.4 amended: an expired
+// positive answer inside the window is served immediately — it was fully
+// validated when fetched — while ServeDNS revalidates it in the background;
+// the refresh's putFreens replaces the entry either way). Cached RRs are
+// deep-copied on retrieval with their TTLs decayed, so callers never share
+// mutable RR pointers with the cache.
 //
 // Per §10.4 line 855 ("cached envelopes are re-verified on use after fetch")
 // this cache stores VERIFICATION RESULTS (rrs, rcode, aa) for their validity
@@ -78,10 +81,11 @@ type ResponseCache struct {
 	now        func() int64 // wall-clock seconds
 	nextStamp  uint64
 	sinceSweep int // inserts since the last full expired-sweep (cadence: cacheSweepEvery)
-	// hits/misses optionally count get() outcomes; nil (the default, or a
-	// SetMetrics(nil) call) leaves the cache uninstrumented.
+	// hits/misses/staleServes optionally count get2() outcomes; nil (the
+	// default, or a SetMetrics(nil) call) leaves the cache uninstrumented.
 	hits   *metrics.Counter
 	misses *metrics.Counter
+	stales *metrics.Counter
 }
 
 // NewResponseCache builds an empty ResponseCache (§10.4). maxEntries <= 0
@@ -123,9 +127,12 @@ func (c *ResponseCache) SetMetrics(m *metrics.Registry) {
 		"Response-cache lookups served from a live cache entry (§10.4).")
 	c.misses = m.NewCounter("freens_resolver_cache_misses_total",
 		"Response-cache lookups absent or expired (resolver re-consulted the namespace).")
+	c.stales = m.NewCounter("freens_resolver_cache_stale_total",
+		"Expired positive answers served while a background refresh revalidated them (§10.4 serve-stale).")
 }
 
-// countHit/countMiss bump the optional counters (no-op when uninstrumented).
+// countHit/countMiss/countStale bump the optional counters (no-op when
+// uninstrumented).
 func (c *ResponseCache) countHit() {
 	if c.hits != nil {
 		c.hits.With().Inc()
@@ -138,37 +145,90 @@ func (c *ResponseCache) countMiss() {
 	}
 }
 
+func (c *ResponseCache) countStale() {
+	if c.stales != nil {
+		c.stales.With().Inc()
+	}
+}
+
 // get returns the cached outcome for key, with every answer RR deep-copied
 // and its TTL decayed to the remaining cache lifetime. ok is false on a miss
 // or an expired entry (which is dropped). The hit/miss counters are bumped
 // OUTSIDE the cache mutex (each does a strings.Join + its own lock; counting
 // under c.mu serialized every query against every insert).
 func (c *ResponseCache) get(key cacheKey) (rrs []dns.RR, rcode int, aa bool, ok bool) {
+	rrs, rcode, aa, status := c.get2(key)
+	return rrs, rcode, aa, status == cacheFresh
+}
+
+// cacheStatus classifies a get2 outcome: cacheFresh (live entry), cacheStale
+// (expired POSITIVE entry still inside the §10.4 serve-stale window — the
+// answer was fully validated when fetched, and ServeDNS will revalidate it
+// in the background while serving this copy), or cacheMiss.
+type cacheStatus int
+
+const (
+	cacheMiss cacheStatus = iota
+	cacheFresh
+	cacheStale
+)
+
+// staleTTL is the DNS TTL emitted when serving a STALE entry: short, so
+// downstream stub resolvers re-ask soon and pick up the refreshed answer
+// (or lose the stale crutch) instead of holding the old copy for a full
+// record TTL.
+const staleTTL = 30
+
+// get2 is get() with the serve-stale dimension: an expired positive entry
+// whose age past expiry is still within StaleServeSecs is returned with
+// cacheStale instead of being dropped (negatives are ALWAYS dropped — a
+// revoked name must go dark within its TTL + NegTTL, never later). The
+// caller is expected to kick a background refresh for stale outcomes; the
+// refresh's putFreens replaces the entry with fresh data either way.
+func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, status cacheStatus) {
 	c.mu.Lock()
 	e, hit := c.entries[key]
 	if !hit {
 		c.mu.Unlock()
 		c.countMiss()
-		return nil, 0, false, false
+		return nil, 0, false, cacheMiss
 	}
 	now := c.now()
-	if now >= e.expiresAt {
-		delete(c.entries, key)
+	if now < e.expiresAt {
+		remaining := uint32(e.expiresAt - now)
+		out := make([]dns.RR, len(e.rrs))
+		for i, rr := range e.rrs {
+			cp := dns.Copy(rr)
+			cp.Header().Ttl = remaining
+			out[i] = cp
+		}
+		rcode, aa = e.rcode, e.aa
 		c.mu.Unlock()
-		c.countMiss()
-		return nil, 0, false, false
+		c.countHit()
+		return out, rcode, aa, cacheFresh
 	}
-	remaining := uint32(e.expiresAt - now)
-	out := make([]dns.RR, len(e.rrs))
-	for i, rr := range e.rrs {
-		cp := dns.Copy(rr)
-		cp.Header().Ttl = remaining
-		out[i] = cp
+	// Expired: positive answers may serve stale (bounded); negatives and
+	// anything past the stale window are dropped for a real re-resolve.
+	if len(e.rrs) > 0 && now < e.expiresAt+int64(constants.StaleServeSecs) {
+		remaining := uint32(e.expiresAt + int64(constants.StaleServeSecs) - now)
+		if remaining > staleTTL {
+			remaining = staleTTL
+		}
+		out := make([]dns.RR, len(e.rrs))
+		for i, rr := range e.rrs {
+			cp := dns.Copy(rr)
+			cp.Header().Ttl = remaining
+			out[i] = cp
+		}
+		rcode, aa = e.rcode, e.aa
+		c.mu.Unlock()
+		c.countStale()
+		return out, rcode, aa, cacheStale
 	}
-	rcode, aa = e.rcode, e.aa
+	delete(c.entries, key)
 	c.mu.Unlock()
-	c.countHit()
-	return out, rcode, aa, true
+	c.countMiss()
+	return nil, 0, false, cacheMiss
 }
 
 // putFreens stores a freens-sourced (aa == true) ResolveQuestion outcome per

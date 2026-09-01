@@ -68,6 +68,16 @@ const (
 const (
 	ResponseTTLCap = 3600 // max TTL emitted by resolver (seconds)
 	NegTTL         = 60   // negative caching (seconds)
+	// StaleServeSecs bounds the serve-stale-while-revalidate window (§10.4,
+	// amended): an EXPIRED positive answer may still be answered — marked as
+	// it always was, validated when it was fetched — while a background
+	// refresh revalidates it, for at most this many seconds past expiry.
+	// Only positive answers qualify (negatives must go dark within their
+	// TTL), and a successful refresh replaces the entry immediately, so the
+	// window only ever matters when the namespace is UNREACHABLE — where
+	// answering with the last known good address beats an outage. Negative
+	// answers never serve stale.
+	StaleServeSecs = 1800
 )
 
 // Storage.

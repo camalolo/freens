@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2057,14 +2058,14 @@ func TestResolveQuestionNoClaimResolver(t *testing.T) {
 type fakeClaimSetLookup struct {
 	fakeClaimLookup
 	set   []*wire.SignedEnvelope
-	calls int
+	calls int32 // atomic: the §10.4 background refresh reads this concurrently
 }
 
 // CollectClaims returns the configured set (the competing claims "nodes
 // offer", §7.4 step 1) — order deliberately caller-controlled to prove the
 // §7.4 step-3 ordering is observation-order-independent.
 func (f *fakeClaimSetLookup) CollectClaims(_ context.Context, alias string, _ int64) ([]*wire.SignedEnvelope, error) {
-	f.calls++
+	atomic.AddInt32(&f.calls, 1)
 	if _, ok := f.claims[alias]; !ok {
 		return nil, nil
 	}
@@ -2300,9 +2301,18 @@ func TestResolveQuestionContestedCacheReconsultsNetwork(t *testing.T) {
 			query() // 1st query resolves and populates the cache.
 			clock += contestedClaimTTLCap + 60
 			query()
-			callsAfter := lookup.calls
+			// §10.4 amended: an expired answer serves STALE while a
+			// background refresh re-consults the network — the takeover
+			// pickup window is now TTL + one refresh instead of a blocking
+			// walk on the answering path. Wait for that refresh before
+			// counting CollectClaims calls.
+			deadline := time.Now().Add(3 * time.Second)
+			for tc.wantRecalled && atomic.LoadInt32(&lookup.calls) < 2 && time.Now().Before(deadline) {
+				time.Sleep(2 * time.Millisecond)
+			}
+			callsAfter := atomic.LoadInt32(&lookup.calls)
 			if tc.wantRecalled && callsAfter != 2 {
-				t.Errorf("CollectClaims calls = %d after the cache lifetime, want 2 (contested entry must expire per §10.4)", callsAfter)
+				t.Errorf("CollectClaims calls = %d after the cache lifetime, want 2 (contested entry must re-consult per §7.5/§10.4)", callsAfter)
 			}
 			if !tc.wantRecalled && callsAfter != 1 {
 				t.Errorf("CollectClaims calls = %d after the cache lifetime, want 1 (uncontested entry must still be served from cache)", callsAfter)

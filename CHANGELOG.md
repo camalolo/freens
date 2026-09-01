@@ -1,7 +1,5 @@
 # Changelog
 
-# Changelog
-
 ## v0.13.9 — setup fixes the nsswitch shadowing (the last mile of first contact)
 
 The closing fix of the fresh-VPS bootstrap saga: on a stock
@@ -22,7 +20,6 @@ the manual sed with a loud warning instead of a green checkbox over an
 armed trap. `uninstall` restores the original. Idempotent; no-op
 without nsswitch.conf or without `resolve`.
 
-# Changelog
 
 ## v0.13.8 — register's two post-success papercuts (one was real)
 
@@ -45,7 +42,6 @@ Found live 2026-09-01 immediately after the fresh VPS's successful
   is found and not revoked, register prints "publish complete" and exits
   zero.
 
-# Changelog
 
 ## v0.13.7 — the witness cooldown stops punishing re-registrations
 
@@ -95,6 +91,42 @@ it to work by itself over the internet").
 
 Tests: learned contacts get probed and confirmed end-to-end; the
 dead-preferred + reachable-alternate shape fails over and confirms.
+
+## v0.13.12 — the walk stops landing on the client (serve-stale-while-revalidate) + /certs page completion
+
+Operator-reported (and reproduced live): DNS answers were instant while
+cached (§10.4, positive = record TTL, default 300 s) but every expiry
+put the FULL screened walk back on the answering path — measured
+~100 ms on the warm LAN, 2.1 s when a WAN hop was involved, seconds on
+a VPS behind restrictive NAT. The data doesn't change at TTL expiry;
+the latency shouldn't either.
+
+- **Serve-stale-while-revalidate (§10.4 amended)**: an expired
+  POSITIVE answer inside a bounded window (30 min) is answered
+  immediately — it carries exactly the validation the fresh answer
+  had — while the resolver revalidates in the background
+  (single-flighted via the existing flight table, semaphore-bounded,
+  one kick per 5 s per name so an unreachable namespace can't spin).
+  The fresh outcome — positive OR negative — replaces the entry, so
+  revocations/rotations still propagate within TTL + one refresh; a
+  failed refresh never poisons the cache (the last known good address
+  keeps being answered until the window closes — better an old address
+  than none during an outage). Negative answers NEVER serve stale, and
+  the contested-alias re-consultation cadence (§7.5) is preserved by
+  the same background refresh. Stale answers carry a short DNS TTL
+  (30 s) so client stubs re-ask soon. New metric:
+  `freens_resolver_cache_stale_total`.
+- **/certs page completion** (the "is it ergonomic" review): the flow
+  publish → issue → clone → renew now lives on ONE page — an inline
+  "publish a sub-name" form (reusing the name endpoint, auto-reload on
+  success) starts it; expiry shows the absolute UTC stamp under the
+  countdown; cloned vhost files wear a "freens-managed" badge so
+  operators can tell our output from hand-written configs at a glance.
+- **CLI: names can lead**. `freens cert nginx www.camalolo -clone
+  camalolo.com` now parses as typed — Go's flag package stops at the
+  first positional, and every cert verb needed its flags first (found
+  live during the rollout). `flagsFirst` reorders with value-flags
+  kept attached; applied to all cert subcommands.
 
 ## v0.13.11 — certmgr CI hotfix (hermetic binary-resolution test)
 

@@ -334,3 +334,63 @@ func TestCertNginxCloneViaUI(t *testing.T) {
 		t.Fatalf("renewal tracking = %v, want [%s]", st.NginxFiles, real)
 	}
 }
+
+func TestCertsPageErgonomicsAfterIssueAndClone(t *testing.T) {
+	e := newCertsTestEnv(t)
+	// Issue + clone via the API, then re-render the page: the expiry column
+	// must show the ABSOLUTE stamp, and the cloned vhost must be badged as
+	// freens-managed (so operators can tell our files from theirs).
+	if code, toast, kind := e.c.postForm(e.ts.URL+"/api/cert/issue", url.Values{"name": {"www.alice"}}); code != 200 || kind != "" {
+		t.Fatalf("issue = %d kind=%q toast=%q", code, kind, toast)
+	}
+	// The clone path needs NO block matching www.alice — re-point the
+	// fixture at an unrelated server_name first.
+	fixtureNginx(t, e.s, "unrelated.local")
+	cloneFixtureFor(t, e.s, "shop.alice")
+	if code, _, kind := e.c.postForm(e.ts.URL+"/api/cert/nginx", url.Values{
+		"name": {"www.alice"}, "clone_source": {"shop.alice"},
+	}); code != 200 || kind != "" {
+		t.Fatalf("clone = %d kind=%q", code, kind)
+	}
+
+	resp, err := e.c.http.Get(e.ts.URL + "/certs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if !strings.Contains(text, "UTC</div>") {
+		t.Errorf("no absolute expiry stamp on the tracked cert:\n%s", text)
+	}
+	if !strings.Contains(text, "freens-managed") {
+		t.Errorf("the cloned vhost row lacks the freens-managed badge")
+	}
+	if !strings.Contains(text, "publish a sub-name") {
+		t.Errorf("the inline publish form is missing")
+	}
+}
+
+// cloneFixtureFor drops a foreign Debian-shaped vhost into the page
+// fixture's tree (the clone path needs a block that does NOT match any
+// freens name).
+func cloneFixtureFor(t *testing.T, s *Server, serverName string) string {
+	t.Helper()
+	root := filepath.Dir(s.nginx.ConfPath)
+	avail := filepath.Join(root, "sites-available")
+	if err := os.MkdirAll(avail, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	enabled := filepath.Join(root, "sites-enabled")
+	if err := os.MkdirAll(enabled, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := "server {\n  listen 443 ssl;\n  server_name " + serverName + ";\n  ssl_certificate /etc/le/x.pem;\n  ssl_certificate_key /etc/le/x.key;\n  root /var/www/x;\n}\n"
+	if err := os.WriteFile(filepath.Join(avail, serverName), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../sites-available/"+serverName, filepath.Join(enabled, serverName)); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(avail, serverName)
+}

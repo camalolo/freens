@@ -1150,9 +1150,25 @@ not by proof of ownership (an alias points *to* ownership; it cannot
 ### 10.4 Caching rules
 
 - Positive freens answers cached ≤ min(TTL, validity remaining).
-- Negative freens answers cached 60 s, marked unauthenticated.
+- Positive answers MAY additionally be served STALE past that horizon —
+  same bounds as serve-stale-while-revalidate in classical DNS — while a
+  background refresh revalidates the entry, for at most a bounded window
+  past expiry (reference implementation: 30 min). The stale copy carries
+  exactly the validation the fresh one had (it went through the same
+  screened path when fetched) and a short TTL so clients re-ask soon.
+  This is a latency guarantee, not a weaker trust model: the walk cost
+  stops landing on the answering path, and a fresh outcome — positive OR
+  negative (revocation, rotation, transfer) — replaces the entry as soon
+  as the background walk completes. When the namespace is unreachable,
+  the last known good address keeps being answered until the window
+  closes (better an old address than none during an outage).
+- Negative freens answers cached 60 s, marked unauthenticated, and
+  NEVER served stale (a revoked name must go dark within TTL + 60 s).
 - Alias claim winners cached per 7.5 (contested: 60 s; uncontested:
-   6 h).
+   6 h) — the re-consultation cadence of a contested winner bounds how
+   long a challenge can go unanswered and is not extended by the
+   serve-stale rule: the refresh re-consults at the same cadence, and
+   the fresh winner replaces the entry.
 - Cached envelopes are re-verified on use after fetch; verification
   results (not envelopes) may be cached for their validity period.
 

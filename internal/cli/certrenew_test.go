@@ -139,3 +139,38 @@ func TestCertSubcommandDispatch(t *testing.T) {
 		t.Fatalf("usage error = %v", err)
 	}
 }
+
+func TestFlagsFirstLetsNamesLead(t *testing.T) {
+	// The natural CLI order (name before flags) must parse — Go's flag
+	// package stops at the first positional otherwise.
+	got := flagsFirst([]string{"www.camalolo", "-clone", "camalolo.com", "-force"}, "clone", "config", "server")
+	want := []string{"-clone", "camalolo.com", "-force", "www.camalolo"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("flagsFirst = %q, want %q", got, want)
+	}
+	// =-joined values, bare value flags, and pure-flag args stay put.
+	got = flagsFirst([]string{"-quiet", "name1", "-deploy-hook=echo hi", "name2", "-days", "3"}, "deploy-hook", "days")
+	want = []string{"-quiet", "-deploy-hook=echo hi", "-days", "3", "name1", "name2"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("flagsFirst = %q, want %q", got, want)
+	}
+
+	// End to end: cert -out-dir AFTER the name issues exactly the same.
+	home := tempHome(t)
+	keys := filepath.Join(home, "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := keychain.Save(keychain.OwnerKeyPath(keys, "alice"), lifecycleKeypair(t, 7), ""); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(home, "out")
+	if _, err := captureStdout(t, func() error {
+		return cmdCert([]string{"-no-track", "www.alice", "-out-dir", out})
+	}); err != nil {
+		t.Fatalf("name-first issue: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "www.alice.crt")); err != nil {
+		t.Fatalf("cert file missing: %v", err)
+	}
+}

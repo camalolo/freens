@@ -87,7 +87,7 @@ func cmdCertIssue(args []string) error {
 	outDir := fs.String("out-dir", ".", "directory for <name>.crt / <name>.key")
 	days := fs.Int("days", 7, "leaf validity in days (capped by the §9.5.3 7-day ceiling for daemon-issued certs)")
 	noTrack := fs.Bool("no-track", false, "skip renewal tracking (one-shot export; `cert renew` will not know this cert)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args, "out-dir", "days")); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 1 {

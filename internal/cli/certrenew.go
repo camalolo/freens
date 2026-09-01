@@ -21,13 +21,41 @@ import (
 	"github.com/camalolo/freens/internal/home"
 )
 
+// flagsFirst reorders CLI args so all flags precede positionals, letting
+// the natural `freens cert nginx www.camalolo -clone camalolo.com` parse —
+// Go's flag package stops at the first positional, and every one of the
+// cert verbs was burn-tested in the wrong order during the live rollout
+// (found on this very box). valueFlags names the flags that consume the
+// NEXT token, so their values move with them.
+func flagsFirst(args []string, valueFlags ...string) []string {
+	vf := map[string]bool{}
+	for _, f := range valueFlags {
+		vf[strings.TrimLeft(f, "-")] = true
+	}
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if len(a) > 1 && a[0] == '-' {
+			flags = append(flags, a)
+			name := strings.TrimLeft(a, "-")
+			if eq := strings.IndexByte(name, '='); eq < 0 && vf[name] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		pos = append(pos, a)
+	}
+	return append(flags, pos...)
+}
+
 func cmdCertRenew(args []string) error {
 	fs := flag.NewFlagSet("cert renew", flag.ContinueOnError)
 	force := fs.Bool("force", false, "renew even when the certificate is not due yet")
 	hook := fs.String("deploy-hook", "", "command to run after each successful renewal (recorded per name)")
 	noReload := fs.Bool("no-reload", false, "skip the nginx reload even for deployed certificates")
 	quiet := fs.Bool("quiet", false, "print only failures (for cron)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args, "deploy-hook")); err != nil {
 		return err
 	}
 	names := fs.Args()
@@ -88,7 +116,7 @@ func cmdCertRenew(args []string) error {
 
 func cmdCertList(args []string) error {
 	fs := flag.NewFlagSet("cert list", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args)); err != nil {
 		return err
 	}
 	states, err := certmgr.ListState(home.Dir())
@@ -127,7 +155,7 @@ func cmdCertNginx(args []string) error {
 	force := fs.Bool("force", false, "replace a foreign ssl_certificate the block already serves")
 	dryRun := fs.Bool("dry-run", false, "show what would change; edit nothing")
 	noReload := fs.Bool("no-reload", false, "edit + validate, but do not reload nginx")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args, "config", "server", "clone")); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 1 {
@@ -179,7 +207,7 @@ func cmdCertNginx(args []string) error {
 
 func cmdCertForget(args []string) error {
 	fs := flag.NewFlagSet("cert forget", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flagsFirst(args)); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 1 {

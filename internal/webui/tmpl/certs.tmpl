@@ -10,8 +10,14 @@
 
 <div class="card">
   <div class="card-title">Names</div>
+  <form class="row" hx-post="/api/name" hx-swap="none"
+        hx-on::after-request="if (event.detail.successful) window.location.reload()">
+    <input type="text" name="target" placeholder="publish a sub-name first, e.g. blog.&lt;alias&gt;" autocomplete="off">
+    <input type="password" name="passphrase" placeholder="passphrase (if encrypted)" autocomplete="new-password">
+    <button class="btn small" type="submit">Publish</button>
+  </form>
   {{if .Rows}}
-  <table>
+  <table class="mt">
     <tr><th>name</th><th>certificate</th><th>expires</th><th></th></tr>
     {{$home := .Home}}
     {{range .Rows}}
@@ -22,7 +28,8 @@
             <span class="mono">{{.CertPath}}</span>
             {{if .InNginx}}<span class="badge ok">in nginx</span>{{end}}
           {{else}}<span class="muted">not issued</span>{{end}}</td>
-      <td>{{if .Tracked}}{{if .Due}}<span class="badge warn">{{.NotAfter}} — due</span>{{else}}{{.NotAfter}}{{end}}{{else}}—{{end}}</td>
+      <td>{{if .Tracked}}{{if .Due}}<span class="badge warn">{{.NotAfter}} — due</span>{{else}}{{.NotAfter}}{{end}}
+            <div class="muted mono">{{.NotAfterAbs}}</div>{{else}}—{{end}}</td>
       <td>
         {{if .Tracked}}
         <form class="row" hx-post="/api/cert/renew" hx-swap="none">
@@ -59,7 +66,8 @@
     {{$clone := .CloneSource}}
     <tr>
       <td class="mono">{{.ServerNames}}</td>
-      <td>{{if .SSL}}{{if .CertPath}}<span class="mono">{{.CertPath}}</span>{{else}}<span class="badge ok">ssl</span>{{end}}{{else}}<span class="muted">http only</span>{{end}}</td>
+      <td>{{if .SSL}}{{if .CertPath}}<span class="mono">{{.CertPath}}</span>{{else}}<span class="badge ok">ssl</span>{{end}}{{else}}<span class="muted">http only</span>{{end}}
+        {{if .Managed}}<span class="badge ok">freens-managed</span>{{end}}</td>
       <td class="mono">{{.File}}</td>
       <td>
         {{if $match}}

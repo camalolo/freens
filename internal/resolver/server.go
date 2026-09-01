@@ -151,8 +151,26 @@ func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 	// never re-executes the lookup chain. Only freens-sourced outcomes are
 	// ever stored (putFreens ignores aa == false), so DNS-forwarded answers
 	// always reach the upstream.
+	//
+	// Serve-stale-while-revalidate (§10.4 amended): an expired POSITIVE
+	// answer inside the stale window is answered immediately — it carries
+	// exactly the validation the fresh answer would (short TTL so stubs
+	// re-ask soon) — while kickRefresh revalidates in the background. The
+	// user-visible effect: the walk cost (~100 ms LAN, seconds over WAN)
+	// stops landing on the client; a revoked/rotated name still goes dark
+	// within TTL + refresh duration, because the fresh outcome — positive
+	// OR negative — replaces the entry.
 	if r.Cache != nil {
-		if rrs, rcode, aa, ok := r.Cache.get(ck); ok {
+		rrs, rcode, aa, status := r.Cache.get2(ck)
+		switch status {
+		case cacheFresh:
+			resp.Rcode = rcode
+			resp.Answer = rrs
+			resp.Authoritative = aa
+			writeReply(w, resp)
+			return
+		case cacheStale:
+			r.kickRefresh(q, ck)
 			resp.Rcode = rcode
 			resp.Answer = rrs
 			resp.Authoritative = aa
