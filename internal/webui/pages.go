@@ -433,6 +433,7 @@ type peerRow struct {
 	Confirmed     int64
 	ConfirmedText string
 	ConfirmedAgo  bool
+	AltAddrs      []string // the node's other known addresses (multi-homed)
 }
 
 func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
@@ -515,6 +516,11 @@ func peerRows(peers []dht.Peer, now int64) (int, []peerRow) {
 			row.ConfirmedText = time.Unix(pr.Confirmed, 0).UTC().Format("2006-01-02 15:04")
 		} else {
 			row.ConfirmedText = "never"
+		}
+		for _, a := range pr.Alts {
+			if a.Addr != pr.Addr {
+				row.AltAddrs = append(row.AltAddrs, a.Addr)
+			}
 		}
 		rows = append(rows, row)
 	}

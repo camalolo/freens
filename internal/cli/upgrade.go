@@ -798,12 +798,19 @@ func cmdUpgrade(args []string) error {
 		return fmt.Errorf("staged freens could not run its config migrations: %w", err)
 	}
 
-	// Windows: the SCM service LOCKS its binary image — stop it before a
-	// byte moves and start it again after. (Linux/darwin rename over the
-	// running image instead, so systemd needs no dance.)
+	// Windows: the SCM services LOCK their binary images — stop them
+	// before a byte moves and start them again after. (Linux/darwin rename
+	// over the running image instead, so systemd needs no dance.) The
+	// webui service is stopped too: its image must not be renamed-aside
+	// by the install, or the running process keeps serving the OLD
+	// template set while the new exe sits unused on disk (found live
+	// 2026-09-01: the v0.13.2 upgrade left freens-web serving v0.13.1-pre
+	// until the next manual restart).
 	winServiceWasRunning := false
+	winWebWasRunning := false
 	if goosWindows {
 		winServiceWasRunning = winSvcRunning()
+		winWebWasRunning = winSvcWebRunning()
 		if winServiceWasRunning {
 			if !winSvcElevated() {
 				return usageErr("the freens service is running and `upgrade` needs admin rights to restart it — re-run from an elevated (Run as administrator) shell (or `net stop freens` first)")
@@ -811,6 +818,15 @@ func cmdUpgrade(args []string) error {
 			fmt.Println("stopping service freens (Windows locks a running image)…")
 			if err := winSvcStop(); err != nil {
 				return fmt.Errorf("stopping the freens service: %w", err)
+			}
+		}
+		if winWebWasRunning {
+			fmt.Println("stopping service freens-web (Windows locks a running image)…")
+			if err := winSvcWebStop(); err != nil {
+				if winServiceWasRunning {
+					_ = winSvcStart() // leave the daemon as we found it
+				}
+				return fmt.Errorf("stopping the freens-web service: %w", err)
 			}
 		}
 	}
@@ -833,12 +849,15 @@ func cmdUpgrade(args []string) error {
 			// still in place (or restored), so a plain start succeeds.
 			_ = winSvcStart()
 		}
+		if goosWindows && winWebWasRunning {
+			_ = winSvcWebStart()
+		}
 		return installErr
 	}
 
 	// Restart the services around the new binaries.
 	if goosWindows {
-		restartWindowsService(winServiceWasRunning)
+		restartWindowsService(winServiceWasRunning, winWebWasRunning)
 	} else {
 		units := activeFreensUnits()
 		if len(units) == 0 {
@@ -858,17 +877,26 @@ func cmdUpgrade(args []string) error {
 	return nil
 }
 
-// restartWindowsService brings the SCM service back after an upgrade (or
-// reports how to roll back when it refuses to start).
-func restartWindowsService(wasRunning bool) {
-	if !wasRunning {
+// restartWindowsService brings the SCM services back after an upgrade (or
+// reports how to roll back when one refuses to start). The webui service
+// is only started when it was running before — its absence on pre-v0.13.0
+// installs is normal.
+func restartWindowsService(daemonWasRunning, webWasRunning bool) {
+	if !daemonWasRunning {
 		fmt.Println("service freens was not running — leaving it stopped (start with: net start freens)")
-		return
+	} else {
+		fmt.Println("starting: service freens")
+		if err := winSvcStart(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: starting the freens service failed (%v)\n", ProgName, err)
+			fmt.Fprintln(os.Stderr, "  start it manually with `net start freens`; roll back with the *.freens-prev files listed above")
+		}
 	}
-	fmt.Println("starting: service freens")
-	if err := winSvcStart(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: warning: starting the freens service failed (%v)\n", ProgName, err)
-		fmt.Fprintln(os.Stderr, "  start it manually with `net start freens`; roll back with the *.freens-prev files listed above")
+	if webWasRunning {
+		fmt.Println("starting: service freens-web")
+		if err := winSvcWebStart(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: warning: starting the freens-web service failed (%v)\n", ProgName, err)
+			fmt.Fprintln(os.Stderr, "  start it manually with `net start freens-web`")
+		}
 	}
 }
 

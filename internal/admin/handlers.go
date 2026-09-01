@@ -771,9 +771,10 @@ type peersResponse struct {
 // node public key (required — recipient_id is inside every §6.3 signature,
 // so a node can only address a peer whose key it knows).
 type peerJSON struct {
-	Addr      string `json:"addr"`
-	PK        string `json:"pk"`
-	Confirmed int64  `json:"confirmed,omitempty"` // unix seconds of last DIRECT exchange (issue #2)
+	Addr      string          `json:"addr"`
+	PK        string          `json:"pk"`
+	Confirmed int64           `json:"confirmed,omitempty"` // unix seconds of last DIRECT exchange (issue #2)
+	Alts      []dht.AddrState `json:"alts,omitempty"`      // other known addresses (multi-homed contacts)
 }
 
 // handlePeers returns every routing-table contact. Deliberately not capped:
@@ -790,6 +791,7 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			Addr:      c.Addr,
 			PK:        hex.EncodeToString(c.PublicKey),
 			Confirmed: c.ConfirmedAt,
+			Alts:      c.Alts,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

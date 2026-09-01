@@ -69,6 +69,13 @@ var (
 	winSvcRunning    = winsvc.Running
 	winSvcStop       = winsvc.Stop
 	winSvcStart      = winsvc.Start
+
+	// The webui SCM service (since v0.13.0). Absent on pre-v0.13.0
+	// installs — RunningWeb reports false there, so callers can treat it
+	// as not-running without caring whether it exists.
+	winSvcWebRunning = winsvc.RunningWeb
+	winSvcWebStop    = winsvc.StopWeb
+	winSvcWebStart   = winsvc.StartWeb
 )
 
 // platform is the effective platform for dispatch decisions (testable:

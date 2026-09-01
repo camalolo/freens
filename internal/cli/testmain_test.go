@@ -42,5 +42,8 @@ func stubWindowsOSHooks() {
 	winSvcRunning = func() bool { return false }
 	winSvcStop = func() error { return errStubbedOSHook }
 	winSvcStart = func() error { return errStubbedOSHook }
+	winSvcWebRunning = func() bool { return false }
+	winSvcWebStop = func() error { return errStubbedOSHook }
+	winSvcWebStart = func() error { return errStubbedOSHook }
 	winRunElevatedGate = func(args ...string) error { return errStubbedOSHook }
 }

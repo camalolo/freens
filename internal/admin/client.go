@@ -326,6 +326,11 @@ func (c *Client) Peers(ctx context.Context) ([]dht.Peer, error) {
 			// 2026-09-01 on the desktop box right after its first
 			// post-wake self-upgrade).
 			Confirmed int64 `json:"confirmed"`
+			// Alts: the node's other known addresses (multi-homed
+			// contacts) — carried so the peers surface can show a seed's
+			// LAN and WAN addresses side by side instead of one
+			// flip-flopping entry.
+			Alts []dht.AddrState `json:"alts"`
 		} `json:"peers"`
 	}
 	if _, err := c.do(ctx, http.MethodGet, "/peers", nil, &out); err != nil {
@@ -337,7 +342,7 @@ func (c *Client) Peers(ctx context.Context) ([]dht.Peer, error) {
 		if err != nil || len(pk) != 32 || p.Addr == "" {
 			continue // defensive: skip a malformed entry, not the whole set
 		}
-		peers = append(peers, dht.Peer{Addr: p.Addr, PublicKey: pk, Confirmed: p.Confirmed})
+		peers = append(peers, dht.Peer{Addr: p.Addr, PublicKey: pk, Confirmed: p.Confirmed, Alts: p.Alts})
 	}
 	return peers, nil
 }

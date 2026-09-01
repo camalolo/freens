@@ -35,13 +35,42 @@ const numBuckets = 256
 // trip): advertisement alone ({nodes} lists) never advances it — that is
 // the anti-ghost invariant (issue #2): a dead contact re-taught by peers
 // must not look alive.
+//
+// A node may legitimately be reachable at MORE than one address — the
+// canonical case is a daemon holding its public IP while also sitting on
+// the operator's LAN (the community seed: WAN + LAN simultaneously). Alts
+// keeps those other known addresses with their own recency so the table
+// accumulates them instead of flip-flopping the single Addr field between
+// them (found live 2026-09-01: the desktop's view of the seed alternated
+// between its WAN and LAN address on every re-learn, and a probe timeout
+// against whichever address was currently stored evicted the node whole).
+// Addr always mirrors the PREFERRED address — the freshest-confirmed one,
+// or the most-recently-seen when none was ever confirmed — because that is
+// the address probes use and {nodes} lists advertise. Alts may be nil.
 type NodeContact struct {
 	NodeID      []byte // 32 bytes (SHA-256(PublicKey))
 	PublicKey   []byte // 32 bytes (Ed25519 verifying key)
-	Addr        string // "ip:port"
+	Addr        string // "ip:port" — the preferred address (see type doc)
 	LastSeen    int64  // unix seconds
 	ConfirmedAt int64  // unix seconds; 0 = never directly confirmed
+
+	Alts []AddrState `json:"alts,omitempty"` // other known addresses, preferred excluded
 }
+
+// AddrState is one known address of a (multi-homed) contact, with the same
+// recency semantics as the contact-level fields — ConfirmedAt is only
+// advanced by direct verified exchanges with that exact address, never by
+// advertisement.
+type AddrState struct {
+	Addr        string `json:"addr"`
+	LastSeen    int64  `json:"last_seen"`
+	ConfirmedAt int64  `json:"confirmed_at,omitempty"`
+}
+
+// maxAddrsPerContact caps how many distinct addresses are tracked per node
+// (preferred + Alts). NAT-mapped ephemeral source addresses can churn; the
+// LRU drop in AddOrRefresh keeps the list to the genuinely-used ones.
+const maxAddrsPerContact = 4
 
 // NewNodeContact validates and constructs a NodeContact. nodeID and publicKey
 // must each be 32 bytes; addr must be non-empty. The byte slices are copied
@@ -75,13 +104,18 @@ func (c *NodeContact) clone() *NodeContact {
 	if c == nil {
 		return nil
 	}
-	return &NodeContact{
+	cc := &NodeContact{
 		NodeID:      append([]byte(nil), c.NodeID...),
 		PublicKey:   append([]byte(nil), c.PublicKey...),
 		Addr:        c.Addr,
 		LastSeen:    c.LastSeen,
 		ConfirmedAt: c.ConfirmedAt,
 	}
+	if len(c.Alts) > 0 {
+		cc.Alts = make([]AddrState, len(c.Alts))
+		copy(cc.Alts, c.Alts)
+	}
+	return cc
 }
 
 // KBucket is a single k-bucket: at most Capacity NodeContact entries ordered
@@ -153,7 +187,12 @@ func (b *KBucket) AddOrRefresh(c *NodeContact) *NodeContact {
 			// Refresh the stored contact's fields in place so other holders
 			// of the same *NodeContact reference observe the update.
 			cur.PublicKey = c.PublicKey
-			cur.Addr = c.Addr
+			// Multi-homing (2026-09-01): a re-learn at a DIFFERENT address
+			// must not clobber the previously known one — it joins Alts,
+			// and the preferred address only moves when the incoming one
+			// is more recent where it counts (direct confirmations first,
+			// then last-seen). One slot per node, every address preserved.
+			cur.mergeAddr(c.Addr, c.LastSeen, c.ConfirmedAt)
 			if c.ConfirmedAt > cur.ConfirmedAt {
 				cur.ConfirmedAt = c.ConfirmedAt
 			}
@@ -172,6 +211,130 @@ func (b *KBucket) AddOrRefresh(c *NodeContact) *NodeContact {
 	}
 	b.Nodes = append(b.Nodes, c)
 	return nil
+}
+
+// mergeAddr folds the incoming (addr, lastSeen, confirmedAt) observation of
+// THIS node into the contact: refreshing it in place when it is already the
+// preferred address, adding/updating it in Alts when it is not, and
+// re-pointing the preferred address when the incoming one outranks the
+// stored one. The ranking: any direct confirmation beats any lack thereof;
+// among confirmed addresses the fresher confirmation wins; among
+// never-confirmed ones the fresher learn wins.
+func (c *NodeContact) mergeAddr(addr string, lastSeen, confirmedAt int64) {
+	if addr == c.Addr {
+		return // the preferred address itself — contact-level fields carry it
+	}
+	for i := range c.Alts {
+		if c.Alts[i].Addr == addr {
+			a := &c.Alts[i]
+			a.LastSeen = lastSeen
+			if confirmedAt > a.ConfirmedAt {
+				a.ConfirmedAt = confirmedAt
+			}
+			c.repointPreferredIfNeeded()
+			return
+		}
+	}
+	c.Alts = append(c.Alts, AddrState{Addr: addr, LastSeen: lastSeen, ConfirmedAt: confirmedAt})
+	c.trimAlts()
+	c.repointPreferredIfNeeded()
+}
+
+// repointPreferredIfNeeded moves the preferred address to the stored address
+// that ranks best (see mergeAddr). Called after every Alts mutation.
+func (c *NodeContact) repointPreferredIfNeeded() {
+	if len(c.Alts) == 0 {
+		return
+	}
+	best := -1
+	for i := range c.Alts {
+		if !addrOutranks(c.Alts[i].ConfirmedAt, c.Alts[i].LastSeen, c.ConfirmedAt, c.LastSeen) {
+			continue
+		}
+		if best == -1 || addrOutranks(c.Alts[i].ConfirmedAt, c.Alts[i].LastSeen, c.Alts[best].ConfirmedAt, c.Alts[best].LastSeen) {
+			best = i
+		}
+	}
+	if best == -1 {
+		return
+	}
+	old := AddrState{Addr: c.Addr, LastSeen: c.LastSeen, ConfirmedAt: c.ConfirmedAt}
+	c.Addr = c.Alts[best].Addr
+	c.LastSeen = c.Alts[best].LastSeen
+	c.ConfirmedAt = c.Alts[best].ConfirmedAt
+	c.Alts[best] = old
+}
+
+// addrOutranks reports whether incoming (confirmedAt, lastSeen) ranks above
+// the stored pair: fresher direct confirmation wins outright; with neither
+// ever confirmed, the fresher learn wins.
+func addrOutranks(inConfirmed, inLastSeen, curConfirmed, curLastSeen int64) bool {
+	if inConfirmed > 0 || curConfirmed > 0 {
+		return inConfirmed > curConfirmed
+	}
+	return inLastSeen > curLastSeen
+}
+
+// trimAlts caps Alts at maxAddrsPerContact-1, dropping the least-recently-
+// seen entries first. Never drops an entry with a fresher confirmation in
+// favor of an older-seen one unless the cap forces it.
+func (c *NodeContact) trimAlts() {
+	for len(c.Alts) > maxAddrsPerContact-1 {
+		oldest := 0
+		for i := range c.Alts {
+			if c.Alts[i].LastSeen < c.Alts[oldest].LastSeen {
+				oldest = i
+			}
+		}
+		c.Alts = append(c.Alts[:oldest], c.Alts[oldest+1:]...)
+	}
+}
+
+// OtherAddrs returns the contact's known addresses other than the preferred
+// one, freshest first. Read-only helper for probes and surfaces.
+func (c *NodeContact) OtherAddrs() []AddrState {
+	out := make([]AddrState, len(c.Alts))
+	copy(out, c.Alts)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ConfirmedAt != out[j].ConfirmedAt {
+			return out[i].ConfirmedAt > out[j].ConfirmedAt
+		}
+		return out[i].LastSeen > out[j].LastSeen
+	})
+	return out
+}
+
+// PromoteAlt re-points the preferred address to the given alt address (which
+// must be present in Alts), demoting the current preferred into Alts. The
+// outgoing preferred enters Alts with its confirmation CLEARED — the caller
+// promotes an alternate precisely because the preferred just failed a probe,
+// and the anti-ghost invariant says a missed probe must not leave liveness
+// behind. Returns true if the switch happened. Used by the probe-failure
+// failover.
+func (rt *RoutingTable) PromoteAlt(nodeID []byte, addr string) bool {
+	bucket, err := rt.BucketFor(nodeID)
+	if err != nil {
+		return false
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for _, cur := range bucket.Nodes {
+		if !bytes.Equal(cur.NodeID, nodeID) {
+			continue
+		}
+		for i := range cur.Alts {
+			if cur.Alts[i].Addr != addr {
+				continue
+			}
+			old := AddrState{Addr: cur.Addr, LastSeen: cur.LastSeen, ConfirmedAt: 0}
+			cur.Addr = cur.Alts[i].Addr
+			cur.LastSeen = cur.Alts[i].LastSeen
+			cur.ConfirmedAt = cur.Alts[i].ConfirmedAt
+			cur.Alts[i] = old
+			return true
+		}
+	}
+	return false
 }
 
 // RoutingTable is a 256-bucket Kademlia routing table keyed on a node's own

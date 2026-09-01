@@ -173,6 +173,12 @@ type Peer struct {
 	Addr      string // "ip:port"
 	PublicKey []byte // 32-byte Ed25519 node public key
 	Confirmed int64  // unix seconds; 0 = never/unknown
+
+	// Alts carries the node's other known addresses (multi-homed contacts,
+	// 2026-09-01): a seed holding its public IP while sitting on the LAN is
+	// reachable at both, and surfaces should show that instead of one
+	// flip-flopping address.
+	Alts []AddrState
 }
 
 // NodeConfig configures a DHT transport Node.
@@ -1172,10 +1178,33 @@ func (n *Node) evictionLoop(ctx context.Context) {
 // so genuinely dead peers still converge within a probe round (or the
 // idle sweep), not the full TTL.
 func (n *Node) probeFailed(c *NodeContact) {
-	if live := n.rt.Get(c.NodeID); live != nil && live.ConfirmedAt > 0 {
-		n.rt.Demote(c.NodeID)
-		n.log.Debug("dht: probe missed, demoted confirmed contact", "addr", c.Addr)
-		return
+	if live := n.rt.Get(c.NodeID); live != nil {
+		// Failover first: another known address for this node takes over
+		// as preferred before we give up on the node. Only addresses with
+		// recency qualify — a direct confirmation, or a learn within the
+		// idle TTL (all of them, when the sweep is disabled).
+		for _, a := range live.OtherAddrs() {
+			if a.Addr == c.Addr {
+				continue
+			}
+			recent := true
+			if n.contactIdleTTL > 0 {
+				recent = n.now()-a.LastSeen <= int64(n.contactIdleTTL/time.Second)
+			}
+			if !recent {
+				continue
+			}
+			if n.rt.PromoteAlt(live.NodeID, a.Addr) {
+				n.log.Debug("dht: probe missed, switched to alternate address",
+					"addr", c.Addr, "next", a.Addr)
+				return
+			}
+		}
+		if live.ConfirmedAt > 0 {
+			n.rt.Demote(c.NodeID)
+			n.log.Debug("dht: probe missed, demoted confirmed contact", "addr", c.Addr)
+			return
+		}
 	}
 	n.rt.Remove(c.NodeID)
 	n.log.Debug("dht: evicted unresponsive contact", "addr", c.Addr)
@@ -1206,6 +1235,28 @@ func (n *Node) evictCandidate(ctx context.Context, c *NodeContact) {
 		// Oldest answered (verified by handle before delivery): alive — keep
 		// it, and with it the rest of the bucket; the newcomer loses (§6.2).
 		return
+	}
+	// Multi-homing (2026-09-01): before declaring the NODE dead, try its
+	// other known addresses — a node reachable at LAN+WAN is only dead when
+	// every address is. The answering address becomes preferred so future
+	// probes use it.
+	if live := n.rt.Get(oldest.NodeID); live != nil {
+		for _, a := range live.OtherAddrs() {
+			if a.Addr == oldest.Addr {
+				continue
+			}
+			altAddr, rerr := net.ResolveUDPAddr("udp", a.Addr)
+			if rerr != nil {
+				continue
+			}
+			actx, acancel := context.WithTimeout(ctx, n.pingTimeout)
+			r2, err2 := n.sendQuery(actx, altAddr, oldest.NodeID, "ping", map[string]any{})
+			acancel()
+			if err2 == nil && r2 != nil {
+				n.rt.PromoteAlt(oldest.NodeID, a.Addr)
+				return // alive at its other address: keep the incumbent
+			}
+		}
 	}
 	if ctx.Err() != nil {
 		return // our shutdown, not the peer's failure: evict nothing

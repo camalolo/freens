@@ -1,6 +1,8 @@
 package dht
 
 import (
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,5 +124,147 @@ func TestRoutingTableDemote(t *testing.T) {
 	}
 	if n.rt.Demote([]byte{0xAA}) {
 		t.Fatal("Demote returned true for an absent contact")
+	}
+}
+
+// ---- multi-homed contacts (2026-09-01) ----
+// A node reachable at more than one address (the seed: WAN + LAN) must
+// accumulate both instead of flip-flopping the single Addr field, prefer
+// the freshest-confirmed one, and survive a probe miss against one of its
+// addresses by failing over to the other.
+
+func TestMultiHomedContactAccumulatesAddresses(t *testing.T) {
+	n := mkWalkProbeNode(t)
+	c := mkContact(t, n, true) // preferred: 192.0.2.10:15353, confirmed
+	n.learn(c)
+
+	// The same node re-learned at its other address (unconfirmed walk find).
+	other := mkContact(t, n, false)
+	other.NodeID = c.NodeID
+	other.PublicKey = c.PublicKey
+	other.Addr = "192.0.2.11:15353"
+	n.learnContact(other)
+
+	live := n.rt.Get(c.NodeID)
+	if live == nil {
+		t.Fatal("contact lost on re-learn at a second address")
+	}
+	if live.Addr != "192.0.2.10:15353" {
+		t.Fatalf("preferred changed to %s without any confirmation", live.Addr)
+	}
+	if len(live.Alts) != 1 || live.Alts[0].Addr != "192.0.2.11:15353" {
+		t.Fatalf("second address not accumulated: %+v", live.Alts)
+	}
+}
+
+func TestMultiHomedPreferenceFollowsConfirmation(t *testing.T) {
+	// Second-granularity timestamps make same-second confirmations a TIE
+	// (strict-> ranking keeps the incumbent — no ping-pong); advance the
+	// clock so the second confirmation genuinely outranks.
+	var clock atomic.Int64
+	const T = int64(1_000_000)
+	clock.Store(T)
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := NewNode(NodeConfig{
+		Keypair:    kp,
+		ListenAddr: "127.0.0.1:0",
+		Store:      NewEnvelopeStore(0, nil),
+		Now:        func() int64 { return clock.Load() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+
+	c := mkContact(t, n, true) // 192.0.2.10 confirmed at T
+	n.learn(c)
+
+	alt := mkContact(t, n, false)
+	alt.NodeID, alt.PublicKey = c.NodeID, c.PublicKey
+	alt.Addr = "192.0.2.11:15353"
+	alt.LastSeen = n.now()
+	n.learnContact(alt)
+	if live := n.rt.Get(c.NodeID); live.Addr != "192.0.2.10:15353" {
+		t.Fatalf("unconfirmed learn stole preference: %s", live.Addr)
+	}
+
+	// A direct exchange at the other address, LATER: THAT address now leads.
+	clock.Store(T + 10)
+	alt.ConfirmedAt = n.now()
+	n.learn(alt)
+	live := n.rt.Get(c.NodeID)
+	if live.Addr != "192.0.2.11:15353" {
+		t.Fatalf("freshly-confirmed address did not win preference: %s", live.Addr)
+	}
+	if len(live.Alts) != 1 || live.Alts[0].Addr != "192.0.2.10:15353" {
+		t.Fatalf("previous preferred not demoted into Alts: %+v", live.Alts)
+	}
+	if live.Alts[0].ConfirmedAt == 0 {
+		t.Fatal("demoted preferred lost its confirmation history")
+	}
+}
+
+func TestProbeFailedFailsOverToAlternate(t *testing.T) {
+	n := mkWalkProbeNode(t)
+	c := mkContact(t, n, true) // preferred 192.0.2.10 (WAN), confirmed
+	n.learn(c)
+
+	alt := mkContact(t, n, false)
+	alt.NodeID, alt.PublicKey = c.NodeID, c.PublicKey
+	alt.Addr = "192.0.2.11:15353" // LAN, learned moments ago
+	alt.LastSeen = n.now()
+	n.learnContact(alt)
+
+	// The WAN probe missed. The node must survive, preferred at the alt.
+	n.probeFailed(c)
+
+	live := n.rt.Get(c.NodeID)
+	if live == nil {
+		t.Fatal("probe miss evicted a multi-homed node with a live alternate")
+	}
+	if live.Addr != "192.0.2.11:15353" {
+		t.Fatalf("failover did not switch preferred to the alternate: %s", live.Addr)
+	}
+	// The failed address sits in Alts with its confirmation cleared.
+	for _, a := range live.Alts {
+		if a.Addr == "192.0.2.10:15353" && a.ConfirmedAt != 0 {
+			t.Fatalf("failed address kept its confirmation stamp: %+v", a)
+		}
+	}
+}
+
+func TestMultiHomedAltCapTrimsLRU(t *testing.T) {
+	n := mkWalkProbeNode(t)
+	c := mkContact(t, n, true)
+	n.learn(c)
+
+	base := n.now()
+	for i := 0; i < 6; i++ {
+		alt := mkContact(t, n, false)
+		alt.NodeID, alt.PublicKey = c.NodeID, c.PublicKey
+		alt.Addr = fmt.Sprintf("192.0.2.%d:15353", 20+i)
+		alt.LastSeen = base + int64(i)
+		n.learnContact(alt)
+	}
+
+	live := n.rt.Get(c.NodeID)
+	if got := len(live.Alts); got != maxAddrsPerContact-1 {
+		t.Fatalf("alt list not capped: %d entries, want %d", got, maxAddrsPerContact-1)
+	}
+	// The newest alt must have survived the trim.
+	found := false
+	for _, a := range live.Alts {
+		if a.Addr == "192.0.2.25:15353" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("newest alt trimmed instead of the oldest: %+v", live.Alts)
 	}
 }
