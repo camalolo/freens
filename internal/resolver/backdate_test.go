@@ -11,15 +11,27 @@ package resolver
 //  1. the corroboration band: modern-dated attestations (fabricated or
 //     honestly gathered for a fresh claim — the transplant variant) do not
 //     count toward a backdated claim's quorum;
-//  2. WITNESS_SET membership: a fully self-consistent fabricated quorum
-//     (own keys, in-band backdated clocks) fails when the collecting walk
-//     can name the converged witness set (the ≥8-reachable-nodes gate);
+//  2. WITNESS_SET membership WITHIN THE CONTEST WINDOW (v0.14.1 horizon):
+//     a fully self-consistent fabricated quorum (own keys, in-band
+//     backdated clocks) fails while the claim is young — the window where
+//     it could displace a LIVE registration — when the collecting walk can
+//     name the converged witness set. Past CONTEST_WINDOW the claim is
+//     FINAL per §7.5(b) and membership is no longer re-litigated: the
+//     pre-v0.14.1 behavior let routing-table churn kill every mature name
+//     whose registration-time witnesses had moved on or departed (found
+//     live fleet-wide 2026-09-01: the seed NXDOMAINed every name it had
+//     itself witnessed);
 //  3. the honest path keeps working: a fresh claim, in-band attestations
-//     from the named set, resolves NOERROR.
+//     from the named set, resolves NOERROR — and so does a MATURE claim
+//     whose witnesses have churned out of the verifier's view (the
+//     v0.14.1 availability regression).
 //
-// The nil-set residual (a sparse view — e.g. the 3-box beta fleet — cannot
-// name a witness set, leaving defense 2 off) is asserted LAST and
-// documented: it is the protocol's Sybil bound (§12), not a bug.
+// The residuals are asserted LAST and documented: (a) a sparse view (nil
+// set) cannot name a witness set — the protocol's Sybil bound (§12);
+// (b) a MATURE self-consistent fabricated quorum now passes because
+// membership has a horizon. Both are the priced-by-grinding §12 bound, not
+// bugs; re-tightening either must update the changelog and this file
+// together.
 
 import (
 	"context"
@@ -145,10 +157,13 @@ func TestBackdatedModernDatedQuorumRejected(t *testing.T) {
 
 // TestBackdatedSelfConsistentQuorumRejectedByWitnessSet: the hardest variant
 // — the attacker fabricates witnesses whose clocks are BACKDATED to match
-// the claim (in-band), so only WITNESS_SET membership can refuse them.
+// the claim (in-band), so only WITNESS_SET membership can refuse them. The
+// claim is TWO HOURS old: inside CONTEST_WINDOW, so membership is enforced
+// (and this is the case that matters — a young backdated claim displacing a
+// live registration).
 func TestBackdatedSelfConsistentQuorumRejectedByWitnessSet(t *testing.T) {
 	const alias = "bank2"
-	claimTS := uint64(fixedNow - 200*86400)
+	claimTS := uint64(fixedNow - 2*3600)
 	_, malloryEnv, _ := bdWorld(t, alias, claimTS, claimTS, constants.W)
 
 	// The converged witness set names 8 honest node IDs (hex form — the
@@ -167,7 +182,80 @@ func TestBackdatedSelfConsistentQuorumRejectedByWitnessSet(t *testing.T) {
 	}
 	src := &bdSetSource{envs: []*wire.SignedEnvelope{malloryEnv}, set: set}
 	if got, _ := bdResolve(t, src, alias); got != nil {
-		t.Fatal("VULNERABLE: self-consistent fabricated quorum resolved against a named witness set")
+		t.Fatal("VULNERABLE: self-consistent fabricated quorum resolved against a named witness set (in-window claim)")
+	}
+}
+
+// TestMatureClaimSurvivesChurnedWitnessSet: the v0.14.1 availability fix as
+// a regression — an HONEST claim registered 15 days ago (attestations
+// in-band at mining time, all verified signatures) must still resolve when
+// the verifier's CURRENT witness set has churned away from the
+// registration-time one (nodes departed, newer nodes shifted the keyspace
+// boundary). Pre-horizon, this was fleet-wide NXDOMAIN for every mature
+// name (the seed refused the very names it had witnessed).
+func TestMatureClaimSurvivesChurnedWitnessSet(t *testing.T) {
+	const alias = "mature"
+	claimTS := uint64(fixedNow - 15*86400)
+	claim, env, _ := bdWorld(t, alias, claimTS, claimTS, constants.W)
+
+	// The converged set names a completely different keyspace neighborhood
+	// (none of the claim's witnesses are members anymore).
+	set := make(map[string]bool, constants.WitnessSet)
+	for i := 0; i < constants.WitnessSet; i++ {
+		hkp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		nid, err := crypto.NodeID(hkp.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		set[hex.EncodeToString(nid)] = true
+	}
+	src := &bdSetSource{envs: []*wire.SignedEnvelope{env}, set: set}
+	got, contested := bdResolve(t, src, alias)
+	if got == nil {
+		t.Fatal("mature honest claim died to witness churn (the v0.14.0 fleet failure)")
+	}
+	if string(got) != string(claim.TldID) {
+		t.Fatal("resolved tld_id does not match the honest claimant")
+	}
+	if contested {
+		t.Error("a 15-day-old winning claim is past CONTEST_WINDOW: must be final, not contested")
+	}
+}
+
+// TestBackdatedMatureFabricatedQuorumResidual: the MIRROR residual — the
+// same horizon that saves mature honest claims also waves through a MATURE
+// SELF-CONSISTENT fabricated quorum against a named set. This is the
+// accepted price (documented, §12-priced): membership's anti-fabrication
+// value is concentrated inside the contest window, where the previous test
+// asserts it still bites. If a later change re-tightens mature-claim
+// membership, this test and TestMatureClaimSurvivesChurnedWitnessSet must
+// be reworked together — one gate cannot both open and close.
+func TestBackdatedMatureFabricatedQuorumResidual(t *testing.T) {
+	const alias = "bank4"
+	claimTS := uint64(fixedNow - 200*86400)
+	_, malloryEnv, _ := bdWorld(t, alias, claimTS, claimTS, constants.W)
+	set := make(map[string]bool, constants.WitnessSet)
+	for i := 0; i < constants.WitnessSet; i++ {
+		hkp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		nid, err := crypto.NodeID(hkp.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		set[hex.EncodeToString(nid)] = true
+	}
+	src := &bdSetSource{envs: []*wire.SignedEnvelope{malloryEnv}, set: set}
+	got, contested := bdResolve(t, src, alias)
+	if got == nil {
+		t.Fatal("horizon changed: a mature fabricated quorum is rejected again — rework this residual AND TestMatureClaimSurvivesChurnedWitnessSet together (one gate cannot both open and close)")
+	}
+	if contested {
+		t.Error("a 200-day-old winning claim is past CONTEST_WINDOW: must be final, not contested")
 	}
 }
 

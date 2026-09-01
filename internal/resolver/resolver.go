@@ -1090,7 +1090,34 @@ func verifyClaimContents(env *wire.SignedEnvelope, alias string, now int64, orac
 	// is the A.4 inference (nonce[0] when sane, else PoWDifficultyInit),
 	// floored at the source's gossiped network difficulty when it implements
 	// DifficultyOracle.
-	if !claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), witnessSet, constants.W) {
+	//
+	// §7.5 FINALITY HORIZON ON MEMBERSHIP (v0.14.1): the WITNESS_SET
+	// restriction is enforced only while the claim is inside its contest
+	// window (now - claim.ts < CONTEST_WINDOW); an older claim — one §7.5(b)
+	// already declares FINAL — verifies on its attestations alone
+	// (signatures + corroboration band + distinctness, all timeless).
+	// Rationale, found live fleet-wide 2026-09-01: membership compares
+	// REGISTRATION-TIME witnesses against the verifier's CURRENT routing
+	// view, and a claim carries exactly W witnesses, so every one of them
+	// must still sit in the closest-8 FOREVER. Any churn — a witness node
+	// departing (the Aug-31 name cleanup), or newer nodes pushing the
+	// keyspace boundary (lucasvps, camalolo-box joining) — silently killed
+	// every mature name whose claim it touched, directly against §8's
+	// "ownership = liveness of the OWNER". The check's anti-fabrication
+	// value is concentrated in the contestable window (a fabricated
+	// backdated claim must displace a LIVE registration to matter, and
+	// while it is inside the window its sybil witnesses must still be in
+	// the verifier's view); after finality the attestations are historical
+	// evidence no more re-derivable than the witnesses' availability. The
+	// residual — grind sybil IDs into the true witness set AND hold them
+	// for the full contest window — is the §12 Sybil bound, now priced in
+	// 48 h of presence instead of forever (see the spec's §7.3 membership
+	// bullet, amended in the same release).
+	set := witnessSet
+	if set != nil && now-int64(claim.Timestamp) >= int64(constants.ContestWindow) {
+		set = nil
+	}
+	if !claims.VerifyFull(claim, effectivePoWDifficulty(claim, oracle), set, constants.W) {
 		return nil
 	}
 	return claim

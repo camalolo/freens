@@ -610,7 +610,23 @@ conditions make a witness count (v0.7.0):
    converged lookup observed them. A verifier whose reachable view holds
    fewer than `WITNESS_SET` nodes (small fleets, partitions, young
    routing tables) MUST NOT enforce membership against a partial set —
-   it skips the restriction rather than reject honest witnesses.
+   it skips the restriction rather than reject honest witnesses. The
+   converged set INCLUDES the verifying node's own ID (v0.14.1: a walk
+   from a node never reaches that node itself, yet it is a member of
+   the network's closest set like any other node — excluding it made
+   membership unsatisfiable for every claim the node had witnessed).
+   Membership is also horizon-bounded (v0.14.1): it is enforced only
+   while the claim is inside its §7.5 contest window
+   (`now - claim.ts < CONTEST_WINDOW`); a claim past the window is
+   FINAL per §7.5(b), its attestations are historical evidence
+   (signatures + the corroboration band are timeless), and
+   re-litigating them against the verifier's CURRENT routing view
+   would let witness departure or ordinary keyspace churn kill mature
+   names — against §8's rule that ownership lives and dies with the
+   OWNER's liveness, not the witnesses'. The residual — an adversary
+   grinding sybil IDs into the true witness set AND holding them for
+   the whole contest window — is the §12 Sybil bound, priced by
+   grinding cost plus 48 h of presence.
 2. *Corroboration band*: the witness's own attestation timestamp lies
    within `[claim.ts - SKEW_TOLERANCE, claim.ts + WITNESS_PRESENT_WINDOW +
    SKEW_TOLERANCE]` — the honest witnessing window (signed at mining

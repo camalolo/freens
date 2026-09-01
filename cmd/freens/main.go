@@ -44,6 +44,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -1134,16 +1135,82 @@ func confirmedPeers(contacts []*dht.NodeContact, now int64) []dht.Peer {
 //
 // Two conservatisms: a record that is REVOKED is never renewed (deliberate
 // death), and a renewal that fails to publish anywhere is retried on the
-// next tick (leases have a full day of slack).
+// next tick. The retry is not left to ShouldRenew alone: a renewal renews
+// BOTH carriers of a name (K_tld + K_claim), and when only one key's put
+// fails while the other succeeds, the fresh local copy resets ShouldRenew —
+// the failed leg would silently wait a full lease before anyone re-signed
+// it (v0.14.0 fleet incident: "accepted by 0 of 7 peers" at one tick, then
+// 24 h of NXDOMAIN while peers served the expired predecessor). Unconfirmed
+// puts therefore land in renewPending and are re-published — no re-sign,
+// the envelope is already good — until the network's own GET confirms them.
+type renewPendingPut struct {
+	env      *wire.SignedEnvelope
+	keys     [][]byte
+	attempts int
+}
+
+// renewPendingMaxAttempts bounds the retry loop: 12 ticks ≈ 2 h of retries
+// per envelope. A network that cannot accept a put in 2 h needs the operator
+// (doctor), not an infinite background hammer.
+const renewPendingMaxAttempts = 12
+
+var renewPending = struct {
+	sync.Mutex
+	m map[string]*renewPendingPut // hex(key) -> pending put
+}{m: map[string]*renewPendingPut{}}
+
 func renewLoop(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, stop <-chan struct{}) {
 	t := time.NewTicker(10 * time.Minute)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
+			retryPendingPuts(node, logger)
 			renewOnce(node, store, logger)
 		case <-stop:
 			return
+		}
+	}
+}
+
+// retryPendingPuts re-publishes unconfirmed renewals and drops the entries
+// the network now reflects (the §6.4 GET returns the exact envelope).
+func retryPendingPuts(node *dht.Node, logger *slog.Logger) {
+	renewPending.Lock()
+	defer renewPending.Unlock()
+	if len(renewPending.m) == 0 {
+		return
+	}
+	for kHex, p := range renewPending.m {
+		p.attempts++
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := node.PublishKeyedAt(ctx, p.keys, p.env)
+		var confirmed bool
+		if err == nil {
+			// Confirm from the NETWORK's view, not the local store: the
+			// incident was precisely "local thinks it's done, network
+			// disagrees". IterativeGet walks the real holders.
+			gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			env, gerr := node.IterativeGet(gctx, p.keys[0])
+			gcancel()
+			if gerr == nil && env != nil && p.env.Record != nil && env.Record != nil {
+				nh, e1 := env.RecordHash()
+				ph, e2 := p.env.RecordHash()
+				confirmed = e1 == nil && e2 == nil && bytes.Equal(nh, ph)
+			}
+		}
+		cancel()
+		switch {
+		case confirmed:
+			delete(renewPending.m, kHex)
+			logger.Info("auto-renew: pending publish confirmed by the network", "sequence", p.env.Record.Sequence)
+		case p.attempts >= renewPendingMaxAttempts:
+			delete(renewPending.m, kHex)
+			logger.Warn("auto-renew: publish unconfirmed after repeated retries — run `freens renew -force <name>` (or check connectivity)",
+				"sequence", p.env.Record.Sequence, "attempts", p.attempts)
+		default:
+			logger.Warn("auto-renew: publish not yet confirmed network-wide; will retry",
+				"sequence", p.env.Record.Sequence, "attempt", p.attempts, "err", err)
 		}
 	}
 }
@@ -1254,9 +1321,24 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		err = node.PublishKeyedAt(ctx, keys, fresh)
 		cancel()
 		if err != nil {
-			logger.Warn("auto-renew: publish failed (retry next tick)", "error", err)
+			logger.Warn("auto-renew: publish failed (queued for network-confirmed retry)", "error", err)
+			renewPending.Lock()
+			for _, k := range keys {
+				renewPending.m[hex.EncodeToString(k)] = &renewPendingPut{env: fresh, keys: keys}
+			}
+			renewPending.Unlock()
 			continue
 		}
+		// The publish reporting success does not mean every holder has it —
+		// the K_tld put can land while the K_claim put silently reaches
+		// nobody until the next lease (the incident above). Queue the keys
+		// for NETWORK-CONFIRMED retry; confirmation drops them within a
+		// tick or two when propagation is healthy.
+		renewPending.Lock()
+		for _, k := range keys {
+			renewPending.m[hex.EncodeToString(k)] = &renewPendingPut{env: fresh, keys: keys}
+		}
+		renewPending.Unlock()
 		// The renewal must BELIEVE what it told the network: install the
 		// fresh envelope in the local store too. Without this the next
 		// tick re-reads the stale sequence here, re-signs the SAME

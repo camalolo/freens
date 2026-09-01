@@ -1,52 +1,70 @@
 # Changelog
 
-## v0.14.1 — the seed could not resolve the names it witnessed (witness-set starvation) + the §9.5.4 trust chain stops aging out
+## v0.14.1 — names stopped resolving when their witnesses moved (§7.3 membership), the seed could not resolve the names it witnessed, renewals stop dying silently, and the §9.5.4 trust chain stops aging out
 
-Two fleet-found fixes, both "the system works until it has been running
-long enough to matter":
+Four fleet-found fixes, all of the "works until the network has run long
+enough to matter" class. The headline symptom, live on the fleet since
+~19:17 on Sep 1: the server NXDOMAINed `minipc`/`nanopi`/`desktop`
+while `admin /resolve` (which skips §7.4 screening) found them all, and
+reproduced on stock v0.13.16. Root causes stacked three deep:
 
-- **dht: the converged witness set now includes the walking node's own
-  ID.** §7.3 membership ("the witness is among the WITNESS_SET = 8
-  closest nodes to K_claim as the verifier's converged lookup observed
-  them") was built from the walk's REACHED contacts — and a walk never
-  reaches itself. Consequence found live fleet-wide: the seed node had
-  witnessed every registration in the community, so every claim except
-  its own carried its attestation — which counted 0/5 forever. Once the
-  seed's routing table grew past 8 contacts (membership enforcement
-  switched on), it NXDOMAINed every other name while `admin /resolve`
-  (which skips §7.4 screening) still found them, and the same claims
-  verified fine from every other box. minipc/nanopi resolving their own
-  neighborhood worked because the seed was in THEIR tables. The fix is
-  one line of accuracy: self's ID joins the candidate set (self is
-  definitionally reachable — it is running the walk — and its offer
-  already joins the collection merge). Regression tests encode the
-  incident math (self completes the set; sparse views still yield nil;
-  a far-away self never displaces real members).
+- **dht: the converged witness set includes the walking node's own ID.**
+  §7.3 membership ("the witness is among the WITNESS_SET = 8 closest
+  nodes to K_claim as the verifier's converged lookup observed them")
+  was built from the walk's REACHED contacts — and a walk never reaches
+  itself. The seed had witnessed every registration in the community,
+  so every claim but its own carried its attestation, which counted 0/5
+  forever on the seed. Self's ID now joins the candidate set (it is
+  definitionally up — it is running the walk — and its offer already
+  joins the merge); a far-away self still never displaces a real
+  member, and sparse views still yield nil/unenforced.
+- **resolver: membership has a §7.5 finality horizon.** A claim carries
+  exactly W = 5 witnesses, so pre-fix membership demanded ALL FIVE sit
+  in the verifier's CURRENT closest-8 forever — any churn (a witness
+  departing in the Aug-31 name cleanup, or lucasvps/camalolo-box
+  joining and shifting the keyspace boundary) killed every mature name
+  it touched, against §8's "ownership = liveness of the OWNER".
+  Membership is now enforced only while the claim is inside its §7.5
+  contest window (`now - ts < CONTEST_WINDOW`); past it the claim is
+  FINAL and verifies on its timeless evidence (signatures, corroboration
+  band, distinctness). The anti-fabrication value is concentrated in
+  that window (a fabricated backdated claim must displace a LIVE
+  registration there, with its sybils still in the verifier's view);
+  the residual — backdate past the horizon with a self-consistent
+  quorum — is the §12 Sybil bound, now documented in the spec's §7.3
+  and pinned by tests (backdate_test.go: the young fabricated quorum is
+  still rejected; the mature honest claim survives churn; both
+  residuals assert loudly so a re-tightening cannot happen silently).
+  Spec §7.3 amended in the same release.
+- **daemon: failed renewal publishes are retried with network
+  confirmation.** The renewal pass renews BOTH carriers of a name
+  (K_tld + K_claim); when minipc's 14:36 publish hit "accepted by 0 of
+  7 peers" on one key while the sibling succeeded, the fresh local copy
+  reset ShouldRenew — the failed leg waited a full lease before anyone
+  re-signed it, peers served the expired predecessor, and the resolvers
+  (correctly) refused it. Unconfirmed puts now land in a retry queue
+  that re-publishes (no re-sign) every tick until the network's own
+  §6.4 GET returns the exact envelope, or 12 attempts (≈2 h) end in a
+  loud operator-directed warning.
 - **cli/trustsync: the §9.5.4 system-trust chain stops silently aging
-  out.** Three compounding defects, all found on the fleet the same
-  day:
-  1. the trust bridge's systemd oneshot tripped the default start
-     limit (5 starts / 10 s) because the daemon touches the spool on
-     every TLSCA re-verification — the path unit went `failed
-     (start-limit-hit)` and stayed dead, so the system CA store froze
-     while the spool moved on. The unit now sets
-     `StartLimitIntervalSec=0` and caps triggers instead.
-  2. `trust-install`/setup skipped installing the bridge whenever the
-     unit files already existed — the boxes with the BROKEN units were
-     exactly the boxes that could never receive the fix. Install is
-     repair-shaped now: write when content differs, reset-failed +
-     restart a tripped bridge, and `trust-install` ensures the bridge
-     too (not just setup).
-  3. the spool held expired cross-certs (they are lifetime-capped by
-     the apex RECORD's 24 h lease, and namespaces a box stops
-     resolving simply go stale there). An expired copy in the system
-     store POISONS verification: it shares its owner CA's subject and
-     deterministic key with the live one, so OpenSSL selects it as the
-     anchor and reports "certificate expired" for a name whose entire
-     presented chain was valid (found live: minipc curling its own
-     webui). The daemon now sweeps expired/unparsable spool entries at
-     startup and on every cross-cert notification, and the bridge only
-     copies certs that pass `openssl x509 -checkend 0`.
+  out.** Three compounding defects, all found the same day: (1) the
+  trust bridge's systemd oneshot tripped the default start limit (5
+  starts / 10 s) — the daemon touches the spool on every TLSCA
+  re-verification — and the path unit went `failed (start-limit-hit)`
+  forever, freezing the system CA store while the spool moved on. The
+  unit sets `StartLimitIntervalSec=0` and caps path triggers. (2)
+  `trust-install`/setup skipped existing unit files, so the boxes with
+  BROKEN units could never receive the fix; install is repair-shaped
+  now (rewrite on content drift, reset-failed + restart, and
+  `trust-install` ensures the bridge too). (3) the spool held expired
+  cross-certs (lifetime-capped by the apex record's 24 h lease) and an
+  expired copy in the system store POISONS verification — it shares the
+  owner CA's subject and deterministic key with the live one, so
+  OpenSSL anchors on it and reports "certificate expired" for a name
+  whose entire presented chain was valid (found live: minipc curling
+  its own webui). The daemon sweeps expired/unparsable spool entries at
+  startup and per notification; the bridge copies only certs passing
+  `openssl x509 -checkend 0`.
 
 ## v0.14.0 — DoH both ways: encrypted upstream + serving /dns-query (spec §9.6)
 
