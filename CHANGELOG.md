@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.13.4 — the UI can no longer lie about its own version
+
+Two hardening fixes straight out of the desktop box's stale-UI ghost
+(2026-09-01: the freens-web process served pre-upgrade templates through
+two "successful" upgrades while every version surface showed fresh
+stamps — the page footer renders the DAEMON's version, so nothing ever
+asked the UI what IT was).
+
+- **`/healthz` reports the webui's own build stamp**:
+  `{"status":"ok","version":"v0.13.4"}` from the binary itself, not the
+  daemon. The one version surface that cannot lie about the UI process.
+- **The upgrade verifies it**: after restarting services, the health
+  check polls the webui's `/healthz` (port from `[webui] listen`,
+  default 8090; redirect-following, TLS-skipping — the §9.5 chain is
+  self-certified, reaching the process is the point) and prints
+  `webui back: version X` — or a warning naming the exact remedy when
+  the stamp predates the installed release. Best-effort, like the daemon
+  check: warns, never fails the upgrade.
+- **HTML responses are `Cache-Control: no-store`**: a browser page
+  cached across an upgrade renders the OLD template skeleton around the
+  NEW 30-second polling fragments — the peers heading drew twice exactly
+  this way, and the mixture looks exactly like a server bug. Assets keep
+  their 1-hour public cache.
+
 ## v0.13.3 — multi-homed contacts + the Windows webui-service restart fix
 
 Diagnosed by the operator, found live on the desktop box (2026-09-01):
