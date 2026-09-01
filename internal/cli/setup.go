@@ -51,6 +51,8 @@ const daemonDNSAddr = "127.0.0.1:5300"
 var (
 	pathResolvConf     = "/etc/resolv.conf"
 	pathResolvBackup   = "/etc/resolv.conf.freens.bak"
+	pathNsswitch       = "/etc/nsswitch.conf"
+	pathNsswitchBackup = "/etc/nsswitch.conf.freens-pre"
 	pathResolvedDrop   = "/etc/systemd/resolved.conf.d/freens.conf"
 	pathSystemctlUnit  = "" // set in tests to a temp path
 	pathLegacyUserUnit = "" // set in tests to a temp path (pre-v0.3.0 unit)
@@ -321,11 +323,25 @@ func wireOSResolver() string {
 	}
 	manual := port53ManualCommands(port)
 
+	// 0) nsswitch shadowing: systemd-resolved's `resolve [!UNAVAIL=return]`
+	//    entry answers single-label lookups with NXDOMAIN and TERMINATES the
+	//    glibc chain before `dns` — resolv.conf and the redirect can be
+	//    perfect and every application still sees "Name or service not
+	//    known" while dig works (found live 2026-09-01, fresh VPS). Fix it
+	//    on every setup path, including the already-wired early return.
+	nss := fixNsswitchShadowing()
+	withNote := func(msg string) string {
+		if nss == "" {
+			return msg
+		}
+		return msg + "; " + nss
+	}
+
 	// 1) The :53 -> port redirect FIRST (never leave resolv.conf pointing
 	//    at a port that nothing answers on).
 	if err := installPort53Redirect(port); err != nil {
 		printManualCommands("port-53 redirect (nft/iptables)", manual[:len(manual)-1])
-		return "OS resolver: MANUAL step printed above (sudo failed) — port-53 redirect to " + addr
+		return withNote("OS resolver: MANUAL step printed above (sudo failed) — port-53 redirect to " + addr)
 	}
 
 	// 2) resolv.conf -> plain "nameserver 127.0.0.1" (backup alongside,
@@ -335,12 +351,12 @@ func wireOSResolver() string {
 	//    searchable and stat needs no read permission on the file).
 	cur, _ := sysReadFile(pathResolvConf)
 	if strings.HasPrefix(string(cur), "nameserver 127.0.0.1\n") {
-		return "OS resolver: already wired (resolv.conf -> 127.0.0.1, :53 -> " + addr + " redirect)"
+		return withNote("OS resolver: already wired (resolv.conf -> 127.0.0.1, :53 -> " + addr + " redirect)")
 	}
 	if !sysStatExists(pathResolvBackup) {
 		if err := sudoRun("backing up "+pathResolvConf, "cp", pathResolvConf, pathResolvBackup); err != nil {
 			printManualCommands("resolv.conf backup + rewrite", manual[len(manual)-1:])
-			return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
+			return withNote("OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1")
 		}
 	}
 	// Replace the file atomically (sysWriteEtc: cp to <path>.freens.new ->
@@ -350,13 +366,111 @@ func wireOSResolver() string {
 	// and be regenerated on the next restart).
 	if err := sysWriteEtc(pathResolvConf, []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
 		printManualCommands("resolv.conf rewrite", manual[len(manual)-1:])
-		return "OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1"
+		return withNote("OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1")
 	}
-	return "OS resolver: resolv.conf -> 127.0.0.1, :53 -> " + addr + " via nft/iptables redirect (backup: " + pathResolvBackup + "; conventional names go upstream through the daemon)"
+	return withNote("OS resolver: resolv.conf -> 127.0.0.1, :53 -> " + addr + " via nft/iptables redirect (backup: " + pathResolvBackup + "; conventional names go upstream through the daemon)")
 }
 
 // nftTableName is our NAT table for the :53 redirect.
 const nftTableName = "freens_dns"
+
+// fixHostsLine rewrites an nsswitch "hosts:" line that would shadow freens
+// names: the `resolve` module (systemd-resolved) with a restricting action
+// like [!UNAVAIL=return] answers single-label lookups with NXDOMAIN from the
+// ORIGINAL upstream config — resolv.conf points at the freens daemon, but
+// glibc never gets there (dig works, ping/applications don't; found live
+// 2026-09-01 on a fresh VPS). The fixed line drops `resolve` and its
+// attached bracketed action and ensures `dns` is present so lookups fall
+// through to resolv.conf. changed=false when the line needs no fix.
+func fixHostsLine(line string) (string, bool) {
+	tokens := strings.Fields(line)
+	if len(tokens) == 0 || tokens[0] != "hosts:" {
+		return line, false
+	}
+	hasResolve := false
+	for _, t := range tokens[1:] {
+		if t == "resolve" {
+			hasResolve = true
+			break
+		}
+	}
+	if !hasResolve {
+		return line, false
+	}
+	out := []string{"hosts:"}
+	skipNextAction := false
+	for _, t := range tokens[1:] {
+		if t == "resolve" {
+			hasResolve = true
+			skipNextAction = true
+			continue
+		}
+		if strings.HasPrefix(t, "[") && skipNextAction {
+			skipNextAction = false // the action bound to `resolve` goes with it
+			continue
+		}
+		skipNextAction = false
+		out = append(out, t)
+	}
+	hasDNS := false
+	for _, t := range out[1:] {
+		if t == "dns" {
+			hasDNS = true
+		}
+	}
+	if !hasDNS {
+		out = append(out, "dns")
+	}
+	return strings.Join(out, " "), true
+}
+
+// fixNsswitchShadowing applies fixHostsLine to /etc/nsswitch.conf, with a
+// backup beside the resolv.conf one. Best-effort: when the privileged write
+// fails, the manual commands are printed with a LOUD warning — a shadowing
+// nsswitch is the difference between "dig works" and "every application
+// works", and users give up exactly there. Returns a human-readable status
+// note ("" when there was nothing to do).
+func fixNsswitchShadowing() string {
+	if goosWindows {
+		return ""
+	}
+	raw, err := sysReadFile(pathNsswitch)
+	if err != nil {
+		return "" // no nsswitch.conf (musl/minimal): glibc defaults include dns
+	}
+	lines := strings.Split(string(raw), "\n")
+	hostIdx := -1
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "hosts:") {
+			hostIdx = i
+			break
+		}
+	}
+	if hostIdx < 0 {
+		return ""
+	}
+	fixed, changed := fixHostsLine(lines[hostIdx])
+	if !changed {
+		return ""
+	}
+	orig := lines[hostIdx]
+	lines[hostIdx] = fixed
+	manual := []string{
+		"sudo cp " + pathNsswitch + " " + pathNsswitchBackup,
+		fmt.Sprintf("sudo sed -i 's|^%s|%s|' %s", orig, fixed, pathNsswitch),
+	}
+	if !sysStatExists(pathNsswitchBackup) {
+		if err := sudoRun("backing up "+pathNsswitch, "cp", pathNsswitch, pathNsswitchBackup); err != nil {
+			printManualCommands("nsswitch.conf hosts fix", manual)
+			return "nsswitch: MANUAL step printed above — WARNING: applications cannot resolve freens names until applied (dig works, ping/apps don't)"
+		}
+	}
+	if err := sysWriteEtc(pathNsswitch, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		printManualCommands("nsswitch.conf hosts fix", manual)
+		return "nsswitch: MANUAL step printed above — WARNING: applications cannot resolve freens names until applied (dig works, ping/apps don't)"
+	}
+	return "nsswitch: hosts line fixed — 'resolve [!UNAVAIL=return]' was shadowing freens names for applications (dig worked, ping didn't); backup: " + pathNsswitchBackup
+}
 
 // installPort53Redirect installs the daddr-scoped NAT rules
 // 127.0.0.1:53 -> :port, idempotently (our table is flushed first). nft is
@@ -563,8 +677,7 @@ func unwireOSResolver() {
 	// resolv.conf restore.
 	if sysStatExists(pathResolvBackup) {
 		if err := sudoRun("restoring "+pathResolvConf, "cp", pathResolvBackup, pathResolvConf); err != nil {
-			printManualCommands("restore resolv.conf", []string{
-				"sudo cp " + pathResolvBackup + " " + pathResolvConf,
+			printManualCommands("restore resolv.conf", []string{"sudo cp " + pathResolvBackup + " " + pathResolvConf,
 				"sudo rm -f " + pathResolvBackup,
 			})
 		} else {
@@ -583,6 +696,22 @@ func unwireOSResolver() {
 			}
 		}
 		printManualCommands("remove freens from resolv.conf", cmds)
+	}
+
+	// nsswitch restore (setup may have fixed the hosts line; put the
+	// original back so systemd-resolved resumes its distro-default role).
+	if sysStatExists(pathNsswitchBackup) {
+		if err := sudoRun("restoring "+pathNsswitch, "cp", pathNsswitchBackup, pathNsswitch); err != nil {
+			printManualCommands("restore nsswitch.conf", []string{
+				"sudo cp " + pathNsswitchBackup + " " + pathNsswitch,
+				"sudo rm -f " + pathNsswitchBackup,
+			})
+		} else {
+			fmt.Printf("restored: %s (from %s)\n", pathNsswitch, pathNsswitchBackup)
+			if err := sudoRun("removing the nsswitch backup", "rm", "-f", pathNsswitchBackup); err != nil {
+				printManualCommands("remove nsswitch backup", []string{"sudo rm -f " + pathNsswitchBackup})
+			}
+		}
 	}
 }
 

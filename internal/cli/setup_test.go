@@ -54,6 +54,14 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 	oldUnit, oldResolv, oldBackup, oldDrop := pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop
 	oldNftTable, oldRedirectProbe := sysStatNftTable, port53RedirectInstalled
 	oldLegacy := pathLegacyUserUnit
+	oldNss, oldNssBak := pathNsswitch, pathNsswitchBackup
+	pathNsswitch = filepath.Join(dir, "nsswitch.conf")
+	pathNsswitchBackup = filepath.Join(dir, "nsswitch.conf.freens-pre")
+	// A clean (non-shadowing) hosts line: existing tests' expectations are
+	// unchanged; the shadowing case has its own tests below.
+	if err := os.WriteFile(pathNsswitch, []byte("hosts: files dns\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	oldBridgePath, oldBridgeSvc := pathTrustBridgePathUnit, pathTrustBridgeSvcUnit
 	oldOutput := sysOutput
 	// The unit-listing probe never hits a real systemctl from tests: a
@@ -104,6 +112,7 @@ func stubSysForTest(t *testing.T) *sysRecorder {
 		pathSystemctlUnit, pathResolvConf, pathResolvBackup, pathResolvedDrop = oldUnit, oldResolv, oldBackup, oldDrop
 		sysStatNftTable, port53RedirectInstalled = oldNftTable, oldRedirectProbe
 		pathLegacyUserUnit = oldLegacy
+		pathNsswitch, pathNsswitchBackup = oldNss, oldNssBak
 		pathTrustBridgePathUnit, pathTrustBridgeSvcUnit = oldBridgePath, oldBridgeSvc
 		sysOutput = oldOutput
 	})
@@ -405,5 +414,115 @@ func TestSetupUnitCarriesFREENSHome(t *testing.T) {
 	}
 	if !strings.Contains(unit, "Restart=on-failure") {
 		t.Errorf("unit lost its Restart policy:\n%s", unit)
+	}
+}
+
+// TestFixHostsLine: the nsswitch shadowing fixer's table — `resolve`
+// (systemd-resolved) with a restricting action TERMINATES the glibc lookup
+// chain before `dns`, so freens names resolve via dig but not via any
+// application (found live 2026-09-01, fresh VPS: "dig works, ping doesn't").
+func TestFixHostsLine(t *testing.T) {
+	cases := []struct {
+		in, want string
+		changed  bool
+	}{
+		{
+			in:   "hosts: files myhostname resolve [!UNAVAIL=return] dns",
+			want: "hosts: files myhostname dns", changed: true,
+		},
+		{
+			in:   "hosts: files resolve [!UNAVAIL=return]",
+			want: "hosts: files dns", changed: true,
+		},
+		{
+			in:   "hosts: files resolve",
+			want: "hosts: files dns", changed: true,
+		},
+		{
+			in:   "hosts: files myhostname resolve",
+			want: "hosts: files myhostname dns", changed: true,
+		},
+		{in: "hosts: files dns", want: "hosts: files dns", changed: false},
+		{in: "hosts: files", want: "hosts: files", changed: false},
+		{in: "", want: "", changed: false},
+		{in: "passwd: files resolve", want: "passwd: files resolve", changed: false},
+	}
+	for _, tc := range cases {
+		got, changed := fixHostsLine(tc.in)
+		if got != tc.want || changed != tc.changed {
+			t.Errorf("fixHostsLine(%q) = (%q, %v), want (%q, %v)", tc.in, got, changed, tc.want, tc.changed)
+		}
+	}
+}
+
+// TestFixNsswitchShadowing: setup applies the hosts-line fix automatically
+// (with a backup), is a no-op on an already-clean file, and on a missing
+// nsswitch.conf (musl/minimal systems).
+func TestFixNsswitchShadowing(t *testing.T) {
+	dir := t.TempDir()
+	oldRead, oldStat, oldWrite, oldSudo := sysReadFile, sysStatExists, sysWriteEtc, sysSudo
+	oldNss, oldBak := pathNsswitch, pathNsswitchBackup
+	t.Cleanup(func() {
+		sysReadFile, sysStatExists, sysWriteEtc, sysSudo = oldRead, oldStat, oldWrite, oldSudo
+		pathNsswitch, pathNsswitchBackup = oldNss, oldBak
+	})
+	pathNsswitch = filepath.Join(dir, "nsswitch.conf")
+	pathNsswitchBackup = filepath.Join(dir, "nsswitch.conf.freens-pre")
+	sysReadFile = os.ReadFile
+	sysStatExists = func(path string) bool { _, err := os.Stat(path); return err == nil }
+	sysWriteEtc = func(path string, content []byte, mode os.FileMode) error {
+		return os.WriteFile(path, content, mode)
+	}
+	sysSudo = func(args ...string) error {
+		if len(args) == 3 && args[0] == "cp" { // emulate the backup copy for real
+			b, err := os.ReadFile(args[1])
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(args[2], b, 0o644)
+		}
+		return nil
+	}
+
+	original := "hosts: files myhostname resolve [!UNAVAIL=return] dns\n" +
+		"passwd: compat\n"
+	if err := os.WriteFile(pathNsswitch, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	note := fixNsswitchShadowing()
+	if note == "" {
+		t.Fatal("shadowing nsswitch produced no fix note")
+	}
+	fixed, err := os.ReadFile(pathNsswitch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fixed), "hosts: files myhostname dns") {
+		t.Fatalf("hosts line not fixed: %q", fixed)
+	}
+	if strings.Contains(string(fixed), "resolve") {
+		t.Fatalf("resolve still present after fix: %q", fixed)
+	}
+	if strings.Contains(string(fixed), "passwd: compat") == false {
+		t.Fatalf("unrelated lines lost: %q", fixed)
+	}
+	if !sysStatExists(pathNsswitchBackup) {
+		t.Fatal("no backup written")
+	}
+	backup, err := os.ReadFile(pathNsswitchBackup)
+	if err != nil || string(backup) != original {
+		t.Fatalf("backup does not hold the original: %q (%v)", backup, err)
+	}
+
+	// Idempotent: a second pass on the fixed file is a no-op.
+	if note := fixNsswitchShadowing(); note != "" {
+		t.Fatalf("second pass on a fixed file returned %q, want empty", note)
+	}
+
+	// Missing nsswitch.conf: silent no-op (musl/minimal systems).
+	pathNsswitch = filepath.Join(dir, "absent.conf")
+	if note := fixNsswitchShadowing(); note != "" {
+		t.Fatalf("missing nsswitch.conf returned %q, want empty", note)
 	}
 }
