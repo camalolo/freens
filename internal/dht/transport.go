@@ -3259,21 +3259,38 @@ func (n *Node) issueToken(raddr *net.UDPAddr) []byte {
 func encodeNodes(contacts []*NodeContact) []any {
 	out := make([]any, 0, len(contacts))
 	for _, c := range contacts {
-		ip := net.ParseIP(hostOf(c.Addr))
-		var ipBytes []byte
-		if ip != nil {
-			if v4 := ip.To4(); v4 != nil {
-				ipBytes = []byte(v4)
-			} else {
-				ipBytes = []byte(ip)
-			}
-		} else {
-			ipBytes = []byte{}
+		out = append(out, encodeNodeEntry(c.Addr, c.NodeID, c.PublicKey))
+		// Multi-homing (2026-09-01, operator idea: "all the peers known
+		// should be returned by the seed"): every known address rides
+		// along as its own entry — same NodeID, different addr. Newcomers
+		// accumulate LAN+WAN for the whole fleet on their FIRST exchange,
+		// so no single node's death (the seed's included) strands them;
+		// v0.13.3+ receivers merge the entries into one multi-homed
+		// contact, older receivers just re-learn (their classic
+		// overwrite behavior, transient). Advertisement never confirms:
+		// the anti-ghost invariant is enforced at learn time, not here.
+		for _, a := range c.Alts {
+			out = append(out, encodeNodeEntry(a.Addr, c.NodeID, c.PublicKey))
 		}
-		port := uint64(portOf(c.Addr))
-		out = append(out, []any{ipBytes, port, c.NodeID, c.PublicKey})
 	}
 	return out
+}
+
+// encodeNodeEntry renders one {nodes} element: [ipBytes, port, nodeID, pk].
+func encodeNodeEntry(addr string, nodeID, pk []byte) []any {
+	ip := net.ParseIP(hostOf(addr))
+	var ipBytes []byte
+	if ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			ipBytes = []byte(v4)
+		} else {
+			ipBytes = []byte(ip)
+		}
+	} else {
+		ipBytes = []byte{}
+	}
+	port := uint64(portOf(addr))
+	return []any{ipBytes, port, nodeID, pk}
 }
 
 // parseNodes decodes a {nodes: [...]} value (a []any of []any) into contacts.

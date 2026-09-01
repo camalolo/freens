@@ -1,6 +1,8 @@
 package dht
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -266,5 +268,84 @@ func TestMultiHomedAltCapTrimsLRU(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("newest alt trimmed instead of the oldest: %+v", live.Alts)
+	}
+}
+
+// ---- multi-addr advertisement (operator idea: "all the peers known should
+// be returned by the seed") ----
+// {nodes} entries are emitted PER KNOWN ADDRESS: a newcomer's first
+// exchange with the seed hands it the whole fleet at LAN+WAN, so no single
+// node's death strands it. Receivers with v0.13.3+ merge same-NodeID
+// entries into one multi-homed contact; the wire format itself is
+// unchanged (older peers just re-learn, their classic overwrite behavior).
+
+func TestEncodeNodesEmitsEveryKnownAddress(t *testing.T) {
+	n := mkWalkProbeNode(t)
+	c := mkContact(t, n, true)
+	n.learn(c)
+	alt := mkContact(t, n, false)
+	alt.NodeID, alt.PublicKey = c.NodeID, c.PublicKey
+	alt.Addr = "192.0.2.11:15353"
+	n.learnContact(alt)
+
+	live := n.rt.Get(c.NodeID)
+	entries := encodeNodes([]*NodeContact{live})
+	if len(entries) != 2 {
+		t.Fatalf("multi-homed contact encoded %d entries, want 2", len(entries))
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		parsed := parseNodes([]any{e})
+		if len(parsed) != 1 {
+			t.Fatalf("entry did not round-trip: %v", e)
+		}
+		seen[parsed[0].Addr] = true
+		if !bytes.Equal(parsed[0].NodeID, c.NodeID) {
+			t.Fatal("round-tripped entry lost its NodeID")
+		}
+	}
+	if !seen["192.0.2.10:15353"] || !seen["192.0.2.11:15353"] {
+		t.Fatalf("addresses missing from advertisement: %v", seen)
+	}
+}
+
+func TestNewcomerAccumulatesFleetAddressesFromSeed(t *testing.T) {
+	// The seed S knows peer P at two addresses (LAN+WAN). A newcomer N
+	// running one find_node against S must end up with P as ONE
+	// multi-homed contact carrying both.
+	seed := mkWalkProbeNode(t)
+	p := mkContact(t, seed, true)
+	seed.learn(p)
+	pAlt := mkContact(t, seed, false)
+	pAlt.NodeID, pAlt.PublicKey = p.NodeID, p.PublicKey
+	pAlt.Addr = "192.0.2.11:15353"
+	seed.learnContact(pAlt)
+
+	newcomer := mkWalkProbeNode(t)
+	target := make([]byte, 32)
+	for i := range target {
+		target[i] = 0x7f // some target; the response carries S's closest
+	}
+	seedAddr, _ := seed.LocalAddr()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := newcomer.sendQuery(ctx, seedAddr, seed.ID(), "find_node", map[string]any{"target": target})
+	if err != nil {
+		t.Fatalf("find_node: %v", err)
+	}
+	// The walk's response handling: parse + learn every returned contact.
+	for _, nc := range parseNodes(resp.A["nodes"]) {
+		newcomer.learnContact(nc)
+	}
+
+	live := newcomer.rt.Get(p.NodeID)
+	if live == nil {
+		t.Fatal("newcomer did not learn the peer from the seed's response")
+	}
+	if len(live.Alts) != 1 || live.Alts[0].Addr != "192.0.2.11:15353" {
+		t.Fatalf("newcomer did not accumulate both addresses: %+v", live)
+	}
+	if live.ConfirmedAt != 0 {
+		t.Fatal("advertisement must not confirm (anti-ghost invariant)")
 	}
 }
