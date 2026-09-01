@@ -932,7 +932,7 @@ func cmdUpgrade(args []string) error {
 			// "successful" upgrades (found live 2026-09-01 on the desktop
 			// box — the footer version comes from the daemon, so nothing
 			// surfaced it). Ask the UI itself for its stamp.
-			waitWebUIBack(10 * time.Second, tag)
+			waitWebUIBack(10*time.Second, tag)
 		}
 	}
 
