@@ -306,8 +306,27 @@ func TestEnvelopeStoreChainLinkPrevHash(t *testing.T) {
 	wrongHash := append([]byte(nil), firstHash...)
 	wrongHash[0] ^= 0xFF
 
-	// Higher sequence + CORRECT prev_hash → accepted.
-	good := makeChainedEnv(t, 2, firstHash, kp)
+	// Higher sequence + CORRECT prev_hash → accepted. The incumbent's hash
+	// is biased AWAY FROM THE TOP of the space first (found live in CI
+	// ~1/300 runs: a goodHash starting 0xff… admitted almost no greater
+	// candidate and the equal-sequence sweep below legitimately found
+	// none). Bias it under 0x80 — expected ~2 draws — after which every
+	// later candidate beats it with probability ≥ 1/2 and the 199-draw
+	// sweep failing is 2^-199, i.e. never.
+	good := func() *wire.SignedEnvelope {
+		for created := uint64(1000); created < 1200; created++ {
+			cand := makeChainedEnvAt(t, 2, firstHash, kp, created)
+			h, err := cand.RecordHash()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h[0] < 0x80 {
+				return cand
+			}
+		}
+		t.Fatal("test setup: could not draw a sub-0x80 incumbent hash in 200 tries")
+		return nil
+	}()
 	if ok, _ := s.Put(key, good, 1600, true); !ok {
 		t.Fatal("Put(seq2, correct prev_hash) should be accepted")
 	}
@@ -699,4 +718,31 @@ func mustHash(t *testing.T, env *wire.SignedEnvelope) []byte {
 		t.Fatalf("RecordHash: %v", err)
 	}
 	return h
+}
+
+// makeChainedEnvAt is makeChainedEnv with a caller-chosen Created — the
+// chain-link test's incumbent-hash bias needs to vary it (the fixed-1000
+// form draws its hash from a random key, which lands in the top of the
+// hash space ~once per few hundred runs and starves the greater-hash
+// sweep of candidates).
+func makeChainedEnvAt(t *testing.T, sequence uint64, prevHash []byte, ownerKP *crypto.Keypair, created uint64) *wire.SignedEnvelope {
+	t.Helper()
+	tldID, err := crypto.TldID(ownerKP.Public())
+	if err != nil {
+		t.Fatalf("TldID: %v", err)
+	}
+	name, err := naming.EncodeWireName(nil, "foo", tldID)
+	if err != nil {
+		t.Fatalf("EncodeWireName: %v", err)
+	}
+	rec, err := wire.NewRecord(name, ownerKP.Public(), sequence, created, 2000)
+	if err != nil {
+		t.Fatalf("NewRecord: %v", err)
+	}
+	rec.PrevHash = prevHash
+	env, err := wire.SignRecord(rec, ownerKP)
+	if err != nil {
+		t.Fatalf("SignRecord: %v", err)
+	}
+	return env
 }
