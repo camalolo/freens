@@ -52,7 +52,7 @@ func (s *Server) startPublishJob(env *wire.SignedEnvelope, claimOnly bool) strin
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), jobPublishBudget)
 		defer cancel()
-		accepted, err := s.runPublish(ctx, env, claimOnly)
+		accepted, _, err := s.runPublish(ctx, env, claimOnly)
 		s.jobsMu.Lock()
 		defer s.jobsMu.Unlock()
 		j.Done = true

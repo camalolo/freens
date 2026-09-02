@@ -1320,9 +1320,37 @@ func (n *Node) hFindNode(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	}
 	closest := n.rt.Closest(target, constants.K)
 	return n.okResp(m, map[string]any{
-		"nodes": encodeNodes(closest),
+		"nodes": n.advertiseableNodes(closest),
 		"token": n.issueToken(raddr),
 	})
+}
+
+// adFreshWindow bounds how long a NEVER-CONFIRMED contact stays
+// advertiseable after its learn: long enough for one walk hop to share a
+// genuinely fresh discovery, short enough that a ghost cannot chain across
+// the fleet forever. Confirmed contacts are always advertiseable (their
+// 1 h idle sweep is the lifetime bound).
+const adFreshWindow = 10 * time.Minute
+
+// advertiseableNodes filters contacts for the {nodes} wire payload: a
+// contact this node has DIRECTLY confirmed, or one learned so recently that
+// sharing it is still useful. Everything else stays in the local table but
+// stops propagating — the 2026-09-02 diagnosis found one-shot CLI ghosts
+// (ephemeral-port confirmed contacts on their origin box) circulating
+// indefinitely: every re-learn starts a fresh clock, so the 1 h idle sweep
+// never starved the fleet-wide loop. With this filter a ghost's spread
+// ends 10 min after its last direct confirmation anywhere, while its
+// origin table still sweeps it on the normal 1 h horizon.
+func (n *Node) advertiseableNodes(contacts []*NodeContact) []any {
+	now := n.now()
+	keep := make([]*NodeContact, 0, len(contacts))
+	for _, c := range contacts {
+		if c.ConfirmedAt == 0 && now-c.LastSeen > int64(adFreshWindow/time.Second) {
+			continue
+		}
+		keep = append(keep, c)
+	}
+	return encodeNodes(keep)
 }
 
 // hGet answers a get(key) with everything this node can offer for key:
@@ -1387,7 +1415,7 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		}
 	} else {
 		// Miss: return the closest known contacts so the requester iterates.
-		args["nodes"] = encodeNodes(n.rt.Closest(key, constants.K))
+		args["nodes"] = n.advertiseableNodes(n.rt.Closest(key, constants.K))
 		evidenceFor = key
 	}
 	// §8.4 evidence piggyback: whatever recovery evidence this node retained
@@ -2019,6 +2047,9 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 			if queried[string(c.NodeID)] {
 				continue
 			}
+			if bytes.Equal(c.NodeID, n.id) {
+				continue // the walker itself: peers re-advertise it back, but its answer is the local view, not the network's
+			}
 			if n.penalized(c.NodeID, now) {
 				continue // recently-failed corpse: skip as a candidate
 			}
@@ -2140,11 +2171,12 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		})
 		var batch []*NodeContact
 		for _, c := range shortlist {
-			if !queried[string(c.NodeID)] {
-				batch = append(batch, c)
-				if len(batch) >= constants.Alpha {
-					break
-				}
+			if queried[string(c.NodeID)] || bytes.Equal(c.NodeID, n.id) {
+				continue // queried, or the walker itself re-advertised back by a peer
+			}
+			batch = append(batch, c)
+			if len(batch) >= constants.Alpha {
+				break
 			}
 		}
 		if len(batch) == 0 {
@@ -2369,14 +2401,22 @@ func (n *Node) sweepIdleContacts(now int64) {
 // The envelope is keyed at K_tld / K_name per KeyForWireName; to publish a
 // claim envelope at K_claim use [Node.PublishClaim].
 func (n *Node) Publish(ctx context.Context, env *wire.SignedEnvelope) error {
+	_, err := n.PublishStats(ctx, env)
+	return err
+}
+
+// PublishStats is Publish with the per-key PublishStats detail (how many of
+// the R closest targets accepted the put at the record's name key).
+func (n *Node) PublishStats(ctx context.Context, env *wire.SignedEnvelope) ([]PublishStats, error) {
 	if env == nil || env.Record == nil {
-		return errors.New("dht: nil envelope")
+		return nil, errors.New("dht: nil envelope")
 	}
 	key, err := KeyForWireName(env.Record.Name)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return n.publishKeyed(ctx, key, env, nil)
+	stats, perr := n.publishKeyedStats(ctx, key, env, nil)
+	return []PublishStats{stats}, perr
 }
 
 // PublishClaim publishes the TLD-record envelope carrying an alias claim at
@@ -2396,18 +2436,25 @@ func (n *Node) Publish(ctx context.Context, env *wire.SignedEnvelope) error {
 // ErrNoPeers with no peers); storing it in the local store is the caller's
 // business (the daemon puts both).
 func (n *Node) PublishClaim(ctx context.Context, env *wire.SignedEnvelope) error {
+	_, err := n.PublishClaimStats(ctx, env)
+	return err
+}
+
+// PublishClaimStats is PublishClaim with the per-key PublishStats detail.
+func (n *Node) PublishClaimStats(ctx context.Context, env *wire.SignedEnvelope) ([]PublishStats, error) {
 	if env == nil || env.Record == nil {
-		return errors.New("dht: nil envelope")
+		return nil, errors.New("dht: nil envelope")
 	}
 	claim, err := claims.DecodeAliasClaim(env.Record.Claim)
 	if err != nil {
-		return fmt.Errorf("dht: envelope carries no decodable alias claim (field 11): %w", err)
+		return nil, fmt.Errorf("dht: envelope carries no decodable alias claim (field 11): %w", err)
 	}
 	key, err := KeyForClaim(claim.Alias)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return n.publishKeyed(ctx, key, env, nil)
+	stats, perr := n.publishKeyedStats(ctx, key, env, nil)
+	return []PublishStats{stats}, perr
 }
 
 // PublishKeyedAt publishes env at the EXPLICIT keys (the dht.StorageKeys
@@ -2421,10 +2468,21 @@ func (n *Node) PublishClaim(ctx context.Context, env *wire.SignedEnvelope) error
 // problem); ErrNoPeers is returned only when no key could even be attempted
 // against a known peer.
 func (n *Node) PublishKeyedAt(ctx context.Context, keys [][]byte, env *wire.SignedEnvelope) error {
+	_, err := n.PublishKeyedAtStats(ctx, keys, env)
+	return err
+}
+
+// PublishKeyedAtStats is PublishKeyedAt with per-key PublishStats: the
+// caller can see, per key, how many of the R targets accepted. Error
+// semantics are identical (last failure when NO key published).
+func (n *Node) PublishKeyedAtStats(ctx context.Context, keys [][]byte, env *wire.SignedEnvelope) ([]PublishStats, error) {
 	published := false
 	var lastErr error
+	out := make([]PublishStats, 0, len(keys))
 	for _, k := range keys {
-		if err := n.publishKeyed(ctx, k, env, nil); err == nil {
+		stats, err := n.publishKeyedStats(ctx, k, env, nil)
+		out = append(out, stats)
+		if err == nil {
 			published = true
 		} else {
 			lastErr = err
@@ -2432,11 +2490,11 @@ func (n *Node) PublishKeyedAt(ctx context.Context, keys [][]byte, env *wire.Sign
 	}
 	if !published {
 		if lastErr != nil {
-			return lastErr
+			return out, lastErr
 		}
-		return ErrNoPeers
+		return out, ErrNoPeers
 	}
-	return nil
+	return out, nil
 }
 
 // publishKeyed is the shared §6.4 PUT body of Publish, PublishClaim and
@@ -2445,24 +2503,41 @@ func (n *Node) PublishKeyedAt(ctx context.Context, keys [][]byte, env *wire.Sign
 // §8.4 recovery blob riding along; see hPut). Best-effort — nil iff at least
 // one peer accepted the envelope.
 func (n *Node) publishKeyed(ctx context.Context, key []byte, env *wire.SignedEnvelope, evidence []byte) error {
+	_, err := n.publishKeyedStats(ctx, key, env, evidence)
+	return err
+}
+
+// PublishStats reports what one keyed publish did against its target set:
+// how many of the R closest contacts were attempted and how many stores
+// accepted the put. Surfaces the "accepted by 3 of 7" gray zone that a
+// bare error/nil cannot express — the 2026-09-02 camalolo incident was a
+// publish that returned nil (one peer somewhere accepted) while the
+// envelope never reached enough holders to survive.
+type PublishStats struct {
+	KeyHex   string // hex of the key this publish targeted
+	Targets  int    // closest R contacts attempted
+	Accepted int    // stores that accepted the put
+}
+
+func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.SignedEnvelope, evidence []byte) (PublishStats, error) {
 	envBytes, err := env.Bytes()
 	if err != nil {
-		return err
+		return PublishStats{KeyHex: hex.EncodeToString(key)}, err
 	}
 	closest := n.rt.Closest(key, constants.RReplication)
+	stats := PublishStats{KeyHex: hex.EncodeToString(key), Targets: len(closest)}
 	if len(closest) == 0 {
-		return ErrNoPeers
+		return stats, ErrNoPeers
 	}
-	accepted := 0
 	for _, c := range closest {
 		if err := n.putToPeer(ctx, key, envBytes, evidence, c); err == nil {
-			accepted++
+			stats.Accepted++
 		}
 	}
-	if accepted == 0 {
-		return fmt.Errorf("dht: publish accepted by 0 of %d peers", len(closest))
+	if stats.Accepted == 0 {
+		return stats, fmt.Errorf("dht: publish accepted by 0 of %d peers", len(closest))
 	}
-	return nil
+	return stats, nil
 }
 
 // ---------------------------------------------------------------------------

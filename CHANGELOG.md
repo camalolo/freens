@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased — the phantom-fresh lease is dead: auto-renew verifies the network, publishes report acceptance, doctor checks the lease cross-box, and ghosts stop circulating
+
+Four follow-ups to the 2026-09-02 camalolo incident (the local keychain
+said "fresh until 12:17" while the network had lost the envelope; every
+non-owner resolver NXDOMAINed the name for ~7 h and nothing on the owner
+noticed):
+
+- **daemon: the auto-renew pass verifies "fresh" leases against the
+  NETWORK.** Once an hour per name (the pass runs every 10 min) a lease
+  that ShouldRenew considers fresh is re-fetched by a network walk that
+  EXCLUDES the daemon's own store — an owner counting its own copy
+  would have "confirmed" itself forever. A missing or older-generation
+  answer re-publishes the exact local envelope (no re-sign, the
+  sequence does not move) and queues it for the existing
+  network-confirmed retry loop. Degraded walks are skipped as
+  inconclusive, never treated as evidence.
+- **dht: walks no longer probe the walker itself.** A peer advertising
+  the walker back (normal Kademlia) used to add the walker's own node
+  to the shortlist, so a "network" GET could be answered by the local
+  store one UDP hop away — poisoning exactly the verification above
+  and, before it, any walk-statistics view. Self is now excluded at
+  batch-pick time in the GET, find_node, and claim-collection walks.
+- **dht+admin: publishes report per-key storing-peer acceptance.**
+  PublishStats carries {key, targets, accepted}; the admin /publish
+  response adds a `keys` array beside the historical `accepted` count,
+  the daemon logs "accepted k of R" (WARN on 0 and on partial), and the
+  auto-renew loop logs the same for every renewal put. "RENEWED" can no
+  longer mean "the puts went nowhere".
+- **dht: ghost one-shot contacts stop circulating in {nodes}.** A
+  contact the node never directly confirmed is advertised only while
+  its learn is fresh (10 min); confirmed contacts keep the 1 h idle
+  sweep as their bound. One-shot CLI ephemeral contacts used to hop
+  across the fleet forever — every re-learn started a fresh clock, and
+  they polluted the closest-8 views around contested keys.
+- **admin+cli: doctor checks the alias's lease as a FOREIGN resolver
+  sees it.** POST /resolve accepts {"network": true}: both fetches walk
+  peers with the daemon's own store/pool excluded and the response
+  carries the network record/claim sequence+expiry. `freens doctor`
+  runs it on the first keychain alias and FAILS with
+  `freens renew -force <alias>` when the network's copy is missing or
+  expired while the local one resolves — the exact signal the incident
+  hid for hours. Degraded walks are reported inconclusive, never
+  failed.
+
 ## v0.14.2 — the peers table stops showing "<nil>:15353" and lists public addresses before LAN ones
 
 Two fleet-visible cleanups around the multi-homed contacts table (each

@@ -153,6 +153,27 @@ type Resolved struct {
 	Sequence uint64 `json:"sequence,omitempty"`
 	TldIDB32 string `json:"tld_id_b32,omitempty"`
 	RRset    []RR   `json:"rrset,omitempty"`
+
+	// Network carries the {"network": true} view (see resolveRequest): the
+	// name as a FOREIGN resolver sees it, the daemon's own local state
+	// excluded. nil unless requested.
+	Network *NetworkView `json:"network,omitempty"`
+}
+
+// NetworkView is the network-forced resolution detail: the record at its
+// name key and — for an apex — the alias's claim envelope, fetched by
+// NETWORK walks that exclude this daemon's own store/pool. This is the
+// check that catches "resolves owner-locally while the network lost the
+// lease" (the 2026-09-02 camalolo incident, invisible to every
+// owner-local check for hours).
+type NetworkView struct {
+	RecordFound    bool   `json:"record_found"`
+	RecordSequence uint64 `json:"record_sequence,omitempty"`
+	RecordExpires  uint64 `json:"record_expires,omitempty"`
+	ClaimFound     bool   `json:"claim_found"` // apex names only
+	ClaimSequence  uint64 `json:"claim_sequence,omitempty"`
+	ClaimExpires   uint64 `json:"claim_expires,omitempty"`
+	Degraded       bool   `json:"degraded,omitempty"` // walk inconclusive; fields not authoritative
 }
 
 // RR is one resource record of a Resolved RRset. Rdata is the raw §4.3 bytes
@@ -344,12 +365,22 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := capped(r)
 	defer cancel()
-	accepted, err := s.runPublish(ctx, env, req.Claim)
+	accepted, keys, err := s.runPublish(ctx, env, req.Claim)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"accepted": accepted})
+	writeJSON(w, http.StatusOK, publishOutcome{Accepted: accepted, Keys: keys})
+}
+
+// publishOutcome is the POST /publish response: accepted keeps the
+// historical contract (count of DISTINCT KEYS with ≥1 peer acceptance),
+// keys carries the per-key storing-peer detail (2026-09-02: "RENEWED"
+// while the puts reached nobody — the bare count could not show a
+// 1-of-7 gray zone).
+type publishOutcome struct {
+	Accepted int                `json:"accepted"`
+	Keys     []dht.PublishStats `json:"keys,omitempty"`
 }
 
 // runPublish is handlePublish's publish core, shared by the synchronous
@@ -357,17 +388,20 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 // install, and the best-effort §7.4/C.1 claim leg. It returns the number
 // of distinct keys at least one peer accepted (mirroring the historical
 // response contract: primary failure is an error; a failed claim leg after
-// a successful primary is only counted down, not failed).
-func (s *Server) runPublish(ctx context.Context, env *wire.SignedEnvelope, claimOnly bool) (int, error) {
+// a successful primary is only counted down, not failed) plus the per-key
+// acceptance detail.
+func (s *Server) runPublish(ctx context.Context, env *wire.SignedEnvelope, claimOnly bool) (int, []dht.PublishStats, error) {
 	claim, claimErr := claims.DecodeAliasClaim(env.Record.Claim)
 	if claimOnly {
-		if err := s.node.PublishClaim(ctx, env); err != nil {
-			return 0, fmt.Errorf("publish-claim failed: %s", err.Error())
+		stats, err := s.node.PublishClaimStats(ctx, env)
+		if err != nil {
+			return 0, stats, fmt.Errorf("publish-claim failed: %s", err.Error())
 		}
-		return 1, nil
+		return 1, stats, nil
 	}
-	if err := s.node.Publish(ctx, env); err != nil {
-		return 0, fmt.Errorf("publish failed: %s", err.Error())
+	stats, err := s.node.PublishStats(ctx, env)
+	if err != nil {
+		return 0, stats, fmt.Errorf("publish failed: %s", err.Error())
 	}
 	// Local-first consistency: also install the envelope in the DAEMON'S
 	// OWN store (§6.4 winner rule makes it harmless — a better incumbent
@@ -377,17 +411,27 @@ func (s *Server) runPublish(ctx context.Context, env *wire.SignedEnvelope, claim
 	// itself still answered sequence N-1 while peers served N).
 	s.storeLocally(env)
 	accepted := 1
+	var all []dht.PublishStats
+	all = append(all, stats...)
 	if claimErr == nil {
 		// §7.4/C.1: the same envelope also lives at K_claim. Best-effort —
 		// the primary (K_tld/K_name) publication already succeeded.
-		if err := s.node.PublishClaim(ctx, env); err != nil {
+		claimStats, err := s.node.PublishClaimStats(ctx, env)
+		all = append(all, claimStats...)
+		if err != nil {
 			s.log.Warn("admin: claim publication at K_claim failed (record published at its name key)",
 				"alias", claim.Alias, "err", err)
 		} else {
 			accepted = 2
 		}
 	}
-	return accepted, nil
+	for _, ks := range all {
+		if ks.Targets > 0 && ks.Accepted < ks.Targets {
+			s.log.Warn("admin: publish partially accepted",
+				"key", ks.KeyHex, "accepted", ks.Accepted, "targets", ks.Targets)
+		}
+	}
+	return accepted, all, nil
 }
 
 // storeLocally installs env at every legitimate key (dht.StorageKeys) in the
@@ -482,6 +526,11 @@ func (s *Server) fetchEnvelope(ctx context.Context, key []byte) (*wire.SignedEnv
 type resolveRequest struct {
 	Name     string `json:"name"`
 	TldIDB32 string `json:"tld_id_b32"`
+	// Network asks for the network-forced view in addition to the normal
+	// local-first resolve: both fetches walk peers and EXCLUDE this
+	// daemon's own store/pool, so an owner can learn that the network no
+	// longer holds the envelope its local bookkeeping believes is fresh.
+	Network bool `json:"network"`
 }
 
 // handleResolve resolves a display name to its winning record. The two-hop
@@ -529,7 +578,11 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "claim lookup failed: "+err.Error())
 		return
 	} else if tldID == nil {
-		writeJSON(w, http.StatusOK, Resolved{Found: false}) // no claim for alias
+		out := Resolved{Found: false} // no claim for alias
+		if req.Network {
+			out.Network = s.networkView(ctx, labels, alias)
+		}
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
 
@@ -538,6 +591,10 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad name: "+err.Error())
 		return
+	}
+	var netView *NetworkView
+	if req.Network {
+		netView = s.networkView(ctx, labels, alias)
 	}
 	var env *wire.SignedEnvelope
 	if s.lookup != nil {
@@ -554,7 +611,11 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if env == nil || env.Record == nil {
-		writeJSON(w, http.StatusOK, Resolved{Found: false})
+		out := Resolved{Found: false}
+		if netView != nil {
+			out.Network = netView
+		}
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
 	if env.IsRevoked() {
@@ -563,10 +624,87 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		// NXDOMAIN — callers that counted bare Found as "resolves" (the
 		// CLI's doctor, status self-checks) were reporting revoked names
 		// as healthy.
-		writeJSON(w, http.StatusOK, Resolved{Found: false, Revoked: true, Name: req.Name})
+		out := Resolved{Found: false, Revoked: true, Name: req.Name}
+		if netView != nil {
+			out.Network = netView
+		}
+		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	writeJSON(w, http.StatusOK, resolvedFrom(labels, alias, tldID, env))
+	out := resolvedFrom(labels, alias, tldID, env)
+	out.Network = netView
+	writeJSON(w, http.StatusOK, out)
+}
+
+// networkView fetches the network-forced view for a name: the record at
+// its name key (and, for an apex, the alias's claim envelope), every fetch
+// a peer walk with the daemon's own store/pool excluded. Best-effort: an
+// inconclusive walk sets Degraded and leaves the fields at zero rather
+// than guessing — callers must treat Degraded as "unknown", not "missing".
+func (s *Server) networkView(ctx context.Context, labels []string, alias string) *NetworkView {
+	if s.node == nil {
+		return nil
+	}
+	v := &NetworkView{}
+	// Record leg: walk the name key. tldID is not re-derived here — the
+	// caller resolved it already; without it (pin-less apex miss) the
+	// record leg is skipped and only the claim leg answers.
+	v.ClaimFound = false
+	env, err := s.walkKeyForLabels(ctx, labels, alias)
+	if err != nil {
+		v.Degraded = true
+	} else if env != nil && env.Record != nil {
+		v.RecordFound = true
+		v.RecordSequence = env.Record.Sequence
+		v.RecordExpires = env.Record.Expires
+	}
+	if len(labels) != 0 {
+		return v // sub-names carry no claim of their own
+	}
+	// Claim leg: the network's live claim envelopes for the alias, local
+	// offers excluded. Renewals are owner-only and sequence-monotonic, so
+	// the max-sequence envelope IS the current generation.
+	envs, _, err := s.node.CollectClaimsRemote(ctx, alias)
+	if err != nil {
+		v.Degraded = true
+		return v
+	}
+	for _, e := range envs {
+		if e == nil || e.Record == nil {
+			continue
+		}
+		if e.Record.Sequence >= v.ClaimSequence && e.Record.Sequence > 0 {
+			v.ClaimFound = true
+			v.ClaimSequence = e.Record.Sequence
+			v.ClaimExpires = e.Record.Expires
+		}
+	}
+	return v
+}
+
+// walkKeyForLabels walks the network for the winning envelope at the name
+// key of (labels, alias) — nil envelope with nil error when nothing is
+// held. The tld_id comes from the caller's claim/pin hop; when it cannot
+// be re-derived the record leg reports degraded rather than inventing a
+// miss.
+func (s *Server) walkKeyForLabels(ctx context.Context, labels []string, alias string) (*wire.SignedEnvelope, error) {
+	tldID, err := s.claimTLDID(ctx, alias)
+	if err != nil {
+		return nil, err
+	}
+	if tldID == nil {
+		return nil, nil
+	}
+	wireName, err := naming.EncodeWireName(labels, alias, tldID)
+	if err != nil {
+		return nil, err
+	}
+	key, err := dht.KeyForWireName(wireName)
+	if err != nil {
+		return nil, err
+	}
+	env, _, err := s.node.IterativeGetDetailed(ctx, key)
+	return env, err
 }
 
 // claimTLDID resolves an alias to its tld_id via the §7.4 claim path:

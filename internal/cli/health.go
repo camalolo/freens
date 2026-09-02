@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/certmgr"
 	"github.com/camalolo/freens/internal/home"
 )
@@ -154,6 +155,19 @@ func cmdStatus(args []string) error {
 	return nil
 }
 
+// networkLeaseState renders the network claim leg's state for the doctor
+// line: which half of "found and unexpired" failed.
+func networkLeaseState(nv *admin.NetworkView) string {
+	switch {
+	case !nv.ClaimFound:
+		return "missing"
+	case nv.ClaimExpires <= uint64(time.Now().Unix()):
+		return fmt.Sprintf("expired at %s", time.Unix(int64(nv.ClaimExpires), 0).Format("15:04"))
+	default:
+		return "stale"
+	}
+}
+
 // hasRecoveryKeys reports whether alias' default register recovery keyfiles
 // exist in the keychain — the "a backup is possible (and wise)" signal.
 func hasRecoveryKeys(alias string) bool {
@@ -247,6 +261,44 @@ func cmdDoctor(args []string) error {
 			}
 		}
 		cancel()
+	}
+
+	// 4b. the NETWORK view of the first alias. Owner-local resolution (4)
+	// can be green while the network has lost the lease: the 2026-09-02
+	// camalolo incident NXDOMAINed the name from every other box for ~7 h
+	// while every check on the owner stayed green. The network view walks
+	// peers with the daemon's own store excluded — a foreign resolver's
+	// answer. Renewals are owner-only and sequence-monotonic, so a missing
+	// or expired network claim is definitive, not transient (degraded
+	// walks are skipped as inconclusive).
+	if len(aliases) > 0 && c != nil && !warming {
+		a := aliases[0]
+		ctx, cancel := adminCtx()
+		r, nerr := c.ResolveNetwork(ctx, a)
+		cancel()
+		nv := func() *admin.NetworkView {
+			if r != nil {
+				return r.Network
+			}
+			return nil
+		}()
+		switch {
+		case nerr != nil:
+			warn("alias %s network view: %v (skipped)", a, nerr)
+		case nv == nil:
+			warn("alias %s network view unavailable (daemon predates v0.14.3?) — upgrade", a)
+		case nv.Degraded:
+			warn("alias %s network view inconclusive (degraded walk) — recheck on the next run", a)
+		case !nv.ClaimFound || nv.ClaimExpires <= uint64(time.Now().Unix()):
+			check(false,
+				"alias %s holds a LIVE network lease (local copy resolves, the network's is %s) — run `freens renew -force %s`",
+				a,
+				networkLeaseState(nv),
+				a)
+		default:
+			check(true, "alias %s network lease live (seq %d, expires in %d m)",
+				a, nv.ClaimSequence, (int64(nv.ClaimExpires)-time.Now().Unix())/60)
+		}
 	}
 
 	// 5. peers. Confirmed contacts are the honest signal: the table fills

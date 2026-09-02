@@ -17,6 +17,7 @@
 package dht
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -84,6 +85,21 @@ import (
 // winner selection) is the RESOLVER's job (§6.5: the DHT does not adjudicate);
 // this method only collects and signature-checks.
 func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedEnvelope, map[string]bool, error) {
+	return n.collectClaims(ctx, alias, true)
+}
+
+// CollectClaimsRemote is CollectClaims WITHOUT the local offer set: only
+// envelopes the NETWORK offered join the merge. This is the verification
+// surface ("does the network still hold what I believe is published?") —
+// an owner checking its own lease must not count its own store/pool copy
+// as the network's answer (the 2026-09-02 camalolo incident: the local
+// store held the fresh envelope while the network had lost it, and a
+// local-inclusive check would have called that healthy forever).
+func (n *Node) CollectClaimsRemote(ctx context.Context, alias string) ([]*wire.SignedEnvelope, map[string]bool, error) {
+	return n.collectClaims(ctx, alias, false)
+}
+
+func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal bool) ([]*wire.SignedEnvelope, map[string]bool, error) {
 	aliasN, err := naming.ValidateAlias(alias)
 	if err != nil {
 		return nil, nil, err
@@ -109,11 +125,14 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 	// storer): the store's §6.4 winner AND the §7.4 top-2 claim pool (which
 	// may hold the competitor the single-slot store dropped). Pass n.now()
 	// so a claim past expires+grace is not offered (§6.4 eviction).
-	if env, _ := n.store.Get(key, n.now()); env != nil {
-		add(env)
-	}
-	for _, env := range n.claims.Top2(key) {
-		add(env)
+	// Skipped in the REMOTE variant — see CollectClaimsRemote.
+	if includeLocal {
+		if env, _ := n.store.Get(key, n.now()); env != nil {
+			add(env)
+		}
+		for _, env := range n.claims.Top2(key) {
+			add(env)
+		}
 	}
 
 	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
@@ -143,6 +162,9 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 		for _, c := range shortlist {
 			if queried[string(c.NodeID)] {
 				continue
+			}
+			if bytes.Equal(c.NodeID, n.id) {
+				continue // the walker itself: peers re-advertise it back, but its answer is the local view, not the network's
 			}
 			if n.penalized(c.NodeID, now) {
 				continue // recently-failed corpse: skip (issue #1 churn)

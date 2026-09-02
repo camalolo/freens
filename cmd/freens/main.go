@@ -1306,6 +1306,7 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			continue // not ours: cached/relayed records are their owners' business
 		}
 		if !renewal.ShouldRenew(now, int64(env.Record.Created), int64(env.Record.Expires)) {
+			renewVerifyFresh(node, logger, env)
 			continue
 		}
 		fresh, err := renewal.RenewEnvelope(env, kp, now)
@@ -1318,8 +1319,9 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = node.PublishKeyedAt(ctx, keys, fresh)
+		stats, err := node.PublishKeyedAtStats(ctx, keys, fresh)
 		cancel()
+		logPublishStats(logger, "auto-renew", stats, err)
 		if err != nil {
 			logger.Warn("auto-renew: publish failed (queued for network-confirmed retry)", "error", err)
 			renewPending.Lock()
@@ -1358,6 +1360,101 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 	if renewed > 0 {
 		logger.Info("auto-renew pass complete", "renewed", renewed)
 	}
+}
+
+// renewVerifyInterval: how often the pass re-verifies that the NETWORK
+// still holds each apparently-fresh lease (a var so tests can shrink it).
+// The 2026-09-02 camalolo incident: the local bookkeeping said "fresh
+// until 12:17" while the network had lost the envelope entirely — every
+// non-owner resolver NXDOMAINed the name for hours and nothing on the
+// owner noticed, because ShouldRenew only looks at the LOCAL store. One
+// network GET per own name per interval is the cheap antidote.
+var renewVerifyInterval = 60 * time.Minute
+
+// renewVerifyLast rate-limits the per-name verification: name (hex wire
+// name) -> unix second of the last attempt.
+var renewVerifyLast sync.Map
+
+// renewVerifyFresh re-checks an own record that ShouldRenew considers
+// fresh: the network's walk (local store EXCLUDED — an owner counting its
+// own copy would "confirm" itself forever) must offer the same envelope,
+// or the lease is re-published on the spot and queued for the
+// network-confirmed retry loop. Degraded walks are skipped (inconclusive,
+// not evidence) — the next window re-checks.
+func renewVerifyFresh(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvelope) {
+	if env == nil || env.Record == nil {
+		return
+	}
+	nameKey := hex.EncodeToString(env.Record.Name)
+	nowS := time.Now().Unix()
+	if v, ok := renewVerifyLast.Load(nameKey); ok &&
+		nowS-v.(int64) < int64(renewVerifyInterval/time.Second) {
+		return
+	}
+	renewVerifyLast.Store(nameKey, nowS)
+
+	keys, err := dht.StorageKeys(env)
+	if err != nil || len(keys) == 0 {
+		return
+	}
+	gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	netEnv, err := node.IterativeGet(gctx, keys[0])
+	gcancel()
+	if errors.Is(err, dht.ErrDegradedMiss) || errors.Is(err, dht.ErrWalkBusy) {
+		logger.Debug("auto-renew: lease verification inconclusive (degraded walk)",
+			"sequence", env.Record.Sequence)
+		return
+	}
+	healthy := err == nil && netEnv != nil && netEnv.Record != nil
+	if healthy {
+		nh, e1 := netEnv.RecordHash()
+		lh, e2 := env.RecordHash()
+		healthy = e1 == nil && e2 == nil && bytes.Equal(nh, lh)
+	}
+	if healthy {
+		logger.Debug("auto-renew: fresh lease verified on the network",
+			"sequence", env.Record.Sequence)
+		return
+	}
+	// The network is missing the lease or holds an older/different
+	// generation: re-publish the EXISTING local envelope (no re-sign — it
+	// is still valid and sequence-correct) and let the confirmed-retry
+	// loop finish the job.
+	netSeq := int64(-1)
+	if netEnv != nil && netEnv.Record != nil {
+		netSeq = int64(netEnv.Record.Sequence)
+	}
+	logger.Warn("auto-renew: network lost a supposedly-fresh lease; re-publishing",
+		"sequence", env.Record.Sequence, "network_sequence", netSeq, "get_err", err)
+	pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stats, perr := node.PublishKeyedAtStats(pctx, keys, env)
+	pcancel()
+	logPublishStats(logger, "auto-renew verify", stats, perr)
+	renewPending.Lock()
+	for _, k := range keys {
+		renewPending.m[hex.EncodeToString(k)] = &renewPendingPut{env: env, keys: keys}
+	}
+	renewPending.Unlock()
+}
+
+// logPublishStats turns dht.PublishStats into one log line per key — the
+// per-target acceptance the bare error/nil used to swallow ("RENEWED" while
+// the puts went nowhere, found live 2026-09-02).
+func logPublishStats(logger *slog.Logger, what string, stats []dht.PublishStats, err error) {
+	for _, s := range stats {
+		if s.Targets == 0 {
+			continue // ErrNoPeers case; the error already says so
+		}
+		if s.Accepted == 0 {
+			logger.Warn(what+": key accepted by 0 peers", "key", s.KeyHex, "targets", s.Targets)
+		} else if s.Accepted < s.Targets {
+			logger.Info(what+": key partially accepted", "key", s.KeyHex,
+				"accepted", s.Accepted, "targets", s.Targets)
+		} else {
+			logger.Debug(what+": key accepted", "key", s.KeyHex, "targets", s.Targets)
+		}
+	}
+	_ = err // the caller reports it in its own terms
 }
 
 // loadNodeKey returns the DHT node identity: from seedHex (a 32-byte hex Ed25519

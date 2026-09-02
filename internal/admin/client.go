@@ -272,6 +272,24 @@ func (c *Client) Resolve(ctx context.Context, name string) (*Resolved, error) {
 	return &res, nil
 }
 
+// ResolveNetwork resolves name through the daemon's NETWORK view
+// ({"network": true}): both fetches walk peers and EXCLUDE the daemon's
+// own store/pool — the "as a foreign resolver sees it" answer. Doctor's
+// stale-lease check rides on this: the 2026-09-02 camalolo incident was
+// invisible to every owner-local check for hours because the owner's own
+// store held the fresh copy while the network had lost it.
+func (c *Client) ResolveNetwork(ctx context.Context, name string) (*Resolved, error) {
+	var res Resolved
+	_, err := c.do(ctx, http.MethodPost, "/resolve", &struct {
+		Name    string `json:"name"`
+		Network bool   `json:"network"`
+	}{Name: name, Network: true}, &res)
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Witness collects §7.3 witness attestations for a claim identity through
 // the daemon's node (POST /witness): the daemon walks toward K_claim, then
 // solicits the WITNESS_SET closest candidates. The returned slice holds the
