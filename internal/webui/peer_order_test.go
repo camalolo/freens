@@ -70,7 +70,7 @@ func TestPeerRowsPublicFirstLANNext(t *testing.T) {
 
 	first := append([]string{rows[0].Addr}, rows[0].AltAddrs...)
 	wantFirst := []string{
-		"220.132.135.54:1026",  // public (stored Alts order kept inside the class)
+		"220.132.135.54:1026", // public (stored Alts order kept inside the class)
 		"220.132.135.54:15454",
 		"192.168.1.16:15454", // LAN
 		"192.168.1.1:15454",
