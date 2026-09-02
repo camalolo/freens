@@ -447,7 +447,24 @@ type peerRow struct {
 	Confirmed     int64
 	ConfirmedText string
 	ConfirmedAgo  bool
-	AltAddrs      []string // the node's other known addresses (multi-homed)
+	AltAddrs      []peerAlt // the node's other known addresses (multi-homed)
+	// ConfirmedAddr is the address the last direct exchange actually rode
+	// ("" when never confirmed) — a "confirmed" row whose headline is an
+	// ephemeral one-shot port explains itself this way (found live: a
+	// friend's box only ever reached us through CLI one-shots).
+	ConfirmedAddr string
+}
+
+// peerAlt is one alternate address row with its display marker. A
+// never-confirmed alternate is marked only when the contact IS confirmed
+// elsewhere (the asymmetry an operator needs to see — the friend's box
+// whose daemon never answered while one-shot ports carried every
+// confirmation); on an advertised contact every address is unconfirmed and
+// the badge already says so. Confirmed alternates stay unmarked: the "at"
+// line under the exchange cell names where the confirmation lives.
+type peerAlt struct {
+	Addr string
+	Mark string
 }
 
 func (s *Server) handleNetwork(w http.ResponseWriter, r *http.Request) {
@@ -534,7 +551,26 @@ func peerRows(peers []dht.Peer, now int64) (int, []peerRow) {
 		} else {
 			row.ConfirmedText = "never"
 		}
-		row.Addr, row.AltAddrs = dht.DisplayAddrs(pr.Addr, pr.Alts)
+		var alts []string
+		row.Addr, alts = dht.DisplayAddrs(pr.Addr, pr.Alts)
+		row.AltAddrs = make([]peerAlt, 0, len(alts))
+		for _, a := range alts {
+			mark := ""
+			if pr.Confirmed > 0 {
+				confirmed := false
+				for _, st := range pr.Alts {
+					if st.Addr == a {
+						confirmed = st.ConfirmedAt > 0
+						break
+					}
+				}
+				if !confirmed {
+					mark = "never confirmed"
+				}
+			}
+			row.AltAddrs = append(row.AltAddrs, peerAlt{Addr: a, Mark: mark})
+		}
+		row.ConfirmedAddr, _ = dht.ConfirmedAddr(pr)
 		rows = append(rows, row)
 	}
 	return len(peers), rows

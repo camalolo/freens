@@ -68,7 +68,7 @@ func TestPeerRowsPublicFirstLANNext(t *testing.T) {
 		t.Fatalf("peerRows returned %d rows, want 2", len(rows))
 	}
 
-	first := append([]string{rows[0].Addr}, rows[0].AltAddrs...)
+	first := append([]string{rows[0].Addr}, altAddrs(rows[0].AltAddrs)...)
 	wantFirst := []string{
 		"220.132.135.54:1026", // public (stored Alts order kept inside the class)
 		"220.132.135.54:15454",
@@ -84,7 +84,7 @@ func TestPeerRowsPublicFirstLANNext(t *testing.T) {
 		}
 	}
 
-	second := append([]string{rows[1].Addr}, rows[1].AltAddrs...)
+	second := append([]string{rows[1].Addr}, altAddrs(rows[1].AltAddrs)...)
 	wantSecond := []string{
 		"220.132.135.54:15353", // public preferred stays first
 		"220.132.135.54:1024",
@@ -139,4 +139,21 @@ func TestNetworkPageRendersOrderedAddrs(t *testing.T) {
 	if iHead > iLAN {
 		t.Errorf("public addr renders after the LAN addr:\n%s", s)
 	}
+	// The confirmation address is named under the exchange cell, and the
+	// never-confirmed alternates carry their marker (the friend-box shape).
+	if !strings.Contains(s, "at 192.168.1.16:15454") {
+		t.Errorf("the confirmed-at line is missing:\n%s", s)
+	}
+	if !strings.Contains(s, "· never confirmed") {
+		t.Errorf("the never-confirmed marker is missing:\n%s", s)
+	}
+}
+
+// altAddrs flattens the render rows' alternates for ordering assertions.
+func altAddrs(alts []peerAlt) []string {
+	out := make([]string, 0, len(alts))
+	for _, a := range alts {
+		out = append(out, a.Addr)
+	}
+	return out
 }

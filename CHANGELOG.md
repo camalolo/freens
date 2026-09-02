@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — "confirmed" now names the address that carried it
+
+Found live on the fleet: a friend's box reached us only through EPHEMERAL
+one-shot CLI ports (:1908, :1025, …), so a peers-table row read
+"confirmed · 1m ago" next to a headline address no daemon ever answered,
+while its real daemon port sat at "never confirmed" (its restrictive NAT
+drops unsolicited sources — only its own outbound traffic confirms).
+Both the webui peers table and `freens peers` now show, per row:
+
+- **"at <address>"** under the last-direct-exchange cell — the address
+  the confirmation actually rode (dht.ConfirmedAddr: the freshest
+  per-address confirmation, which for multi-homed contacts need not be
+  the displayed headline).
+- **"· never confirmed" markers** on alternates, shown only when the
+  contact IS confirmed elsewhere — the asymmetry an operator needs to
+  see. On an advertised contact every address is unconfirmed and the
+  badge already says so. `freens peers` lists them compactly as
+  `never confirmed: :1025 :1024` (same-host ports shortened).
+
+`freens peers -json` gains `confirmed_addr` and per-alt `confirmed`
+flags; the alts list follows the display rules (non-literals dropped).
+
 ## Unreleased — `freens peers`, `freens keys`, `freens store`: the CLI catches up with the web UI's read surfaces
 
 The web UI's Network/Keys/Store pages had no `freens` verb behind them —

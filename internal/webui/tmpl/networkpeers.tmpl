@@ -4,9 +4,9 @@
 <tr><th>Address</th><th>Node ID</th><th>Last direct exchange</th><th>State</th></tr>
 {{range .PeerRows}}
 <tr>
-  <td class="mono">{{.Addr}}{{range .AltAddrs}}<div class="muted" style="font-size:.75rem">also {{.}}</div>{{end}}</td>
+  <td class="mono">{{.Addr}}{{range .AltAddrs}}<div class="muted" style="font-size:.75rem">also {{.Addr}}{{if .Mark}} · {{.Mark}}{{end}}</div>{{end}}</td>
   <td class="mono">{{printf "%.12s…" .PK}}</td>
-  <td class="mono">{{.ConfirmedText}}</td>
+  <td class="mono">{{.ConfirmedText}}{{if .ConfirmedAddr}}<div class="muted" style="font-size:.75rem">at {{.ConfirmedAddr}}</div>{{end}}</td>
   <td>{{if .ConfirmedAgo}}<span class="badge ok">confirmed</span>{{else}}<span class="badge dim">advertised</span>{{end}}</td>
 </tr>
 {{end}}

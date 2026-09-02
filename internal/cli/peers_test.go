@@ -50,6 +50,38 @@ func TestCmdPeersOrdersPublicFirstAndMarksState(t *testing.T) {
 	if !strings.Contains(out, "node aabbccddeeff…") {
 		t.Errorf("the node-id prefix is missing:\n%s", out)
 	}
+	// The confirmed-at address is named (the friend-box lesson: "confirmed"
+	// on an ephemeral one-shot port must say which port carried it), and
+	// the never-confirmed alternates are listed with same-host ports short.
+	if !strings.Contains(out, "(at 192.168.1.16:15454)") {
+		t.Errorf("the confirmation address is missing:\n%s", out)
+	}
+	if !strings.Contains(out, "never confirmed: 220.132.135.54:15454 192.168.1.1:15454") {
+		t.Errorf("the never-confirmed alternates are missing:\n%s", out)
+	}
+	_ = s
+}
+
+// TestCmdPeersConfirmedAtEphemeralPort: the live fleet shape that prompted
+// the rendering — a confirmed contact whose confirmation rode an ephemeral
+// one-shot port (:1908) while the real daemon (:15353) never answered.
+func TestCmdPeersConfirmedAtEphemeralPort(t *testing.T) {
+	h := tempHome(t)
+	s := startStubAdmin(t, h+"/admin.sock", nil)
+	pk := "40b1a48208d40000000000000000000000000000000000000000000000000000"
+	s.peersJSON = `{"peers":[{"addr":"61.224.174.153:1908","pk":"` + pk + `","confirmed":` + now2() + `,
+		 "alts":[{"addr":"61.224.174.153:15353"},{"addr":"61.224.174.153:1025"}]}]}`
+
+	out, err := captureStdout(t, func() error { return cmdPeers(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "confirmed · 0m ago (at 61.224.174.153:1908)") {
+		t.Errorf("the ephemeral confirmation address must be named:\n%s", out)
+	}
+	if !strings.Contains(out, "never confirmed: :15353 :1025") {
+		t.Errorf("same-host never-confirmed addrs must render as :port:\n%s", out)
+	}
 	_ = s
 }
 

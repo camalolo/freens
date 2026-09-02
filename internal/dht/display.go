@@ -60,3 +60,23 @@ func addrDisplayRank(addr string) int {
 	}
 	return 0
 }
+
+// ConfirmedAddr names the address a multi-homed contact's last direct
+// exchange actually rode (the freshest per-address confirmation), with its
+// timestamp — ""/0 when the contact was never confirmed. Found live
+// 2026-09-02: a friend's box exchanged only through EPHEMERAL one-shot CLI
+// ports (:1908, :1025, …), so "confirmed · 1m ago" sat next to a headline
+// address no daemon ever answered — the confirmation's address is the part
+// that makes the row explain itself.
+func ConfirmedAddr(p Peer) (string, int64) {
+	addr, best := p.Addr, p.Confirmed
+	for _, a := range p.Alts {
+		if a.ConfirmedAt > best {
+			addr, best = a.Addr, a.ConfirmedAt
+		}
+	}
+	if best <= 0 {
+		return "", 0
+	}
+	return addr, best
+}
