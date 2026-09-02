@@ -35,6 +35,8 @@ type stubAdmin struct {
 	getKey         []byte               // when set, /get serves getEnv (base64)
 	getEnv         *wire.SignedEnvelope // when getKey matches
 	statusJSON     string               // when set, served instead of the default /status body
+	peersJSON      string               // when set, served by /peers
+	storeJSON      string               // when set, served by /store
 }
 
 // startStubAdmin listens on sock (the admin socket path of a temp home).
@@ -94,7 +96,18 @@ func startStubAdmin(t *testing.T, sock string, resolve map[string]string) *stubA
 		fmt.Fprint(w, `{}`)
 	})
 	mux.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
+		if s.peersJSON != "" {
+			fmt.Fprint(w, s.peersJSON)
+			return
+		}
 		fmt.Fprint(w, `[]`)
+	})
+	mux.HandleFunc("/store", func(w http.ResponseWriter, r *http.Request) {
+		if s.storeJSON != "" {
+			fmt.Fprint(w, s.storeJSON)
+			return
+		}
+		fmt.Fprint(w, `{"entries":[],"count":0}`)
 	})
 	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
 		var gj struct {

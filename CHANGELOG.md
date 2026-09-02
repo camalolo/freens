@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — `freens peers`, `freens keys`, `freens store`: the CLI catches up with the web UI's read surfaces
+
+The web UI's Network/Keys/Store pages had no `freens` verb behind them —
+the operator asked where the peers listing went (2026-09-02):
+
+- **`freens peers`** prints the running daemon's routing table: one block
+  per multi-homed contact with display-ordered addresses (public first,
+  LAN after — the SAME dht.DisplayAddrs helper the webui table uses, so
+  the two surfaces can never diverge again), the node-key prefix the web
+  UI shows, last direct exchange, and the honest confirmed/advertised
+  state. `-v` adds full keys + node IDs; `-json` for scripts. Rows sort
+  confirmed-first. Refusing to run against `-peers` standalone: the
+  routing table is daemon state.
+- **`freens keys`** lists the local keychain inventory (owner/recovery
+  keyfiles, sizes, mod times, passphrase-encryption flag) —
+  keychain.Inventory, the Keys page's source.
+- **`freens store`** lists the daemon's live envelope store (GET /store):
+  decoded names, sequences, live/lapsed/REVOKED lease state, §7.4 claim
+  flags, expiry and size — the Store page's source, lapsed entries last.
+
 ## Unreleased — the phantom-fresh lease is dead: auto-renew verifies the network, publishes report acceptance, doctor checks the lease cross-box, and ghosts stop circulating
 
 Four follow-ups to the 2026-09-02 camalolo incident (the local keychain

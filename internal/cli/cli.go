@@ -99,6 +99,9 @@ var dispatch = map[string]func([]string) error{
 	"start":           cmdStart,
 	"backup":          cmdBackup,
 	"status":          cmdStatus,
+	"peers":           cmdPeers,
+	"keys":            cmdKeys,
+	"store":           cmdStore,
 	"doctor":          cmdDoctor,
 	"upgrade":         cmdUpgrade,
 	"upgrade-migrate": cmdUpgradeMigrate,
@@ -241,6 +244,10 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "                         (prompts for the name when interactive; safe to re-run)")
 	fmt.Fprintln(w, "  setup                  install: config, seeds, system systemd service (boots with the machine), OS resolver wiring (--uninstall reverses)")
 	fmt.Fprintln(w, "  status                 plain-language health: daemon + name -> IP (-v adds raw daemon fields)")
+	fmt.Fprintln(w, "  peers                  the running daemon's routing table: addresses, node IDs, last")
+	fmt.Fprintln(w, "                         direct exchange, confirmed/advertised (-v raw; -json)")
+	fmt.Fprintln(w, "  keys                   the local keychain inventory (owner/recovery keyfiles)")
+	fmt.Fprintln(w, "  store                  the running daemon's envelope store: names, sequences, leases")
 	fmt.Fprintln(w, "  doctor                 health checks: admin socket, DNS path, aliases, peers, seeds, OS resolver")
 	fmt.Fprintln(w, "                         (--fix repairs: starts the daemon, wires the OS resolver)")
 	fmt.Fprintln(w, "  upgrade                self-update: fetch the latest GitHub release, verify + install its binaries in")
