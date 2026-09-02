@@ -3329,10 +3329,21 @@ func (n *Node) issueToken(raddr *net.UDPAddr) []byte {
 // encodeNodes serializes contacts as a CBOR array of [ip, port, node_id, pk]
 // arrays (the {nodes: [...]} payload of find_node / get-miss). IPv4 is emitted
 // as 4 bytes, IPv6 as 16.
+//
+// Addresses that are not literal "ip:port" (hostname-shaped seeds.conf
+// contacts: freens.camalolo.com:15353) are SKIPPED, never encoded: §6.2
+// advertises (ip, port, node_pubkey) — an IP — and encoding a hostname would
+// emit empty IP bytes, which receivers decode as a literal "<nil>:port"
+// contact (found live 2026-09-02: the community seed propagated
+// "<nil>:15353" alts fleet-wide through every {nodes} reply that listed it).
+// The hostname contact stays dialable LOCALLY (ResolveUDPAddr resolves at
+// ping time); only its wire advertisement is suppressed.
 func encodeNodes(contacts []*NodeContact) []any {
 	out := make([]any, 0, len(contacts))
 	for _, c := range contacts {
-		out = append(out, encodeNodeEntry(c.Addr, c.NodeID, c.PublicKey))
+		if advertiseableAddr(c.Addr) {
+			out = append(out, encodeNodeEntry(c.Addr, c.NodeID, c.PublicKey))
+		}
 		// Multi-homing (2026-09-01, operator idea: "all the peers known
 		// should be returned by the seed"): every known address rides
 		// along as its own entry — same NodeID, different addr. Newcomers
@@ -3343,10 +3354,20 @@ func encodeNodes(contacts []*NodeContact) []any {
 		// overwrite behavior, transient). Advertisement never confirms:
 		// the anti-ghost invariant is enforced at learn time, not here.
 		for _, a := range c.Alts {
-			out = append(out, encodeNodeEntry(a.Addr, c.NodeID, c.PublicKey))
+			if advertiseableAddr(a.Addr) {
+				out = append(out, encodeNodeEntry(a.Addr, c.NodeID, c.PublicKey))
+			}
 		}
 	}
 	return out
+}
+
+// advertiseableAddr reports whether addr is a literal "ip:port" whose host
+// parses as a SPECIFIED IP address — the only shape §6.2 allows on the wire.
+// See the encodeNodes doc for the "<nil>:port" failure this prevents.
+func advertiseableAddr(addr string) bool {
+	ip := net.ParseIP(hostOf(addr))
+	return ip != nil && !ip.IsUnspecified()
 }
 
 // encodeNodeEntry renders one {nodes} element: [ipBytes, port, nodeID, pk].
@@ -3396,6 +3417,18 @@ func parseNodes(raw any) []*NodeContact {
 			continue
 		}
 		ip := net.IP(ipBytes)
+		// Defense against old peers (pre-2026-09-02) that encoded
+		// hostname-shaped contacts as EMPTY ip bytes: net.IP{}.String() is
+		// the literal "<nil>", and learning "<nil>:port" poisons the table
+		// with an undialable address. Only real 4-byte (IPv4) or 16-byte
+		// (IPv6) addresses are contacts; the unspecified address advertises
+		// nothing dialable either.
+		if n := len(ipBytes); n != net.IPv4len && n != net.IPv6len {
+			continue
+		}
+		if ip.IsUnspecified() {
+			continue
+		}
 		addr := net.JoinHostPort(ip.String(), strconv.FormatUint(port, 10))
 		c, err := NewNodeContact(nodeID, pk, addr, 0)
 		if err != nil {

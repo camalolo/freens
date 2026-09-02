@@ -7,9 +7,11 @@ import (
 	"embed"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -519,11 +521,17 @@ func (s *Server) handleDashChecks(w http.ResponseWriter, r *http.Request) {
 }
 
 // peerRows converts the daemon's peer list into render rows (the confirmed
-// badge + "last direct exchange" text).
+// badge + "last direct exchange" text). Each row's address list is put in
+// DISPLAY order: public/global addresses first, LAN/private ones after (the
+// daemon's stored preferred order is kept inside each class), and addresses
+// that are not IP literals are dropped — pre-2026-09-02 fleets exchanged
+// hostname-shaped seed contacts as empty {nodes} ip bytes, which receivers
+// learned as the literal "<nil>:port" (see internal/dht/transport.go
+// encodeNodes).
 func peerRows(peers []dht.Peer, now int64) (int, []peerRow) {
 	rows := make([]peerRow, 0, len(peers))
 	for _, pr := range peers {
-		row := peerRow{Addr: pr.Addr, PK: fmt.Sprintf("%x", pr.PublicKey), Confirmed: pr.Confirmed}
+		row := peerRow{PK: fmt.Sprintf("%x", pr.PublicKey), Confirmed: pr.Confirmed}
 		if pr.Confirmed > 0 && now-pr.Confirmed < 3600 {
 			row.ConfirmedAgo = true
 			row.ConfirmedText = fmt.Sprintf("%dm ago", (now-pr.Confirmed)/60)
@@ -532,14 +540,60 @@ func peerRows(peers []dht.Peer, now int64) (int, []peerRow) {
 		} else {
 			row.ConfirmedText = "never"
 		}
-		for _, a := range pr.Alts {
-			if a.Addr != pr.Addr {
-				row.AltAddrs = append(row.AltAddrs, a.Addr)
-			}
-		}
+		row.Addr, row.AltAddrs = displayAddrs(pr.Addr, pr.Alts)
 		rows = append(rows, row)
 	}
 	return len(peers), rows
+}
+
+// displayAddrs merges a contact's preferred address with its alternates into
+// (headline, alternates) display form: non-literal addresses dropped, public
+// addresses first, LAN/private/loopback after, stored order preserved within
+// each class. Purely cosmetic — the daemon's preferred (probe) address and
+// Alts bookkeeping are untouched.
+func displayAddrs(primary string, alts []dht.AddrState) (string, []string) {
+	var addrs []string
+	if isIPLiteralAddr(primary) {
+		addrs = append(addrs, primary)
+	}
+	for _, a := range alts {
+		if a.Addr != primary && isIPLiteralAddr(a.Addr) {
+			addrs = append(addrs, a.Addr)
+		}
+	}
+	sort.SliceStable(addrs, func(i, j int) bool {
+		return addrDisplayRank(addrs[i]) < addrDisplayRank(addrs[j])
+	})
+	if len(addrs) == 0 {
+		return primary, nil // nothing parseable: show the raw value as-is
+	}
+	return addrs[0], addrs[1:]
+}
+
+// isIPLiteralAddr reports whether addr is "ip:port" with a parseable IP.
+func isIPLiteralAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return net.ParseIP(host) != nil
+}
+
+// addrDisplayRank orders addresses for the peers table: 0 = public/global,
+// 1 = LAN (private, loopback, link-local) or unparseable (sorts last).
+func addrDisplayRank(addr string) int {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 1
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return 1
+	}
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		return 1
+	}
+	return 0
 }
 
 type keyRow = keychain.KeyInfo

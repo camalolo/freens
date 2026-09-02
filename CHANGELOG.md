@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.14.2 — the peers table stops showing "<nil>:15353" and lists public addresses before LAN ones
+
+Two fleet-visible cleanups around the multi-homed contacts table (each
+peer row shows every address a node is known at, added v0.13.3):
+
+- **dht: hostname-shaped contacts no longer ride `{nodes}`
+  advertisements.** seeds.conf pins the community seed by HOSTNAME
+  (`freens.camalolo.com:15353#…`), so every node's routing table holds a
+  contact whose address is not an IP literal. That is fine for dialing
+  (ResolveUDPAddr resolves at ping time) but was poison on the wire:
+  `encodeNodeEntry` emitted EMPTY ip bytes for it, and every receiver's
+  `parseNodes` stringified those bytes as the literal text `<nil>` —
+  teaching the whole fleet an undialable `<nil>:15353` "address" for the
+  seed (node 38c5d5b3…, visible in every webUI peers table since the
+  multi-homing rollout). encodeNodes now skips addresses whose host does
+  not parse as an IP (preferred or alt — the entry is simply not
+  advertised; the contact stays dialable locally), and parseNodes skips
+  entries with empty/garbage/unspecified ip bytes so old peers cannot
+  reintroduce the artifact. Spec §6.2 amended (advertised addresses are
+  literals; malformed entries are skipped).
+- **webui: the peers table orders each node's addresses public-first.**
+  The row lists the public/global addresses first, then LAN/private/
+  link-local ones (stored recency order kept within each class), and
+  drops addresses that are not IP literals — so a pre-fix `<nil>` alt
+  still hiding in a running table renders nowhere until the daemon
+  restart clears it. Display-only: the daemon's preferred (probe)
+  address and Alts bookkeeping are untouched. IPv6 addresses order as
+  public (a global v6 sorts first; fe80::/10 and fc00::/7 sort as LAN).
+
 ## v0.14.1 — names stopped resolving when their witnesses moved (§7.3 membership), the seed could not resolve the names it witnessed, renewals stop dying silently, and the §9.5.4 trust chain stops aging out
 
 Four fleet-found fixes, all of the "works until the network has run long

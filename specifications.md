@@ -422,6 +422,12 @@ automatically contributes a node"). Clients MAY disable participation
   forgery detectable.
 - Transport: UDP. Default port 15353 (`FREENS_PORT`). Port is
   configurable; nodes advertise `(ip, port, node_pubkey)`.
+  The advertised address is a LITERAL IP: `{nodes}` entries carry the
+  address as 4 (IPv4) or 16 (IPv6) raw bytes. A node MAY keep a
+  hostname-shaped contact locally (seeds re-resolve at dial time), but
+  MUST NOT encode one into `{nodes}` — receivers treat unparseable/empty
+  IP bytes as a malformed entry and skip it (never a literal "<nil>"
+  contact; found live 2026-09-02).
 
 ### 6.3 RPC protocol
 
