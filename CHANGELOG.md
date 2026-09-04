@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — v0.15.5: the register-page render fix, the publish walk-rescue, and the daemon-path re-attest hook
+
+Three fixes straight from live-fleet testing of v0.15.4:
+
+- **webui: registering a name no longer 500s at the progress card.**
+  The register page inlines the jobfragment template with the PAGE's
+  data — but jobfragment evaluates fields the page struct does not
+  carry, and a missing struct field is a template EXECUTION error. The
+  page had 500'd ("render error") on every re-attached progress card
+  since v0.6.0, hiding the actual outcome of every webui registration —
+  found live when the first real browser registration attempt (a §7.7
+  "com" refusal on desktop) surfaced it. The page now renders the
+  attached job's VIEW data (shared with the polled fragment endpoint),
+  so a refused registration shows its clean refusal message. (The §7.7
+  gate itself was never involved — it refused correctly before any key
+  was generated.)
+- **dht: a publish that accepts nothing from its local table rescues
+  itself with a real walk.** The live incident this fixes: standalone
+  `renew -force -peers` reported "publish (K_claim): accepted by 0 of 8
+  peers" while the fleet was healthy — the put targets came from
+  rt.Closest over a bootstrap table polluted with ghost one-shot
+  contacts, so every put timed out. When the table round yields zero
+  acceptances, the publish now runs IterativeFindNode once and puts to
+  the closest REACHED contacts — the targets it should have used in the
+  first place — and reports the honest count. Bounded: the rescue only
+  runs on the total-failure path.
+- **admin: daemon-path renewals now drive §8.3 re-attestation.** The
+  v0.15.4 collection hook lived in the auto-renew tick and the
+  standalone CLI path — but the standalone path's K_claim leg is
+  exactly what the ghost pollution breaks, so in practice re-attests
+  only fired on the tick. /publish's claim leg now triggers the
+  collection fire-and-forget from the daemon (whose routing view is
+  warm), so every daemon-transport renewal keeps the fleet's freshness
+  evidence alive.
+
 ## Unreleased — v0.15.4: the v2 renewal amendment (§8.3 re-attestation — network-transferable freshness evidence)
 
 The designated v2 path from the backdated-claim defense, implemented:

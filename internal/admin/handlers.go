@@ -424,6 +424,15 @@ func (s *Server) runPublish(ctx context.Context, env *wire.SignedEnvelope, claim
 				"alias", claim.Alias, "err", err)
 		} else {
 			accepted = 2
+			// §8.3 re-attestation (v2 amendment): the claim leg just
+			// published, so drive the witness re-notarization FROM THE
+			// DAEMON — its routing view is warm, unlike a standalone CLI
+			// node's ghost-polluted table (the standalone path cannot
+			// reliably do this; found live 2026-09-04). Fire-and-forget:
+			// the HTTP response must not wait on a witness round, and the
+			// collection is best-effort by design (never a publish
+			// failure).
+			go s.collectReAttests(claim)
 		}
 	}
 	for _, ks := range all {
@@ -433,6 +442,21 @@ func (s *Server) runPublish(ctx context.Context, env *wire.SignedEnvelope, claim
 		}
 	}
 	return accepted, all, nil
+}
+
+// collectReAttests drives the §8.3 witness re-notarization for a freshly
+// published claim (the daemon-path hook: CLI renewals via the admin socket
+// reach here, and the daemon's warm table reaches the real witness set).
+// Best-effort end to end — a short haul is logged, never an error.
+func (s *Server) collectReAttests(claim *claims.AliasClaim) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	atts, err := s.node.CollectReAttests(ctx, claim.Alias, claim, constants.WitnessSet)
+	if err != nil {
+		s.log.Debug("admin: re-attest collection failed", "alias", claim.Alias, "err", err)
+		return
+	}
+	s.log.Info("admin: re-attested claim at witness set", "alias", claim.Alias, "witnesses", len(atts))
 }
 
 // storeLocally installs env at every legitimate key (dht.StorageKeys) in the

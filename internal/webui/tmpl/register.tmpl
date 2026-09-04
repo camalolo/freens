@@ -26,7 +26,7 @@
   <div class="card" id="jobcard" {{if not .JobID}}style="display:none"{{end}}>
     <div class="card-title">Job</div>
     <div id="jobbody">
-      {{if .JobID}}{{template "jobfragment" .}}{{end}}
+      {{if .JobID}}{{template "jobfragment" .Job}}{{end}}
     </div>
   </div>
 </div>

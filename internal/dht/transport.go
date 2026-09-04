@@ -2762,8 +2762,35 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 			stats.Accepted++
 		}
 	}
+	// Walk-rescue (v0.15.5): zero acceptances from the local-table round
+	// means the table VIEW around key is suspect — a cold standalone node's
+	// bootstrap table is polluted with ghost one-shot contacts, and every
+	// put to them times out while the namespace is perfectly healthy (found
+	// live 2026-09-04: standalone renew reported "accepted by 0 of 8" on a
+	// resolving fleet). Rescue once with a REAL walk: IterativeFindNode
+	// returns the closest REACHED contacts, which is what a put should have
+	// targeted in the first place. Bounded: it runs only on the
+	// total-failure path (rare for a warm daemon, the rule for a cold
+	// one-shot node).
+	if stats.Accepted == 0 && ctx.Err() == nil {
+		tried := make(map[string]bool, len(closest))
+		for _, c := range closest {
+			tried[string(c.NodeID)] = true
+		}
+		reached := n.IterativeFindNode(ctx, key, constants.RReplication)
+		for _, c := range reached {
+			if tried[string(c.NodeID)] || bytes.Equal(c.NodeID, n.ID()) {
+				continue
+			}
+			tried[string(c.NodeID)] = true
+			stats.Targets++
+			if err := n.putToPeer(ctx, key, envBytes, evidence, c); err == nil {
+				stats.Accepted++
+			}
+		}
+	}
 	if stats.Accepted == 0 {
-		return stats, fmt.Errorf("dht: publish accepted by 0 of %d peers", len(closest))
+		return stats, fmt.Errorf("dht: publish accepted by 0 of %d peers", stats.Targets)
 	}
 	return stats, nil
 }

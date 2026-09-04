@@ -150,9 +150,28 @@ func (s *Server) recentJobs() []recentJob {
 	return out
 }
 
-// renderJobFragment executes the jobfragment template standalone.
-func (s *Server) renderJobFragment(w http.ResponseWriter, j *job) {
+// jobView is the jobfragment template's data. The polled fragment endpoint
+// (renderJobFragment) and the register page's inline render share it — the
+// page MUST pass THIS, not the page data: jobfragment evaluates fields the
+// page struct does not have, and a missing struct field is a template
+// EXECUTION error (the v0.6.0-era inline call passed registerPageData, so
+// every re-attached progress card 500'd with "render error" — found live
+// 2026-09-04, the first real browser registration attempt).
+type jobView struct {
+	JobID     string
+	JobLabel  string
+	JobPct    int
+	JobDone   bool
+	JobError  string
+	JobResult *RegisterResult
+	JobSteps  []jobStepView
+}
+
+// viewOf snapshots j's render state under its mutex (the runner writes
+// steps/pct/Err/Result in its final critical section).
+func (s *Server) viewOf(j *job) jobView {
 	j.mu.Lock()
+	defer j.mu.Unlock()
 	steps := make([]jobStepView, 0, len(j.steps))
 	for i, st := range j.steps {
 		v := jobStepView{Text: st}
@@ -165,25 +184,24 @@ func (s *Server) renderJobFragment(w http.ResponseWriter, j *job) {
 		}
 		steps = append(steps, v)
 	}
-	pct := j.pct
-	errText := j.Err
-	done := j.Done
 	var res *RegisterResult
 	if rr, ok := j.Result.(*RegisterResult); ok { // read under j.mu: the runner writes Result in its final critical section
 		res = rr
 	}
-	j.mu.Unlock()
+	return jobView{
+		JobID:     j.ID,
+		JobLabel:  j.Label,
+		JobPct:    j.pct,
+		JobDone:   j.Done,
+		JobError:  j.Err,
+		JobResult: res,
+		JobSteps:  steps,
+	}
+}
 
-	data := struct {
-		JobID     string
-		JobLabel  string
-		JobPct    int
-		JobDone   bool
-		JobError  string
-		JobResult *RegisterResult
-		JobSteps  []jobStepView
-	}{j.ID, j.Label, pct, done, errText, res, steps}
-	s.fragment(w, "jobfragment", data)
+// renderJobFragment executes the jobfragment template standalone.
+func (s *Server) renderJobFragment(w http.ResponseWriter, j *job) {
+	s.fragment(w, "jobfragment", s.viewOf(j))
 }
 
 // fragment renders a named fragment template (not a full layout) — for

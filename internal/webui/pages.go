@@ -378,6 +378,9 @@ type registerPageData struct {
 	DefaultIP     string
 	WitnessQuorum int
 	JobID         string
+	// Job is the attached job's fragment view (nil when none) — what the
+	// inline {{template "jobfragment"}} renders (see handleRegisterPage).
+	Job jobView
 }
 
 func (s *Server) handleRegisterPage(w http.ResponseWriter, r *http.Request) {
@@ -388,9 +391,13 @@ func (s *Server) handleRegisterPage(w http.ResponseWriter, r *http.Request) {
 	if diff, err := s.d.Difficulty(r.Context()); err == nil {
 		d.WitnessQuorum = diff.WitnessQuorum
 	}
-	// An in-flight or recent job re-attaches the live progress card.
+	// An in-flight or recent job re-attaches the live progress card. The
+	// inline render gets the JOB's view data — the fragment template
+	// evaluates fields the page struct does not carry (the v0.6.0-era
+	// page-data call 500'd every re-attach; found live 2026-09-04).
 	if j := s.latestJob(); j != nil {
 		d.JobID = j.ID
+		d.Job = s.viewOf(j)
 	}
 	s.render(w, http.StatusOK, "register", d)
 }
