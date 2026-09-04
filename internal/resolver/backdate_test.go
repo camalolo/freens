@@ -28,12 +28,16 @@ package resolver
 //
 // The residuals are asserted LAST and documented: (a) a sparse view (nil
 // set) cannot name a witness set — the protocol's Sybil bound (§12);
-// (b) a MATURE self-consistent fabricated quorum now passes because
-// membership has a horizon. Both are the priced-by-grinding §12 bound, not
-// bugs; re-tightening either must update the changelog and this file
-// together.
+// (b) a MATURE self-consistent fabricated quorum passes because membership
+// has a horizon — v0.15.3 blunts the displacement version of this (the #8
+// ratchet, claims_ratchet.go: an unobserved past-horizon identity cannot
+// displace one this resolver established, tested below), but first-sight
+// acceptance remains the fail-open bootstrap. Both residuals are the
+// priced-by-grinding §12 bound, not bugs; re-tightening either must update
+// the changelog and this file together.
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"testing"
@@ -306,5 +310,132 @@ func TestBackdatedSparseViewResidualDocumentsSybilBound(t *testing.T) {
 	}
 	if contested {
 		t.Error("a 100-day-old winning claim is past CONTEST_WINDOW: must be final, not contested")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v0.15.3 — the #8 ratchet (claims_ratchet.go): a past-horizon identity a
+// resolver never observed cannot displace one it did. The fixtures reuse
+// bdWorld/bdSetSource; the resolver is SHARED across resolutions so the
+// ledger state carries, which is the point.
+// ---------------------------------------------------------------------------
+
+// bdResolver builds one resolver over a mutable bdSetSource with a fixed
+// clock, returning both (the caller mutates src.envs between resolutions).
+func bdResolver(t *testing.T, src *bdSetSource) *Resolver {
+	t.Helper()
+	cfg, err := ParseConfig("[tld-routes]\n* = freens\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(cfg, src, nil)
+	r.Now = func() int64 { return fixedNow }
+	return r
+}
+
+func bdResolveR(r *Resolver, alias string) (tldID []byte, contested bool) {
+	got, contested, _ := r.resolveAliasClaim(context.Background(), alias, fixedNow)
+	return got, contested
+}
+
+// TestBackdatedNewcomerCannotDisplaceEstablished: the §6.4 ordering alone is
+// earliest-asserted-ts-first, so Mallory's older self-consistent backdated
+// claim WINS against the established victim. The ratchet drops the unproven
+// newcomer (and refuses to serve it during the incumbent's replication gap).
+func TestBackdatedNewcomerCannotDisplaceEstablished(t *testing.T) {
+	const alias = "ratchetv"
+	victimClaim, victimEnv, _ := bdWorld(t, alias, uint64(fixedNow-90*86400), uint64(fixedNow-90*86400), constants.W)
+	malloryClaim, malloryEnv, _ := bdWorld(t, alias, uint64(fixedNow-95*86400), uint64(fixedNow-95*86400), constants.W)
+	_ = malloryClaim
+
+	src := &bdSetSource{set: nil}
+	r := bdResolver(t, src)
+
+	// Resolution 1: only the victim visible — resolves, identity established.
+	src.envs = []*wire.SignedEnvelope{victimEnv}
+	got, _ := bdResolveR(r, alias)
+	if !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("victim's mature claim did not resolve on first sight")
+	}
+
+	// Resolution 2: Mallory's older forgery joins the set. Pre-ratchet this
+	// resolved to Mallory (that IS the #8 hole); the ratchet drops the
+	// newcomer.
+	src.envs = []*wire.SignedEnvelope{victimEnv, malloryEnv}
+	got, _ = bdResolveR(r, alias)
+	if !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("VULNERABLE: backdated newcomer displaced the established identity")
+	}
+
+	// Resolution 3: replication gap — ONLY the forgery visible. Answer a
+	// miss (NXDOMAIN) rather than serve the unproven claim.
+	src.envs = []*wire.SignedEnvelope{malloryEnv}
+	got, _ = bdResolveR(r, alias)
+	if got != nil {
+		t.Fatal("forgery served during the incumbent's replication gap")
+	}
+}
+
+// TestBackdatedFirstSightBootstrapDocumentsBound: a fresh resolver's FIRST
+// sight of a past-horizon claim accepts (fail-open bootstrap — the resolver
+// has nothing to defend). This is the standing bound claims_ratchet.go
+// documents: squatting a never-resolved alias is not defeated here; it
+// needs the renewal-fresh-attestation amendment.
+func TestBackdatedFirstSightBootstrapDocumentsBound(t *testing.T) {
+	const alias = "ratchets"
+	_, malloryEnv, _ := bdWorld(t, alias, uint64(fixedNow-95*86400), uint64(fixedNow-95*86400), constants.W)
+	src := &bdSetSource{envs: []*wire.SignedEnvelope{malloryEnv}, set: nil}
+	if got, _ := bdResolve(t, src, alias); got == nil {
+		t.Fatal("fresh-resolver bootstrap refused a past-horizon claim — the ratchet must be fail-open on first sight")
+	}
+}
+
+// TestBackdatedEstablishedDefendsAcrossResolutions: the SAME resolver that
+// bootstrapped on identity A drops a later-appearing past-horizon identity B
+// — the shared-resolver variant of the bootstrap test above (bdResolve
+// builds a fresh resolver per call, which resets the ledger).
+func TestBackdatedEstablishedDefendsAcrossResolutions(t *testing.T) {
+	const alias = "ratchetd"
+	firstClaim, firstEnv, _ := bdWorld(t, alias, uint64(fixedNow-95*86400), uint64(fixedNow-95*86400), constants.W)
+	_, laterEnv, _ := bdWorld(t, alias, uint64(fixedNow-94*86400), uint64(fixedNow-94*86400), constants.W)
+
+	src := &bdSetSource{set: nil}
+	r := bdResolver(t, src)
+
+	src.envs = []*wire.SignedEnvelope{firstEnv}
+	got, _ := bdResolveR(r, alias)
+	if !bytes.Equal(got, firstClaim.TldID) {
+		t.Fatal("bootstrap resolution failed")
+	}
+
+	src.envs = []*wire.SignedEnvelope{firstEnv, laterEnv}
+	got, _ = bdResolveR(r, alias)
+	if !bytes.Equal(got, firstClaim.TldID) {
+		t.Fatal("VULNERABLE: a second past-horizon identity displaced the established one")
+	}
+}
+
+// TestHonestInWindowClaimUnaffectedByRatchet: the ratchet never touches
+// in-window claims (they passed membership) — a fresh honest registration
+// riding alongside an established mature claim survives the filter, and the
+// §6.4 ordering picks the mature incumbent (earlier ts) as before.
+func TestHonestInWindowClaimUnaffectedByRatchet(t *testing.T) {
+	const alias = "ratcheth"
+	victimClaim, victimEnv, _ := bdWorld(t, alias, uint64(fixedNow-90*86400), uint64(fixedNow-90*86400), constants.W)
+	freshClaim, freshEnv, _ := bdWorld(t, alias, uint64(fixedNow-60), uint64(fixedNow-60), constants.W)
+	_ = freshClaim
+
+	src := &bdSetSource{set: nil}
+	r := bdResolver(t, src)
+
+	src.envs = []*wire.SignedEnvelope{victimEnv}
+	if got, _ := bdResolveR(r, alias); !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("incumbent did not establish")
+	}
+
+	src.envs = []*wire.SignedEnvelope{victimEnv, freshEnv}
+	got, _ := bdResolveR(r, alias)
+	if !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("honest in-window registration changed the outcome (ordering must still pick the earlier ts)")
 	}
 }

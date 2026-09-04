@@ -151,6 +151,21 @@ func (r *Resolver) ResolveMsg(ctx context.Context, m *dns.Msg) *dns.Msg {
 	resp.SetReply(m)
 	resp.RecursionAvailable = r.Upstream != nil || r.Freens != nil
 
+	// RFC 6891 responder duties: when the request carried an OPT, echo one
+	// advertising back the requester's own payload size (clamped to the
+	// protocol floor and a sane ceiling). writeReply uses it as the UDP
+	// truncation budget, so EDNS-capable stubs get large answers over UDP.
+	if opt := m.IsEdns0(); opt != nil {
+		size := int(opt.UDPSize())
+		if size < dns.MinMsgSize {
+			size = dns.MinMsgSize
+		}
+		if size > maxEDNSPayload {
+			size = maxEDNSPayload
+		}
+		resp.SetEdns0(uint16(size), false)
+	}
+
 	if len(m.Question) == 0 {
 		resp.Rcode = dns.RcodeFormatError
 		return resp
@@ -216,19 +231,37 @@ func (r *Resolver) ResolveMsg(ctx context.Context, m *dns.Msg) *dns.Msg {
 	return resp
 }
 
-// writeReply sends resp, truncating UDP responses that exceed the classic
-// 512-byte datagram budget so the client sees TC + TCP fallback instead of a
-// silently-dropped oversized datagram (miekg/dns never frames UDP errors for
-// us; pre-v0.7.1 a >512 B answer simply vanished — found auditing the TXT
-// paths). No-op truncation for TCP.
+// writeReply sends resp, truncating UDP responses to the datagram budget the
+// CLIENT advertised: 512 bytes classic, or the EDNS0 payload size the
+// requester declared (echoed onto the response by ResolveMsg) — serving a
+// 4 KB-capable EDNS client 512-byte truncation forces needless TCP fallback
+// for every large answer (found in the 2026-09-04 audit). Truncation itself
+// stays: an oversized datagram would be silently dropped by the network
+// (miekg/dns never frames UDP errors for us; pre-v0.7.1 a >512 B answer
+// simply vanished — found auditing the TXT paths). No truncation for TCP.
 func writeReply(w dns.ResponseWriter, resp *dns.Msg) {
 	if addr := w.RemoteAddr(); addr != nil {
 		if _, isUDP := addr.(*net.UDPAddr); isUDP {
-			resp.Truncate(dns.MinMsgSize)
+			budget := dns.MinMsgSize
+			if opt := resp.IsEdns0(); opt != nil && int(opt.UDPSize()) > budget {
+				budget = int(opt.UDPSize())
+			}
+			resp.Truncate(budget)
 		}
 	}
 	_ = w.WriteMsg(resp)
 }
+
+// maxEDNSPayload caps the UDP payload size we advertise (upstream) and
+// honor (client-facing): 4096 is the traditional interoperable maximum.
+const maxEDNSPayload = 4096
+
+// upstreamEDNSPayload is the UDP payload size Forward advertises when the
+// client query carries no OPT of its own: 1232, the DNS flag-day safe
+// ceiling that avoids IP fragmentation while still fitting 2.4× the classic
+// 512-byte budget (TXT and DNSSEC answers mostly stay UDP instead of forcing
+// a TC round-trip and a TCP retry per lookup — the audit's EDNS finding).
+const upstreamEDNSPayload = 1232
 
 // DNSUpstream is a concrete Upstream that forwards queries to a list of
 // conventional recursive resolvers (e.g. ["9.9.9.9", "149.112.112.112"]) using
@@ -269,11 +302,22 @@ func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	if attempts <= 0 {
 		attempts = 2
 	}
+	// EDNS0 (RFC 6891): a query without an OPT advertises the classic 512
+	// byte budget, so upstreams compress/shrink answers into TC + TCP retry
+	// territory even though they would happily send 1232+ bytes over UDP.
+	// Advertise upstreamEDNSPayload on a COPY (the caller may reuse the
+	// original message — the DoH face marshals it verbatim). A query that
+	// already carries OPT is forwarded untouched.
+	q2 := q
+	if q.IsEdns0() == nil {
+		q2 = q.Copy()
+		q2.SetEdns0(upstreamEDNSPayload, false)
+	}
 	var lastErr error
 	for _, srv := range u.Servers {
 		addr := ensureDNSPort(srv)
 		for attempt := 0; attempt < attempts; attempt++ {
-			resp, err := exchangeWith(ctx, q, addr, net0, timeout)
+			resp, err := exchangeWith(ctx, q2, addr, net0, timeout)
 			if err != nil {
 				lastErr = err
 				continue
@@ -290,7 +334,7 @@ func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 			// other failed exchange: try the next attempt/server, SERVFAIL
 			// if none succeeds.
 			if resp.Truncated && net0 == "udp" {
-				r2, terr := exchangeWith(ctx, q, addr, "tcp", timeout)
+				r2, terr := exchangeWith(ctx, q2, addr, "tcp", timeout)
 				if terr == nil && r2 != nil {
 					return r2, nil
 				}

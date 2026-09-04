@@ -208,6 +208,13 @@ type Resolver struct {
 
 	refreshFailing map[cacheKey]bool
 
+	// pastHorizon is the #8 backdated-claim ratchet (v0.15.3): the ledger
+	// of past-horizon claim identities this resolver has observed resolving
+	// per alias, consulted by filterPastHorizonNewcomers before the §6.4
+	// ordering. Lazily initialized (zero-value Resolvers keep working).
+	pastHorizon *pastHorizonLedger
+	pastHorMu   sync.Mutex
+
 	// MaxConcurrentResolutions bounds simultaneously in-flight DISTINCT
 	// resolutions (v0.9.2 overload cap). Single-flight collapses identical
 	// questions, but a distinct-name query flood — every miss caching its
@@ -937,11 +944,6 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	// verifyClaimContents).
 	var maxDeadExpires int64
 	var maxDeadPH []byte // strongest tombstone's claim identity
-	type liveClaim struct {
-		claim   *claims.AliasClaim
-		created int64
-		ph      []byte
-	}
 	liveClaims := make([]liveClaim, 0, len(envs))
 	for _, env := range envs {
 		if claim := verifyClaimEnvelope(env, alias, now, oracle, witnessSet); claim != nil {
@@ -952,38 +954,47 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 			liveClaims = append(liveClaims, liveClaim{claim, int64(env.Record.Created), ph})
 			continue
 		}
-		// Tombstone candidate: same full content screen minus liveness
-		// (no oracle floor and no WITNESS_SET membership — the claim was
-		// mined and witnessed days ago; A.4's "any historically valid D"
-		// and set churn both argue for the relaxed check), plus dead and
-		// inside the window. Revoked carriers (§8.5, deliberate death)
-		// are not tombstones. The §4.4 checks IsBasicValid would have
-		// done on the live path are applied here explicitly EXCEPT the
-		// time window (structure, signature, sequence).
-		if env != nil && env.Record != nil && !env.IsRevoked() &&
-			env.Record.Version == constants.ProtoVersion &&
-			env.Record.Sequence >= 1 &&
-			env.Record.Validate() == nil &&
-			env.VerifySignature() &&
-			uint64(now) >= env.Record.Expires &&
-			int64(env.Record.Expires)+int64(constants.AliasReuseDelay) > now &&
-			verifyClaimContents(env, alias, now, nil, nil) != nil {
-			if int64(env.Record.Expires) > maxDeadExpires {
-				maxDeadExpires = int64(env.Record.Expires)
-				if deadClaim, derr := claims.DecodeAliasClaim(env.Record.Claim); derr == nil {
-					if ph, pherr := deadClaim.PrefixHash(); pherr == nil {
-						maxDeadPH = ph
-					} else {
-						maxDeadPH = nil
-					}
-				} else {
-					maxDeadPH = nil
+		// Tombstone candidate. v0.15.3: the screen is dht.ClaimEvidence —
+		// the ONE shared content screen (structure, signature, decode,
+		// alias match, future-ts, claimant binding, PoW + quorum). Until
+		// this folded, the resolver carried a second hand-rolled copy of
+		// the §8.4 screen that had ALREADY drifted from the dht's (this
+		// side checked Record.Version/Sequence/Validate, the tombstone
+		// side did not). Same full content screen minus liveness — no
+		// oracle floor and no WITNESS_SET membership (the claim was mined
+		// and witnessed days ago; A.4's "any historically valid D" and set
+		// churn both argue for the relaxed check) — plus dead and inside
+		// the window. Revoked carriers (§8.5, deliberate death) are not
+		// tombstones.
+		if env != nil && env.Record != nil && !env.IsRevoked() {
+			if _, deadPH := dht.ClaimEvidence(env, alias, now); deadPH != nil &&
+				uint64(now) >= env.Record.Expires &&
+				int64(env.Record.Expires)+int64(constants.AliasReuseDelay) > now {
+				if int64(env.Record.Expires) > maxDeadExpires {
+					maxDeadExpires = int64(env.Record.Expires)
+					maxDeadPH = deadPH
 				}
 			}
 		}
 	}
 	if len(liveClaims) == 0 {
 		return nil, false, false // every competing claim failed the §7.4 step-2 filter
+	}
+	// #8 backdated-claim ratchet (v0.15.3): drop past-horizon identity
+	// newcomers against established ones BEFORE the §6.4 ordering — the
+	// ordering is earliest-asserted-ts-first, and an asserted ts is
+	// attacker-chosen (see claims_ratchet.go for the full model).
+	r.pastHorMu.Lock()
+	if r.pastHorizon == nil {
+		r.pastHorizon = newPastHorizonLedger()
+	}
+	liveClaims = r.filterPastHorizonNewcomers(alias, liveClaims, now)
+	r.pastHorMu.Unlock()
+	if len(liveClaims) == 0 {
+		// Every survivor was an unproven past-horizon newcomer — answer
+		// as a miss (never degraded: the walk itself succeeded; the set
+		// just failed verification).
+		return nil, false, false
 	}
 	if maxDeadExpires > 0 {
 		continuity := false
@@ -1106,28 +1117,43 @@ func verifyClaimContents(env *wire.SignedEnvelope, alias string, now int64, orac
 	// floored at the source's gossiped network difficulty when it implements
 	// DifficultyOracle.
 	//
-	// §7.5 FINALITY HORIZON ON MEMBERSHIP (v0.14.1): the WITNESS_SET
-	// restriction is enforced only while the claim is inside its contest
-	// window (now - claim.ts < CONTEST_WINDOW); an older claim — one §7.5(b)
-	// already declares FINAL — verifies on its attestations alone
-	// (signatures + corroboration band + distinctness, all timeless).
-	// Rationale, found live fleet-wide 2026-09-01: membership compares
-	// REGISTRATION-TIME witnesses against the verifier's CURRENT routing
-	// view, and a claim carries exactly W witnesses, so every one of them
-	// must still sit in the closest-8 FOREVER. Any churn — a witness node
-	// departing (the Aug-31 name cleanup), or newer nodes pushing the
+	// §7.5 FINALITY HORIZON ON MEMBERSHIP (v0.14.1, ratchet-amended
+	// v0.15.3): the WITNESS_SET restriction is enforced only while the
+	// claim is inside its contest window (now - claim.ts < CONTEST_WINDOW);
+	// an older claim — one §7.5(b) already declares FINAL — verifies on its
+	// attestations alone (signatures + corroboration band + distinctness,
+	// all timeless). Rationale, found live fleet-wide 2026-09-01: membership
+	// compares REGISTRATION-TIME witnesses against the verifier's CURRENT
+	// routing view, and a claim carries exactly W witnesses, so every one of
+	// them must still sit in the closest-8 FOREVER. Any churn — a witness
+	// node departing (the Aug-31 name cleanup), or newer nodes pushing the
 	// keyspace boundary (lucasvps, camalolo-box joining) — silently killed
 	// every mature name whose claim it touched, directly against §8's
-	// "ownership = liveness of the OWNER". The check's anti-fabrication
-	// value is concentrated in the contestable window (a fabricated
-	// backdated claim must displace a LIVE registration to matter, and
-	// while it is inside the window its sybil witnesses must still be in
-	// the verifier's view); after finality the attestations are historical
-	// evidence no more re-derivable than the witnesses' availability. The
-	// residual — grind sybil IDs into the true witness set AND hold them
-	// for the full contest window — is the §12 Sybil bound, now priced in
-	// 48 h of presence instead of forever (see the spec's §7.3 membership
-	// bullet, amended in the same release).
+	// "ownership = liveness of the OWNER".
+	//
+	// The residual the horizon leaves (assessed honestly in the #8 audit
+	// follow-up, 2026-09-04): a BACKDATED claim — minted with an ancient
+	// asserted ts and self-witnessed attestations — is born past the
+	// horizon and never faces the membership check at all; its content
+	// profile is byte-for-byte what a legitimately-old claim looks like.
+	// The §6.3 witness ts gate fences the MINT (no honest node signs a
+	// claim older than WITNESS_PRESENT_WINDOW), but the forged claim never
+	// asks an honest node. Two mitigations carry the gap until the protocol
+	// amendment (renewals re-collecting fresh attestations) closes it:
+	//
+	//   - §7.3 witness exclusivity (dht.liveClaimConflict): no honest
+	//     witness co-signs a different-identity claim over a live name, so
+	//     the forgery cannot be converted into a witness-sanctioned
+	//     registration that out-orders the incumbent;
+	//   - the past-horizon ratchet (claims_ratchet.go, applied in
+	//     resolveClaimSet BEFORE the §6.4 ordering): a past-horizon identity
+	//     this resolver never observed cannot displace one it did.
+	//
+	// What remains is the standing squat of never-before-resolved aliases
+	// and disputes between two established identities — both need the
+	// renewal-fresh-attestation amendment, and in the meantime cost the
+	// attacker no less than registering the alias normally (§12 sybil
+	// economics; first-come-first-served is the system's own rule).
 	set := witnessSet
 	if set != nil && now-int64(claim.Timestamp) >= int64(constants.ContestWindow) {
 		set = nil

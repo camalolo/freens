@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased — v0.15.3: the backdated-claim defense (witness exclusivity + the resolver ratchet) and four audit P1/P2s
+
+The remaining open findings from the 2026-09-04 audit:
+
+- **#8, the backdated-claim hole — designed, then closed where content
+  can close it.** The audit's sharpest find: §6.4 orders claims
+  earliest-ASSERTED-timestamp-first, the §6.3 witness ts gate fences the
+  front (no honest node signs a claim older than 5 min), but a claim
+  minted ALREADY-backdated carries only the attacker's self-signed
+  attestations — and because it is born past the §7.5 contest horizon,
+  it NEVER faces the WITNESS_SET membership check. Content alone cannot
+  detect it: a forged old-ts claim is byte-for-byte what a
+  legitimately-old claim looks like (renewals keep the original claim
+  immutable forever). Two mitigations carry the gap:
+  - **§7.3 witness exclusivity** (dht `liveClaimConflict`): a witness
+    refuses to co-sign a different-identity claim for an alias on which
+    it holds a LIVE, fully content-valid claim. Until now exclusivity
+    emerged only from the resolver's ordering — the witness set would
+    happily mint a second claim over a live name. The refusing witness
+    set IS the storing set around K_claim, so a live name can no longer
+    gather a fresh-claim quorum from honest witnesses; same identity
+    (renewals, parked-claim retries) is exempt; quorum-less pooled
+    fabrications still lock nothing (the DoS-safety bar).
+  - **The past-horizon ratchet** (resolver `claims_ratchet.go`): every
+    resolver keeps a bounded per-alias ledger of the past-horizon claim
+    identities it has observed resolving. An UNOBSERVED past-horizon
+    identity cannot displace an established one — and is refused even
+    during the incumbent's replication gaps (NXDOMAIN, not the forgery).
+    Fail-open on a verifier's first sight (the documented residual:
+    first-sight squatting and two-established-identity disputes need the
+    renewal-fresh-attestation protocol amendment, now written into the
+    spec as the designated v2 path).
+  - The v0.14.1 comment claiming the residual was "48 h of sybil
+    presence" was wrong (a backdated claim need not hold anything for
+    48 h — it is never in the window); rewritten with the honest model.
+  - Spec: §7.3 gains the exclusivity rule + updated residual; §7.5
+    documents the horizon's ratchet; §8.4 documents the shared screen.
+- **The dual §8.4 tombstone screens unified.** The resolver carried a
+  second hand-rolled copy of the tombstone evidence screen that had
+  ALREADY drifted from the dht's (it checked record version/sequence/
+  validation, the witness/storer side did not). One shared screen
+  (`dht.ClaimEvidence`) now backs every §8.4 enforcement point — witness
+  gate, put gate, resolver continuity — verifying identically, in the
+  stronger direction.
+- **EDNS both directions.** Upstream: `Forward` advertises a 1232-byte
+  UDP payload on queries with no OPT (the classic 512 advertisement
+  forced TC + a TCP retry per large answer, on a copy — the caller's
+  message is never mutated). Client-facing: the resolver echoes an OPT
+  advertising the requester's declared payload (clamped 512-4096) and
+  `writeReply` truncates against THAT budget — an EDNS-capable stub no
+  longer gets 512-byte truncation and needless TCP fallback.
+- **Cache case-folding (RFC 1035 §2.3.3).** Cache keys fold the qname to
+  lowercase: `Example.COM` and `example.com` were two independent
+  entries (a miss for one, a separately-expiring copy for the other).
+  The persistence-reload path folds too.
+- **Routing `Closest` stops cloning the world.** It runs on every walk
+  step, RPC reply, and put target pick; it used to deep-clone EVERY
+  contact before sorting, then return a slice. It now gathers pointers,
+  sorts under the read lock, and clones only the n survivors.
+
 ## Unreleased — v0.15.2: the audit batch (webui CSRF, silent-data-loss paths, bounded state, dead code)
 
 The 2026-09-04 full-tree audit (staticcheck + four parallel deep reads,

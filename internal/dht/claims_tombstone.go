@@ -83,45 +83,84 @@ import (
 // surface it as "retry after the window", not as "network too small".
 var ErrAliasReuseWindow = errors.New("dht: alias is inside its §8.4 reuse window (expired claim, ALIAS_REUSE_DELAY not elapsed)")
 
-// reuseWindowEnd returns the §8.4 reuse-window end time (expires +
-// AliasReuseDelay) when env is a DEAD-but-content-valid claim envelope for
-// alias whose window is still open at now, and 0 otherwise. "Content-valid"
-// is the full §7.4 step-2 filter minus liveness: envelope signature, claim
-// decode + alias match, claim-timestamp sanity, claimant binding (signer ==
-// claimant pk, TLD-record shape, tld_id match), PoW, and the ≥ W DISTINCT
-// CORROBORATING witness quorum (witnessSet nil: the WITNESS_SET membership
-// restriction is deliberately not applied to tombstones — the converged set
-// names today's closest nodes, which churns over a 30-day window and would
-// un-evidence honestly-witnessed old claims; binding, distinctness, and the
-// corroboration band all still apply).
-func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) int64 {
-	if env == nil || env.Record == nil || !env.VerifySignature() || env.IsRevoked() {
-		return 0 // §8.5: deliberate death is not a tombstone
+// ClaimEvidence is THE shared content screen for "is this envelope valid
+// claim EVIDENCE" — every consumer that reasons about a stored claim
+// envelope as a tombstone, a live conflicting claim, or §8.4 continuity must
+// run it; v0.15.3 folded the resolver's second, hand-rolled copy of the
+// screen (which had already drifted: it checked Record.Version/Sequence/
+// Validate, the dht side did not) into this one function (2026-09-04 audit,
+// "dual §8.4 tombstone screens"). It verifies, in order:
+//
+//   - structure: non-nil record, not revoked (§8.5 deliberate death is not
+//     evidence), the wire protocol version, sequence ≥ 1, and §4.4 record
+//     validation;
+//   - authenticity: the envelope signature verifies;
+//   - content: claim decode (field 11), alias match, the §7.4 anti-forgery
+//     future-timestamp check, claimant binding (Signer == ClaimantPK — only
+//     the claimant key can publish its own claim), the TLD-record shape
+//     (zero labels, tld_id match), and the full §7.4 step-2 filter
+//     (claimant consistency, PoW at the historically-inferred difficulty per
+//     A.4's "any historically valid D", and the ≥ W DISTINCT CORROBORATING
+//     witness quorum — witnessSet nil: the WITNESS_SET membership
+//     restriction is deliberately not applied to evidence, since the
+//     converged set names TODAY's closest nodes and churns away from
+//     honestly-witnessed old claims; binding, distinctness, and the
+//     corroboration band all still apply).
+//
+// The quorum requirement is what keeps the screen DoS-safe: a rogue peer can
+// pool and re-serve whatever it likes, but a PoW-valid, quorum-less
+// fabrication never becomes evidence that locks or steals an alias.
+//
+// On success it returns the decoded claim and its identity (SHA-256 of the
+// canonical PoW prefix — the same prefixHash witnesses signed); on any
+// failure it returns (nil, nil).
+func ClaimEvidence(env *wire.SignedEnvelope, alias string, now int64) (*claims.AliasClaim, []byte) {
+	if env == nil || env.Record == nil || env.IsRevoked() {
+		return nil, nil
+	}
+	if env.Record.Version != constants.ProtoVersion ||
+		env.Record.Sequence < 1 ||
+		env.Record.Validate() != nil ||
+		!env.VerifySignature() {
+		return nil, nil
 	}
 	claim, cerr := claims.DecodeAliasClaim(env.Record.Claim)
 	if cerr != nil {
-		return 0
+		return nil, nil
 	}
 	aliasN, aerr := naming.ValidateAlias(alias)
 	if aerr != nil || claim.Alias != aliasN {
-		return 0
+		return nil, nil
 	}
 	// §7.4 anti-forgery: a future-dated claim is garbage today too.
 	if int64(claim.Timestamp) > now+int64(constants.SkewTolerance) {
-		return 0
+		return nil, nil
 	}
 	// Claimant binding: the carrier is the claimant's own TLD record.
 	if !bytes.Equal(env.Signer, claim.ClaimantPK) {
-		return 0
+		return nil, nil
 	}
 	labels, tldID, derr := naming.DecodeWireName(env.Record.Name)
 	if derr != nil || len(labels) != 0 || !bytes.Equal(tldID, claim.TldID) {
-		return 0
+		return nil, nil
 	}
-	// Full §7.4 content screen (PoW + quorum, historical difficulty per
-	// A.4's "any historically valid D" letter — no oracle floor applies to
-	// a claim mined days ago).
+	// Full §7.4 content screen (PoW + quorum, historical difficulty).
 	if !claims.VerifyFull(claim, claims.InferDifficulty, nil, constants.W) {
+		return nil, nil
+	}
+	ph, perr := claim.PrefixHash()
+	if perr != nil {
+		return nil, nil // unhashable identity: cannot prove anything about it
+	}
+	return claim, ph
+}
+
+// reuseWindowEnd returns the §8.4 reuse-window end time (expires +
+// AliasReuseDelay) when env is a DEAD-but-content-valid claim envelope for
+// alias whose window is still open at now, and 0 otherwise. "Content-valid"
+// is exactly ClaimEvidence (see above).
+func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) int64 {
+	if _, ph := ClaimEvidence(env, alias, now); ph == nil {
 		return 0
 	}
 	exp := int64(env.Record.Expires)
@@ -139,7 +178,8 @@ func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) int64 {
 // (its prefix hash) and — when the presentation carries an envelope, the
 // hPut path — the envelope itself. It scans this node's ClaimPool for the
 // alias's K_claim and consults every candidate as potential tombstone
-// evidence (fully re-verified; see reuseWindowEnd):
+// evidence (fully re-verified via ClaimEvidence; see claims_tombstone.go's
+// header for why the full re-verification is DoS-safe):
 //
 //   - a candidate with a DIFFERENT claim identity inside an open window
 //     refuses the presentation (a new claim while the alias is cooling off);
@@ -173,15 +213,7 @@ func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, now in
 		if end == 0 {
 			continue // not (valid, dead, in-window) evidence
 		}
-		candClaim, cerr := claims.DecodeAliasClaim(cand.Record.Claim)
-		if cerr != nil {
-			continue
-		}
-		candPH, perr := candClaim.PrefixHash()
-		if perr != nil {
-			continue
-		}
-		if bytes.Equal(candPH, incomingPrefixHash) {
+		if _, candPH := ClaimEvidence(cand, aliasN, now); bytes.Equal(candPH, incomingPrefixHash) {
 			// Same claim identity: the tombstone's own claim, re-carried
 			// by its claimant (v0.9.1) — renewal or resurrection, both
 			// are ownership continuity. Never refused.
@@ -191,4 +223,48 @@ func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, now in
 		return end
 	}
 	return 0
+}
+
+// liveClaimConflict reports whether this node's ClaimPool holds a LIVE
+// (unexpired, fully content-valid per ClaimEvidence) claim for alias whose
+// identity DIFFERS from incomingPrefixHash.
+//
+// v0.15.3 — the §7.3 witness exclusivity check (the first slice of the #8
+// backdated-claim defense): hWitness refuses to co-sign a claim for an alias
+// on which it holds live conflicting evidence. Until now exclusivity emerged
+// ONLY from the resolver's §6.4 ordering — nothing stopped a witness from
+// co-signing a second, different-identity claim for a live name, which is
+// the mint an attacker needs to convert registration attempts into takeovers
+// (the §6.4 order then adjudicates between the two as if both were honest).
+// The witness set around K_claim IS the set of storing nodes, so for any
+// live name the co-signing witnesses almost all hold the incumbent: without
+// this check a fresh claim could always be minted over it; with it, a fresh
+// different-identity claim gathers no quorum from honest witnesses. Same
+// identity is exempt (renewals and register's parked-claim retries). DoS
+// safety mirrors the tombstone screen: the conflicting evidence must pass
+// ClaimEvidence in full, so a rogue peer cannot pool a fabrication and
+// freeze registrations (a fabricated LIVE claim requires the same
+// PoW-plus-quorum work as a real registration).
+func (n *Node) liveClaimConflict(alias string, incomingPrefixHash []byte, now int64) bool {
+	if n == nil || n.claims == nil {
+		return false
+	}
+	aliasN, err := naming.ValidateAlias(alias)
+	if err != nil {
+		return false
+	}
+	kClaim, err := KeyForClaim(aliasN)
+	if err != nil {
+		return false
+	}
+	for _, cand := range n.claims.Top2(kClaim) {
+		_, candPH := ClaimEvidence(cand, aliasN, now)
+		if candPH == nil {
+			continue // not content-valid evidence
+		}
+		if now < int64(cand.Record.Expires) && !bytes.Equal(candPH, incomingPrefixHash) {
+			return true // a live, different-identity claim already holds the alias
+		}
+	}
+	return false
 }

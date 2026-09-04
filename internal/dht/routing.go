@@ -455,23 +455,37 @@ func (rt *RoutingTable) Get(nodeID []byte) *NodeContact {
 }
 
 // Closest returns the n contacts nearest to target by XOR distance, ascending.
-// All contacts are gathered (cloned) and stably sorted by XOR distance to
-// target, so equal distances retain storage order. n is clamped to
-// [0, len(contacts)]. Safe for concurrent use; the returned contacts are copies.
+// All contacts are gathered and stably sorted by XOR distance to target, so
+// equal distances retain storage order. n is clamped to [0, len(contacts)].
+// Safe for concurrent use; the returned contacts are copies.
+//
+// v0.15.3: the per-call cost dropped from clone-EVERY-contact to clone-the-n
+// survivors — Closest runs on every walk step, RPC reply, and put target
+// pick, and the table's contact count grows with the peer book while n is
+// typically 8-20 (found in the 2026-09-04 audit). The sort and the surviving
+// clones both hold the read lock: contact structs are mutated in place by
+// probation/exchange updates, so touching them unlocked would race.
 func (rt *RoutingTable) Closest(target []byte, n int) []*NodeContact {
 	rt.mu.RLock()
-	all := rt.allContactsLocked()
-	rt.mu.RUnlock()
-	sort.SliceStable(all, func(i, j int) bool {
-		return CompareDistance(target, all[i].NodeID, all[j].NodeID) < 0
+	ptrs := make([]*NodeContact, 0, rt.Size())
+	for _, b := range rt.Buckets {
+		ptrs = append(ptrs, b.Nodes...)
+	}
+	sort.SliceStable(ptrs, func(i, j int) bool {
+		return CompareDistance(target, ptrs[i].NodeID, ptrs[j].NodeID) < 0
 	})
 	if n < 0 {
 		n = 0
 	}
-	if n > len(all) {
-		n = len(all)
+	if n > len(ptrs) {
+		n = len(ptrs)
 	}
-	return all[:n]
+	out := make([]*NodeContact, n)
+	for i := 0; i < n; i++ {
+		out[i] = ptrs[i].clone()
+	}
+	rt.mu.RUnlock()
+	return out
 }
 
 // AllContacts returns cloned copies of every contact in storage order (bucket

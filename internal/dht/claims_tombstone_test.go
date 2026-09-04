@@ -521,3 +521,164 @@ func TestDifficultyStatePersistenceRoundTrip(t *testing.T) {
 		t.Errorf("garbage difficulty restored as %d, want the floor %d", got, constants.PoWDifficultyInit)
 	}
 }
+
+// TestClaimEvidenceStructureScreen: ClaimEvidence is the ONE shared
+// evidence screen (v0.15.3 folded the resolver's drifted copy into it) —
+// the structural bits (version, sequence, §4.4 record validation) must
+// refuse evidence, not just the signature/content checks.
+func TestClaimEvidenceStructureScreen(t *testing.T) {
+	now := time.Now().Unix()
+	alias := "evidfoo"
+	env, claim, kp := tombstoneFixture(t, alias, uint64(now-100), now-100, now+80000, true, false)
+	if _, ph := ClaimEvidence(env, alias, now); ph == nil {
+		t.Fatal("healthy live carrier: want evidence")
+	}
+
+	rebuild := func(mutate func(*wire.Record)) *wire.SignedEnvelope {
+		rec := *env.Record
+		mutate(&rec)
+		e, err := wire.SignRecord(&rec, kp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	if _, ph := ClaimEvidence(rebuild(func(r *wire.Record) { r.Version = 99 }), alias, now); ph != nil {
+		t.Error("wrong protocol version accepted as evidence")
+	}
+	if _, ph := ClaimEvidence(rebuild(func(r *wire.Record) { r.Sequence = 0 }), alias, now); ph != nil {
+		t.Error("sequence-0 carrier accepted as evidence")
+	}
+	// Identity must be stable across carrier regenerations (the same claim
+	// re-carried by a renewal envelope is the SAME evidence identity).
+	ph1, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ph2 := ClaimEvidence(env, alias, now)
+	if !bytes.Equal(ph1, ph2) {
+		t.Error("ClaimEvidence prefix hash != claim.PrefixHash")
+	}
+}
+
+// TestLiveClaimConflictMatrix: the §7.3 witness exclusivity screen (v0.15.3,
+// the first slice of the #8 backdated-claim defense) — a LIVE, fully
+// content-valid, DIFFERENT-identity claim conflicts; same identity (renewal
+// / parked-claim retry), dead incumbents (the tombstone path's job), and
+// quorum-less pooled fabrications (DoS safety) do not.
+func TestLiveClaimConflictMatrix(t *testing.T) {
+	now := time.Now().Unix()
+	alias := "conflictfoo"
+	kClaim, err := KeyForClaim(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live, liveClaim, _ := tombstoneFixture(t, alias, uint64(now-100), now-100, now+80000, true, false)
+	phLive, err := liveClaim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherClaim, _ := tombstoneFixture(t, alias, uint64(now-10), now-10, now+86000, true, false)
+	phOther, err := otherClaim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n := gossipStateNode(t)
+	if !n.claims.Offer(kClaim, live) {
+		t.Fatal("fixture: live claim not pooled")
+	}
+	if !n.liveClaimConflict(alias, phOther, now) {
+		t.Error("live different-identity claim: want conflict")
+	}
+	if n.liveClaimConflict(alias, phLive, now) {
+		t.Error("same identity (renewal/retry): want no conflict")
+	}
+
+	// Dead incumbent: no conflict — the §8.4 tombstone path owns that case.
+	n3 := gossipStateNode(t)
+	dead, _, _ := tombstoneFixture(t, alias, uint64(now-90000), now-90000, now-3600, true, false)
+	if !n3.claims.Offer(kClaim, dead) {
+		t.Fatal("fixture: dead claim not pooled")
+	}
+	if n3.liveClaimConflict(alias, phOther, now) {
+		t.Error("dead incumbent flagged as a live conflict")
+	}
+
+	// Quorum-less pooled fabrication: no conflict (a rogue peer must not be
+	// able to freeze registrations by pooling a PoW-valid fake).
+	n4 := gossipStateNode(t)
+	fake, _, _ := tombstoneFixture(t, alias, uint64(now-100), now-100, now+80000, false, false)
+	if !n4.claims.Offer(kClaim, fake) {
+		t.Fatal("fixture: fabrication not pooled")
+	}
+	if n4.liveClaimConflict(alias, phOther, now) {
+		t.Error("quorum-less fabrication blocked a registration (DoS)")
+	}
+}
+
+// TestWitnessRefusesLiveConflictingClaim (wire level): a witness whose pool
+// holds a live claim does not co-sign a DIFFERENT claim for that alias —
+// the mint a takeover needs — while a witness holding only a quorum-less
+// fabrication still co-signs (no lock).
+func TestWitnessRefusesLiveConflictingClaim(t *testing.T) {
+	now := time.Now().Unix()
+	alias := "exclufoo"
+
+	w, _ := startTestNode(t, nil)
+	defer w.Close()
+	a, _ := startTestNode(t, nil)
+	defer a.Close()
+	wAddr, err := w.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddPeer(w.PublicKey(), wAddr.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	live, _, _ := tombstoneFixture(t, alias, uint64(now-100), now-100, now+80000, true, false)
+	kClaim, err := KeyForClaim(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.claims.Offer(kClaim, live) {
+		t.Fatal("fixture: live claim not pooled")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	id := newWitnessIdentity(t, uint64(now))
+	nonce, powHash := id.mineWitnessPoW(t, alias)
+	atts, err := a.CollectWitnesses(ctx, alias, id.tldID, id.claimantKP.Public(), id.ts, nonce, powHash, 1)
+	if err != nil {
+		t.Fatalf("CollectWitnesses: %v", err)
+	}
+	if len(atts) != 0 {
+		t.Fatalf("witness co-signed over its own live claim: %d attestations, want 0", len(atts))
+	}
+
+	// Rogue variant: a pooled fabrication must not freeze registrations.
+	w2, _ := startTestNode(t, nil)
+	defer w2.Close()
+	a2, _ := startTestNode(t, nil)
+	defer a2.Close()
+	w2Addr, err := w2.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a2.AddPeer(w2.PublicKey(), w2Addr.String()); err != nil {
+		t.Fatal(err)
+	}
+	fake, _, _ := tombstoneFixture(t, alias, uint64(now-100), now-100, now+80000, false, false)
+	if !w2.claims.Offer(kClaim, fake) {
+		t.Fatal("fixture: fabrication not pooled")
+	}
+	id2 := newWitnessIdentity(t, uint64(now))
+	nonce2, powHash2 := id2.mineWitnessPoW(t, alias)
+	atts, err = a2.CollectWitnesses(ctx, alias, id2.tldID, id2.claimantKP.Public(), id2.ts, nonce2, powHash2, 1)
+	if err != nil || len(atts) != 1 {
+		t.Fatalf("fabrication froze the alias: atts=%d err=%v, want 1/nil", len(atts), err)
+	}
+}

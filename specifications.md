@@ -665,6 +665,21 @@ beyond `SKEW_TOLERANCE` or older than `WITNESS_PRESENT_WINDOW`
 arbitrarily old claim would otherwise out-order every honest one
 forever).
 
+**Witness exclusivity (v0.15.3):** a witness MUST also refuse to
+co-sign a claim for an alias on which it holds a LIVE, fully
+content-valid claim of a DIFFERENT identity (same identity is exempt —
+that is a renewal or the registrant's own parked-claim retry). Before
+this rule, exclusivity emerged only from the verifier-side §7.4
+ordering, and the witness set would co-sign a second claim over a live
+name — exactly the mint an attacker needs to convert a fabricated
+backdated claim into a witness-sanctioned registration that out-orders
+the incumbent. The refusing witness set is by construction the storing
+set around `K_claim`, so a live name cannot gather a fresh-claim quorum
+from honest witnesses. The conflicting evidence must pass the FULL
+content screen (structure, signature, claimant binding, PoW, quorum),
+so a rogue peer pooling a quorum-less fabrication cannot freeze
+registrations — the same DoS-safety bar as the §8.4 tombstone screen.
+
 **Why so tight (v0.9.0, anti-sniping):** the age gate was formerly
 `WITNESS_COOLDOWN` (1 h). But the witness RPC necessarily discloses the
 alias to its witness set — the alias is inside the PoW prefix a witness
@@ -687,14 +702,23 @@ fresh mine faster than the victim, needing no backdating at all —
 would require commit–reveal registration (see §7.1), deferred as a v2
 candidate.
 
-**Residual (documented):** against a verifier that cannot name the
-witness set, an attacker forging a fully self-consistent quorum (own
-keys, in-band backdated clocks, valid PoW) still wins the Section 7.4
-ordering for a backdated claim. The v2 binding, the band, and the
-membership gate raise this from a zero-cost attack to a Sybil attack
-priced by NodeID grinding against the real witness set; closing it
-entirely requires a network dense enough that converged lookups always
-name the `WITNESS_SET`.
+**Residual (documented, v0.15.3 assessment):** against a verifier that
+cannot name the witness set, an attacker forging a fully
+self-consistent quorum (own keys, in-band backdated clocks, valid PoW)
+still presents a claim whose content is indistinguishable from honest
+history. Two v0.15.3 mitigations carry the gap: the witness
+exclusivity rule above stops the forgery from being re-minted through
+honest witnesses over a live name, and verifiers keep a bounded ledger
+of the past-horizon claim identities they have observed resolving per
+alias, refusing an unobserved past-horizon identity that would displace
+an established one (fail-open on a verifier's first sight of an alias).
+What remains — first-sight squatting of never-resolved aliases, and
+disputes between two established identities — requires the protocol
+amendment of renewal re-collecting fresh witness attestations (a
+past-horizon claim carrying attestations the §7.3 ts gate guarantees
+only genuinely-recent claims can earn); until then it costs the
+attacker no less than registering the alias normally, priced by
+NodeID grinding against the real witness set.
 
 ### 7.4 Registration procedure
 
@@ -751,6 +775,19 @@ of each other, clients MUST NOT treat either as final until either
 earlier-ordered valid claim appears within `CONTEST_WINDOW` (48 h).
 Resolvers MAY resolve contested aliases to the current deterministic
 winner while flagging the name as contested in diagnostics.
+
+**Finality horizon on membership (v0.14.1) and its residual
+(v0.15.3):** the §7.3 `WITNESS_SET` membership restriction is enforced
+only while a claim is inside its contest window; an older claim
+verifies on its attestations alone (churn must not un-evidence mature
+names). Because a claim minted ALREADY-backdated is born past the
+horizon, its attestations are the attacker's own, and verifiers keep a
+bounded per-alias ledger of the past-horizon identities they have
+observed: an unobserved past-horizon identity MUST NOT displace an
+established one (fail-open on a verifier's first sight of an alias).
+This is the resolver-side half of the §7.3 witness exclusivity rule;
+see that section for the residual and the renewal-fresh-attestation
+amendment that closes it.
 
 ### 7.6 Cost summary
 
@@ -923,6 +960,17 @@ lock an alias. Enforcement is best-effort at the availability of a
 retained envelope: a network that retains no copy of the dead claim
 cannot distinguish the window (the same R-replication availability
 argument as record storage).
+
+**One evidence screen (v0.15.3):** the full content screen behind "a
+verified tombstone" — structure (record version, sequence ≥ 1, §4.4
+validation), signature, claim decode, alias match, future-timestamp
+refusal, claimant binding, PoW, and the ≥ W distinct corroborating
+witness quorum — is a single shared implementation consumed by every
+§8.4 enforcement point (the witness reuse-window gate, the storing-node
+put gate, and the resolver's tombstone continuity check). The original
+implementation carried two hand-rolled copies that had already drifted
+(the resolver checked the record-structure bits, the witness/storer
+side did not); both now verify identically, in the stronger direction.
 
 ### 8.5 Revoke
 

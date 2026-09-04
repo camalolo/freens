@@ -197,3 +197,71 @@ func TestTruncatedWithTCPFallbackServesTCP(t *testing.T) {
 		t.Fatalf("forward = %v, %v — want the complete TCP answer", resp, err)
 	}
 }
+
+// TestCacheKeysFoldCase (RFC 1035 §2.3.3): mixed-case spellings of the same
+// name must share one cache entry — a case-sensitive key made Example.COM a
+// miss for a cached example.com and split entries per spelling.
+func TestCacheKeysFoldCase(t *testing.T) {
+	a := cacheKeyFor(dns.Question{Name: "Example.COM.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	b := cacheKeyFor(dns.Question{Name: "example.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	if a != b {
+		t.Fatal("cache keys for case variants of one name differ — the cache is case-sensitive")
+	}
+}
+
+// TestForwardAdvertisesEDNS: a query with no OPT is extended (on a copy) to
+// advertise a 1232-byte UDP payload upstream — the classic 512-byte
+// advertisement forced big answers into TC + TCP retry per lookup.
+func TestForwardAdvertisesEDNS(t *testing.T) {
+	old := exchangeWith
+	t.Cleanup(func() { exchangeWith = old })
+
+	var sawOPT bool
+	exchangeWith = func(ctx context.Context, q *dns.Msg, addr, network string, timeout time.Duration) (*dns.Msg, error) {
+		opt := q.IsEdns0()
+		if opt == nil || opt.UDPSize() != upstreamEDNSPayload {
+			t.Errorf("upstream query carried no EDNS0(%d) advertisement", upstreamEDNSPayload)
+		} else {
+			sawOPT = true
+		}
+		resp := new(dns.Msg).SetReply(q)
+		return resp, nil
+	}
+
+	u := &DNSUpstream{Servers: []string{"192.0.2.53"}}
+	q := new(dns.Msg).SetQuestion("big.example.com.", dns.TypeTXT)
+	if _, err := u.Forward(context.Background(), q); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if !sawOPT {
+		t.Fatal("the EDNS advertisement was never exercised")
+	}
+	if q.IsEdns0() != nil {
+		t.Error("Forward mutated the CALLER's query message (DoH re-marshals it verbatim)")
+	}
+}
+
+// TestResolveMsgEchoesClientEDNS: a client advertising a large UDP payload
+// gets that budget honored in the UDP truncation decision — serving a
+// 4096-capable stub 512-byte truncation forced needless TCP fallback.
+func TestResolveMsgEchoesClientEDNS(t *testing.T) {
+	cfg, err := ParseConfig("[tld-routes]\n* = freens\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(cfg, nil, nil)
+
+	q := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	q.SetEdns0(4096, false)
+	resp := r.ResolveMsg(context.Background(), q)
+	if opt := resp.IsEdns0(); opt == nil || opt.UDPSize() != maxEDNSPayload {
+		t.Fatalf("response OPT = %v, want the client's payload clamped to %d", opt, maxEDNSPayload)
+	}
+
+	// A classic (non-EDNS) client keeps classic framing: no OPT echoed.
+	plain := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	resp2 := r.ResolveMsg(context.Background(), plain)
+	if resp2.IsEdns0() != nil {
+		t.Error("non-EDNS query got an OPT echoed")
+	}
+}

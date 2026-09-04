@@ -33,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,9 +62,16 @@ type cacheKey struct {
 	qclass uint16
 }
 
-// cacheKeyFor builds the cache key of a DNS question.
+// cacheKeyFor builds the cache key of a DNS question. The name is folded to
+// lowercase per RFC 1035 §2.3.3 ("comparing data in domain names should be
+// case-insensitive") — the wire preserves the asker's case, but Example.COM
+// and example.com are THE SAME name, and a case-sensitive cache split them
+// into independent entries (a miss for one, a separately-expiring copy for
+// the other; found in the 2026-09-04 audit). Freens single-label names are
+// validated lowercase end-to-end, so folding only ever changes upstream-DNS
+// keys in practice.
 func cacheKeyFor(q dns.Question) cacheKey {
-	return cacheKey{name: q.Name, qtype: q.Qtype, qclass: q.Qclass}
+	return cacheKey{name: strings.ToLower(q.Name), qtype: q.Qtype, qclass: q.Qclass}
 }
 
 // cacheEntry is a cached ResolveQuestion outcome plus its expiry (unix
@@ -438,7 +446,9 @@ func (c *ResponseCache) LoadFrom(path string) error {
 		}
 		c.nextStamp++
 		e.stamp = c.nextStamp
-		c.entries[cacheKey{name: pe.Name, qtype: pe.Qtype, qclass: pe.Qclass}] = e
+		// Same RFC 1035 §2.3.3 fold as cacheKeyFor — persisted keys
+		// predate the fold, so normalize here too.
+		c.entries[cacheKey{name: strings.ToLower(pe.Name), qtype: pe.Qtype, qclass: pe.Qclass}] = e
 		restored++
 	}
 	return nil

@@ -1813,6 +1813,19 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if n.claimReuseRefusal(aliasN, prefixHash, now) > 0 {
 		return n.errResp(m, 301, "alias in reuse window")
 	}
+	// §7.3 witness exclusivity (v0.15.3): refuse to co-sign a
+	// different-identity claim for an alias this node already holds a LIVE
+	// claim for. Exclusivity used to emerge only from the resolver's §6.4
+	// ordering; without a mint-side check the witness set would happily
+	// co-sign a second claim over a live name and let §6.4 adjudicate two
+	// "honest" claims (liveClaimConflict for the full rationale — it is the
+	// first slice of the backdated-claim defense). Same identity is exempt:
+	// renewals never re-run this RPC, and register's parked-claim retries
+	// re-present the SAME claim.
+	if n.liveClaimConflict(aliasN, prefixHash, now) {
+		n.log.Info("witness refused: alias already claimed (live conflicting claim)", "alias", aliasN)
+		return n.errResp(m, 305, "alias already claimed")
+	}
 	n.witnessMu.Lock()
 	last, seen := n.witnessLast[aliasN]
 	cooling := seen &&
