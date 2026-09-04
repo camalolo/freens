@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — v0.16.1: the walk returns only candidates that ANSWERED (the rescue's missing half)
+
+- **dht: `IterativeFindNode` excludes failed probes from its result.**
+  The walk queried dead candidates correctly (§6.2 eviction, progress via
+  the queried-map) but its RETURN VALUE was the top-want **by distance**
+  over everything it knew — so a dense cluster of dead contacts could
+  occupy the entire result and hide the live nodes the walk actually
+  reached deeper in the list. The v0.15.5 walk-rescue documented its
+  contract as "the closest REACHED contacts" and filtered the result
+  against its already-tried set — with a ghost-dominated `reached` it
+  added nothing and the publish still reported "accepted by 0 of 8"
+  while the storing peers sat one round away. Failed probes are now
+  dropped from the result (they were already evicted/demoted in the
+  table), so put targets and witness candidates come only from nodes
+  that answered. Found chasing the `TestPublishRescuesGhostTableWithWalk`
+  CI failure (which had failed on BOTH the v0.15.5 and v0.16.0 commits —
+  born flaky): the fixture also stamped no `LastSeen` on its synthetic
+  ghosts, making them instantly eligible for the idle sweep — a second,
+  independent coin flip. Both layers fixed; the test is now deterministic
+  across repeated runs.
+
 ## Unreleased — v0.16.0: §9.5.4 trust hardening (quarantine, rotation gate, liveness sweep), §7.7 project namespace, `freens trust ls/remove`
 
 The malicious-use hardening pass on the TLS trust layer, each piece

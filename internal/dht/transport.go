@@ -2365,6 +2365,17 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		return nil // island
 	}
 	queried := make(map[string]bool, len(shortlist))
+	// v0.16: candidates whose probe FAILED are excluded from the RESULT.
+	// They stay in the shortlist (the §6.2 eviction handles the table; the
+	// walk's queried-map still makes progress through them), but returning
+	// them as "the closest nodes to target" hands every consumer — put
+	// targets, witness candidates — a corpse that answers nothing. The
+	// walk-rescue (v0.15.5) documented its contract as "the closest REACHED
+	// contacts"; before this fix a dense ghost cluster could occupy the
+	// entire top-want by distance and starve the rescue of the live nodes
+	// the walk actually found (found 2026-09-04: the rescue test's walk
+	// reached the real storing peers but returned only the dead cluster).
+	failed := make(map[string]bool, len(shortlist))
 	for round := 0; round < maxLookupRounds; round++ {
 		sort.SliceStable(shortlist, func(i, j int) bool {
 			return CompareDistance(target, shortlist[i].NodeID, shortlist[j].NodeID) < 0
@@ -2402,6 +2413,7 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		for i, r := range results {
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
 				n.probeFailed(batch[i])
+				failed[string(batch[i].NodeID)] = true
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)
@@ -2420,13 +2432,19 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		// each round makes progress. maxLookupRounds (256) × ALPHA bounds
 		// the worst case.
 	}
-	sort.SliceStable(shortlist, func(i, j int) bool {
-		return CompareDistance(target, shortlist[i].NodeID, shortlist[j].NodeID) < 0
-	})
-	if len(shortlist) > want {
-		shortlist = shortlist[:want]
+	reached := make([]*NodeContact, 0, len(shortlist))
+	for _, c := range shortlist {
+		if !failed[string(c.NodeID)] {
+			reached = append(reached, c)
+		}
 	}
-	return shortlist
+	sort.SliceStable(reached, func(i, j int) bool {
+		return CompareDistance(target, reached[i].NodeID, reached[j].NodeID) < 0
+	})
+	if len(reached) > want {
+		reached = reached[:want]
+	}
+	return reached
 }
 
 // findNodeRound issues one find_node(target) RPC to c and returns the

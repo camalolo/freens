@@ -54,12 +54,22 @@ func TestPublishRescuesGhostTableWithWalk(t *testing.T) {
 	// every exchange rejected instantly on the recipient-ID check). With 16
 	// ghosts nearer than ANY random-ID peer, the closest-8 round-1 targets
 	// are all ghosts.
+	//
+	// LastSeen MUST be stamped: the idle sweep (issue #2) treats a
+	// never-confirmed contact's learn time as its probation start, and a
+	// zero stamp reads as the epoch — instantly sweep-eligible. The 1-minute
+	// sweep tick landing before the publish's Closest deleted the whole
+	// cluster mid-test and turned this into a coin-flip CI failure (found
+	// 2026-09-04: alternating PASS/FAIL in CI on both v0.15.5 and v0.16.0;
+	// a real learnContact always stamps LastSeen, so only the fixture lied).
+	now := time.Now().Unix()
 	for i := 0; i < 2*constants.RReplication; i++ {
 		ghostID := append([]byte(nil), key...)
 		ghostID[31] = key[31] ^ byte(i) // XOR-distance exactly i from key
 		if _, err := a.rt.Add(&NodeContact{
-			NodeID: ghostID,
-			Addr:   bAddr.String(),
+			NodeID:   ghostID,
+			Addr:     bAddr.String(),
+			LastSeen: now,
 		}); err != nil {
 			t.Fatalf("ghost %d: %v", i, err)
 		}
