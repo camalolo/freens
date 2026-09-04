@@ -680,6 +680,24 @@ content screen (structure, signature, claimant binding, PoW, quorum),
 so a rogue peer pooling a quorum-less fabrication cannot freeze
 registrations — the same DoS-safety bar as the §8.4 tombstone screen.
 
+**Re-attestation (v2 renewal amendment, v0.15.4):** the witness RPC
+gains a re-attest mode: a request whose claim `ts` is older than
+`WITNESS_PRESENT_WINDOW` is not a stale re-presentation but the OWNER
+asking the witness to RE-NOTARIZE a claim it holds. A witness honors it
+only when (a) the exact claim identity (PoW prefix hash) is pooled
+here and passes the full content screen — a witness re-attests only
+what it holds; (b) it has held that identity for at least
+`RE_ATTEST_HOLD` (24 h) — fresh forgeries cannot farm signatures
+between their put and their re-attest round, so a fresh attestation
+carries real age; and (c) no live conflicting identity competes for the
+alias (the exclusivity rule, applied to the re-attest channel: a
+disputed alias is re-attested for NEITHER side). The witness signs a
+NOW-dated attestation over the unchanged claim identity — the §7.3 ts
+gate guarantees honest witnesses never put their current clock under a
+claim whose asserted `ts` is not genuinely recent — and keeps what it
+signed, serving it to verifiers (§8.3). The §7.3 cooldown applies
+unchanged.
+
 **Why so tight (v0.9.0, anti-sniping):** the age gate was formerly
 `WITNESS_COOLDOWN` (1 h). But the witness RPC necessarily discloses the
 alias to its witness set — the alias is inside the PoW prefix a witness
@@ -702,23 +720,29 @@ fresh mine faster than the victim, needing no backdating at all —
 would require commit–reveal registration (see §7.1), deferred as a v2
 candidate.
 
-**Residual (documented, v0.15.3 assessment):** against a verifier that
+**Residual (documented, v0.15.4 assessment):** against a verifier that
 cannot name the witness set, an attacker forging a fully
 self-consistent quorum (own keys, in-band backdated clocks, valid PoW)
 still presents a claim whose content is indistinguishable from honest
-history. Two v0.15.3 mitigations carry the gap: the witness
-exclusivity rule above stops the forgery from being re-minted through
-honest witnesses over a live name, and verifiers keep a bounded ledger
-of the past-horizon claim identities they have observed resolving per
-alias, refusing an unobserved past-horizon identity that would displace
-an established one (fail-open on a verifier's first sight of an alias).
-What remains — first-sight squatting of never-resolved aliases, and
-disputes between two established identities — requires the protocol
-amendment of renewal re-collecting fresh witness attestations (a
-past-horizon claim carrying attestations the §7.3 ts gate guarantees
-only genuinely-recent claims can earn); until then it costs the
-attacker no less than registering the alias normally, priced by
-NodeID grinding against the real witness set.
+history. Three mitigations carry the gap: the witness exclusivity rule
+above stops the forgery from being re-minted through honest witnesses
+over a live name; verifiers keep a bounded ledger of the past-horizon
+claim identities they have observed resolving per alias, refusing an
+unobserved past-horizon identity that would displace an established one
+(fail-open on a verifier's first sight of an alias); and the v2
+renewal amendment (the re-attestation mode above, consumed per §8.3)
+gives every continuously-held claim a network-transferable freshness
+anchor — a past-horizon claim whose fresh re-attestations reach a
+`WITNESS_SET`-checked quorum carries evidence no first-sight forgery
+can present without today's sybil presence. The remaining bound —
+patient first-sight squatting of never-resolved aliases whose holders
+stop re-attesting, and disputes between two identities that BOTH hold
+fresh evidence on disjoint witness sets — costs the attacker no less
+than registering the alias normally, priced by NodeID grinding against
+the real witness set. A future release MAY flip the resolver's
+fresh-evidence preference (§8.3) into a hard requirement for
+past-horizon claims once fleet re-attestation coverage is demonstrated
+for a full renewal cycle.
 
 ### 7.4 Registration procedure
 
@@ -777,17 +801,18 @@ Resolvers MAY resolve contested aliases to the current deterministic
 winner while flagging the name as contested in diagnostics.
 
 **Finality horizon on membership (v0.14.1) and its residual
-(v0.15.3):** the §7.3 `WITNESS_SET` membership restriction is enforced
+(v0.15.4):** the §7.3 `WITNESS_SET` membership restriction is enforced
 only while a claim is inside its contest window; an older claim
 verifies on its attestations alone (churn must not un-evidence mature
 names). Because a claim minted ALREADY-backdated is born past the
 horizon, its attestations are the attacker's own, and verifiers keep a
 bounded per-alias ledger of the past-horizon identities they have
 observed: an unobserved past-horizon identity MUST NOT displace an
-established one (fail-open on a verifier's first sight of an alias).
-This is the resolver-side half of the §7.3 witness exclusivity rule;
-see that section for the residual and the renewal-fresh-attestation
-amendment that closes it.
+established one (fail-open on a verifier's first sight of an alias) —
+UNLESS it carries a fresh §8.3 re-attestation quorum, which outranks
+observation. This is the resolver-side half of the §7.3 witness
+exclusivity and re-attestation rules; see those sections for the
+residual and the designated v2 path.
 
 ### 7.6 Cost summary
 
@@ -893,6 +918,26 @@ hand-off history offline.
 
 For a whole-TLD transfer, the same operation on the TLD record
 transfers the alias and all undelegated names at once.
+
+**Renewal re-attestation (v2 amendment, v0.15.4):** renewals —
+re-signs at sequence+1 with a fresh window, no PoW — now also
+RE-NOTARIZE the claim: after publishing, the owner walks the converged
+witness set around `K_claim` and drives the §7.3 re-attest mode, and
+verifiers consuming the claim set (§7.4 step 1) merge the holders'
+stored fresh re-attestations alongside the envelopes. At the verifier,
+among PAST-HORIZON claims (§7.5), a claim whose fresh attestations
+(witness-clock within `RE_ATTEST_FRESH` = 48 h, signature-valid,
+distinct, and — when the walk names the set — `WITNESS_SET` members)
+reach the `W` quorum PREEMPTS past-horizon claims without such
+evidence: evidence outranks both asserted age and a resolver's own
+prior observation. In-window claims are untouched — ordering rules,
+and their membership was just enforced. Re-attestation is best-effort
+by design: a short haul is "this cycle gathered nothing", never a
+renewal failure (availability outranks evidence freshness — the §8.4
+lesson); the holding period means each witness signs from its second
+renewal cycle onward, so evidence accumulates in the background and a
+future release MAY harden the preference into a requirement (§7.3
+residual).
 
 ### 8.4 Recovery
 

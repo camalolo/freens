@@ -103,11 +103,19 @@ func bdWorld(t *testing.T, alias string, claimTS, attTS uint64, n int) (*claims.
 }
 
 // bdSetSource is a ClaimSetWithWitnesses fake: fixed envelopes + a fixed
-// witness set (nil = sparse view).
+// witness set (nil = sparse view), plus the §8.3 re-attestation sets (nil
+// map = the source carries no freshness evidence).
 type bdSetSource struct {
 	envs  []*wire.SignedEnvelope
 	set   map[string]bool
+	ratts map[string][]*claims.WitnessAttestation
 	inner RecordLookup // the chain walk after alias resolution (unused here)
+}
+
+// ReAttestSets structurally satisfies the resolver's optional
+// resolver.ReAttestSource interface (v2 renewal amendment).
+func (s *bdSetSource) ReAttestSets(_ context.Context, _ string, _ int64) (map[string][]*claims.WitnessAttestation, error) {
+	return s.ratts, nil
 }
 
 func (s *bdSetSource) CollectClaimsWithWitnesses(_ context.Context, _ string, _ int64) ([]*wire.SignedEnvelope, map[string]bool, error) {
@@ -437,5 +445,133 @@ func TestHonestInWindowClaimUnaffectedByRatchet(t *testing.T) {
 	got, _ := bdResolveR(r, alias)
 	if !bytes.Equal(got, victimClaim.TldID) {
 		t.Fatal("honest in-window registration changed the outcome (ordering must still pick the earlier ts)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v0.15.4 — the §8.3 fresh-evidence preference (the v2 amendment's payoff):
+// a past-horizon claim carrying a verified fresh witness quorum adjudicates
+// disputes WITHOUT any prior resolver observation, and outranks observation.
+// ---------------------------------------------------------------------------
+
+// bdFreshQuorum builds constants.W fresh attestations over ph, dated now,
+// from distinct throwaway node keypairs.
+func bdFreshQuorum(t *testing.T, ph []byte, now int64) []*claims.WitnessAttestation {
+	t.Helper()
+	atts := make([]*claims.WitnessAttestation, 0, constants.W)
+	for i := 0; i < constants.W; i++ {
+		kp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		att, err := claims.NewWitnessAttestation(kp, uint64(now), ph)
+		if err != nil {
+			t.Fatal(err)
+		}
+		atts = append(atts, att)
+	}
+	return atts
+}
+
+// TestFreshEvidenceAdjudicatesDisputeWithoutHistory: the amendment's core
+// promise. Fresh resolver (no ratchet history), two past-horizon identities
+// — §6.4 ordering alone crowns the OLDER forgery. The victim's claim carries
+// a fresh witness quorum; the preference preempts the forgery on FIRST SIGHT.
+func TestFreshEvidenceAdjudicatesDisputeWithoutHistory(t *testing.T) {
+	const alias = "v2dispute"
+	victimClaim, victimEnv, _ := bdWorld(t, alias, uint64(fixedNow-90*86400), uint64(fixedNow-90*86400), constants.W)
+	_, forgeryEnv, _ := bdWorld(t, alias, uint64(fixedNow-95*86400), uint64(fixedNow-95*86400), constants.W)
+
+	victimPh, err := victimClaim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &bdSetSource{
+		envs:  []*wire.SignedEnvelope{victimEnv, forgeryEnv},
+		set:   nil, // sparse view: membership unenforced — evidence carries it alone
+		ratts: map[string][]*claims.WitnessAttestation{hex.EncodeToString(victimPh): bdFreshQuorum(t, victimPh, fixedNow)},
+	}
+	r := bdResolver(t, src)
+	got, _ := bdResolveR(r, alias)
+	if !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("VULNERABLE: the forged older-ts claim won despite the victim's fresh witness quorum")
+	}
+}
+
+// TestFreshEvidenceOutranksResolverObservation: the ratchet defends what a
+// resolver saw first — but fresh §8.3 evidence outranks observation. The
+// forgery is established first (first sight), then the victim arrives WITH
+// a fresh quorum: the victim wins.
+func TestFreshEvidenceOutranksResolverObservation(t *testing.T) {
+	const alias = "v2outrank"
+	victimClaim, victimEnv, _ := bdWorld(t, alias, uint64(fixedNow-90*86400), uint64(fixedNow-90*86400), constants.W)
+	_, forgeryEnv, _ := bdWorld(t, alias, uint64(fixedNow-95*86400), uint64(fixedNow-95*86400), constants.W)
+
+	victimPh, err := victimClaim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &bdSetSource{set: nil}
+	r := bdResolver(t, src)
+
+	// Round 1: only the forgery visible — bootstrapped as established.
+	src.envs = []*wire.SignedEnvelope{forgeryEnv}
+	if got, _ := bdResolveR(r, alias); got == nil {
+		t.Fatal("fixture: forgery did not bootstrap")
+	}
+
+	// Round 2: the victim arrives WITH fresh evidence.
+	src.envs = []*wire.SignedEnvelope{victimEnv, forgeryEnv}
+	src.ratts = map[string][]*claims.WitnessAttestation{hex.EncodeToString(victimPh): bdFreshQuorum(t, victimPh, fixedNow)}
+	got, _ := bdResolveR(r, alias)
+	if !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("the ratchet's observation outranked fresh witness evidence — evidence must win")
+	}
+}
+
+// TestForgedFreshAttestationsCountedOnlyInSet: fresh attestations are only
+// as good as their membership. The forgery presents self-made fresh
+// attestations, but the source NAMES the converged witness set — and the
+// attacker's keypairs are not in it — so the quorum does not count, no
+// preference fires, and the established victim survives via the ratchet.
+func TestForgedFreshAttestationsCountedOnlyInSet(t *testing.T) {
+	const alias = "v2forgenotinset"
+	victimClaim, victimEnv, _ := bdWorld(t, alias, uint64(fixedNow-90*86400), uint64(fixedNow-90*86400), constants.W)
+	forgeryClaim, forgeryEnv, _ := bdWorld(t, alias, uint64(fixedNow-95*86400), uint64(fixedNow-95*86400), constants.W)
+
+	forgeryPh, err := forgeryClaim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The witness set: 8 honest node IDs — none of them the attacker's.
+	set := make(map[string]bool, constants.WitnessSet)
+	for i := 0; i < constants.WitnessSet; i++ {
+		hkp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		nid, err := crypto.NodeID(hkp.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		set[hex.EncodeToString(nid)] = true
+	}
+	src := &bdSetSource{
+		envs:  []*wire.SignedEnvelope{victimEnv, forgeryEnv},
+		set:   set,
+		ratts: map[string][]*claims.WitnessAttestation{hex.EncodeToString(forgeryPh): bdFreshQuorum(t, forgeryPh, fixedNow)},
+	}
+	r := bdResolver(t, src)
+
+	// The forgery's fake evidence does not count against the named set; the
+	// victim (established here first) survives the ratchet.
+	src.envs = []*wire.SignedEnvelope{victimEnv}
+	if got, _ := bdResolveR(r, alias); !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("fixture: victim did not establish")
+	}
+	src.envs = []*wire.SignedEnvelope{victimEnv, forgeryEnv}
+	got, _ := bdResolveR(r, alias)
+	if !bytes.Equal(got, victimClaim.TldID) {
+		t.Fatal("VULNERABLE: forged attestations outside the witness set counted toward a fresh quorum")
 	}
 }

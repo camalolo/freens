@@ -154,16 +154,66 @@ func (l *pastHorizonLedger) observe(alias, phHex string, now int64) {
 	ids[phHex] = now
 }
 
-// filterPastHorizonNewcomers applies the ratchet to the live claim set
-// before §6.4 ordering: past-horizon identities never before observed for
-// this alias are dropped when the alias HAS at least one established
-// identity in the same resolution. Returns the filtered slice (in place —
-// callers have not aliased it yet).
-func (r *Resolver) filterPastHorizonNewcomers(alias string, lives []liveClaim, now int64) []liveClaim {
+// filterPastHorizonNewcomers applies, in order:
+//
+//  1. the §8.3 re-attestation preference (v2 amendment): among the
+//     PAST-HORIZON survivors, a claim carrying a verified FRESH witness
+//     quorum preempts one without — network-transferable evidence (priced
+//     by §12 sybil presence, since fresh attestations are membership-
+//     checkable) outranks both asserted age AND this resolver's own prior
+//     observation. When no claim carries fresh evidence, this step is a
+//     no-op and the horizon's status quo (§6.4 ordering) stands.
+//  2. the #8 ratchet: past-horizon identities never before observed for
+//     this alias are dropped when the alias HAS an established identity —
+//     except a fresh-evidenced one, which observation cannot override.
+//
+// Returns the filtered slice (in place — callers have not aliased it yet).
+func (r *Resolver) filterPastHorizonNewcomers(alias string, lives []liveClaim, witnessSet map[string]bool, reAttestSets map[string][]*claims.WitnessAttestation, now int64) []liveClaim {
 	if len(lives) == 0 {
 		return lives
 	}
 	horizon := now - int64(constants.ContestWindow)
+
+	// Step 1 — the fresh-evidence preference among past-horizon claims.
+	evidenced := make(map[string]bool, len(lives))
+	anyEvidence := false
+	if len(reAttestSets) > 0 {
+		for _, lc := range lives {
+			if int64(lc.claim.Timestamp) > horizon {
+				continue // in-window: rides the membership-checked path
+			}
+			phHex := hex.EncodeToString(lc.ph)
+			if claims.HasFreshQuorum(reAttestSets[phHex], lc.ph, now, int64(constants.ReAttestFresh), witnessSet, constants.W) {
+				evidenced[phHex] = true
+				anyEvidence = true
+			}
+		}
+	}
+	if anyEvidence {
+		kept := lives[:0]
+		for _, lc := range lives {
+			phHex := hex.EncodeToString(lc.ph)
+			if int64(lc.claim.Timestamp) <= horizon && !evidenced[phHex] {
+				// A past-horizon claim without freshness evidence loses to
+				// one that has it — even if THIS resolver observed the
+				// stale identity before (evidence outranks observation).
+				if r.Logger != nil {
+					r.Logger.Warn("dropping past-horizon claim without fresh re-attestations",
+						"alias", alias, "identity", phHex)
+				}
+				continue
+			}
+			kept = append(kept, lc)
+		}
+		lives = kept
+		if len(lives) == 0 {
+			return lives
+		}
+	}
+
+	// Step 2 — the observation ratchet (unchanged semantics, with
+	// fresh-evidenced identities exempt: they carry §12-priced evidence,
+	// which is stronger than this resolver's own history).
 	past := 0
 	for _, lc := range lives {
 		if int64(lc.claim.Timestamp) <= horizon {
@@ -195,10 +245,11 @@ func (r *Resolver) filterPastHorizonNewcomers(alias string, lives []liveClaim, n
 		switch {
 		case phHexes[i] == "":
 			kept = append(kept, lc) // in-window
-		case est[i] || !defended:
+		case est[i] || !defended || evidenced[phHexes[i]]:
 			// This identity IS the established one, or the alias has no
 			// established identity at all (fresh resolver bootstrap —
-			// everything is new, keep all and learn).
+			// everything is new, keep all and learn), or it carries fresh
+			// §8.3 evidence (stronger than observation).
 			kept = append(kept, lc)
 			r.pastHorizon.observe(alias, phHexes[i], now)
 		default:

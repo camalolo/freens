@@ -465,6 +465,59 @@ func (c *AliasClaim) hasQuorumFromPrefixHash(prefixHash []byte, witnessSetIDs ma
 	return len(counted) >= quorum
 }
 
+// FreshAttestations filters the given attestations to the ones that are
+// VALID for the claim identity (v2 signature over prefixHash, node key
+// binding, distinct) AND dated within freshWindow of now — the §8.3
+// re-attestation evidence class (v2 renewal amendment): unlike the mint
+// attestations' corroboration band (around the claim's asserted ts), these
+// are dated by witnesses against THEIR CURRENT clock, which the §6.3 ts gate
+// guarantees they would only put under a claim they have been holding. The
+// attestations arrive from storing nodes' pools (each re-attesting witness
+// keeps what it signed); the verifier re-checks every signature — pool state
+// is untrusted input, exactly like pooled envelopes.
+func FreshAttestations(atts []*WitnessAttestation, prefixHash []byte, now int64, freshWindow int64) []*WitnessAttestation {
+	if len(atts) == 0 {
+		return nil
+	}
+	lo := now - freshWindow
+	hi := now + int64(constants.SkewTolerance)
+	seen := make(map[string]struct{}, len(atts))
+	out := make([]*WitnessAttestation, 0, len(atts))
+	for _, w := range atts {
+		k := hex.EncodeToString(w.NodeID)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		if !w.Verify(prefixHash) {
+			continue
+		}
+		if ts := int64(w.TS); ts >= lo && ts <= hi {
+			seen[k] = struct{}{}
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// HasFreshQuorum reports whether atts carry at least quorum DISTINCT fresh
+// attestations for the claim identity (see FreshAttestations), optionally
+// restricted to witnessSetIDs — the same §7.3 WITNESS_SET restriction as
+// HasQuorum, and for the same reason: fresh attestations are dated NOW, so
+// membership in the converged set IS checkable, and the restriction is what
+// makes the evidence cost a real sybil presence instead of five self-made
+// keypairs. Non-nil witnessSetIDs with a nil set from a sparse view must
+// pass nil (unenforced), matching HasQuorum semantics.
+func HasFreshQuorum(atts []*WitnessAttestation, prefixHash []byte, now int64, freshWindow int64, witnessSetIDs map[string]bool, quorum int) bool {
+	counted := make(map[string]struct{}, len(atts))
+	for _, w := range FreshAttestations(atts, prefixHash, now, freshWindow) {
+		k := hex.EncodeToString(w.NodeID)
+		if witnessSetIDs == nil || witnessSetIDs[k] {
+			counted[k] = struct{}{}
+		}
+	}
+	return len(counted) >= quorum
+}
+
 // CanonicalBytes returns the canonical CBOR encoding of the whole claim
 // (RFC 8949 §4.2). This is the byte string embedded verbatim in
 // wire.Record.Claim (field 11).

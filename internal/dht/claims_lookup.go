@@ -85,6 +85,15 @@ import (
 // winner selection) is the RESOLVER's job (§6.5: the DHT does not adjudicate);
 // this method only collects and signature-checks.
 func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedEnvelope, map[string]bool, error) {
+	envs, set, _, err := n.collectClaims(ctx, alias, true)
+	return envs, set, err
+}
+
+// CollectClaimsWithReAttests is CollectClaims plus the §8.3 re-attestation
+// sets the converged holders offered (identity hex → fresh, signature-
+// verified attestations). DHTLookup merges them into its pool so the
+// resolver-side freshness evidence survives the walk.
+func (n *Node) CollectClaimsWithReAttests(ctx context.Context, alias string) ([]*wire.SignedEnvelope, map[string]bool, map[string][]*claims.WitnessAttestation, error) {
 	return n.collectClaims(ctx, alias, true)
 }
 
@@ -96,20 +105,39 @@ func (n *Node) CollectClaims(ctx context.Context, alias string) ([]*wire.SignedE
 // store held the fresh envelope while the network had lost it, and a
 // local-inclusive check would have called that healthy forever).
 func (n *Node) CollectClaimsRemote(ctx context.Context, alias string) ([]*wire.SignedEnvelope, map[string]bool, error) {
-	return n.collectClaims(ctx, alias, false)
+	envs, set, _, err := n.collectClaims(ctx, alias, false)
+	return envs, set, err
 }
 
-func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal bool) ([]*wire.SignedEnvelope, map[string]bool, error) {
+func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal bool) ([]*wire.SignedEnvelope, map[string]bool, map[string][]*claims.WitnessAttestation, error) {
 	aliasN, err := naming.ValidateAlias(alias)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	key, err := KeyForClaim(aliasN)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	collected := make(map[string]*wire.SignedEnvelope) // H_record → envelope
+	// §8.3 (v2 amendment): re-attestations offered alongside the envelopes,
+	// merged per claim identity. Signature + freshness are verified HERE at
+	// the merge — peer pool state is untrusted input.
+	merged := make(map[string][]*claims.WitnessAttestation)
+	now := n.now()
+	mergeReAttests := func(rts map[string][]*claims.WitnessAttestation) {
+		for phHex, atts := range rts {
+			ph, derr := hex.DecodeString(phHex)
+			if derr != nil || len(ph) != constants.SHA256Len {
+				continue
+			}
+			fresh := claims.FreshAttestations(atts, ph, now, int64(constants.ReAttestFresh))
+			if len(fresh) == 0 {
+				continue
+			}
+			merged[phHex] = append(merged[phHex], fresh...)
+		}
+	}
 	add := func(env *wire.SignedEnvelope) {
 		if env == nil || env.Record == nil || !env.VerifySignature() {
 			return
@@ -137,13 +165,13 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 
 	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
 	if len(shortlist) == 0 {
-		return sortedByRecordHash(collected), nil, nil // island: local copy only.
+		return sortedByRecordHash(collected), nil, nil, nil // island: local copy only.
 	}
 	// Work-amplification cap (as IterativeGetDetailed): the walk holds one
 	// WalkConcurrency slot for its whole run; a saturated budget refuses
 	// with ErrWalkBusy rather than queueing.
 	if !n.acquireWalk() {
-		return nil, nil, ErrWalkBusy
+		return nil, nil, nil, ErrWalkBusy
 	}
 	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
@@ -181,7 +209,8 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 		type res struct {
 			envs  []*wire.SignedEnvelope // every offer (§7.4 `envelopes` + legacy `envelope`)
 			nodes []*NodeContact
-			err   error // probe failure (drives §6.2 eviction)
+			rts   map[string][]*claims.WitnessAttestation // §8.3 re-attestations offered with them
+			err   error                                   // probe failure (drives §6.2 eviction)
 		}
 		results := make([]res, len(batch))
 		var wg sync.WaitGroup
@@ -195,8 +224,8 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 				// effectively unavailable.
 				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 				defer cancel()
-				es, ns, err := n.getFromPeer(pctx, key, c)
-				results[i] = res{es, ns, err}
+				es, ns, rts, err := n.getFromPeer(pctx, key, c)
+				results[i] = res{es, ns, rts, err}
 			}(i, c)
 		}
 		wg.Wait()
@@ -234,6 +263,7 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 			for _, e := range r.envs {
 				add(e)
 			}
+			mergeReAttests(r.rts)
 		}
 		// Adaptive batch, same rationale as IterativeGet (issue #1).
 		if roundAnswered == 0 {
@@ -260,6 +290,7 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 	}
 	var finalsThrottled, finalsFailed int32 // atomic; merged after fwg.Wait
 	finals := make([][]*wire.SignedEnvelope, len(reachable))
+	finalsRts := make([]map[string][]*claims.WitnessAttestation, len(reachable))
 	var fwg sync.WaitGroup
 	for i, c := range reachable {
 		fwg.Add(1)
@@ -267,7 +298,10 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 			defer fwg.Done()
 			pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 			defer cancel()
-			envs, _, err := n.getFromPeer(pctx, key, c)
+			envs, _, rts, err := n.getFromPeer(pctx, key, c)
+			if err == nil && len(rts) > 0 {
+				finalsRts[i] = rts
+			}
 			switch {
 			case err == nil:
 				finals[i] = envs
@@ -290,6 +324,9 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 			add(e)
 		}
 	}
+	for _, rts := range finalsRts {
+		mergeReAttests(rts)
+	}
 
 	// Degraded-miss classification (issue #1): an EMPTY collected set with
 	// probe failures — or §12-throttled holders whose "held or not" answer
@@ -297,9 +334,9 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 	// resolver must retry (SERVFAIL) rather than negative-cache an NXDOMAIN
 	// for an alias whose claim holders were alive all along.
 	if len(collected) == 0 && (probesFailed > 0 || probesThrottled > 0) {
-		return nil, nil, ErrDegradedMiss
+		return nil, nil, nil, ErrDegradedMiss
 	}
-	return sortedByRecordHash(collected), convergedWitnessSet(answered, key, n.ID()), nil
+	return sortedByRecordHash(collected), convergedWitnessSet(answered, key, n.ID()), merged, nil
 }
 
 // convergedWitnessSet names the §7.3 WITNESS_SET (the WitnessSet = 8 closest
@@ -489,7 +526,7 @@ func (l *DHTLookup) CollectClaimsWithWitnesses(ctx context.Context, alias string
 
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
-	envs, witnessSet, err := l.node.CollectClaims(c, alias)
+	envs, witnessSet, reattests, err := l.node.CollectClaimsWithReAttests(c, alias)
 	// ErrWalkBusy (overload refusal) is handled exactly like ErrDegradedMiss:
 	// a LOCAL claim still serves (a saturated walk does not invalidate what
 	// this node already holds), only an empty-everywhere overload propagates.
@@ -521,6 +558,13 @@ func (l *DHTLookup) CollectClaimsWithWitnesses(ctx context.Context, alias string
 		for _, env := range set {
 			l.node.claims.Offer(key, env)
 		}
+		// §8.3 (v2 amendment): the holders' fresh re-attestations join the
+		// local pool (each set was signature- and freshness-verified at the
+		// walk's merge), so resolver-side freshness evidence survives the
+		// walk that discovered it.
+		for phHex, atts := range reattests {
+			l.node.claims.StoreReAttests(key, phHex, atts)
+		}
 	}
 	// Empty-slot-only cache-back (see doc comment): an occupied slot is never
 	// displaced — that is what collapses a contested split.
@@ -528,4 +572,39 @@ func (l *DHTLookup) CollectClaimsWithWitnesses(ctx context.Context, alias string
 		_, _ = l.store.Put(key, set[0], now, true)
 	}
 	return set, witnessSet, nil
+}
+
+// ReAttestSets returns the fresh re-attestations this node holds for the
+// alias's pooled claim identities (§8.3, v2 amendment): identity hex → the
+// stored attestations, RAW — the resolver verifies signatures and freshness
+// itself (pool state is untrusted input). The sets are populated by the
+// witness RPC's re-attest mode (each re-attesting witness keeps what it
+// signed) and merged here from the converged holders during
+// CollectClaimsWithWitnesses. It structurally satisfies the resolver's
+// optional resolver.ReAttestSource interface (same structural-satisfaction
+// trick as CollectClaims — the import would cycle).
+func (l *DHTLookup) ReAttestSets(ctx context.Context, alias string, now int64) (map[string][]*claims.WitnessAttestation, error) {
+	key, err := KeyForClaim(alias)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string][]*claims.WitnessAttestation)
+	for _, env := range l.node.claims.Top2(key) {
+		if env == nil || env.Record == nil {
+			continue
+		}
+		claim, cerr := claims.DecodeAliasClaim(env.Record.Claim)
+		if cerr != nil {
+			continue
+		}
+		ph, perr := claim.PrefixHash()
+		if perr != nil {
+			continue
+		}
+		atts := l.node.claims.ReAttestsOf(key, hex.EncodeToString(ph))
+		if len(atts) > 0 {
+			out[hex.EncodeToString(ph)] = atts
+		}
+	}
+	return out, nil
 }

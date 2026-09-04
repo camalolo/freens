@@ -61,6 +61,27 @@ const (
 	RecoveryTimelock = 259200  // default recovery delay (72 h)
 )
 
+// Re-attestation (the v2 renewal amendment, §8.3/§7.3): renewals re-collect
+// witness attestations for the UNCHANGED claim identity, dated NOW. The §6.3
+// ts gate guarantees an honest witness only ever signs a claim whose ts is
+// within WitnessPresentWindow of its own clock, so a claim whose FRESH
+// attestations exist has been continuously held and witnessed — the
+// resolver-side freshness evidence that anchors past-horizon claims.
+const (
+	// ReAttestHold is how long a storing node must have held a claim
+	// identity before it re-attests it: fresh forgeries cannot farm
+	// signatures in the window between their put and their re-attest round,
+	// so a fresh attestation quorum carries real age. 24 h = one renewal
+	// cycle; churned-in witnesses become eligible one cycle after
+	// acquiring the chain.
+	ReAttestHold = 86400
+	// ReAttestFresh is how recent an attestation must be (witness clock vs
+	// now) to count as freshness evidence at the verifier: one contest
+	// window, so a claim re-attested every renewal cycle (24 h leases)
+	// always carries live evidence.
+	ReAttestFresh = ContestWindow
+)
+
 // Resolver caching.
 const (
 	ResponseTTLCap = 3600 // max TTL emitted by resolver (seconds)

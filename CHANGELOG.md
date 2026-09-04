@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — v0.15.4: the v2 renewal amendment (§8.3 re-attestation — network-transferable freshness evidence)
+
+The designated v2 path from the backdated-claim defense, implemented:
+
+- **The witness RPC gains a re-attest mode (§7.3).** A request whose
+  claim ts is older than the present window is no longer refused
+  outright when it carries `reattest: true` — it is the owner asking
+  the witness to RE-NOTARIZE a claim it holds. Eligibility: the exact
+  claim identity is pooled here (a witness re-attests only what it
+  holds, screened by the full §7.4 content filter), held for at least
+  `RE_ATTEST_HOLD` (24 h — fresh forgeries cannot farm signatures
+  between their put and their re-attest round), and no live conflicting
+  identity competes (the exclusivity rule on the re-attest channel: a
+  disputed alias is re-attested for NEITHER side). The witness signs a
+  NOW-dated attestation over the unchanged claim identity — the ts gate
+  guarantees honest witnesses never put their current clock under a
+  claim whose asserted ts is not genuinely recent — and keeps what it
+  signed.
+- **Renewals drive it (§8.3).** After a successful publish, the daemon's
+  auto-renew and `freens renew` walk the converged witness set and
+  collect re-attestations — best-effort by design: a short haul is
+  "this cycle gathered nothing", never a renewal failure. Holding
+  periods mean each witness signs from its second renewal cycle onward,
+  so fleet evidence accumulates in the background.
+- **Verifiers consume it.** hGet serves the holder's stored fresh
+  re-attestations alongside the envelopes (flat
+  [identity, attestation] pairs — no nested maps on the wire, graceful
+  with pre-amendment peers); the collect path merges and re-verifies
+  them into the local pool; and in the resolver, among PAST-HORIZON
+  claims, one whose fresh attestations reach the W quorum —
+  membership-checked whenever the walk names the witness set — PREEMPTS
+  past-horizon claims without such evidence. Evidence outranks both
+  asserted age and the v0.15.3 ratchet's own observation. The ratchet
+  remains the fallback for names without evidence yet, and in-window
+  claims are untouched (ordering rules).
+- **Pool state**: per claim-identity firstSeen stamps (the holding
+  period is per IDENTITY, so renewal generations never re-arm it) and
+  stored re-attestation sets, both persisted in a claims-meta.json
+  sidecar (the holding period must survive restarts, or every upgrade
+  re-arms it fleet-wide), bounded (16 per identity, swept with the pool,
+  re-verified on load — a hand-edited meta file cannot manufacture
+  evidence).
+- **Spec**: §7.3 re-attest mode + updated residual (the remaining bound
+  is §12 economics); §8.3 the renewal amendment + the verifier's
+  preference rule; §7.5 evidence-outranks-observation. A future release
+  MAY flip the preference into a hard requirement for past-horizon
+  claims once fleet coverage is demonstrated for a full renewal cycle.
+
 ## Unreleased — v0.15.3: the backdated-claim defense (witness exclusivity + the resolver ratchet) and four audit P1/P2s
 
 The remaining open findings from the 2026-09-04 audit:

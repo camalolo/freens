@@ -73,7 +73,7 @@ type ClaimSetResolver interface {
 }
 
 // ClaimSetWithWitnesses is the OPTIONAL v0.7.0 extension of ClaimSetResolver:
-// the same collected claim set, PLUS the converged WITNESS SET of the very
+// the same collected claim set, PLUS the converged WITNESS_SET of the very
 // walk that collected it — the hex(NodeID) set of the WitnessSet = 8 closest
 // REACHED nodes to K_claim (§7.3), or nil when the source's reachable view is
 // too sparse to honestly name a set (small fleets, partitions, young tables).
@@ -90,6 +90,17 @@ type ClaimSetResolver interface {
 // satisfies this interface structurally (CollectClaimsWithWitnesses).
 type ClaimSetWithWitnesses interface {
 	CollectClaimsWithWitnesses(ctx context.Context, alias string, now int64) ([]*wire.SignedEnvelope, map[string]bool, error)
+}
+
+// ReAttestSource is the OPTIONAL §8.3 re-attestation source (v2 renewal
+// amendment, v0.15.4): it returns the fresh re-attestation sets the holders
+// offered for the alias's pooled claim identities (identity hex → raw
+// attestations). dht.DHTLookup satisfies it structurally (ReAttestSets).
+// The resolver verifies every attestation itself (signature over the claim
+// identity, witness-clock freshness, distinctness, and — when the walk names
+// the witness set — membership): pool state is untrusted input.
+type ReAttestSource interface {
+	ReAttestSets(ctx context.Context, alias string, now int64) (map[string][]*claims.WitnessAttestation, error)
 }
 
 // HistoryResolver is the OPTIONAL §8.3 transfer-history source: it returns the
@@ -980,15 +991,24 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	if len(liveClaims) == 0 {
 		return nil, false, false // every competing claim failed the §7.4 step-2 filter
 	}
-	// #8 backdated-claim ratchet (v0.15.3): drop past-horizon identity
-	// newcomers against established ones BEFORE the §6.4 ordering — the
-	// ordering is earliest-asserted-ts-first, and an asserted ts is
-	// attacker-chosen (see claims_ratchet.go for the full model).
+	// #8 backdated-claim ratchet (v0.15.3) + §8.3 fresh-evidence preference
+	// (v2 amendment, v0.15.4): drop past-horizon identity newcomers against
+	// established ones BEFORE the §6.4 ordering — the ordering is
+	// earliest-asserted-ts-first, and an asserted ts is attacker-chosen —
+	// and give any claim carrying a verified fresh re-attestation quorum
+	// precedence among past-horizon identities (claims_ratchet.go for the
+	// order of the two steps and why evidence outranks observation).
 	r.pastHorMu.Lock()
 	if r.pastHorizon == nil {
 		r.pastHorizon = newPastHorizonLedger()
 	}
-	liveClaims = r.filterPastHorizonNewcomers(alias, liveClaims, now)
+	var reAttestSets map[string][]*claims.WitnessAttestation
+	if rs, ok := r.Freens.(ReAttestSource); ok {
+		if sets, rerr := rs.ReAttestSets(ctx, alias, now); rerr == nil {
+			reAttestSets = sets
+		}
+	}
+	liveClaims = r.filterPastHorizonNewcomers(alias, liveClaims, witnessSet, reAttestSets, now)
 	r.pastHorMu.Unlock()
 	if len(liveClaims) == 0 {
 		// Every survivor was an unproven past-horizon newcomer — answer

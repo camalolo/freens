@@ -1469,8 +1469,54 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		if len(arr) > 0 {
 			args["envelopes"] = arr
 		}
+		// §8.3 (v2 amendment): this node's own stored re-attestations for
+		// the pooled identities ride along, as [identity-hex, attestation]
+		// pairs (a FLAT list — no nested map, so the field survives any
+		// CBOR decoder's interface{} handling). Each is a self-verifying
+		// v2 attestation; the consumer re-checks every signature against
+		// the named identity (pool state is untrusted input). A peer
+		// running a pre-amendment binary simply omits the field — graceful.
+		if rts := n.reAttestArgs(key, pooled); len(rts) > 0 {
+			args["reattests"] = rts
+		}
 	}
 	return n.okResp(m, args)
+}
+
+// reAttestArgs builds the hGet reattests field: a flat list of
+// [identity-hex, attestation-bytes] pairs, one per stored re-attestation,
+// for every pooled identity this node holds fresh evidence for.
+func (n *Node) reAttestArgs(key []byte, pooled []*wire.SignedEnvelope) []any {
+	var out []any
+	now := n.now()
+	for _, e := range pooled {
+		if e == nil || e.Record == nil {
+			continue
+		}
+		claim, err := claims.DecodeAliasClaim(e.Record.Claim)
+		if err != nil {
+			continue
+		}
+		ph, err := claim.PrefixHash()
+		if err != nil {
+			continue
+		}
+		atts := n.claims.ReAttestsOf(key, hex.EncodeToString(ph))
+		if len(atts) == 0 {
+			continue
+		}
+		fresh := claims.FreshAttestations(atts, ph, now, int64(constants.ReAttestFresh))
+		if len(fresh) == 0 {
+			continue // stale evidence is not worth the bytes
+		}
+		phHex := hex.EncodeToString(ph)
+		for _, a := range fresh {
+			if ab, err := a.CanonicalBytes(); err == nil {
+				out = append(out, []any{phHex, ab})
+			}
+		}
+	}
+	return out
 }
 
 // hPut stores an envelope after verifying the write token, the envelope
@@ -1794,9 +1840,6 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if ts > nowU+uint64(constants.SkewTolerance) {
 		return n.errResp(m, 305, "claim ts in the future")
 	}
-	if ts <= nowU && nowU-ts > uint64(constants.WitnessPresentWindow) {
-		return n.errResp(m, 305, "claim ts too old")
-	}
 
 	// §7.3 WITNESS_COOLDOWN: one (re-signable) claim per alias per window.
 	//
@@ -1825,6 +1868,34 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if n.liveClaimConflict(aliasN, prefixHash, now) {
 		n.log.Info("witness refused: alias already claimed (live conflicting claim)", "alias", aliasN)
 		return n.errResp(m, 305, "alias already claimed")
+	}
+	// §8.3 re-attestation mode (v2 renewal amendment, v0.15.4): a request
+	// carrying reattest=true whose claim ts is OLDER than the present
+	// window is not a stale re-presentation — it is the owner asking this
+	// node to re-notarize a claim it has been holding. Eligibility: the
+	// exact claim identity is pooled here (a witness only re-attests what
+	// it holds), this node has held it for at least ReAttestHold (fresh
+	// forgeries cannot farm signatures between their put and their
+	// re-attest round), and no live conflicting identity competes (the
+	// exclusivity rule above, applied to the re-attest channel too — a
+	// disputed alias gets re-attested for NEITHER side). The §7.3 cooldown
+	// and the signing flow below are shared with the mint path; the
+	// attestation is dated NOW either way, which is what makes it freshness
+	// evidence at the verifier.
+	reattest, _ := m.A["reattest"].(bool)
+	if ts <= nowU && nowU-ts > uint64(constants.WitnessPresentWindow) {
+		if !reattest {
+			return n.errResp(m, 305, "claim ts too old")
+		}
+		if why := n.reAttestRefusal(aliasN, prefixHash, now); why != "" {
+			n.log.Info("witness refused: re-attest", "alias", aliasN, "reason", why)
+			return n.errResp(m, 305, "re-attest refused: "+why)
+		}
+	} else if reattest {
+		// A fresh-ts request has no business asking for the re-attest
+		// mode: it IS an ordinary witness request (the two paths sign
+		// identically), so treat it as one.
+		reattest = false
 	}
 	n.witnessMu.Lock()
 	last, seen := n.witnessLast[aliasN]
@@ -1878,6 +1949,14 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if err != nil {
 		return n.errResp(m, 301, "attestation encode failed")
 	}
+	// §8.3: a re-attestation is evidence — this node keeps what it signed
+	// (per claim identity) so hGet can serve it to verifiers merging fresh
+	// quorums across the converged set.
+	if reattest {
+		if phHex := hex.EncodeToString(prefixHash); phHex != "" {
+			n.claims.StoreReAttests(kClaimFor(aliasN), phHex, []*claims.WitnessAttestation{att})
+		}
+	}
 	// Appendix A.4: count the accepted claim only on this node's FIRST
 	// co-sign of the alias (`seen` from the witnessLast probe above);
 	// every PoWRetargetBlock acceptances the node's own difficulty
@@ -1886,11 +1965,65 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		n.diff.recordAccepted(now)
 	}
 	n.log.Info("dht: witnessed alias claim",
-		"alias", aliasN, "claimant", HexID(claimant), "ts", now)
+		"alias", aliasN, "claimant", HexID(claimant), "ts", now, "reattest", reattest)
 	return n.okResp(m, map[string]any{
 		"attestation": attBytes,                           // bstr .cbor WitnessAttestation
 		"difficulty":  uint64(n.diff.currentDifficulty()), // Appendix A.4 gossip
 	})
+}
+
+// reAttestRefusal answers WHY a re-attestation request for (alias,
+// prefixHash) cannot be honored at now, or "" when it can. The eligibility
+// anchor is this node's own pool: a witness re-attests only a claim identity
+// it holds, only after holding it for constants.ReAttestHold (fresh
+// forgeries cannot farm signatures between their put and their re-attest
+// round), and only while no live conflicting identity competes for the alias
+// (a disputed alias gets re-attested for NEITHER side — the §7.3 exclusivity
+// rule applied to the re-attest channel).
+func (n *Node) reAttestRefusal(alias string, prefixHash []byte, now int64) string {
+	if n == nil || n.claims == nil {
+		return "no claim pool"
+	}
+	aliasN, err := naming.ValidateAlias(alias)
+	if err != nil {
+		return "bad alias"
+	}
+	kClaim, err := KeyForClaim(aliasN)
+	if err != nil {
+		return "bad alias"
+	}
+	// The exact identity must be pooled here, and pass the full content
+	// screen (the pool's Offer screen is PoW-side only; ClaimEvidence is
+	// the full §7.4 filter — a pooled-but-invalid envelope is not evidence).
+	found := false
+	for _, cand := range n.claims.Top2(kClaim) {
+		if _, candPH := ClaimEvidence(cand, aliasN, now); candPH != nil && bytes.Equal(candPH, prefixHash) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "identity not held here"
+	}
+	phHex := hex.EncodeToString(prefixHash)
+	if !n.claims.ReAttestEligible(kClaim, phHex, now) {
+		return "holding period not met"
+	}
+	if n.liveClaimConflict(aliasN, prefixHash, now) {
+		return "live conflicting claim"
+	}
+	return ""
+}
+
+// kClaimFor returns the claim storage key of a validated alias ("" never
+// happens for a naming.ValidateAlias-clean alias; the error degrades to a
+// nil key, which the pool rejects).
+func kClaimFor(alias string) []byte {
+	k, err := KeyForClaim(alias)
+	if err != nil {
+		return nil
+	}
+	return k
 }
 
 // claimPrefixHash returns SHA-256(PoW prefix) for a claim identity, where the
@@ -2150,7 +2283,7 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 				// candidate makes misses unboundedly slow (§6.4 GET latency).
 				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
 				defer cancel()
-				es, ns, err := n.getFromPeer(pctx, key, c)
+				es, ns, _, err := n.getFromPeer(pctx, key, c)
 				results[i] = res{es, ns, err}
 			}(i, c)
 		}
@@ -2322,23 +2455,23 @@ func (n *Node) findNodeRound(ctx context.Context, target []byte, c *NodeContact)
 // failure (drives §6.2 eviction in IterativeGet) — with ONE exception: a
 // §12 301 "throttled" answer returns [ErrThrottled], which the walks treat
 // as "peer alive, answer withheld" (no eviction, not an authoritative miss).
-func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*wire.SignedEnvelope, []*NodeContact, error) {
+func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*wire.SignedEnvelope, []*NodeContact, map[string][]*claims.WitnessAttestation, error) {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve: %w", err)
+		return nil, nil, nil, fmt.Errorf("resolve: %w", err)
 	}
 	resp, err := n.sendQuery(ctx, addr, c.NodeID, "get", map[string]any{"key": key})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if resp == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	if resp.Y == wire.MsgTypeError {
 		if code, ok := errorCode(resp); ok && code == 301 {
-			return nil, nil, ErrThrottled
+			return nil, nil, nil, ErrThrottled
 		}
-		return nil, nil, nil // any other y="e": a successful exchange, nothing offered
+		return nil, nil, nil, nil // any other y="e": a successful exchange, nothing offered
 	}
 	var envs []*wire.SignedEnvelope
 	if raw, ok := resp.A["envelopes"].([]any); ok {
@@ -2359,7 +2492,35 @@ func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*
 	if raw, ok := resp.A["nodes"]; ok {
 		nodes = parseNodes(raw)
 	}
-	return envs, nodes, nil
+	// §8.3 (v2 amendment): the peer's stored re-attestations as
+	// [identity-hex, attestation] pairs. Decoded only — signature and
+	// freshness are verified at the merge (untrusted input).
+	var rts map[string][]*claims.WitnessAttestation
+	if raw, ok := resp.A["reattests"].([]any); ok {
+		for _, item := range raw {
+			pair, ok := item.([]any)
+			if !ok || len(pair) != 2 {
+				continue
+			}
+			phHex, ok1 := pair[0].(string)
+			ab, ok2 := pair[1].([]byte)
+			if !ok1 || !ok2 || len(ab) == 0 || len(phHex) != 2*constants.SHA256Len {
+				continue
+			}
+			if _, err := hex.DecodeString(phHex); err != nil {
+				continue
+			}
+			att, derr := claims.DecodeWitnessAttestation(ab)
+			if derr != nil {
+				continue
+			}
+			if rts == nil {
+				rts = make(map[string][]*claims.WitnessAttestation)
+			}
+			rts[phHex] = append(rts[phHex], att)
+		}
+	}
+	return envs, nodes, rts, nil
 }
 
 // learnContact refreshes/inserts a contact discovered via find_node/get (a
@@ -2734,6 +2895,82 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 	return deduped, nil
 }
 
+// CollectReAttests is the §8.3 renewal-side collector (v2 amendment): walk
+// the converged witness set around K_claim and ask each node to RE-NOTARIZE
+// the given (unchanged) claim identity — the witness RPC's re-attest mode.
+// Each honoring witness signs a NOW-dated attestation over the claim's
+// prefix hash and keeps it in its own pool (so verifiers merging fresh
+// quorums across the set can find it later). Best-effort by design: the
+// caller treats a short haul as "this cycle gathered nothing", never as a
+// renewal failure (§8.3 renewal availability outranks evidence freshness —
+// the v0.9.1 lesson).
+func (n *Node) CollectReAttests(ctx context.Context, alias string, claim *claims.AliasClaim, count int) ([]*claims.WitnessAttestation, error) {
+	if n == nil || claim == nil {
+		return nil, errors.New("dht: collect re-attests needs a claim")
+	}
+	aliasN, err := naming.ValidateAlias(alias)
+	if err != nil {
+		return nil, err
+	}
+	prefixHash, err := claim.PrefixHash()
+	if err != nil {
+		return nil, err
+	}
+	if count <= 0 {
+		count = constants.WitnessSet
+	}
+	kClaim, err := KeyForClaim(aliasN)
+	if err != nil {
+		return nil, err
+	}
+	// The same walk CollectWitnesses uses, so the re-attesting set and a
+	// verifier's converged view agree (Kademlia convergence, §7.4 step 3).
+	candidates := n.IterativeFindNode(ctx, kClaim, count+witnessSelfSlack)
+	filtered := candidates[:0]
+	for _, c := range candidates {
+		if !bytes.Equal(c.NodeID, n.ID()) {
+			filtered = append(filtered, c)
+		}
+	}
+	candidates = filtered
+	if len(candidates) > count {
+		candidates = candidates[:count]
+	}
+	if len(candidates) == 0 {
+		candidates = n.rt.Closest(kClaim, count)
+	}
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		out []*claims.WitnessAttestation
+	)
+	for _, c := range candidates {
+		wg.Add(1)
+		go func(c *NodeContact) {
+			defer wg.Done()
+			att, _ := n.witnessFromPeerMode(ctx, c, aliasN, claim.TldID, claim.ClaimantPK, claim.Timestamp, claim.Nonce, claim.PowHash, prefixHash, true)
+			if att == nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			out = append(out, att)
+		}(c)
+	}
+	wg.Wait()
+	seen := make(map[string]bool, len(out))
+	deduped := make([]*claims.WitnessAttestation, 0, len(out))
+	for _, att := range out {
+		k := string(att.NodeID)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		deduped = append(deduped, att)
+	}
+	return deduped, nil
+}
+
 // witnessFromPeer issues one §6.3 witness RPC to c and returns the parsed,
 // claim-verified attestation (nil on any failure — see CollectWitnesses),
 // plus whether the peer's refusal was an §8.4 reuse-window refusal (used by
@@ -2744,11 +2981,18 @@ func (n *Node) CollectWitnesses(ctx context.Context, alias string, tldID, claima
 // re-verifies the PoW, before its v2 signature (bound to the prefix hash) is
 // worth anything.
 func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash, prefixHash []byte) (*claims.WitnessAttestation, bool) {
+	return n.witnessFromPeerMode(ctx, c, alias, tldID, claimantPK, ts, nonce, powHash, prefixHash, false)
+}
+
+// witnessFromPeerMode is witnessFromPeer with the §8.3 re-attest switch:
+// reattest=true asks the peer to re-notarize a claim it holds (its ts is
+// older than the present window by definition of the mode).
+func (n *Node) witnessFromPeerMode(ctx context.Context, c *NodeContact, alias string, tldID, claimantPK []byte, ts uint64, nonce, powHash, prefixHash []byte, reattest bool) (*claims.WitnessAttestation, bool) {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
 		return nil, false
 	}
-	resp, err := n.sendQuery(ctx, addr, c.NodeID, "witness", map[string]any{
+	args := map[string]any{
 		"alias":             alias,
 		"tld_id":            tldID,
 		"claimant":          claimantPK,
@@ -2756,7 +3000,11 @@ func (n *Node) witnessFromPeer(ctx context.Context, c *NodeContact, alias string
 		"nonce":             nonce,
 		"pow_hash":          powHash,
 		"claim_prefix_hash": prefixHash,
-	})
+	}
+	if reattest {
+		args["reattest"] = true
+	}
+	resp, err := n.sendQuery(ctx, addr, c.NodeID, "witness", args)
 	if err != nil || resp == nil {
 		return nil, false
 	}

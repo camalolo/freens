@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
@@ -178,5 +179,20 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 
 	pin := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
 	fmt.Printf("%s: RENEWED (sequence %d, fresh 24 h window) tld_id_b32=%s\n", display, env.Record.Sequence, pin)
+
+	// §8.3 re-attestation (v2 amendment): best-effort re-notarization of
+	// the unchanged claim at the converged witness set — renewals keep the
+	// network's freshness evidence alive. NEVER a renewal failure (§8.3:
+	// availability outranks evidence freshness); standalone nodes with a
+	// cold view simply gather nothing this cycle.
+	if standalone != nil && len(env.Record.Claim) > 0 {
+		if claim, cerr := claims.DecodeAliasClaim(env.Record.Claim); cerr == nil {
+			actx, acancel := context.WithTimeout(context.Background(), cliTimeout)
+			defer acancel()
+			if atts, aerr := standalone.CollectReAttests(actx, claim.Alias, claim, constants.WitnessSet); aerr == nil && len(atts) > 0 {
+				fmt.Printf("%s: re-attested at %d witness(es)\n", display, len(atts))
+			}
+		}
+	}
 	return nil
 }

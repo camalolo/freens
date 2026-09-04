@@ -64,6 +64,7 @@ import (
 	"time"
 
 	"github.com/camalolo/freens/internal/admin"
+	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/cli"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
@@ -1339,6 +1340,21 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			}
 			renewPending.Unlock()
 			continue
+		}
+		// §8.3 re-attestation (v2 amendment): best-effort re-notarization
+		// of the unchanged claim at the converged witness set. Renewals run
+		// daily; the holding period (24 h) means each witness signs from
+		// its second cycle onward, so the fleet's freshness evidence
+		// accumulates in the background. NEVER a renewal failure: log and
+		// move on (availability outranks evidence freshness — v0.9.1).
+		if claim, cerr := claims.DecodeAliasClaim(fresh.Record.Claim); cerr == nil {
+			rctx, rcancel := context.WithTimeout(context.Background(), 45*time.Second)
+			if atts, rerr := node.CollectReAttests(rctx, claim.Alias, claim, constants.WitnessSet); rerr != nil {
+				logger.Debug("auto-renew: re-attest collection failed", "error", rerr)
+			} else {
+				logger.Info("auto-renew: re-attested at witness set", "alias", claim.Alias, "witnesses", len(atts))
+			}
+			rcancel()
 		}
 		// The publish reporting success does not mean every holder has it —
 		// the K_tld put can land while the K_claim put silently reaches
