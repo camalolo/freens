@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/naming"
@@ -90,19 +91,43 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 	}
 
 	// Fetch the CURRENT signed envelope (the network view of the lease).
+	//
+	// Standalone mode runs ONE node for the whole fetch→renew→publish flow:
+	// the §6.2 warm-up below fills its table with the TRUE closest sets, and
+	// the publish at the end REUSES that warmth. (Two cold nodes used to be
+	// the shape — the publish leg then bootstrapped blind behind the same
+	// store-hitting peer, and a renewed envelope could under-replicate: the
+	// bootstrap accepted it while the real storers never heard about it,
+	// found live in the phantom-sequence regression test.)
 	var prev *wire.SignedEnvelope
+	var standalone *dht.Node // non-nil in standalone mode: the warmed flow node
 	if tr.daemon() {
 		ctx, cancel := adminCtx()
 		defer cancel()
 		prev, _ = tr.client.Get(ctx, key)
 	} else {
-		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), cliTimeout)
+		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 2*cliTimeout)
 		defer nodeCancel()
 		node, nerr := startCLINode(nodeCtx, "", "", tr.peers)
 		if nerr != nil {
 			return nerr
 		}
+		standalone = node
 		defer node.Close()
+		// §6.2: bootstrap peers alone cap sequence discovery at THEIR stores —
+		// a peer answering a get from its store omits {nodes}, so the walk
+		// can never learn the true closest-set and the freshly minted
+		// sequence bases on a possibly lapsed copy (found live 2026-09-04:
+		// a standalone renew through one stale bootstrap peer minted
+		// seq-21 while the network held 23 — §6.4 max-sequence made it a
+		// global loser). Fill the table with the TRUE closest sets of both
+		// keys first (find_node responses always carry {nodes}); the
+		// discovery get then races the real storers and EnvelopeWins picks
+		// the max-sequence copy. Same pattern as register's witness walk.
+		node.IterativeFindNode(nodeCtx, key, constants.RReplication)
+		if kClaim, kerr := dht.KeyForClaim(alias); kerr == nil {
+			node.IterativeFindNode(nodeCtx, kClaim, constants.WitnessSet)
+		}
 		prev, _ = node.IterativeGet(nodeCtx, key)
 	}
 	if prev == nil {
@@ -136,18 +161,16 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 			}
 		}
 	} else {
-		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), cliTimeout)
-		defer nodeCancel()
-		node, nerr := startCLINode(nodeCtx, "", "", tr.peers)
-		if nerr != nil {
-			return nerr
+		if standalone == nil {
+			return fmt.Errorf("standalone renew node missing")
 		}
-		defer node.Close()
-		if err := node.Publish(nodeCtx, env); err != nil {
+		pctx, pcancel := context.WithTimeout(context.Background(), cliTimeout)
+		defer pcancel()
+		if err := standalone.Publish(pctx, env); err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}
 		if len(env.Record.Claim) > 0 {
-			if err := node.PublishClaim(nodeCtx, env); err != nil {
+			if err := standalone.PublishClaim(pctx, env); err != nil {
 				return fmt.Errorf("publish (K_claim): %w", err)
 			}
 		}

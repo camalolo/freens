@@ -359,6 +359,13 @@ func cmdRegister(args []string) error {
 		if kerr != nil {
 			return kerr
 		}
+		// §6.2: the witness walk warmed the table toward K_claim — a
+		// DIFFERENT key. A retry (revoke-then-re-register) must not discover
+		// its base sequence through a bootstrap peer's possibly-stale store
+		// hit (a store-hit get omits {nodes}; the walk never learns the true
+		// closest-set — the phantom-sequence class, found live 2026-09-04).
+		// Walk toward K_tld itself first so the R closest storers are known.
+		node.IterativeFindNode(ctx, kTld, constants.RReplication)
 		if cur, cerr := node.IterativeGet(ctx, kTld); cerr == nil && cur != nil {
 			seq = cur.Record.Sequence + 1
 		}

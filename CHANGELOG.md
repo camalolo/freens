@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — the phantom-sequence class dies: claim caches revalidate, standalone renew walks the true closest-set
+
+Second half of the minipc-incident findings (2026-09-04; the first half
+shipped in v0.15.0's §7.7):
+
+- **`DHTLookup.LookupClaim` now actually mirrors `Lookup`** — including
+  stale-cache revalidation. A fetched claim cache is served only while
+  fresh (fetchedAt + min-TTL); past freshness the next lookup re-walks
+  the network and adopts what it finds (adopted copies are cached and
+  their fetch time restamped). Before: local hit → serve, forever — so a
+  node that cached a claim envelope which then LAPSED served the dead
+  copy for the whole §6.4 ExpiryGrace day while the network moved on;
+  the resolver's §7.4 checklist rightly rejected the expired envelope
+  and the name NXDOMAINed locally while every fresher vantage resolved
+  (nanopi vs minipc, ~1 h observed, 24 h possible). Authoritative local
+  seeds (no fetchedAt) keep the eternal fast path — owner-local and
+  `-load`-seeded views are unchanged. One claim-specific refinement
+  beyond Lookup: a DEGRADED walk (probes failed) with a LAPSED cached
+  copy returns ErrDegradedMiss (SERVFAIL upstream, never negative-
+  cached) instead of an authoritative-looking NXDOMAIN — issue #1's
+  contract extended to the claim hop.
+- **Standalone `renew` runs ONE warmed node for the whole flow.** The
+  fetch leg now warms the table with `IterativeFindNode` toward BOTH
+  keys (K_tld and K_claim — find_node responses always carry {nodes},
+  immune to the store-hit blindness) before the discovery get, so
+  §6.4's EnvelopeWins bases the new sequence on the max-sequence copy
+  the network actually holds. Before: the discovery get behind a single
+  stale bootstrap peer saw only that peer's store copy (store hits omit
+  {nodes} — the walk never learns the true closest-set) and minted a
+  globally-losing sequence ("phantom 21": seq-21 minted while the
+  network held 23). The publish now reuses the same warmed node — the
+  old second, cold node could under-replicate the renewed envelope
+  past the very peer that blinded discovery (caught by the regression
+  test). `register`'s standalone sequence discovery gets the same K_tld
+  warm-up.
+
 ## Unreleased — §7.7 reserved-alias policy: freens can never become ".com"
 
 Prompted by the "what happens if someone registers `com`?" audit. The

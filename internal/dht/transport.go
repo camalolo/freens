@@ -3177,10 +3177,39 @@ func (l *DHTLookup) LoadFetchMetaJSON(data []byte) error {
 
 // LookupClaim returns the SignedEnvelope stored at K_claim for alias — the
 // §7.4/C.1 claim pointer: the TLD-record envelope whose field 11 carries the
-// AliasClaim. It mirrors [DHTLookup.Lookup] for the claim key space: local
-// store first, then an iterative network GET, caching on success so subsequent
-// lookups are local. Returns (nil, nil) when no claim envelope is available
-// locally or across the reachable network.
+// AliasClaim. It mirrors [DHTLookup.Lookup] for the claim key space —
+// including the STALE-CACHE REVALIDATION: a fetched claim cache is served
+// only while fresh (fetchedAt + cacheFreshness); past freshness the next
+// lookup re-walks the network and adopts what it finds. Without that
+// revalidation a node that cached a claim envelope which then LAPSED would
+// serve the dead copy for the whole §6.4 ExpiryGrace day while the network
+// moved on to a newer sequence — the resolver's §7.4 checklist rightly
+// rejects the expired envelope, so the name NXDOMAINs locally while every
+// fresher vantage resolves it (found live 2026-09-04: nanopi served
+// NXDOMAIN for minipc for ~1 h from its lapsed seq-20 cache while the
+// network held 22/23).
+//
+// Semantics per path, mirroring Lookup with one claim-specific refinement:
+//
+//	fresh local hit (authoritative seeds have no fetchedAt and are always
+//	fresh; fetched caches are fresh for cacheFreshness):
+//	  serve it — the fast path, unchanged.
+//	stale/absent local + network walk finds an envelope:
+//	  adopt and cache it (§6.4 EnvelopeWins already picked the max-sequence
+//	  copy across the closest set).
+//	stale/absent local + CLEAN network miss ("not held" everywhere):
+//	  serve the stale copy if any (a lapsed name keeps resolving into the
+//	  §7.4 checklist, which NXDOMAINs it — negative-cacheable, the network
+//	  agrees); else (nil, nil).
+//	stale/absent local + DEGRADED walk (issue #1) with a LAPSED cached copy:
+//	  ErrDegradedMiss — the resolver maps it to SERVFAIL, never negative-
+//	  cached, so a lapsed local view cannot masquerade as an authoritative
+//	  NXDOMAIN while the holders are alive. (A live-but-possibly-stale copy
+//	  is still served on a degraded walk — offline resilience, the checklist
+//	  accepts it.)
+//
+// Returns (nil, nil) when no claim envelope is available locally or across
+// the reachable network.
 //
 // This structurally satisfies the resolver's optional ClaimResolver interface
 // (§9.2 step 3a network alias resolution); no import of internal/resolver is
@@ -3190,25 +3219,46 @@ func (l *DHTLookup) LookupClaim(ctx context.Context, alias string, now int64) (*
 	if err != nil {
 		return nil, err
 	}
-	if env, _ := l.store.Get(key, now); env != nil {
-		return env, nil
+	cached, _ := l.store.Get(key, now)
+	l.mu.Lock()
+	fresh := cached != nil && l.freshLocked(key, cached, now)
+	l.mu.Unlock()
+	if fresh {
+		return cached, nil
 	}
 	if l.node == nil {
-		return nil, nil
+		return cached, nil // island: serve the stale cache or nil
 	}
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
-	env, err := l.node.IterativeGet(c, key)
-	if err != nil {
-		return nil, err
+	env, _, gerr := l.node.IterativeGetDetailed(c, key)
+	if env != nil {
+		// Cache the fetched claim envelope locally (§6.4 "nodes along the lookup
+		// path MAY cache"; verifySignature=true defensively re-checks it) and
+		// stamp its fetch time so freshness tracking applies to it too.
+		_, _ = l.store.Put(key, env, now, true)
+		l.mu.Lock()
+		var k [constants.SHA256Len]byte
+		copy(k[:], key)
+		l.fetchedAt[k] = now
+		l.mu.Unlock()
+		return env, nil
 	}
-	if env == nil {
-		return nil, nil
+	// The walk did not produce a newer envelope. Serve the cached copy only
+	// when that is honest: a CLEAN miss ("not held" everywhere reachable)
+	// means the network agrees there is nothing newer — the stale copy stands
+	// (the checklist bounds a lapsed one). A DEGRADED walk (probes failed)
+	// plus a LAPSED copy is not honest to answer: NXDOMAIN would be
+	// negative-cached for a name whose holders may be alive — the issue-#1
+	// SERVFAIL contract. A live cached copy is fine either way.
+	lapsed := cached != nil && cached.Record != nil && now >= int64(cached.Record.Expires)
+	if cached != nil && !(gerr != nil && lapsed) {
+		return cached, nil
 	}
-	// Cache the fetched claim envelope locally (§6.4 "nodes along the lookup
-	// path MAY cache"; verifySignature=true defensively re-checks it).
-	_, _ = l.store.Put(key, env, now, true)
-	return env, nil
+	if gerr != nil {
+		return nil, gerr
+	}
+	return nil, nil
 }
 
 // ---------------------------------------------------------------------------

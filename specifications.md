@@ -508,6 +508,19 @@ tokens are `HMAC-SHA256(rotating_secret, peer_ip)` and rotate every
 (key = `K_name`) and answer `get` from cache subject to expiry. Caching
 nodes never mutate envelopes (they are opaque + signature-protected).
 
+**Cache freshness (clarified 2026-09-04, the phantom-freshness lessons):**
+a cached envelope is a *hint*, not an answer, once its freshness window
+has passed. Resolvers (§9.2) and claim lookups MUST revalidate a cached
+envelope against the network once it is stale, and MUST NOT let a cached
+copy that fails validity (e.g. lapsed) conclude authoritatively — a
+lapsed local copy with a degraded network view yields a retryable
+failure (SERVFAIL), never a negative-cached "not found". Sequence
+discovery (renew / re-register) MUST NOT base on a single peer's cached
+copy: the discovery walk warms the true closest-set first (a store-hit
+`get` answer omits `{nodes}`, so bootstrap peers alone cannot reveal
+it), and the winner is taken by `(sequence desc, H_record desc)` across
+the real storers.
+
 ### 6.5 What the DHT does *not* do
 
 - It does not order transactions globally.
