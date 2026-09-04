@@ -156,12 +156,6 @@ func (d *difficultyState) medianObserved() (int, bool) {
 	return sorted[(len(sorted)-1)/2], true
 }
 
-// currentDifficultyOn returns the node's own current PoW difficulty (bits),
-// per Appendix A.4 (gossiped in this node's witness responses).
-func (n *Node) currentDifficulty() int {
-	return n.diff.currentDifficulty()
-}
-
 // ---------------------------------------------------------------------------
 // Appendix A.4 state persistence (v0.8.0)
 // ---------------------------------------------------------------------------

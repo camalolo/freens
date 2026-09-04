@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased — v0.15.2: the audit batch (webui CSRF, silent-data-loss paths, bounded state, dead code)
+
+The 2026-09-04 full-tree audit (staticcheck + four parallel deep reads,
+every P0 re-verified by hand) landed its fixes:
+
+- **webui: every browser mutation works again.** The CSRF gate demanded
+  `X-Requested-With: XMLHttpRequest`, which htmx never sends (it stamps
+  `HX-Request: true`) — all ten `hx-post` flows 400'd from any real
+  browser since the guard shipped, while the Go tests (which set the
+  header by hand) stayed green. The gate now accepts either custom
+  header; the CSRF property is unchanged (cross-site posts cannot set
+  custom headers at all).
+- **revoke/forget stop lying about network failures.** A failed
+  discovery walk used to be treated as "nothing published": revoke then
+  minted a sequence-1 tombstone that silently lost the §6.4 winner race
+  (name stayed live while the CLI printed REVOKED), and forget DELETED
+  the keys anyway — live name, keyless user. Walk errors now abort both
+  verbs; forget's nothing-published branch also prompts before pruning
+  interactively (it was the one destructive path with no confirmation);
+  the un-revoke hint now names `register` for apexes (`name` refuses
+  them).
+- **passphrase prompt failures abort.** A `term.ReadPassword` error
+  returned `("", nil)` and the owner key was silently written in
+  PLAINTEXT. Now the error propagates; nothing is written.
+- **resolver: a TC'd upstream answer is no longer served as final** when
+  its TCP retry fails (partial answers silently dropped records) — the
+  truncation is treated as a failed exchange, SERVFAIL if no upstream
+  succeeds.
+- **Bounded state (four leaks):** dht `deadUntil` and `witnessLast` now
+  sweep expired entries on insert past a floor (previously one
+  permanent map entry per probed corpse / per alias ever co-signed);
+  the admin `witnessCache` drops its memo past 4096 entries; the webui
+  retires each per-connection one-shot listener when the connection
+  closes (previously a parked goroutine + map entry leaked per served
+  connection on the always-on UI).
+- **Races:** the webui job fragment read `j.Result` outside the job
+  mutex (racing the runner's final write on every completion poll); the
+  nginx toolchain's lazy init raced across concurrent cert handlers
+  (now once-guarded).
+- **`freens name` (the phantom-sequence class, last member):** the
+  standalone discovery get is now preceded by `IterativeFindNode`
+  warm-up toward the name and apex keys, and a failed walk aborts the
+  publish instead of silently minting sequence 1.
+- **Wire-visible spec reference fix:** every v0.15.0 reserved-alias
+  comment AND the witness refusal string cited "spec §7.6"; the policy
+  lives in §7.7. All references corrected.
+- **Dead code purged** (all repo-verified): cli `netIP`, `reusableClaim`,
+  `claimStatePath`, `difficultyOf`, `base32Decode`, `publishEnv`,
+  `backupReadmeTemplate` (keychain's copy is the live one),
+  `systemctlActive`; webui `errDenied`, `wantsHTML`, the ops.go
+  import-keeper block, dead `ttl`/`_ = d` locals in mutations.go; dht
+  `(*Node).currentDifficulty`; claims `corroboratingWitnesses` and the
+  `OrderKey` type/method — with the claims-pool's field-by-field
+  duplicate of the §7.4 ordering deleted in favor of the now-exported
+  `claims.LessOrderKey` (one ordering, two packages, no drift);
+  resolver `ValidateServeBool`; renewal `FreshWindow`; upnp Gateway
+  diagnostics getters; constants.R; certmgr `ErrServeFilesNotFound`.
+  certmgr `runWithTimeout` was dead because NOTHING used it — nginx
+  `-t`/`reload` execs ran without any timeout, wedging the certs page
+  on a hung nginx; all certmgr nginx/systemctl execs are now bounded at
+  30 s (`runBounded`).
+- **dht `putToPeer`** no longer dereferences `putResp` inside the branch
+  guarded by its own nil check.
+
 ## Unreleased — the phantom-sequence class dies: claim caches revalidate, standalone renew walks the true closest-set
 
 Second half of the minipc-incident findings (2026-09-04; the first half

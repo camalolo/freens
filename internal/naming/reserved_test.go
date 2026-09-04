@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestIsReservedTLD spot-checks both data kinds (§7.6): delegated root-zone
+// TestIsReservedTLD spot-checks both data kinds (§7.7): delegated root-zone
 // TLDs (famous + ccTLD + an IDN A-label from the IANA snapshot) and the
 // hand-maintained special-use names, against near-miss non-reserved aliases.
 func TestIsReservedTLD(t *testing.T) {
@@ -83,7 +83,7 @@ func TestCheckRegisterable(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrReserved) {
 		t.Fatalf("CheckRegisterable(com) = %v, want an ErrReserved wrap", err)
 	}
-	for _, want := range []string{"com", "spec §7.6", "-allow-reserved"} {
+	for _, want := range []string{"com", "spec §7.7", "-allow-reserved"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}

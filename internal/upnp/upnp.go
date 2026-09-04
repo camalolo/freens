@@ -88,12 +88,6 @@ type Logger interface {
 	Debug(msg string, args ...any)
 }
 
-// Service returns the WAN connection service URN (diagnostics).
-func (g *Gateway) Service() string { return g.service }
-
-// ControlURL returns the SOAP control endpoint (diagnostics).
-func (g *Gateway) ControlURL() string { return g.control.String() }
-
 // ssdpSearch is the injectable SSDP wave (tests substitute a fake LOCATION).
 var ssdpSearch = func(ctx context.Context) ([]string, error) {
 	return ssdpWave0(ctx)

@@ -95,7 +95,7 @@ type Server struct {
 	dnsResolve func(ctx context.Context, query []byte) ([]byte, error)
 	reloadConf func() (string, error)
 
-	// allowReserved is the §7.6 override mirrored from the daemon's
+	// allowReserved is the §7.7 override mirrored from the daemon's
 	// -allow-reserved flag (SetAllowReserved, same late-wiring idiom): when
 	// false (the default) the claim hop inside /resolve and /publish's
 	// helpers treats a reserved-TLD alias as claim-less — the admin face

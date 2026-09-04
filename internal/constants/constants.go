@@ -29,9 +29,6 @@ const (
 	TokenRotation = 300   // write-token epoch (5 min)
 )
 
-// R is the replication factor for put (Appendix A).
-const R = 8
-
 // Records / TTL.
 const (
 	RecordDefaultTTL = 86400   // default record lifetime (24 h)

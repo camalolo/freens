@@ -34,8 +34,10 @@ type Server struct {
 	auth     *authStore
 
 	// nginx is the certmgr toolchain the Certificates page deploys with
-	// (nil = discover lazily; tests substitute a fixture tree).
-	nginx *certmgr.NginxEnv
+	// (nil = discover lazily; tests substitute a fixture tree). nginxOnce
+	// guards the lazy init — the cert handlers run on concurrent goroutines.
+	nginx     *certmgr.NginxEnv
+	nginxOnce sync.Once
 
 	// doh is the §9.6 serve-face state (doh.go): the cached [upstream]/[doh]
 	// conf view. dnsClient is the admin-socket client the /dns-query relay
@@ -334,7 +336,8 @@ func (s *Server) routeConn(tlsSrv, plainSrv *http.Server, tlsConf *tls.Config, c
 		c.Close()
 		return
 	}
-	l := &oneShotListener{conn: &replayConn{Conn: c, first: first[0], prefix: true}, quit: make(chan struct{})}
+	rc := &replayConn{Conn: c, first: first[0], prefix: true}
+	l := &oneShotListener{conn: rc, quit: make(chan struct{})}
 	s.shutMu.Lock()
 	s.oneshots[l] = struct{}{}
 	shutting := s.shuttingDown
@@ -344,20 +347,46 @@ func (s *Server) routeConn(tlsSrv, plainSrv *http.Server, tlsConf *tls.Config, c
 		c.Close()
 		return
 	}
+	// Retire the listener when the http server is DONE with the connection
+	// (it always Close()s it — keep-alive included). Before this hook the
+	// map entry and the Accept goroutine parked on <-l.quit lived until
+	// process Shutdown: one leak per served connection (found in the
+	// 2026-09-04 audit; on an always-on UI with htmx polling that is
+	// unbounded). Serve itself cannot be waited on — it stays in Accept
+	// until the listener closes.
+	retired := false
+	rc.onClose = func() {
+		l.Close()
+		s.shutMu.Lock()
+		if !retired {
+			retired = true
+			delete(s.oneshots, l)
+		}
+		s.shutMu.Unlock()
+	}
 	if first[0] == 0x16 {
 		tlsSrv.Serve(tls.NewListener(l, tlsConf))
-		return
+	} else {
+		plainSrv.Serve(l)
 	}
-	plainSrv.Serve(l)
+	l.Close()
+	s.shutMu.Lock()
+	retired = true
+	delete(s.oneshots, l)
+	s.shutMu.Unlock()
 }
 
 // replayConn replays the sniffed first byte before the real stream (the
-// TLS handshake and the HTTP request both need it).
+// TLS handshake and the HTTP request both need it). onClose, when set,
+// fires exactly once when the http server closes the connection.
 type replayConn struct {
 	net.Conn
-	first  byte
-	prefix bool
-	readMu sync.Mutex
+	first   byte
+	prefix  bool
+	readMu  sync.Mutex
+	onClose func()
+	closeMu sync.Mutex
+	closed  bool
 }
 
 func (c *replayConn) Read(p []byte) (int, error) {
@@ -369,6 +398,20 @@ func (c *replayConn) Read(p []byte) (int, error) {
 		return 1, nil
 	}
 	return c.Conn.Read(p)
+}
+
+func (c *replayConn) Close() error {
+	c.closeMu.Lock()
+	already := c.closed
+	c.closed = true
+	onClose := c.onClose
+	c.onClose = nil
+	c.closeMu.Unlock()
+	err := c.Conn.Close()
+	if !already && onClose != nil {
+		onClose()
+	}
+	return err
 }
 
 // oneShotListener yields exactly one connection to an http.Server, then

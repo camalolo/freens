@@ -47,17 +47,6 @@ func runShell(line string, timeout time.Duration) (string, error) {
 	return out, err
 }
 
-// runWithTimeout is runShell for a name+args command (no shell parsing).
-func runWithTimeout(timeout time.Duration, name string, args ...string) (ExecResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	res, err := execRunner(ctx, name, args...)
-	if ctx.Err() == context.DeadlineExceeded {
-		return res, ctx.Err()
-	}
-	return res, err
-}
-
 // execLookPath is a seam over exec.LookPath (the binary-resolution test
 // swaps the candidate list instead in practice, but tests may stub this).
 var execLookPath = exec.LookPath

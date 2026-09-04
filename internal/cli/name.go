@@ -94,7 +94,15 @@ func cmdName(args []string) error {
 	if tr.daemon() {
 		ctx, cancel := adminCtx()
 		defer cancel()
-		if cur, gerr := tr.client.Get(ctx, nameKey); gerr == nil && cur != nil && cur.Record != nil {
+		cur, gerr := tr.client.Get(ctx, nameKey)
+		if gerr != nil {
+			// A failed discovery walk must not publish at seq 1: a
+			// sub-name that already exists would silently lose the §6.4
+			// winner race while the CLI prints PUBLISHED (the
+			// phantom-sequence class; found in the 2026-09-04 audit).
+			return fmt.Errorf("sequence discovery failed: %w (nothing published — retry)", gerr)
+		}
+		if cur != nil && cur.Record != nil {
 			seq = cur.Record.Sequence + 1
 		}
 		if apexIP == "" {
@@ -110,7 +118,15 @@ func cmdName(args []string) error {
 			return err
 		}
 		defer node.Close()
-		if env, err := node.IterativeGet(nodeCtx, nameKey); err == nil && env != nil {
+		// §6.2: warm the table toward the name key AND the apex key before
+		// discovery — a store-hit get omits {nodes}, so a bootstrap peer's
+		// stale copy alone would blind the walk (the phantom-sequence
+		// class; same fix as register/renew, found in the 2026-09-04
+		// audit).
+		node.IterativeFindNode(nodeCtx, nameKey, constants.RReplication)
+		if env, gerr := node.IterativeGet(nodeCtx, nameKey); gerr != nil {
+			return fmt.Errorf("sequence discovery failed: %w (nothing published — retry)", gerr)
+		} else if env != nil {
 			seq = env.Record.Sequence + 1
 		}
 		if apexIP == "" {
@@ -122,6 +138,7 @@ func cmdName(args []string) error {
 			if err != nil {
 				return err
 			}
+			node.IterativeFindNode(nodeCtx, apexKey, constants.RReplication)
 			if env, err := node.IterativeGet(nodeCtx, apexKey); err == nil && env != nil {
 				for _, rr := range env.Record.RRset {
 					if rr.Type == wire.RRTypeA && len(rr.Rdata) == net.IPv4len {

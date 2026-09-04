@@ -19,7 +19,6 @@ var (
 	errWeakPassword    = errors.New("password must be at least 8 characters")
 	errBadLogin        = errors.New("wrong password")
 	errNotBootstrapped = errors.New("no password set yet")
-	errDenied          = errors.New("forbidden")
 )
 
 // gate rejects requests whose source IP is outside the allowlist with a
@@ -73,12 +72,20 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 	})
 }
 
-// requireCSRFAlias enforces the X-Requested-With header on mutations
-// (htmx sets it on every request it issues; cross-site form posts cannot).
+// requireCSRF enforces the custom-header check on mutations. htmx stamps
+// every request it issues with `HX-Request: true`; non-htmx AJAX callers
+// conventionally send `X-Requested-With: XMLHttpRequest`. Either satisfies
+// the gate — the CSRF property comes from the header being CUSTOM: a
+// cross-site form post cannot set request headers at all, and a cross-site
+// fetch/XHR cannot set them without a CORS approval this server never
+// grants. (v0.15.2 fix: the gate used to demand X-Requested-With only,
+// which htmx does NOT send — every real-browser mutation 400'd while the
+// Go tests, which set the header by hand, stayed green.)
 func requireCSRF(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead &&
-			r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
+			r.Header.Get("X-Requested-With") != "XMLHttpRequest" &&
+			r.Header.Get("HX-Request") == "" {
 			http.Error(w, "missing CSRF header", http.StatusBadRequest)
 			return
 		}
@@ -104,10 +111,4 @@ func remoteIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-// wantsHTML reports whether the request is a browser navigation (vs htmx
-// fragment or curl).
-func wantsHTML(r *http.Request) bool {
-	return !strings.Contains(r.Header.Get("HX-Request"), "true")
 }

@@ -576,7 +576,7 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	contested := false
 	degraded := false
 	if len(tldID) == 0 {
-		// §7.6 reserved-alias gate (naming/reserved.go): a delegated ICANN
+		// §7.7 reserved-alias gate (naming/reserved.go): a delegated ICANN
 		// TLD or IANA special-use alias is treated as claim-less — NXDOMAIN,
 		// no claim walk, AA per the caller's route wrapping — EVEN IF the
 		// network holds a (rogue-witnessed) claim. This is the resolution

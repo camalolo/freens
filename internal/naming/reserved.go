@@ -1,9 +1,9 @@
-// reserved.go — the §7.6 reserved-alias policy: an alias that equals a
+// reserved.go — the §7.7 reserved-alias policy: an alias that equals a
 // delegated ICANN TLD (com, net, de, xn--… — see reserved_tlds.go for the
 // full data and its rationale) or an IANA special-use name (localhost,
 // onion, …) must not become a freens TLD claim.
 //
-// Why (spec §7.6, prompted by the "what if someone registers com?" audit):
+// Why (spec §7.7, prompted by the "what if someone registers com?" audit):
 // the alias IS the TLD in freens, so a claim on "com" makes the claimant the
 // owner of the whole freens .com namespace — including every name that
 // reaches freens through the §9.3 NXDOMAIN fallthrough (typos, expired
@@ -13,7 +13,7 @@
 // to mint, witness, or resolve such claims by default.
 //
 // Enforcement points (all local policy, never protocol law — a modified
-// client can still do what it likes; §7.6 is what honest reference-
+// client can still do what it likes; §7.7 is what honest reference-
 // implementation nodes do):
 //
 //   - `freens register` / webui register: refuse to MINT the claim
@@ -33,7 +33,7 @@ package naming
 import "fmt"
 
 // ReservedReason returns a human-readable reason string when alias is a
-// reserved TLD name per §7.6, or "" when it is not. The input should be the
+// reserved TLD name per §7.7, or "" when it is not. The input should be the
 // normalized (lowercase) alias; validation is the caller's prerequisite
 // (ValidateAlias). Reasons distinguish the two data kinds only for messaging;
 // the policy is identical for both.
@@ -44,16 +44,16 @@ func ReservedReason(alias string) string {
 	return ""
 }
 
-// IsReservedTLD reports whether alias is reserved per §7.6.
+// IsReservedTLD reports whether alias is reserved per §7.7.
 func IsReservedTLD(alias string) bool {
 	_, ok := reservedTLDs[alias]
 	return ok
 }
 
-// ErrReserved is wrapped by every §7.6 gate error (errors.Is-compatible).
+// ErrReserved is wrapped by every §7.7 gate error (errors.Is-compatible).
 var ErrReserved = fmt.Errorf("reserved alias")
 
-// CheckRegisterable validates alias per §3.2 and then applies the §7.6
+// CheckRegisterable validates alias per §3.2 and then applies the §7.7
 // reserved-alias gate. It is the single funnel for every claim-MINTING path
 // (`freens register`, the web UI register form). Resolution/witness gates
 // use IsReservedTLD directly — they run on already-normalized aliases and
@@ -64,7 +64,7 @@ func CheckRegisterable(alias string) (string, error) {
 		return "", err
 	}
 	if reason := ReservedReason(norm); reason != "" {
-		return "", fmt.Errorf("%w: %q is %s — freens refuses to claim it so freens names can never be mistaken for real DNS (spec §7.6); pick a different alias, or pass -allow-reserved to override", ErrReserved, norm, reason)
+		return "", fmt.Errorf("%w: %q is %s — freens refuses to claim it so freens names can never be mistaken for real DNS (spec §7.7); pick a different alias, or pass -allow-reserved to override", ErrReserved, norm, reason)
 	}
 	return norm, nil
 }

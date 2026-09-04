@@ -19,7 +19,7 @@
 // K_claim → up to 2 envelopes ordered BEST-FIRST by the §7.4 step-3 tuple
 // (timestamp, pow_hash, tld_id) ascending — earliest asserted time wins, ties
 // by lower PoW hash, then lower TLD ID (computed from the decoded AliasClaim
-// via the claims package's exported OrderKey; the ordering is the same total
+// via the claims package's exported LessOrderKey; the ordering is the same total
 // order claims.OrderClaims applies, reproduced here without modifying
 // internal/claims). It is filled by hPut's explicit-K_claim branch (§7.4
 // registration step 5) and by collecting nodes (DHTLookup.CollectClaims
@@ -128,21 +128,6 @@ func (n *Node) SweepClaimPool(now int64) int {
 	return n.claims.Sweep(now)
 }
 
-// claimOrderLess is the §7.4 step-3 ascending total order on AliasClaims,
-// built from the exported claims.OrderKey: (timestamp, pow_hash, tld_id),
-// earliest/lower wins. It matches the unexported claims.lessOrderKey used by
-// claims.OrderClaims / claims.SelectWinner (same tuple, same bytes.Compare
-// semantics) without reaching into internal/claims.
-func claimOrderLess(a, b *claims.AliasClaim) bool {
-	if a.Timestamp != b.Timestamp {
-		return a.Timestamp < b.Timestamp
-	}
-	if cmp := bytes.Compare(a.PowHash, b.PowHash); cmp != 0 {
-		return cmp < 0
-	}
-	return bytes.Compare(a.TldID, b.TldID) < 0
-}
-
 // Offer inserts env under key if it belongs in the top 2: it is stored when
 // the pool holds fewer than 2 claims for key, or when it orders STRICTLY
 // better (§7.4 tuple) than the current worst member, evicting that member.
@@ -200,7 +185,7 @@ func (p *ClaimPool) Offer(key []byte, env *wire.SignedEnvelope) bool {
 		// Full: keep the newcomer only if it beats the worst member strictly;
 		// an equal tuple (same claim contents in a different envelope) loses
 		// to the incumbent, keeping the pool stable under republication.
-		if !claimOrderLess(pc.claim, cur[1].claim) {
+		if !claims.LessOrderKey(pc.claim, cur[1].claim) {
 			return false
 		}
 		p.bytes -= cur[1].size // the evicted worst leaves the byte budget
@@ -209,7 +194,7 @@ func (p *ClaimPool) Offer(key []byte, env *wire.SignedEnvelope) bool {
 	cur = append(cur, pc)
 	p.bytes += pc.size
 	// Maintain best-first order (<= 2 members; stable for equal tuples).
-	if len(cur) == 2 && claimOrderLess(cur[1].claim, cur[0].claim) {
+	if len(cur) == 2 && claims.LessOrderKey(cur[1].claim, cur[0].claim) {
 		cur[0], cur[1] = cur[1], cur[0]
 	}
 	p.byKey[k] = cur

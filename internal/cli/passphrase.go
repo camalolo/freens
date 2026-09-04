@@ -56,13 +56,17 @@ func promptNewPassphrase() (string, error) {
 	p1, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
 	if err != nil {
-		return "", nil
+		// A failed read must ABORT, never degrade to "": an empty result
+		// here flows into the plaintext-keyfile path and silently writes
+		// the owner key unencrypted (found in the 2026-09-04 audit —
+		// directly against this file's stated policy).
+		return "", fmt.Errorf("reading passphrase: %w (nothing was written; re-run to try again)", err)
 	}
 	fmt.Print("Repeat passphrase: ")
 	p2, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("reading passphrase (repeat): %w (nothing was written; re-run to try again)", err)
 	}
 	return confirmNewPassphrase(string(p1), string(p2))
 }

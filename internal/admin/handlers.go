@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
@@ -713,7 +714,7 @@ func (s *Server) walkKeyForLabels(ctx context.Context, labels []string, alias st
 // cache-on-fetch) and falls back to a raw iterative GET otherwise. Returns
 // (nil, nil) when no claim is published for the alias.
 func (s *Server) claimTLDID(ctx context.Context, alias string) ([]byte, error) {
-	// §7.6 reserved-alias gate (naming/reserved.go): without this daemon's
+	// §7.7 reserved-alias gate (naming/reserved.go): without this daemon's
 	// -allow-reserved override, a reserved-TLD alias is claim-less here too
 	// — the admin face (/resolve, the CLI `freens resolve`/`get -peers`
 	// paths that ride it) agrees with the DNS face and never accepts a
@@ -922,15 +923,32 @@ func (s *Server) handleWitness(w http.ResponseWriter, r *http.Request) {
 		out.Attestations = append(out.Attestations, base64.StdEncoding.EncodeToString(b))
 	}
 	witnessCache.Store(cacheKey, out)
+	// Bound the memo: entries were daemon-lifetime, so a socket client could
+	// pump unbounded distinct claim contexts (each ~1 KB of attestations).
+	// Past the cap, drop the WHOLE cache — it is a pure memo; re-collection
+	// repopulates it (found in the 2026-09-04 audit).
+	if n := witnessCacheCount.Add(1); n%witnessCacheCap == 0 {
+		witnessCache.Range(func(k, _ any) bool {
+			witnessCache.Delete(k)
+			return true
+		})
+		witnessCacheCount.Store(0)
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 // witnessCache memoizes completed §7.3 witness collections keyed by
 // "<alias>|<tld>|<claimant>|<ts>|<nonce>|<pow>" (see handleWitness). Entries
-// live for the daemon's lifetime — a claim's witness set is immutable once
-// quorum-signed, and re-collection is exactly what the cache exists to
-// spare the network.
+// live until the size cap drops the memo — a claim's witness set is
+// immutable once quorum-signed, and re-collection is exactly what the cache
+// exists to spare the network, so wholesale eviction is always safe.
 var witnessCache sync.Map
+
+// witnessCacheCap is the memo's entry budget; witnessCacheCount counts
+// stores since the last drop.
+const witnessCacheCap = 4096
+
+var witnessCacheCount atomic.Int64
 
 // ---------------------------------------------------------------------------
 // GET /peers

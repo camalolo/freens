@@ -426,19 +426,19 @@ func TestOrderKeyTieBreak(t *testing.T) {
 		}
 		// Distinct claimants → distinct tld_id; pow_hash very likely distinct.
 		wantFirst := a
-		if lessOrderKey(b, a) {
+		if LessOrderKey(b, a) {
 			wantFirst = b
 		}
 		if got := SelectWinner([]*AliasClaim{a, b}); got != wantFirst {
-			t.Error("SelectWinner tie-break disagrees with lessOrderKey")
+			t.Error("SelectWinner tie-break disagrees with LessOrderKey")
 		}
 		got := OrderClaims([]*AliasClaim{a, b})
 		if len(got) != 2 || got[0] != wantFirst {
-			t.Error("OrderClaims tie-break disagrees with lessOrderKey")
+			t.Error("OrderClaims tie-break disagrees with LessOrderKey")
 		}
-		// Total order: exactly one of lessOrderKey(a,b)/lessOrderKey(b,a) holds.
-		lab := lessOrderKey(a, b)
-		lba := lessOrderKey(b, a)
+		// Total order: exactly one of LessOrderKey(a,b)/LessOrderKey(b,a) holds.
+		lab := LessOrderKey(a, b)
+		lba := LessOrderKey(b, a)
 		if lab == lba {
 			t.Error("tie-break not antisymmetric for distinct claimants")
 		}

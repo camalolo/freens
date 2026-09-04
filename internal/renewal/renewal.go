@@ -161,6 +161,3 @@ func EnsureTLSCA(rec *wire.Record, kp *crypto.Keypair, now uint64) {
 	}
 	rec.RRset = append(rec.RRset, rr)
 }
-
-// FreshWindow is the human-readable validity a renewal grants.
-func FreshWindow() time.Duration { return time.Duration(constants.RecordDefaultTTL) * time.Second }

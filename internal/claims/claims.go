@@ -264,7 +264,7 @@ type AliasClaim struct {
 
 // OrderKey is the §7.4 step-3 ordering tuple (timestamp, pow_hash, tld_id),
 // ascending. It holds the raw slice fields for inspection; ordering itself is
-// performed by lessOrderKey / OrderClaims / SelectWinner using bytes.Compare.
+// performed by LessOrderKey / OrderClaims / SelectWinner using bytes.Compare.
 type OrderKey struct {
 	TS      uint64
 	PowHash []byte
@@ -420,37 +420,6 @@ func (c *AliasClaim) validWitnessesFromPrefixHash(prefixHash []byte) []*WitnessA
 	return out
 }
 
-// corroboratingWitnesses is ValidWitnesses further restricted to the
-// CORROBORATION BAND: a witness only corroborates a claim when its own
-// attestation timestamp is consistent with the claimant-asserted timestamp —
-//
-//	claim.ts - SKEW_TOLERANCE  <=  w.TS  <=  claim.ts + WITNESS_PRESENT_WINDOW + SKEW_TOLERANCE
-//
-// Rationale (v0.7.0 security fix, the §7.4 backdating hole): the §7.4 step-3
-// order is earliest-timestamp-first on the CLAIMANT-asserted timestamp, and
-// the spec's own argument is "witness timestamps, not claimant timestamps,
-// are the honest ordering signal". The honest witness flow puts w.TS within
-// [claim.ts - skew, claim.ts + present window + skew]: a legitimate claim is
-// witnessed at mining time (|w.TS - claim.ts| ≈ seconds) or re-presented
-// during register's cooldown-safe retries (claim.ts up to
-// WITNESS_PRESENT_WINDOW old), with SKEW_TOLERANCE (60 s) of clock slack on
-// both ends. An attestation dated OUTSIDE that band is either not from the
-// honest flow or not for this claim's asserted time — it must not count
-// toward the quorum, so a backdated claim cannot borrow modern-dated
-// attestations (fabricated or transplanted) to fake corroboration.
-//
-// v0.9.0: the band's upper edge tracks the witness RPC's age gate, which was
-// tightened from WITNESS_COOLDOWN (1 h) to WITNESS_PRESENT_WINDOW (5 min) —
-// band and gate must agree, or attestations no honest witness would sign
-// would still corroborate on the verifier side.
-func (c *AliasClaim) corroboratingWitnesses() []*WitnessAttestation {
-	ph, err := c.PrefixHash()
-	if err != nil {
-		return nil // an unhashable claim identity attests nothing
-	}
-	return c.corroboratingWitnessesFromPrefixHash(ph)
-}
-
 // corroboratingWitnessesFromPrefixHash is corroboratingWitnesses with the
 // claim's prefix hash precomputed (VerifyFull's shared-prefix path).
 func (c *AliasClaim) corroboratingWitnessesFromPrefixHash(prefixHash []byte) []*WitnessAttestation {
@@ -599,12 +568,12 @@ func MineAliasClaim(alias string, claimantKP *crypto.Keypair, timestamp uint64, 
 // §7.4 — deterministic ordering / full-validity helpers
 // ---------------------------------------------------------------------------
 
-// lessOrderKey implements the §7.4 step-3 ascending total order
+// LessOrderKey implements the §7.4 step-3 ascending total order
 // (timestamp, pow_hash, tld_id): earlier timestamp wins; ties broken by lower
 // PoW hash, then lower TLD ID. Used by SelectWinner (linear min) and
 // OrderClaims (sort.SliceStable) for deterministic, observation-independent
 // convergence.
-func lessOrderKey(a, b *AliasClaim) bool {
+func LessOrderKey(a, b *AliasClaim) bool {
 	if a.Timestamp != b.Timestamp {
 		return a.Timestamp < b.Timestamp
 	}
@@ -637,7 +606,7 @@ func SelectWinner(claims []*AliasClaim) *AliasClaim {
 		if !structurallyAndPoWValid(c) {
 			continue
 		}
-		if best == nil || lessOrderKey(c, best) {
+		if best == nil || LessOrderKey(c, best) {
 			best = c
 		}
 	}
@@ -656,7 +625,7 @@ func OrderClaims(claims []*AliasClaim) []*AliasClaim {
 		}
 	}
 	sort.SliceStable(survivors, func(i, j int) bool {
-		return lessOrderKey(survivors[i], survivors[j])
+		return LessOrderKey(survivors[i], survivors[j])
 	})
 	return survivors
 }

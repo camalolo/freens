@@ -1,6 +1,6 @@
 package dht
 
-// witness_reserved_test.go — the §7.6 reserved-alias gate on the §6.3 witness
+// witness_reserved_test.go — the §7.7 reserved-alias gate on the §6.3 witness
 // RPC (naming/reserved.go): a node running with the default policy REFUSES to
 // co-sign a claim whose alias is a delegated ICANN TLD or IANA special-use
 // name, before any crypto work; NodeConfig.AllowReserved opts a node out so a
@@ -67,7 +67,7 @@ func TestWitnessRefusesReservedAlias(t *testing.T) {
 		t.Fatalf("CollectWitnesses: %v", err)
 	}
 	if len(atts) != 0 {
-		t.Fatalf("got %d attestations for a reserved alias, want 0 (the §7.6 gate must refuse)", len(atts))
+		t.Fatalf("got %d attestations for a reserved alias, want 0 (the §7.7 gate must refuse)", len(atts))
 	}
 	// localhost (special-use kind) is refused the same way.
 	id2 := newWitnessIdentity(t, uint64(time.Now().Unix()))

@@ -1,7 +1,7 @@
-// Package naming — reserved_tlds.go is the §7.6 reserved-alias data: the
+// Package naming — reserved_tlds.go is the §7.7 reserved-alias data: the
 // strings a freens alias must not collide with, because claiming one would
 // let a freens TLD masquerade as part of ICANN DNS (spec §9.3 "ICANN
-// collision policy" narrows the harm on the resolution side; §7.6 closes the
+// collision policy" narrows the harm on the resolution side; §7.7 closes the
 // registration/witness/resolution-side abuse).
 //
 // Two kinds of entry, deliberately COMBINED into one lookup:
@@ -34,14 +34,14 @@
 // verdict).
 //
 // The list is data, not protocol law: -allow-reserved (CLI register / daemon
-// flag / [options] allow-reserved) overrides it locally. spec §7.6.
+// flag / [options] allow-reserved) overrides it locally. spec §7.7.
 package naming
 
 // ReservedTLDsSnapshot is the IANA root-zone version the data below was
 // generated from (the "# Version" header of tlds-alpha-by-domain.txt).
 const ReservedTLDsSnapshot = "2026090300"
 
-// reservedTLDs is the §7.6 reserved set: delegated root-zone TLDs (IANA
+// reservedTLDs is the §7.7 reserved set: delegated root-zone TLDs (IANA
 // snapshot above) + IANA special-use names. Keys are lowercase A-labels.
 var reservedTLDs = map[string]struct{}{
 	"aaa":                      {},

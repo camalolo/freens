@@ -135,3 +135,65 @@ func TestRefreshFailureLogsTransitionsOnce(t *testing.T) {
 		t.Fatalf("WARN lines after recovery = %d, want still 1", n)
 	}
 }
+
+// TestTruncatedWithoutTCPFallbackIsNotServed: a TC'd UDP answer whose TCP
+// retry fails is an INCOMPLETE answer — serving it as final silently drops
+// records, because nothing downstream re-sets TC on the client-facing
+// response. The forward must treat the truncation as a failed exchange
+// (next attempt/server, SERVFAIL if none) — found in the 2026-09-04 audit.
+func TestTruncatedWithoutTCPFallbackIsNotServed(t *testing.T) {
+	old := exchangeWith
+	t.Cleanup(func() { exchangeWith = old })
+
+	var tcpTried bool
+	exchangeWith = func(ctx context.Context, q *dns.Msg, addr, network string, timeout time.Duration) (*dns.Msg, error) {
+		if network == "tcp" {
+			tcpTried = true
+			return nil, errors.New("tcp unreachable")
+		}
+		resp := new(dns.Msg).SetReply(q)
+		resp.Truncate(512) // set the TC bit like a real oversized UDP answer
+		resp.Truncated = true
+		return resp, nil
+	}
+
+	u := &DNSUpstream{Servers: []string{"192.0.2.53"}}
+	q := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	resp, err := u.Forward(context.Background(), q)
+	if err == nil {
+		t.Fatalf("forward served a TRUNCATED answer as final (%d answers, TC=%v) — records would be silently dropped", len(resp.Answer), resp.Truncated)
+	}
+	if !tcpTried {
+		t.Error("the TCP retry was never attempted")
+	}
+	if !strings.Contains(err.Error(), "truncated") {
+		t.Errorf("err = %v, want it to name the truncation", err)
+	}
+}
+
+// TestTruncatedWithTCPFallbackServesTCP: the happy path — TC over UDP with
+// a working TCP retry still returns the complete TCP answer.
+func TestTruncatedWithTCPFallbackServesTCP(t *testing.T) {
+	old := exchangeWith
+	t.Cleanup(func() { exchangeWith = old })
+
+	exchangeWith = func(ctx context.Context, q *dns.Msg, addr, network string, timeout time.Duration) (*dns.Msg, error) {
+		resp := new(dns.Msg).SetReply(q)
+		if network == "udp" {
+			resp.Truncated = true
+			return resp, nil
+		}
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   []byte{192, 0, 2, 7},
+		})
+		return resp, nil
+	}
+
+	u := &DNSUpstream{Servers: []string{"192.0.2.53"}}
+	q := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	resp, err := u.Forward(context.Background(), q)
+	if err != nil || len(resp.Answer) != 1 {
+		t.Fatalf("forward = %v, %v — want the complete TCP answer", resp, err)
+	}
+}

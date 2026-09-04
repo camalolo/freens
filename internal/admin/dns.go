@@ -50,7 +50,7 @@ func (s *Server) SetReloader(fn func() (string, error)) {
 	s.mu.Unlock()
 }
 
-// SetAllowReserved mirrors the daemon's §7.6 override flag into the admin
+// SetAllowReserved mirrors the daemon's §7.7 override flag into the admin
 // face (naming/reserved.go): with it off (the default), the claim hop of
 // /resolve and its helpers treats a reserved-TLD alias (com, localhost, …)
 // as claim-less — "a node running without -allow-reserved never accepts a
@@ -61,7 +61,7 @@ func (s *Server) SetAllowReserved(b bool) {
 	s.mu.Unlock()
 }
 
-// allowReservedEnabled reports the §7.6 override state.
+// allowReservedEnabled reports the §7.7 override state.
 func (s *Server) allowReservedEnabled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

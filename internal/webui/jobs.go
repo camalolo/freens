@@ -38,6 +38,17 @@ func (s *Server) startJob(label string, run func(ctx context.Context, progress f
 	if j := s.runningLocked(); j != nil {
 		return j.ID // a job is already running: attach to it
 	}
+	// Bound the map: finished jobs are pruned on dashboard render
+	// (recentJobs), but a UI that never visits the dashboard would grow
+	// the map forever — drop hour-old finished jobs past a floor here too.
+	if len(s.jobs) > maxJobsRetained {
+		cutoff := time.Now().Add(-time.Hour)
+		for id, j := range s.jobs {
+			if j.Done && j.Started.Before(cutoff) {
+				delete(s.jobs, id)
+			}
+		}
+	}
 	s.jobSeq++
 	j := &job{ID: itoa(s.jobSeq), Label: label, Started: time.Now()}
 	s.jobs[j.ID] = j
@@ -67,6 +78,11 @@ func (s *Server) startJob(label string, run func(ctx context.Context, progress f
 	}()
 	return j.ID
 }
+
+// maxJobsRetained bounds the jobs map between dashboard renders (startJob
+// prunes hour-old finished jobs past this floor; recentJobs prunes on every
+// render regardless).
+const maxJobsRetained = 64
 
 func (s *Server) job(id string) *job {
 	s.jobsMu.Lock()
@@ -152,12 +168,12 @@ func (s *Server) renderJobFragment(w http.ResponseWriter, j *job) {
 	pct := j.pct
 	errText := j.Err
 	done := j.Done
-	j.mu.Unlock()
-
 	var res *RegisterResult
-	if rr, ok := j.Result.(*RegisterResult); ok {
+	if rr, ok := j.Result.(*RegisterResult); ok { // read under j.mu: the runner writes Result in its final critical section
 		res = rr
 	}
+	j.mu.Unlock()
+
 	data := struct {
 		JobID     string
 		JobLabel  string

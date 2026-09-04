@@ -36,6 +36,19 @@ func (n *NginxEnv) run(ctx context.Context, name string, args ...string) (ExecRe
 	return execRunner(ctx, name, args...)
 }
 
+// nginxExecTimeout bounds every nginx/systemctl exec the certmgr drives.
+// Without it a hung `nginx -t`/`systemctl reload` pins the caller forever —
+// the webui's http.Server sets no WriteTimeout, so the certs page wedges
+// until service restart (found in the 2026-09-04 audit).
+const nginxExecTimeout = 30 * time.Second
+
+// runBounded is run with the nginxExecTimeout budget.
+func (n *NginxEnv) runBounded(name string, args ...string) (ExecResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), nginxExecTimeout)
+	defer cancel()
+	return n.run(ctx, name, args...)
+}
+
 // sudoWrap prefixes args with -n -- and returns "sudo" as the binary when
 // escalating; otherwise the bare binary + args.
 func sudoWrap(use bool, name string, args ...string) (string, []string) {
@@ -690,7 +703,7 @@ func (n *NginxEnv) Validate(useSudo bool) error {
 		return err
 	}
 	bin, args := sudoWrap(useSudo, n.Binary, "-t", "-c", n.ConfPath)
-	res, err := n.run(context.Background(), bin, args...)
+	res, err := n.runBounded(bin, args...)
 	if err == nil {
 		return nil
 	}
@@ -698,7 +711,7 @@ func (n *NginxEnv) Validate(useSudo bool) error {
 	// on a root-owned config): retry under sudo -n before declaring defeat.
 	if !useSudo && sudoAvailable() {
 		bin, args := sudoWrap(true, n.Binary, "-t", "-c", n.ConfPath)
-		if res2, err2 := n.run(context.Background(), bin, args...); err2 == nil {
+		if res2, err2 := n.runBounded(bin, args...); err2 == nil {
 			return nil
 		} else {
 			return fmt.Errorf("%s", strings.TrimSpace(res2.Stdout+" "+res2.Stderr))
@@ -716,13 +729,13 @@ func (n *NginxEnv) Reload(useSudo bool) error {
 	}
 	if _, err := os.Stat("/run/systemd/system"); err == nil && runtime.GOOS != "windows" {
 		bin, args := sudoWrap(useSudo, "systemctl", "reload", "nginx")
-		if _, err := n.run(context.Background(), bin, args...); err == nil {
+		if _, err := n.runBounded(bin, args...); err == nil {
 			return nil
 		}
 		// systemd present but nginx not a unit (hand-rolled): signal form.
 	}
 	bin, args := sudoWrap(useSudo, n.Binary, "-s", "reload", "-c", n.ConfPath)
-	res, err := n.run(context.Background(), bin, args...)
+	res, err := n.runBounded(bin, args...)
 	if err != nil {
 		return fmt.Errorf("%s", strings.TrimSpace(res.Stdout+" "+res.Stderr))
 	}

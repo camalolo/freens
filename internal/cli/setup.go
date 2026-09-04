@@ -824,11 +824,6 @@ func systemctlUser(args ...string) error {
 	return sysRun("systemctl", append([]string{"--user"}, args...)...)
 }
 
-// systemctlActive reports whether the system unit is active.
-var systemctlActive = func(unit string) bool {
-	return sysRun("systemctl", "is-active", "--quiet", unit) == nil
-}
-
 // ---------------------------------------------------------------------------
 // templates
 // ---------------------------------------------------------------------------

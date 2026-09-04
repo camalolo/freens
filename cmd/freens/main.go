@@ -268,7 +268,7 @@ func run(args []string) error {
 	if *upstreamCSV != "" {
 		cfg.UpstreamServers = splitCSV(*upstreamCSV)
 	}
-	// §7.6 reserved-alias override: flag > config [options] > default (off).
+	// §7.7 reserved-alias override: flag > config [options] > default (off).
 	// One effective value drives BOTH gates — the witness side (NodeConfig.
 	// AllowReserved) and the resolver/admin side (cfg.AllowReserved + the
 	// admin Server mirror) — so a node cannot end up with split policy.
@@ -281,7 +281,7 @@ func run(args []string) error {
 		"upstream", cfg.UpstreamServers,
 		"load_dir", loadEffective,
 		"idna", naming.IDNANormalizer != nil, // §3.2 U-labels accepted?
-		"allow_reserved", cfg.AllowReserved, // §7.6 override active?
+		"allow_reserved", cfg.AllowReserved, // §7.7 override active?
 	)
 
 	// -peers-file: validated and parsed AFTER config/flag validation but
@@ -416,7 +416,7 @@ func run(args []string) error {
 		// the "no -peers needed" path. Node-less daemons still serve
 		// status-only.
 		adminSrv = admin.New(node, dhtLookup, version, logger)
-		adminSrv.SetAllowReserved(cfg.AllowReserved) // §7.6: keep the admin face in step with the resolver face
+		adminSrv.SetAllowReserved(cfg.AllowReserved) // §7.7: keep the admin face in step with the resolver face
 		go func() {
 			if err := adminSrv.ListenAndServe(home.AdminSock()); err != nil {
 				logger.Warn("admin socket failed", "sock", home.AdminSock(), "error", err)
@@ -1662,7 +1662,7 @@ func defineFlags(fs *flag.FlagSet) *flags {
 		"punycode (xn--…) ASCII, which strict LDH accepts either way; subdomain labels\n"+
 		"(the part before the alias) stay strict ASCII LDH regardless. Equivalent to\n"+
 		"[options] \"idna = true\" in the config file; an explicit -idna=false overrides it.")
-	f.allowReserved = fs.Bool("allow-reserved", false, "override the §7.6 reserved-alias policy: this daemon may WITNESS (co-sign\n"+
+	f.allowReserved = fs.Bool("allow-reserved", false, "override the §7.7 reserved-alias policy: this daemon may WITNESS (co-sign\n"+
 		"claims for) and RESOLVE freens aliases that equal delegated ICANN TLDs or IANA\n"+
 		"special-use names (com, net, localhost, …). Default OFF: register refuses to mint\n"+
 		"such claims, the node refuses to witness them, and the resolver + admin faces\n"+

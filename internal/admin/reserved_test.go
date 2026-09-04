@@ -1,6 +1,6 @@
 package admin
 
-// reserved_test.go — the §7.6 reserved-alias gate on the admin face
+// reserved_test.go — the §7.7 reserved-alias gate on the admin face
 // (claimTLDID): without this daemon's -allow-reserved override (mirrored via
 // SetAllowReserved), /resolve treats a reserved-TLD alias as claim-less —
 // "a node running without -allow-reserved never accepts a freens .com" holds
@@ -45,7 +45,7 @@ func TestResolveReservedAliasGate(t *testing.T) {
 		t.Fatalf("Resolve(com): %v", err)
 	}
 	if res.Found {
-		t.Fatal("Resolve(com).Found = true under the default policy — the §7.6 gate failed")
+		t.Fatal("Resolve(com).Found = true under the default policy — the §7.7 gate failed")
 	}
 
 	// The override accepts the same record.

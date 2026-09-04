@@ -388,11 +388,6 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
 	return os.Rename(tmp.Name(), path)
 }
 
-// ErrServeFilesNotFound is a doctor/UX helper answer.
-func ErrServeFilesNotFound(name string) error {
-	return fmt.Errorf("%w: run `freens cert %s` (or issue it from the web UI) first", ErrNotTracked, name)
-}
-
 // containsName: exact membership (server_name lists, deployed-file lists).
 func containsName(list []string, want string) bool {
 	for _, s := range list {

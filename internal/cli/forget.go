@@ -106,6 +106,18 @@ func cmdForget(args []string) error {
 	action := "nothing to revoke"
 	switch {
 	case cur == nil:
+		// Nothing published AT THIS VANTAGE — but the network walk can come
+		// up empty from a partitioned view, and this branch deletes the only
+		// copies of the keys. Prompt interactively exactly like the
+		// revoke-and-prune branch (found in the 2026-09-04 audit: this was
+		// the ONE destructive path with no confirmation).
+		if !*yes && sysIsTerminal() {
+			fmt.Printf("forget %s — nothing is published for it right now, and this DELETES the owner + recovery keys from this machine (a live record elsewhere would become un-revocable).\nProceed? [y/N] ", displayName)
+			var answer string
+			if _, err := fmt.Scanln(&answer); err != nil || (answer != "y" && answer != "Y" && answer != "yes") {
+				return usageErr("forget aborted")
+			}
+		}
 		fmt.Printf("%s: nothing published — pruning the keychain files\n", displayName)
 	case cur.IsRevoked():
 		fmt.Printf("%s: already revoked — pruning the keychain files\n", displayName)
@@ -137,9 +149,9 @@ func cmdForget(args []string) error {
 
 	fmt.Printf("FORGOTTEN. %s: %s; key files removed: %d\n", displayName, action, pruned)
 	if *keepKeys {
-		fmt.Println("keys kept (-keep-keys); the name stays revoked — un-revoke by republishing (`freens name <name>`)")
+		fmt.Println("keys kept (-keep-keys); the name stays revoked — un-revoke by republishing (see below)")
 	} else {
-		fmt.Printf("to ever use %s again: restore the key (freens backup -restore) and republish (`freens name %s` or register)\n", displayName, displayName)
+		fmt.Printf("to ever use %s again: restore the key (freens backup -restore) and republish (`%s`)\n", displayName, unRevokeHint(labels, displayName))
 	}
 	fmt.Println("note: sub-names (www.<alias> …) are separate records — they lapse on their own leases unless revoked too.")
 	return nil

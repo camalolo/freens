@@ -22,7 +22,6 @@ import (
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/keychain"
-	"github.com/camalolo/freens/internal/wire"
 )
 
 // adminTimeout bounds every admin-socket round trip from the CLI side.
@@ -96,25 +95,6 @@ func pickTransport(peersCSV string) (*transport, error) {
 
 // daemon reports whether the transport is the running daemon.
 func (t *transport) daemon() bool { return t != nil && t.client != nil }
-
-// publishEnv PUTs env via whichever transport was picked. The daemon path
-// returns the number of storing peers the daemon reports; the standalone
-// path returns 0 (the one-shot node's Publish already walked to the R
-// closest storers, same as the classic CLI).
-func (t *transport) publishEnv(ctx context.Context, env *wire.SignedEnvelope) (int, error) {
-	if t.daemon() {
-		return t.client.Publish(ctx, env)
-	}
-	node, err := startCLINode(ctx, "", "", t.peers)
-	if err != nil {
-		return 0, err
-	}
-	defer node.Close()
-	if err := node.Publish(ctx, env); err != nil {
-		return 0, err
-	}
-	return 0, nil
-}
 
 // firstAdminIP extracts the first A-record address from an admin Resolved
 // RRset — falling back to AAAA (16-byte rdata) when no A exists — the

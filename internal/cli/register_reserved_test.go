@@ -1,6 +1,6 @@
 package cli
 
-// register_reserved_test.go — the §7.6 registration gate on `freens register`
+// register_reserved_test.go — the §7.7 registration gate on `freens register`
 // (naming.CheckRegisterable): a claim on a delegated ICANN TLD / IANA
 // special-use alias is refused BEFORE any key generation, PoW mining, or
 // network traffic, with the -allow-reserved hint; the flag lets a deliberate
@@ -23,7 +23,7 @@ func TestRegisterRefusesReservedAlias(t *testing.T) {
 	for _, alias := range []string{"com", "localhost", "net", "de"} {
 		err := cmdRegister([]string{alias, "-ip", "203.0.113.6"})
 		if err == nil {
-			t.Fatalf("register %s: want the §7.6 reserved-alias error, got nil", alias)
+			t.Fatalf("register %s: want the §7.7 reserved-alias error, got nil", alias)
 		}
 		if !errors.Is(err, naming.ErrReserved) {
 			t.Fatalf("register %s: error %v does not wrap naming.ErrReserved", alias, err)
@@ -41,7 +41,7 @@ func TestRegisterRefusesReservedAlias(t *testing.T) {
 }
 
 // TestRegisterAllowReservedPassesGate: with -allow-reserved the SAME alias
-// gets past the §7.6 gate — the run proceeds and fails later (test sandbox:
+// gets past the §7.7 gate — the run proceeds and fails later (test sandbox:
 // no daemon on the admin socket), never with the reserved-alias refusal.
 func TestRegisterAllowReservedPassesGate(t *testing.T) {
 	if testing.Short() {

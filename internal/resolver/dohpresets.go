@@ -56,11 +56,3 @@ func DoHPresetURL(s string) (string, bool) {
 	}
 	return "", false
 }
-
-// ValidateServeBool parses the [doh] "serve" value shape (same spellings as
-// the resolver's config booleans). Exported so the CLI and webui can
-// validate before writing the key.
-func ValidateServeBool(v string) error {
-	_, err := parseConfigBool(v)
-	return err
-}

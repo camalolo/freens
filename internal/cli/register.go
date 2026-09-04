@@ -77,7 +77,7 @@ func cmdRegister(args []string) error {
 	outKey := fs.String("out-key", "", "where to write a GENERATED owner key (default <home>/keys/<alias>.key; 0600)")
 	outDir := fs.String("out-dir", ".", "directory for the artifacts (<alias>.tld.cbor)")
 	noRecovery := fs.Bool("no-recovery", false, "do NOT generate the default 2-of-3 recovery keyfiles / embed a spec 5.4 policy in the apex record")
-	allowReserved := fs.Bool("allow-reserved", false, "override the §7.6 reserved-alias policy: allow claiming an alias that equals a delegated ICANN TLD or IANA special-use name (com, localhost, …)")
+	allowReserved := fs.Bool("allow-reserved", false, "override the §7.7 reserved-alias policy: allow claiming an alias that equals a delegated ICANN TLD or IANA special-use name (com, localhost, …)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -98,7 +98,7 @@ func cmdRegister(args []string) error {
 	if *alias == "" {
 		return usageErr("register needs an alias: %s register <alias>  (e.g. %s register alice; -ip and -peers default to this machine's outbound IPv4 and the running daemon)", ProgName, ProgName)
 	}
-	// §7.6 reserved-alias gate (naming/reserved.go) — BEFORE any key
+	// §7.7 reserved-alias gate (naming/reserved.go) — BEFORE any key
 	// generation, PoW mining, or network traffic: an alias equal to a
 	// delegated ICANN TLD or IANA special-use name is refused so a freens
 	// claim can never masquerade as part of real DNS (the freens ".com"
@@ -120,7 +120,7 @@ func cmdRegister(args []string) error {
 		return usageErr("%q is not a valid alias: %v", *alias, verr)
 	}
 	if *allowReserved {
-		fmt.Printf("*** -allow-reserved: claiming a reserved TLD alias (%s) — freens nodes will refuse to witness it and resolvers refuse to resolve it by default (spec §7.6); other freens users will NOT see this namespace\n", *alias)
+		fmt.Printf("*** -allow-reserved: claiming a reserved TLD alias (%s) — freens nodes will refuse to witness it and resolvers refuse to resolve it by default (spec §7.7); other freens users will NOT see this namespace\n", *alias)
 	}
 	if *difficulty < constants.PoWDifficultyInit {
 		return usageErr("-difficulty must be >= %d (the network default, Appendix A.4)", constants.PoWDifficultyInit)
@@ -594,32 +594,6 @@ func writeKeyFileEnc(path string, kp *crypto.Keypair, passphrase string) error {
 	return keychain.Save(path, kp, passphrase)
 }
 
-// netIP parses a dotted-quad IPv4 (the CLI's A-record convention); nil on
-// anything else.
-func netIP(s string) []byte {
-	if ip := net.ParseIP(s); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			return append([]byte(nil), ip4...)
-		}
-	}
-	return nil
-}
-
-// reusableClaim is the persisted mined claim (cooldown-safe retries): the
-// JSON mirrors the AliasClaim fields the witness prefix hash covers.
-type reusableClaim struct {
-	Alias       string `json:"alias"`
-	TldIDB32    string `json:"tld_id_b32"`
-	ClaimantB64 string `json:"claimant_b64"`
-	Timestamp   uint64 `json:"timestamp"`
-	Difficulty  int    `json:"difficulty"`
-	NonceB64    string `json:"nonce_b64"`
-}
-
-func claimStatePath(alias string) string {
-	return filepath.Join(home.KeysDir(), alias+".claim.json")
-}
-
 // loadReusableClaim returns the persisted claim when it matches alias, owner
 // key, difficulty AND is still witnessable (v0.9.0: the §6.3 witness RPC
 // refuses claims whose timestamp is older than WITNESS_PRESENT_WINDOW, so a
@@ -637,19 +611,6 @@ func loadReusableClaim(alias string, kp *crypto.Keypair, difficulty int) *claims
 // saveReusableClaim persists the claim for cooldown-safe retries (0600).
 func saveReusableClaim(alias string, c *claims.AliasClaim) {
 	keychain.SaveReusableClaim(home.KeysDir(), alias, c)
-}
-
-// difficultyOf reads the difficulty from the nonce[0] convention (Appendix
-// A.4); falls back to the network default.
-func difficultyOf(c *claims.AliasClaim) int {
-	if len(c.Nonce) > 0 && int(c.Nonce[0]) >= constants.PoWDifficultyInit {
-		return int(c.Nonce[0])
-	}
-	return constants.PoWDifficultyInit
-}
-
-func base32Decode(s string) ([]byte, error) {
-	return base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(s))
 }
 
 // fileExists reports whether path is a regular file.

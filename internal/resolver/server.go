@@ -282,11 +282,20 @@ func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 				lastErr = errors.New("resolver: upstream returned no response")
 				continue
 			}
-			// TC bit on UDP → retry over TCP against the same server.
+			// TC bit on UDP → retry over TCP against the same server. If the
+			// TCP retry fails, the truncated UDP answer must NOT be served:
+			// it is an INCOMPLETE answer, and nothing downstream re-sets TC
+			// on the client-facing response — serving it silently drops
+			// records (found in the 2026-09-04 audit). Treat it like any
+			// other failed exchange: try the next attempt/server, SERVFAIL
+			// if none succeeds.
 			if resp.Truncated && net0 == "udp" {
-				if r2, err := exchangeWith(ctx, q, addr, "tcp", timeout); err == nil && r2 != nil {
+				r2, terr := exchangeWith(ctx, q, addr, "tcp", timeout)
+				if terr == nil && r2 != nil {
 					return r2, nil
 				}
+				lastErr = fmt.Errorf("upstream %s: answer truncated and TCP retry failed: %v", addr, terr)
+				continue
 			}
 			return resp, nil
 		}

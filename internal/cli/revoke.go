@@ -5,7 +5,7 @@
 // 12), signed by the owner key. The §6.4 winner rule installs it over the
 // live record in every store; the resolver then NXDOMAINs the name at any
 // hop that is revoked (§8.5 lines 708-713). Un-revoking = publishing any
-// newer sequence (`freens name <name>` again).
+// newer sequence (register for apexes, name for sub-names).
 //
 // Like `name`, every default comes from live state: owner key from the
 // keychain, sequence fetched from the network, publish via the running
@@ -114,8 +114,8 @@ func cmdRevoke(args []string) error {
 		return err
 	}
 
-	fmt.Printf("REVOKED. %s no longer resolves (sequence %d; un-revoke with `%s name %s`)\n",
-		displayName, seq, ProgName, displayName)
+	fmt.Printf("REVOKED. %s no longer resolves (sequence %d; un-revoke with `%s`)\n",
+		displayName, seq, unRevokeHint(labels, displayName))
 	fmt.Printf("tld_id_b32=%s\n", pin)
 	fmt.Printf("k_name=%s\n", hex.EncodeToString(naming.DHTKeyName(wireName)))
 	return nil
@@ -144,9 +144,24 @@ func discoverEnvelope(tr *transport, key []byte) (*wire.SignedEnvelope, error) {
 	defer node.Close()
 	env, err := node.IterativeGet(ctx, key)
 	if err != nil {
-		return nil, nil // a walk failure is "nothing reachable", same as the daemon's 404
+		// A walk FAILURE is not "nothing reachable": treating it as a miss
+		// bases the tombstone's sequence on nothing (seq 1) and silently
+		// loses the §6.4 winner race against the live record — the name
+		// keeps resolving while the CLI prints REVOKED (found in the
+		// 2026-09-04 audit). Propagate; only a clean (nil, nil) is a miss.
+		return nil, err
 	}
 	return env, nil
+}
+
+// unRevokeHint names the tool that can actually re-publish the name:
+// `name` refuses apex forms (register owns the apex, tombstones included),
+// so an apex hint must point at register.
+func unRevokeHint(labels []string, displayName string) string {
+	if len(labels) == 0 {
+		return ProgName + " register " + displayName
+	}
+	return ProgName + " name " + displayName
 }
 
 // publishRevokedAt signs the §9.5 tombstone (empty RRset, revoke = true)

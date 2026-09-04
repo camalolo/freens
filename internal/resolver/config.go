@@ -73,7 +73,7 @@ type Config struct {
 	// names at all, and pairs it with a "freens" connection suffix.
 	SuffixRescue bool
 
-	// AllowReserved overrides the §7.6 reserved-alias policy
+	// AllowReserved overrides the §7.7 reserved-alias policy
 	// (naming/reserved.go): default OFF, meaning freensResolve treats an
 	// alias that equals a delegated ICANN TLD or an IANA special-use name
 	// ("com", "localhost", …) as claim-less — NXDOMAIN, no network walk —

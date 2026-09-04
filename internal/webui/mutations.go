@@ -26,13 +26,13 @@ func (s *Server) handleRegisterStart(w http.ResponseWriter, r *http.Request) {
 		Passphrase: r.PostFormValue("passphrase"),
 		NoRecovery: r.PostFormValue("recovery") != "on",
 	}
-	ttl, _ := time.ParseDuration(r.PostFormValue("ttl") + "s")
-	if n, err := fmt.Sscanf(r.PostFormValue("ttl"), "%d", new(int)); err == nil && n == 1 {
-		var secs uint64
-		fmt.Sscanf(r.PostFormValue("ttl"), "%d", &secs)
+	// The form posts the TTL as whole seconds ("" ⇒ ops.Register's 300 s
+	// default; garbage ⇒ same default — a bad TTL is never worth 400ing a
+	// registration over).
+	var secs uint64
+	if n, _ := fmt.Sscanf(r.PostFormValue("ttl"), "%d", &secs); n == 1 {
 		in.TTL = secs
 	}
-	_ = ttl
 	job := s.startJob("register "+in.Alias, func(ctx context.Context, progress func(string)) (any, error) {
 		return s.ops().Register(ctx, in, progress)
 	})
@@ -48,16 +48,6 @@ func (s *Server) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such job", http.StatusNotFound)
 		return
 	}
-	d := struct {
-		JobID     string
-		JobLabel  string
-		JobPct    int
-		JobDone   bool
-		JobError  string
-		JobResult *RegisterResult
-		JobSteps  []jobStepView
-	}{}
-	_ = d
 	s.renderJobFragment(w, j)
 }
 

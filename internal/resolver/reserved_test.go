@@ -1,6 +1,6 @@
 package resolver
 
-// reserved_test.go — the §7.6 resolution-side gate (naming/reserved.go +
+// reserved_test.go — the §7.7 resolution-side gate (naming/reserved.go +
 // resolver.go freensResolve): an alias equal to a delegated ICANN TLD or
 // IANA special-use name is treated as claim-less — NXDOMAIN, claim source
 // never able to answer — EVEN when the network holds a perfectly valid,
@@ -47,7 +47,7 @@ func TestResolveQuestionReservedAliasClaimRefused(t *testing.T) {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}
 	if rcode != dns.RcodeNameError {
-		t.Fatalf("rcode = %d, want NXDOMAIN(%d): the §7.6 gate must refuse a freens .com even with a rogue-witnessed claim", rcode, dns.RcodeNameError)
+		t.Fatalf("rcode = %d, want NXDOMAIN(%d): the §7.7 gate must refuse a freens .com even with a rogue-witnessed claim", rcode, dns.RcodeNameError)
 	}
 	if len(rrs) != 0 {
 		t.Fatalf("len(rrs) = %d, want 0", len(rrs))
@@ -91,7 +91,7 @@ func TestResolveQuestionReservedAliasPinWins(t *testing.T) {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
 	if rcode != dns.RcodeSuccess || len(rrs) != 1 {
-		t.Fatalf("rcode = %d len = %d, want NOERROR with 1 RR (a pin must win over the §7.6 gate)", rcode, len(rrs))
+		t.Fatalf("rcode = %d len = %d, want NOERROR with 1 RR (a pin must win over the §7.7 gate)", rcode, len(rrs))
 	}
 }
 

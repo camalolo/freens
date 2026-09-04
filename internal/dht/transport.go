@@ -311,7 +311,7 @@ type NodeConfig struct {
 	// freens-native (node-key signatures, internal/turn docs); the socket also
 	// answers STUN Binding, so it doubles as a -stun target.
 	TurnServer *turn.ServerConfig
-	// AllowReserved overrides the §7.6 reserved-alias policy (naming/reserved.go):
+	// AllowReserved overrides the §7.7 reserved-alias policy (naming/reserved.go):
 	// by default this node REFUSES to co-sign witness attestations for claims
 	// whose alias is a delegated ICANN TLD or an IANA special-use name ("com",
 	// "localhost", …) — no quorum, no claim. The override exists for operators
@@ -337,7 +337,7 @@ type Node struct {
 	conn           net.PacketConn
 	closed         atomic.Bool
 	passive        bool
-	allowReserved  bool          // §7.6 override: witness reserved-alias claims anyway
+	allowReserved  bool          // §7.7 override: witness reserved-alias claims anyway
 	refreshEvery   time.Duration // resolved: >0 = run refresh loop
 	republishEvery time.Duration // resolved: >0 = run republish loop
 	contactIdleTTL time.Duration // resolved: >0 = run the idle sweep
@@ -397,7 +397,8 @@ type Node struct {
 
 	// witnessLast implements the §7.3 WITNESS_COOLDOWN rule: alias → the last
 	// claim this node co-signed (identified by its §7.3 PoW prefix hash) and
-	// when. Guarded by witnessMu.
+	// when. Guarded by witnessMu. Bounded by witnessLastPruneAt (insert-time
+	// sweep of post-cooldown entries).
 	witnessMu   sync.Mutex
 	witnessLast map[string]witnessSigned
 
@@ -423,6 +424,18 @@ type Node struct {
 // timeouts while 3/7 nodes were down).
 const deadPenaltyWindow = 30 * time.Second
 
+// deadPenaltySweepAt bounds the deadUntil map: past this many entries every
+// insert sweeps expired ones. Without the sweep the map grows by one
+// permanent entry per distinct probed corpse for the node's lifetime —
+// churn ghosts and adversarially advertised dead contacts included (found
+// in the 2026-09-04 audit).
+const deadPenaltySweepAt = 1024
+
+// witnessLastPruneAt bounds the witnessLast map the same way: past this
+// many aliases co-signed, entries older than WitnessCooldown are swept on
+// insert (they can never affect the cooldown rule again).
+const witnessLastPruneAt = 1024
+
 // markDead records the dead-peer penalty for id (now + window).
 func (n *Node) markDead(id []byte, now int64) {
 	n.penaltyMu.Lock()
@@ -431,6 +444,13 @@ func (n *Node) markDead(id []byte, now int64) {
 		return
 	}
 	n.deadUntil[string(id)] = now + int64(deadPenaltyWindow/time.Second)
+	if len(n.deadUntil) >= deadPenaltySweepAt {
+		for k, until := range n.deadUntil {
+			if now >= until {
+				delete(n.deadUntil, k)
+			}
+		}
+	}
 }
 
 // penalized reports whether id is inside its dead-peer penalty window.
@@ -1701,7 +1721,7 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	if !ok || aerr != nil || len(nonce) == 0 || len(powHash) != constants.SHA256Len {
 		return n.errResp(m, 305, "bad witness args")
 	}
-	// §7.6 reserved-alias gate (naming/reserved.go): a claim on a delegated
+	// §7.7 reserved-alias gate (naming/reserved.go): a claim on a delegated
 	// ICANN TLD or IANA special-use name is refused BEFORE any crypto work —
 	// this node does not co-sign claims that would put a freens TLD inside
 	// real-DNS namespace (the phishing-with-a-padlock class). NodeConfig.
@@ -1709,8 +1729,8 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	// other witnesses' gates are unchanged. Error family 305 like the other
 	// claim-content refusals: permanent for this claim, not retryable.
 	if naming.IsReservedTLD(aliasN) && !n.allowReserved {
-		n.log.Info("witness refused: reserved alias (spec §7.6)", "alias", aliasN)
-		return n.errResp(m, 305, "reserved alias refused (spec §7.6)")
+		n.log.Info("witness refused: reserved alias (spec §7.7)", "alias", aliasN)
+		return n.errResp(m, 305, "reserved alias refused (spec §7.7)")
 	}
 	if len(tldID) != constants.SHA256Len || len(claimant) != constants.Ed25519PublicKeyLen {
 		return n.errResp(m, 305, "bad tld_id/claimant length")
@@ -1815,6 +1835,18 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 			prefixHash: append([]byte(nil), prefixHash...),
 			claimant:   append([]byte(nil), claimant...),
 			at:         now,
+		}
+		if len(n.witnessLast) >= witnessLastPruneAt {
+			// Entries older than the cooldown can never affect the rule
+			// again — drop them so the map stays bounded by recently
+			// witnessed aliases (found in the 2026-09-04 audit: one
+			// permanent entry per alias ever co-signed, adversarial
+			// traffic included — a fresh D=24 PoW per entry).
+			for k, w := range n.witnessLast {
+				if now-w.at >= int64(constants.WitnessCooldown) {
+					delete(n.witnessLast, k)
+				}
+			}
 		}
 	}
 	n.witnessMu.Unlock()
@@ -2788,7 +2820,10 @@ func (n *Node) putToPeer(ctx context.Context, key, envBytes, evidence []byte, c 
 	if err != nil {
 		return err
 	}
-	if putResp == nil || putResp.Y == wire.MsgTypeError {
+	if putResp == nil {
+		return errors.New("dht: put rejected: empty response")
+	}
+	if putResp.Y == wire.MsgTypeError {
 		return fmt.Errorf("dht: put rejected: %v", putResp.A["code"])
 	}
 	return nil

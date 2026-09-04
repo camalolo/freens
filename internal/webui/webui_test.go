@@ -279,6 +279,23 @@ func TestCSRFHeaderRequiredOnMutations(t *testing.T) {
 	if code2 == http.StatusBadRequest {
 		t.Errorf("mutation WITH header still 400 (CSRF check too strict?)")
 	}
+	// v0.15.2 regression: htmx (the browser UI's actual client) stamps
+	// HX-Request, NOT X-Requested-With — the gate used to 400 every real
+	// browser mutation while these header-setting tests stayed green.
+	req, err := http.NewRequest("POST", ts.URL+"/api/renew", strings.NewReader(url.Values{"name": {"alice"}}.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("HX-Request", "true")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusBadRequest {
+		t.Error("mutation with the htmx HX-Request header 400'd — the CSRF gate is unpassable from the real UI again")
+	}
 }
 
 func TestPagesRender(t *testing.T) {

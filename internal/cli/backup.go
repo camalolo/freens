@@ -140,27 +140,3 @@ func backupRestore(path string, force bool) error {
 	fmt.Printf("done — check your names with `%s status`\n", ProgName)
 	return nil
 }
-
-const backupReadmeTemplate = `freens key backup
-=================
-
-This file contains the private keys of your freens name(s). Whoever holds
-it owns the names. Keep it secret; keep it somewhere safe OFF this machine.
-
-Restore on any machine with:
-
-    %s backup -restore <this file>
-
-Contents:
-  %s
-
-File naming:
-  <name>.key          the owner key — proves you own <name>
-  <name>.recN.key     recovery key N — any 2 of 3 recover a lost owner key
-  <name>.claim.json   reusable registration state (speeds up retries)
-
-If you chose a passphrase at registration, the .key files are encrypted
-(FREENSK1); unlocking needs the passphrase (prompted, or the
-FREENS_PASSPHRASE environment variable). Without a passphrase they are
-plain hex — protect the backup file itself.
-`

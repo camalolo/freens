@@ -18,11 +18,15 @@ import (
 	"github.com/camalolo/freens/internal/keychain"
 )
 
-// nginxEnv is the indirection tests swap for a fixture tree.
+// nginxEnv is the indirection tests swap for a fixture tree. The lazy init
+// is once-guarded: the cert handlers run on concurrent goroutines and an
+// unsynchronized nil check is a data race (found in the 2026-09-04 audit).
 func (s *Server) nginxEnv() *certmgr.NginxEnv {
-	if s.nginx == nil {
-		s.nginx = &certmgr.NginxEnv{}
-	}
+	s.nginxOnce.Do(func() {
+		if s.nginx == nil {
+			s.nginx = &certmgr.NginxEnv{}
+		}
+	})
 	return s.nginx
 }
 

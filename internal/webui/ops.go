@@ -6,15 +6,12 @@
 package webui
 
 import (
-	"bytes"
 	"context"
 	"encoding/base32"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"sort"
 	"strings"
 	"time"
 
@@ -59,7 +56,7 @@ type RegisterResult struct {
 }
 
 // registerError carries a user-facing message (safe to render raw) plus an
-// OPTIONAL cause, so gate errors (§7.6 naming.ErrReserved) stay
+// OPTIONAL cause, so gate errors (§7.7 naming.ErrReserved) stay
 // errors.Is-identifiable to programmatic callers even though the HTTP layer
 // only ever renders the message.
 type registerError struct {
@@ -105,7 +102,7 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	if err != nil {
 		return RegisterResult{}, userErr("invalid alias: %v", err)
 	}
-	// §7.6 reserved-alias gate (naming/reserved.go): the web UI has NO
+	// §7.7 reserved-alias gate (naming/reserved.go): the web UI has NO
 	// override for a claim on a delegated ICANN TLD / IANA special-use name
 	// — this form is exactly the first-time-user surface the gate protects.
 	// The error points to the CLI flag so a deliberate operator still has a
@@ -548,12 +545,6 @@ func outboundIPv4() (string, error) {
 	addr := c.LocalAddr().(*net.UDPAddr)
 	return addr.IP.String(), nil
 }
-
-var (
-	_ = base64.StdEncoding
-	_ = bytes.Equal
-	_ = sort.Strings
-)
 
 // ---------------------------------------------------------------------------
 // naming / display helpers shared across files
