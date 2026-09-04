@@ -26,6 +26,10 @@ func runCertutil(args ...string) error {
 	return exec.Command("certutil", args...).Run()
 }
 
+// SystemCertPath: the Windows system trust is a certutil store, not a file
+// (uninstallSystem handles the removal) — nothing for the CLI to stat.
+func (e *Engine) SystemCertPath(alias string) string { return "" }
+
 // installSystem puts the cross-cert into the intermediate store (machine
 // first, per-user fallback). The cert's subject (CN = alias) is what a
 // later uninstallSystem matches on.

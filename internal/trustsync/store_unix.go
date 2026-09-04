@@ -14,7 +14,18 @@ import (
 	"path/filepath"
 )
 
+// SystemCertPath reports where the direct system-bundle copy lives for
+// alias (empty when the platform has no file-based system bundle — the
+// `freens trust remove` verb stats it to print the root-removal recipe).
+func (e *Engine) SystemCertPath(alias string) string {
+	return e.sysPath(alias)
+}
+
 func (e *Engine) sysPath(alias string) string {
+	if e.opts.SysCAPath != "" {
+		// Test seam (Options.SysCAPath): a private bundle directory.
+		return filepath.Join(e.opts.SysCAPath, "freens-cross-"+alias+".crt")
+	}
 	return "/usr/local/share/ca-certificates/freens-cross-" + alias + ".crt"
 }
 

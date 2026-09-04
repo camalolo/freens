@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,7 +89,7 @@ func TestOnOwnerCAInstallsAndDedupes(t *testing.T) {
 	caDER, caKey := ownerCA(t, seed, "bob", time.Now())
 	expires := time.Now().Add(24 * time.Hour).Unix()
 
-	e.OnOwnerCA("bob", []byte{1, 2, 3}, caDER, expires)
+	e.OnOwnerCA("bob", []byte{1, 2, 3}, caDER, expires, false)
 
 	snap := e.Snapshot()
 	if len(snap) != 1 || snap[0].Alias != "bob" {
@@ -130,42 +131,361 @@ func TestOnOwnerCAInstallsAndDedupes(t *testing.T) {
 
 	// Duplicate notification: same identity, still fresh — no re-mint.
 	st1 := e.Snapshot()[0]
-	e.OnOwnerCA("bob", []byte{1, 2, 3}, caDER, expires)
+	e.OnOwnerCA("bob", []byte{1, 2, 3}, caDER, expires, false)
 	st2 := e.Snapshot()[0]
 	if st1.NotAfter != st2.NotAfter {
 		t.Fatal("duplicate notification re-minted the cross-cert")
 	}
 }
 
-// TestOnOwnerCARotatesOnCAChange: same tld_id, NEW CA bytes (a CA rotation)
-// must re-mint rather than dedupe.
-func TestOnOwnerCARotatesOnCAChange(t *testing.T) {
+// TestOnOwnerCARotationGate: same tld_id, NEW CA bytes (a CA rotation).
+// The §9.5.4 observation gate defers the swap: the installed cross-cert
+// stays authoritative for rotationGrace, the state shows "rotating" with
+// the pending CA, and only a post-grace re-observation completes it.
+func TestOnOwnerCARotationGate(t *testing.T) {
+	clock := time.Now()
 	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
 	e := mustEngine(t, opts)
-	expires := time.Now().Add(24 * time.Hour).Unix()
+	expires := clock.Add(24 * time.Hour).Unix()
 
-	ca1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", time.Now())
+	ca1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.OnOwnerCA("bob", []byte{1}, ca1, expires)
+	e.OnOwnerCA("bob", []byte{1}, ca1, expires, false)
 	before := e.Snapshot()[0]
+	pe0, err := os.ReadFile(e.spoolPath("bob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCrossFP := tlsca.Fingerprint(pe0) // spool holds the CROSS-cert: fingerprint its bytes
 
 	// A different derivation day ⇒ different cert bytes ⇒ a new ca_sha256.
-	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", time.Now().Add(48*time.Hour))
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(ca1) == string(ca2) {
 		t.Skip("CA bytes identical across derivation days (test invariant broken)")
 	}
-	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800)
-	after := e.Snapshot()[0]
-	if after.CASha256 == before.CASha256 {
-		t.Fatal("CA rotation did not update the recorded CA hash")
+	newFP := tlsca.Fingerprint(ca2)
+
+	// First sight of the new CA: DEFERRED — old cross-cert stays installed.
+	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800, false)
+	mid := e.Snapshot()[0]
+	if mid.CASha256 != before.CASha256 {
+		t.Fatal("rotation swapped the recorded CA before the grace elapsed")
 	}
-	if after.NotAfter == before.NotAfter {
-		t.Fatal("CA rotation did not re-mint the cross-cert")
+	if mid.Status != statusRotating || mid.PendingCASha256 != newFP {
+		t.Fatalf("mid-rotation state = %+v, want rotating with pending", mid)
+	}
+	// The spool (bridge source of truth) still holds the OLD cross-cert.
+	pe, err := os.ReadFile(e.spoolPath("bob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlsca.Fingerprint(pe) != oldCrossFP {
+		t.Fatal("spool cross-cert was swapped before the grace elapsed")
+	}
+
+	// Pre-grace re-observation: still deferred, grace does NOT restart.
+	clock = clock.Add(rotationGrace / 2)
+	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800, false)
+	if s := e.Snapshot()[0]; s.Status != statusRotating {
+		t.Fatalf("pre-grace re-observation completed the rotation (status %q)", s.Status)
+	}
+
+	// Post-grace re-observation: the rotation completes.
+	clock = clock.Add(rotationGrace)
+	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800, false)
+	after := e.Snapshot()[0]
+	if after.CASha256 != newFP {
+		t.Fatal("post-grace observation did not complete the rotation")
+	}
+	if after.Status != statusInstalled || after.PendingCASha256 != "" {
+		t.Fatalf("post-rotation state = %+v, want installed with no pending", after)
+	}
+	pe, err = os.ReadFile(e.spoolPath("bob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlsca.Fingerprint(pe) == oldCrossFP {
+		t.Fatal("post-rotation spool file still holds the old cross-cert")
+	}
+}
+
+// TestOnOwnerCARotationAbortsOnRevert: while a rotation is pending, a
+// notification reverting to the installed CA aborts it (the rrset flipped
+// back — typical DHT propagation lag, and exactly what a flapping tamper
+// looks like).
+func TestOnOwnerCARotationAbortsOnRevert(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	expires := clock.Add(24 * time.Hour).Unix()
+
+	ca1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.OnOwnerCA("bob", []byte{1}, ca1, expires, false)
+	orig := e.Snapshot()[0]
+
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ca1) == string(ca2) {
+		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+	}
+	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800, false) // pending
+	e.OnOwnerCA("bob", []byte{1}, ca1, expires, false)        // flip back
+
+	got := e.Snapshot()[0]
+	if got.Status != statusInstalled || got.PendingCASha256 != "" {
+		t.Fatalf("state after revert = %+v, want installed with no pending", got)
+	}
+	if got.CASha256 != orig.CASha256 {
+		t.Fatal("revert changed the installed CA")
+	}
+}
+
+// TestOnOwnerCARotationFastPathWhenExpired: when the INSTALLED cross-cert
+// has already expired, a CA change swaps immediately — the routine
+// post-expiry owner-CA re-mint (every 10 years) must not serve a pointless
+// grace on top of an already-dead anchor.
+func TestOnOwnerCARotationFastPathWhenExpired(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+
+	ca1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1-hour record ⇒ the cross-cert (capped by it) dies in 1 hour too.
+	e.OnOwnerCA("bob", []byte{1}, ca1, clock.Add(time.Hour).Unix(), false)
+
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ca1) == string(ca2) {
+		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+	}
+
+	clock = clock.Add(2 * time.Hour) // the installed cross-cert is now expired
+	e.OnOwnerCA("bob", []byte{1}, ca2, clock.Add(24*time.Hour).Unix(), false)
+	got := e.Snapshot()[0]
+	if got.CASha256 != tlsca.Fingerprint(ca2) {
+		t.Fatal("expired-anchor CA change served the grace instead of the fast path")
+	}
+	if got.Status != statusInstalled || got.PendingCASha256 != "" {
+		t.Fatalf("fast-path state = %+v", got)
+	}
+}
+
+// TestOnOwnerCAQuarantinesYoungClaim: a claim inside the §7.5 contest
+// window is recorded but NOT trusted — no spool file, nothing to install —
+// and the next mature notification installs (the quarantine lifts by claim
+// age, with no timer needed).
+func TestOnOwnerCAQuarantinesYoungClaim(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", clock)
+	expires := clock.Add(24 * time.Hour).Unix()
+
+	e.OnOwnerCA("bob", []byte{1}, caDER, expires, true) // young
+	snap := e.Snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("quarantine state = %+v", snap)
+	}
+	if snap[0].Status != statusQuarantined || snap[0].NotAfter != 0 {
+		t.Fatalf("young-claim state = %+v, want quarantined with nothing installed", snap[0])
+	}
+	if _, err := os.Stat(e.spoolPath("bob")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("quarantined namespace reached the spool")
+	}
+
+	// Duplicate young notification: still held (dedup, no re-journal).
+	e.OnOwnerCA("bob", []byte{1}, caDER, expires, true)
+	if s := e.Snapshot()[0]; s.Status != statusQuarantined {
+		t.Fatalf("young re-observation changed state: %+v", s)
+	}
+
+	// The claim matures: the SAME CA installs on the next notification.
+	e.OnOwnerCA("bob", []byte{1}, caDER, expires, false)
+	got := e.Snapshot()[0]
+	if got.Status != statusInstalled || got.NotAfter == 0 {
+		t.Fatalf("post-maturity state = %+v, want installed", got)
+	}
+	if _, err := os.Stat(e.spoolPath("bob")); err != nil {
+		t.Fatalf("mature install missing from spool: %v", err)
+	}
+}
+
+// TestQuarantineHoldsAcrossCAChange: a young namespace re-advertising a
+// DIFFERENT CA stays quarantined (a young claim is exactly where CA
+// tampering is cheapest) and installs whatever CA is current once mature.
+func TestQuarantineHoldsAcrossCAChange(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	ca1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ca1) == string(ca2) {
+		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+	}
+	expires := clock.Add(24 * time.Hour).Unix()
+
+	e.OnOwnerCA("bob", []byte{1}, ca1, expires, true)
+	e.OnOwnerCA("bob", []byte{1}, ca2, expires, true) // young + different CA
+	if s := e.Snapshot()[0]; s.Status != statusQuarantined || s.CASha256 != tlsca.Fingerprint(ca2) {
+		t.Fatalf("young CA-flip state = %+v", s)
+	}
+	if _, err := os.Stat(e.spoolPath("bob")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("young CA-flip reached the spool")
+	}
+
+	// Maturity: the currently-advertised CA installs (no grace on top).
+	e.OnOwnerCA("bob", []byte{1}, ca2, expires, false)
+	got := e.Snapshot()[0]
+	if got.Status != statusInstalled || got.CASha256 != tlsca.Fingerprint(ca2) {
+		t.Fatalf("post-maturity state = %+v", got)
+	}
+}
+
+// TestSweepPurgesExpiredStateAndSystem: the v0.16 liveness half — an
+// expired cross-cert now purges the engine state AND the direct
+// system-bundle entry (SysCAPath seam), not just the spool file. A
+// namespace whose lease lapsed must leave zero trusted material behind.
+func TestSweepPurgesExpiredStateAndSystem(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	opts.SystemStore = true
+	opts.SysCAPath = t.TempDir()
+	e := mustEngine(t, opts)
+
+	seed := ownerSeed(t, 9)
+	caGone, _ := ownerCA(t, seed, "gone", clock)
+	caLive, _ := ownerCA(t, seed, "live", clock)
+	e.OnOwnerCA("gone", []byte{1}, caGone, clock.Add(time.Hour).Unix(), false)
+	e.OnOwnerCA("live", []byte{1}, caLive, clock.Add(24*time.Hour).Unix(), false)
+
+	goneSys := e.SystemCertPath("gone")
+	if _, err := os.Stat(goneSys); err != nil {
+		t.Fatalf("fixture: system copy missing: %v", err)
+	}
+	if _, err := os.Stat(e.SystemCertPath("live")); err != nil {
+		t.Fatalf("fixture: live system copy missing: %v", err)
+	}
+
+	clock = clock.Add(2 * time.Hour) // "gone"'s lease lapsed, "live" holds
+	e.sweepSpool()                   // the sweeper's tick calls exactly this
+
+	if _, err := os.Stat(e.spoolPath("gone")); !os.IsNotExist(err) {
+		t.Errorf("expired spool file survived (err=%v)", err)
+	}
+	if _, err := os.Stat(goneSys); !os.IsNotExist(err) {
+		t.Errorf("expired SYSTEM copy survived the sweep (err=%v)", err)
+	}
+	for _, s := range e.Snapshot() {
+		if s.Alias == "gone" {
+			t.Error("expired alias still in engine state")
+		}
+	}
+	// The live namespace is untouched.
+	if _, err := os.Stat(e.spoolPath("live")); err != nil {
+		t.Errorf("live entry was swept: %v", err)
+	}
+	if _, err := os.Stat(e.SystemCertPath("live")); err != nil {
+		t.Errorf("live system copy was swept: %v", err)
+	}
+}
+
+// TestRunSweeperStopsAndSweeps: the daemon-side timer sweep runs without
+// traffic, converges an expired entry, and returns when stop closes.
+func TestRunSweeperStopsAndSweeps(t *testing.T) {
+	var clockNano atomic.Int64
+	clockNano.Store(time.Now().UnixNano())
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return time.Unix(0, clockNano.Load()) }
+	e := mustEngine(t, opts)
+	seed := ownerSeed(t, 9)
+	now := time.Unix(0, clockNano.Load())
+	der, err := tlsca.CrossCert(e.rootDER, e.rootKey, mustCA(t, seed, "gone", now), "gone", now.Add(time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(e.spoolPath("gone"), tlsca.CertPEM(der), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The clock leaps past the entry's expiry while the sweeper runs.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		e.RunSweeper(stop, 5*time.Millisecond)
+		close(done)
+	}()
+	clockNano.Store(time.Now().Add(2 * time.Hour).UnixNano())
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(e.spoolPath("gone")); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sweeper never removed the expired entry")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sweeper did not stop")
+	}
+}
+
+// TestRemoveAlias: the operator path (`freens trust remove`) purges
+// spool + state + system regardless of identity signals.
+func TestRemoveAlias(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	opts.SystemStore = true
+	opts.SysCAPath = t.TempDir()
+	e := mustEngine(t, opts)
+	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", clock)
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(24*time.Hour).Unix(), false)
+
+	if !e.RemoveAlias("bob") {
+		t.Fatal("RemoveAlias reported nothing to remove")
+	}
+	if len(e.Snapshot()) != 0 {
+		t.Fatal("state survived RemoveAlias")
+	}
+	if _, err := os.Stat(e.spoolPath("bob")); !os.IsNotExist(err) {
+		t.Error("spool file survived RemoveAlias")
+	}
+	if _, err := os.Stat(e.SystemCertPath("bob")); !os.IsNotExist(err) {
+		t.Error("system copy survived RemoveAlias")
+	}
+	if e.RemoveAlias("bob") {
+		t.Fatal("second RemoveAlias reported work done")
 	}
 }
 
@@ -175,7 +495,7 @@ func TestOnAliasDeadPurges(t *testing.T) {
 	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", time.Now())
 	tldID := []byte{1, 2, 3}
 	expires := time.Now().Add(24 * time.Hour).Unix()
-	e.OnOwnerCA("bob", tldID, caDER, expires)
+	e.OnOwnerCA("bob", tldID, caDER, expires, false)
 	if len(e.Snapshot()) != 1 {
 		t.Fatal("fixture: nothing installed")
 	}
@@ -210,7 +530,7 @@ func TestOnOwnerCAValidatesScreen(t *testing.T) {
 	opts := testOpts(t)
 	e := mustEngine(t, opts)
 	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", time.Now())
-	e.OnOwnerCA("alice", []byte{1}, caDER, time.Now().Add(24*time.Hour).Unix())
+	e.OnOwnerCA("alice", []byte{1}, caDER, time.Now().Add(24*time.Hour).Unix(), false)
 	if len(e.Snapshot()) != 0 {
 		t.Fatal("CN/alias mismatch was installed")
 	}
@@ -228,7 +548,7 @@ func TestOnOwnerCAConcurrent(t *testing.T) {
 	done := make(chan struct{})
 	for i := 0; i < 8; i++ {
 		go func() {
-			e.OnOwnerCA("bob", []byte{1}, caDER, expires)
+			e.OnOwnerCA("bob", []byte{1}, caDER, expires, false)
 			done <- struct{}{}
 		}()
 	}
@@ -248,7 +568,7 @@ func TestStatePersists(t *testing.T) {
 	opts := testOpts(t)
 	e1 := mustEngine(t, opts)
 	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", time.Now())
-	e1.OnOwnerCA("bob", []byte{1, 2, 3}, caDER, time.Now().Add(24*time.Hour).Unix())
+	e1.OnOwnerCA("bob", []byte{1, 2, 3}, caDER, time.Now().Add(24*time.Hour).Unix(), false)
 
 	e2 := mustEngine(t, opts)
 	snap := e2.Snapshot()
@@ -297,7 +617,7 @@ func TestSweepSpoolRemovesExpired(t *testing.T) {
 	// The sweep runs inside OnOwnerCA — a (deduped) notification is the
 	// realistic trigger.
 	caDER, _ := ownerCA(t, seed, "fresh", now)
-	e.OnOwnerCA("fresh", []byte{1}, caDER, now.Add(24*time.Hour).Unix())
+	e.OnOwnerCA("fresh", []byte{1}, caDER, now.Add(24*time.Hour).Unix(), false)
 
 	if _, err := os.Stat(e.spoolPath("fresh")); err != nil {
 		t.Errorf("fresh entry was swept: %v", err)

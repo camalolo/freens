@@ -32,20 +32,39 @@ package naming
 
 import "fmt"
 
-// ReservedReason returns a human-readable reason string when alias is a
-// reserved TLD name per §7.7, or "" when it is not. The input should be the
+// ReservedReason returns a human-readable reason string when alias is
+// reserved per §7.7, or "" when it is not. The input should be the
 // normalized (lowercase) alias; validation is the caller's prerequisite
-// (ValidateAlias). Reasons distinguish the two data kinds only for messaging;
-// the policy is identical for both.
+// (ValidateAlias). Reasons distinguish the data kinds only for messaging;
+// the policy is identical for all of them.
+//
+// Two kinds of entry, deliberately COMBINED into one lookup (IsReservedTLD):
+//
+//   - TLD-shaped collisions: every delegated ICANN TLD and every IANA
+//     special-use name — claiming one would let a freens TLD masquerade as
+//     part of real DNS (reserved_tlds.go).
+//   - The project's own namespace: the "freens" alias itself — it is not a
+//     TLD, but it is the name this software, its docs, its setup tooling
+//     (the Windows connection-specific suffix "freens" behind the §9.4
+//     suffix rescue) and every user's muscle memory already mean. A claim
+//     on it would own `www.freens`, `mail.freens`, … — the first names a
+//     new user tries, served by a stranger with a green padlock.
 func ReservedReason(alias string) string {
+	if _, ok := projectReserved[alias]; ok {
+		return "the freens project's own namespace (the alias this software, its docs and its tooling already mean — spec §7.7)"
+	}
 	if _, ok := reservedTLDs[alias]; ok {
 		return "a reserved TLD name (delegated ICANN TLD, IANA root-zone snapshot " + ReservedTLDsSnapshot + ", or IANA special-use name)"
 	}
 	return ""
 }
 
-// IsReservedTLD reports whether alias is reserved per §7.7.
+// IsReservedTLD reports whether alias is reserved per §7.7 (TLD-shaped
+// collisions or the project's own namespace).
 func IsReservedTLD(alias string) bool {
+	if _, ok := projectReserved[alias]; ok {
+		return true
+	}
 	_, ok := reservedTLDs[alias]
 	return ok
 }

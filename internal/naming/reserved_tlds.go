@@ -41,6 +41,13 @@ package naming
 // generated from (the "# Version" header of tlds-alpha-by-domain.txt).
 const ReservedTLDsSnapshot = "2026090300"
 
+// projectReserved is the §7.7 project-namespace set: aliases that belong to
+// freens itself. Not TLD-shaped (none appear in the ICANN root zone) but
+// equally unclaimable — see reserved.go for the rationale.
+var projectReserved = map[string]struct{}{
+	"freens": {},
+}
+
 // reservedTLDs is the §7.7 reserved set: delegated root-zone TLDs (IANA
 // snapshot above) + IANA special-use names. Keys are lowercase A-labels.
 var reservedTLDs = map[string]struct{}{

@@ -596,6 +596,10 @@ func run(args []string) error {
 		logger.Warn("tls config ignored", "error", err)
 		tlsCfg = &tlsConfig{}
 	}
+	// trustEngine (nil when [tls] trust-sync = false) is hoisted so the
+	// §9.5.4 liveness sweeper can start with the other background loops
+	// once bgStop exists.
+	var trustEngine *trustsync.Engine
 	if !tlsCfg.TrustSyncOff {
 		if tsEngine, terr := trustsync.New(trustsync.Options{
 			HomeDir:     home.Dir(),
@@ -605,6 +609,7 @@ func run(args []string) error {
 		}); terr != nil {
 			logger.Warn("tls trust sync disabled", "error", terr)
 		} else {
+			trustEngine = tsEngine
 			res.TLSSync = tsEngine
 			tlsSnapshot = func() any {
 				return map[string]any{
@@ -755,6 +760,12 @@ func run(args []string) error {
 	// bgStop ends the background goroutines (gauge refresh, SIGHUP reload)
 	// during shutdown so no reload ever races the teardown below.
 	bgStop := make(chan struct{})
+	// §9.5.4 trust liveness sweeper (v0.16): expired cross-certs purge
+	// spool + state + system + NSS installs even when nothing resolves the
+	// namespace anymore — trust must converge to exactly the live set.
+	if trustEngine != nil {
+		go trustEngine.RunSweeper(bgStop, 30*time.Minute)
+	}
 	// Proactive refresh sweeper: names hit in the last 24 h keep being
 	// revalidated in the background even with zero client queries — from
 	// the client POV a name in recurring use is answered from cache

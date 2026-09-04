@@ -22,11 +22,15 @@ func TestIsReservedTLD(t *testing.T) {
 		{"localhost", true}, {"onion", true}, {"test", true},
 		{"example", true}, {"invalid", true}, {"local", true},
 		{"arpa", true}, {"home", true},
+		// the project's own namespace (v0.16): not TLD-shaped, but the name
+		// this software, its docs, its tooling and the Windows suffix rescue
+		// already mean — a stranger must never own `www.freens`.
+		{"freens", true},
 		// case is the caller's concern (aliases arrive normalized), but the
 		// data is lowercase and IsReservedTLD does no folding.
 		{"COM", false},
 		// not reserved
-		{"camalolo", false}, {"freens", false}, {"minipc", false},
+		{"camalolo", false}, {"minipc", false},
 		{"foo-bar", false}, {"abc123", false}, {"comm", false},
 		{"com2", false}, {"", false},
 	}
@@ -37,6 +41,9 @@ func TestIsReservedTLD(t *testing.T) {
 	}
 	if r := ReservedReason("com"); r == "" {
 		t.Error(`ReservedReason("com") is empty, want a reason`)
+	}
+	if r := ReservedReason("freens"); r == "" || !strings.Contains(r, "project") {
+		t.Errorf(`ReservedReason("freens") = %q, want a project-namespace reason`, r)
 	}
 	if r := ReservedReason("camalolo"); r != "" {
 		t.Errorf(`ReservedReason("camalolo") = %q, want ""`, r)

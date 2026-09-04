@@ -246,7 +246,9 @@ type Resolver struct {
 
 	// TLSSync is the OPTIONAL §9.5.4 trust-sync sink (nil ⇒ disabled). It is
 	// notified — asynchronously, never blocking the answer — whenever a
-	// VERIFIED winning apex record carries a TLSCA RR (OnOwnerCA), and when
+	// VERIFIED winning apex record carries a TLSCA RR (OnOwnerCA; the
+	// claimYoung flag carries the §7.5 contest signal so the sink can
+	// QUARANTINE young claims instead of trusting them), and when
 	// an alias is definitely dead (OnAliasDead: no surviving claim, a
 	// tombstoned/expired/missing apex record). Only the SCREENED path
 	// notifies (§4.4 validity + §7.4 claim screening): trust sync must never
@@ -259,8 +261,11 @@ type Resolver struct {
 // trust-sync engine (internal/trustsync): cross-certify verified owner CAs
 // into the local trust stores; purge what died. tldID nil in OnAliasDead
 // means "the alias has no claim left" (purge regardless of identity).
+// claimYoung in OnOwnerCA is the §7.5 CONTEST_WINDOW signal computed for
+// the answer (false for pin-resolved aliases — operator policy skips the
+// quarantine by construction).
 type TLSTrustSync interface {
-	OnOwnerCA(alias string, tldID []byte, caDER []byte, recordExpires int64)
+	OnOwnerCA(alias string, tldID []byte, caDER []byte, recordExpires int64, claimYoung bool)
 	OnAliasDead(alias string, tldID []byte)
 }
 
@@ -692,15 +697,20 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	}
 
 	// §9.5.4: the verified winning apex may carry the owner-CA binding —
-	// hand it to trust sync (asynchronously; never in the answer path). The
-	// bytes are copied: the sink runs concurrently with the shared flight.
+	// hand it to trust sync (asynchronously; never in the answer path).
+	// claimYoung = contested: a §7.5-young winning claim's CA is
+	// quarantined by the sink instead of trusted (no green padlock for a
+	// Sybil-minted fresh claim; install follows automatically once the
+	// claim matures past the contest window). The bytes are copied: the
+	// sink runs concurrently with the shared flight.
 	if r.TLSSync != nil {
 		for _, rr := range chain[0].Record.RRset {
 			if rr != nil && rr.Type == wire.RRTypeTLSCA {
 				caDER := append([]byte(nil), rr.Rdata...)
 				tld := append([]byte(nil), tldID...)
 				expires := int64(chain[0].Record.Expires)
-				go r.TLSSync.OnOwnerCA(alias, tld, caDER, expires)
+				young := contested
+				go r.TLSSync.OnOwnerCA(alias, tld, caDER, expires, young)
 				break
 			}
 		}

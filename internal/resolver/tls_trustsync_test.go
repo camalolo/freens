@@ -5,6 +5,7 @@ package resolver
 
 import (
 	"context"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -24,10 +25,11 @@ type captureSync struct {
 }
 
 type caCall struct {
-	alias   string
-	tldID   []byte
-	caDER   []byte
-	expires int64
+	alias      string
+	tldID      []byte
+	caDER      []byte
+	expires    int64
+	claimYoung bool
 }
 
 type deadCall struct {
@@ -35,13 +37,13 @@ type deadCall struct {
 	tldID []byte
 }
 
-func (c *captureSync) OnOwnerCA(alias string, tldID, caDER []byte, expires int64) {
+func (c *captureSync) OnOwnerCA(alias string, tldID, caDER []byte, expires int64, claimYoung bool) {
 	if c.delay > 0 {
 		time.Sleep(c.delay)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cas = append(c.cas, caCall{alias, tldID, caDER, expires})
+	c.cas = append(c.cas, caCall{alias, tldID, caDER, expires, claimYoung})
 }
 
 func (c *captureSync) OnAliasDead(alias string, tldID []byte) {
@@ -128,6 +130,40 @@ func TestTrustSyncNotifiedOnVerifiedOwnerCA(t *testing.T) {
 	}
 	if call.expires != int64(w.tldEnv.Record.Expires) {
 		t.Fatalf("expires = %d, want %d", call.expires, w.tldEnv.Record.Expires)
+	}
+	// The fixture uses the LEGACY single-claim path (fakeClaimLookup), which
+	// cannot assess contest age and reports claimYoung=false by design (see
+	// resolveAliasClaim). The SET path's young signal is proven in
+	// TestTrustSyncYoungClaimQuarantineSignal.
+	if call.claimYoung {
+		t.Fatal("legacy claim path must not invent a young signal")
+	}
+}
+
+// TestTrustSyncYoungClaimQuarantineSignal: a CONTEST_WINDOW-young winning
+// claim notifies the sink with claimYoung=true — the §9.5.4 quarantine
+// signal (the sink then holds the CA instead of trusting it; the resolver
+// caps the answer's TTL via the §10.4 contested rule either way). Needs the
+// §7.4 SET path (the legacy single-claim path cannot assess contest age).
+func TestTrustSyncYoungClaimQuarantineSignal(t *testing.T) {
+	// The claim's asserted ts sits at fixedNow: inside the §7.5 window.
+	w := newClaimedWorldAt(t, "footld", uint64(fixedNow), net.IPv4(203, 0, 113, 77))
+	caDER := addTLSCA(t, w, "footld")
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{w.tldEnv}, w)
+
+	sync := &captureSync{}
+	r := newResolver(claimConfig(), lookup, nil)
+	r.TLSSync = sync
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	if _, rcode, _, err := r.ResolveQuestion(context.Background(), q); err != nil || rcode != dns.RcodeSuccess {
+		t.Fatalf("young-claim answer broken: rcode=%d err=%v", rcode, err)
+	}
+	waitFor(t, func() bool { return sync.caCount() == 1 })
+	if !sync.cas[0].claimYoung {
+		t.Fatal("contest-window-young claim did not carry the quarantine signal")
+	}
+	if !bytesEq(sync.cas[0].caDER, caDER) {
+		t.Fatal("young-claim caDER mismatch")
 	}
 }
 

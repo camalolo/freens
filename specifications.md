@@ -826,9 +826,13 @@ residual and the designated v2 path.
 ### 7.7 Reserved alias policy (reference implementation)
 
 A claim whose alias equals a **delegated ICANN TLD** (the IANA root-zone
-database: `com`, `net`, `de`, IDN TLDs in A-label form, …) or an **IANA
+database: `com`, `net`, `de`, IDN TLDs in A-label form, …), an **IANA
 special-use name** (`localhost`, `invalid`, `test`, `example`, `onion`,
-`local`, `arpa`, `home`) MUST NOT be minted by the reference
+`local`, `arpa`, `home`), or the **project's own namespace** (`freens`
+itself — not TLD-shaped, but the name this software, its documentation,
+its tooling, and the §9.4 Windows suffix-rescue suffix already mean; a
+claim on it would own `www.freens` and every other name a new user's
+muscle memory tries first) MUST NOT be minted by the reference
 implementation's tooling, and honest nodes MUST refuse to assist it. The
 reference snapshot is compiled into the implementation (a runtime "does
 upstream DNS know this TLD?" check was considered and rejected: it moves
@@ -1236,6 +1240,54 @@ The browser then verifies a completely standard chain — leaf
 modification and **no per-friend imports**: the first name resolution
 already delivered and authenticated every CA the visitor will need,
 via the DHT.
+
+The reference implementation adds three §9.5.4 hardening gates
+(fleet-tested from v0.16):
+
+1. **Young-claim quarantine.** When the resolution's winning claim is
+   still inside the §7.5 `CONTEST_WINDOW`, the daemon records the CA
+   binding but installs NO cross-cert: the namespace answers DNS but
+   carries no green padlock until the claim has matured past the
+   contest window (the next resolution after maturity installs; a
+   pin-resolved alias is never young — explicit operator policy skips
+   the quarantine by construction). Rationale: the §9.3 fallthrough turns
+   typos into padlocked phishing sites; a Sybil quorum can mint a claim
+   minutes before a victim's first visit, so a fresh claim is exactly
+   where the CA must be held longest. A young claim changing its CA
+   stays quarantined (the window is when a swap is cheapest).
+2. **Rotation observation gate.** The owner-CA key is derived
+   deterministically from `SK_tld` and its certificate is valid for
+   `TLS_CA_VALIDITY` (10 y), so a TLSCA change under a LIVE installed
+   binding (same tld_id, different CA) is — before expiry — either a
+   routine re-mint or tampered/intercepted rrset bytes. The daemon
+   does not swap instantly: it keeps the installed cross-cert
+   authoritative, journals a WARN (`trust ls` shows `rotating` with
+   the pending fingerprint since), and completes the swap only after
+   the same new CA has been observed for the rotation grace time
+   (1 h). A flip back to the previous CA aborts the rotation. An
+   exchange whose installed CA has already EXPIRED swaps immediately
+   (the routine path must not ride a pointless grace on top of a dead
+   anchor). This does not stop key theft (a stolen key needs no
+   rotation); it turns CA manipulation loud, attributable and
+   grace-delayed, and gives operators the `trust ls` surface to
+   notice it.
+3. **Liveness sweep.** Cross-certs are lifetime-capped by the apex
+   RECORD's expiry (≤ 24 h leases), so an expired cross-cert means the
+   alias's lease lapsed. The daemon sweeps the spool on a timer (not
+   only while a namespace is being resolved) and a lapsed entry now
+   purges the engine state AND the direct system-bundle / NSS installs
+   — not just the spool file — so a box's trust stores converge to
+   exactly the live set even for namespaces nobody resolved during
+   their lease. A renewal re-mints from the next resolution.
+   (This is the mechanism that prevents an expired same-subject
+   anchor from poisoning an otherwise-fresh chain — found live
+   2026-09-01 as "certificate expired" on minipc.)
+
+The operator inventory for all three states is `freens trust ls`
+(installed / quarantined / rotating + CA fingerprints + expiry);
+`freens trust remove <alias>` purges a namespace from this box's
+spool, state, system bundle and NSS stores on demand (the daemon
+re-installs only from live network evidence).
 
 #### 9.5.5 First-visit race
 

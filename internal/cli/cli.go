@@ -84,6 +84,7 @@ var dispatch = map[string]func([]string) error{
 	"get":             cmdGet,
 	"name":            cmdName,
 	"cert":            cmdCert,
+	"trust":           cmdTrust,
 	"trust-install":   cmdTrustInstall,
 	"doh":             cmdDoh,
 	"transfer":        cmdTransfer,
@@ -274,6 +275,9 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "                         `cert nginx <name>` wires an existing server block (backup -> edit ->")
 	fmt.Fprintln(w, "                         nginx -t -> reload), `cert list` / `cert forget` manage the tracked table")
 	fmt.Fprintln(w, "  trust-install          one-time per device: import your local trust root so https://<name> works (spec 9.5)")
+	fmt.Fprintln(w, "  trust ls               every cross-certified namespace this box holds, with its trust status")
+	fmt.Fprintln(w, "                         (installed / quarantined / rotating — spec 9.5.4)")
+	fmt.Fprintln(w, "  trust remove <alias>   purge a namespace's cross-cert from this box's trust stores")
 	fmt.Fprintln(w, "  doh                    DNS-over-HTTPS (spec 9.6): `doh` shows state, `doh upstream <quad9|cloudflare|")
 	fmt.Fprintln(w, "                         google|URL|off>` encrypts upstream forwarding (applied live), `doh serve <on|off>`")
 	fmt.Fprintln(w, "                         exposes https://<this-box>:8090/dns-query, `doh test [name]` self-checks")

@@ -405,6 +405,13 @@ type TLSCross struct {
 	CASha256    string `json:"ca_sha256"`
 	NotAfter    int64  `json:"not_after"`
 	SystemStore bool   `json:"system_store"`
+	// §9.5.4 v0.16 states: "installed" (or "" from an older daemon),
+	// "quarantined" (claim inside the §7.5 contest window — DNS serves, TLS
+	// trust waits) or "rotating" (CA change serving its observation grace).
+	Status string `json:"status"`
+	// In-grace rotation detail (rotating only).
+	PendingCASha256 string `json:"pending_ca_sha256,omitempty"`
+	PendingSince    int64  `json:"pending_since,omitempty"`
 }
 
 // DNSQuery relays one raw DNS wire query to the daemon's resolver

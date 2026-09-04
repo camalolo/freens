@@ -202,6 +202,18 @@ func cmdRegister(args []string) error {
 
 	// --- default-on recovery (spec 5.4; user decision) ---------------------
 	recPaths, recPolicy, recReused, err := recoveryPlan(*noRecovery, home.KeysDir(), *alias, keyPassphrase)
+	if errors.Is(err, keychain.ErrNeedsPassphrase) && keyPassphrase == "" {
+		// Encrypted RETRY: the reused owner key was unlocked inside
+		// seedKeypair, which does not return the passphrase — the recovery
+		// keyfiles need it too (env wins, else prompt; found live 2026-09-04
+		// when the second attempt of a killed register failed here with
+		// "passphrase required" despite FREENS_PASSPHRASE set).
+		keyPassphrase, perr := passphraseForUnlock()
+		if perr != nil {
+			return perr
+		}
+		recPaths, recPolicy, recReused, err = recoveryPlan(*noRecovery, home.KeysDir(), *alias, keyPassphrase)
+	}
 	if err != nil {
 		return err
 	}

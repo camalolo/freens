@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased — v0.16.0: §9.5.4 trust hardening (quarantine, rotation gate, liveness sweep), §7.7 project namespace, `freens trust ls/remove`
+
+The malicious-use hardening pass on the TLS trust layer, each piece
+fleet-verified before commit:
+
+- **§9.5.4 young-claim quarantine.** A resolution whose winning claim is
+  still inside the §7.5 `CONTEST_WINDOW` records the namespace's owner CA
+  but installs NO cross-cert: DNS answers serve, TLS trust waits until the
+  claim matures. A Sybil-witnessed fresh claim now gets zero green-padlock
+  window — the padlock has to be earned by surviving the contest period.
+  The signal rides the existing `contested` computation (resolver →
+  `OnOwnerCA`); pin-resolved aliases skip the quarantine by construction
+  (explicit operator policy).
+- **§9.5.4 rotation observation gate.** The owner CA key is derived
+  deterministically from `SK_tld` with a 10-year certificate, so a TLSCA
+  change under a LIVE installed binding is never routine: the daemon keeps
+  the old cross-cert authoritative, journals a loud WARN, shows
+  `rotating (→<fp> since <ts>)` in `trust ls` and admin `/tls`, and
+  completes the swap only after the new CA persists across the 1-hour
+  observation grace. Flip-backs abort the rotation. An installed CA that
+  already EXPIRED swaps immediately (the legitimate decade-cycle re-mint
+  gains nothing from a grace on a dead anchor).
+- **§9.5.4 liveness sweep.** Expired cross-certs now purge engine state
+  AND direct system-bundle / NSS installs — not just the spool file —
+  driven both by traffic and by a new daemon-side 30-minute timer
+  (`RunSweeper`): a box that stops resolving a namespace still converges
+  its trust stores when the namespace's lease lapses. Also fixes a
+  latent dedup hole: a fresh state entry whose spool file vanished
+  re-mints instead of silently trusting nothing.
+- **§7.7 project-namespace reservation.** `freens` itself is now a
+  reserved alias (refused at mint, witness co-sign and resolution, same
+  as the TLD list): it is not a TLD, but it is the name the software, its
+  docs, its tooling and the Windows suffix-rescue suffix already mean —
+  a stranger must never own `www.freens` with a green padlock.
+- **`freens trust ls` / `freens trust remove <alias>`.** First-class
+  operator inventory of every cross-certified namespace on the box
+  (status, CA fingerprint, expiry, system/spool) and the one-command
+  purge of a poisoned or unwanted namespace (-json for scripts; admin
+  `/tls` carries the same status fields).
+- **cli: a RETRIED register with a passphrase-encrypted keychain no
+  longer dies on its own recovery keyfiles.** On the "owner key reused"
+  path the passphrase never reached the recovery-plan reload, so every
+  retry of an interrupted registration failed with "keyfile is
+  passphrase-encrypted (passphrase required)" even with
+  FREENS_PASSPHRASE set — found live during this release's fleet test
+  (the retry flow the docs call free-to-retry was unreachable for
+  encrypted keys). The unlock passphrase is now fetched lazily (env
+  wins, else prompt) exactly when the recovery keyfiles need it.
+
 ## Unreleased — v0.15.5: the register-page render fix, the publish walk-rescue, and the daemon-path re-attest hook
 
 Three fixes straight from live-fleet testing of v0.15.4:

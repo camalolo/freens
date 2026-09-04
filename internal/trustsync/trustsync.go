@@ -17,6 +17,19 @@
 //
 // OnAliasDead removes everything for the alias (rotation keyed by tld_id:
 // a stale death signal for a superseded identity is ignored).
+//
+// v0.16 §9.5.4 hardening (this package):
+//   - YOUNG-CLAIM QUARANTINE: OnOwnerCA carries the resolver's contested
+//     flag; a claim inside the §7.5 contest window gets DNS answers but no
+//     cross-cert — no green padlock for Sybil-minted fresh claims.
+//   - ROTATION OBSERVATION GATE: a TLSCA change under a live installed
+//     binding (deterministic derivation + 10 y CA window ⇒ either the
+//     routine post-expiry re-mint or tampered rrset bytes) serves a loud,
+//     grace-delayed swap instead of an instant one.
+//   - LIVENESS SWEEP: expired cross-certs now purge state + direct system
+//     + NSS installs (not just the spool file), on traffic AND on a timer
+//     (RunSweeper) — a box that stops resolving a namespace still converges.
+
 package trustsync
 
 import (
@@ -49,6 +62,34 @@ var ErrTrustSync = errors.New("trustsync: error")
 // above a quiet weekend gap, below any realistic lease.
 const refreshWithin = 6 * time.Hour
 
+// rotationGrace is the §9.5.4 CA-rotation observation gate: a TLSCA change
+// under a LIVE installed binding is not trusted until the same new CA has
+// been observed for this long across resolutions. The owner CA key is
+// derived deterministically from SK_tld and its certificate is valid for
+// TLSCAValidityDays (10 y), so a same-identity CA change before expiry is
+// either the rare routine re-mint or tampered rrset bytes — the gate turns
+// the tampered case from a silent instant padlock swap into a LOUD,
+// grace-delayed one (the journal WARN fires immediately; `freens trust ls`
+// shows the pending state for the whole window). A rotation whose installed
+// CA has already EXPIRED skips the grace (the routine re-mint path).
+const rotationGrace = time.Hour
+
+// Trust states (crossState.Status; "" loads as installed for state files
+// written before the field existed).
+const (
+	statusInstalled   = "installed"
+	statusQuarantined = "quarantined"
+	statusRotating    = "rotating"
+)
+
+// statusOf normalizes the legacy empty status.
+func statusOf(s string) string {
+	if s == "" {
+		return statusInstalled
+	}
+	return s
+}
+
 // Options configures an engine. HomeDir is required; empty optional paths
 // disable the corresponding installer.
 type Options struct {
@@ -63,6 +104,9 @@ type Options struct {
 	// SystemStore enables the DIRECT system-bundle install attempt (root
 	// daemons). Default on; the spool file is ALWAYS written either way.
 	SystemStore bool
+	// SysCAPath overrides the system CA bundle directory (unix; empty =
+	// /usr/local/share/ca-certificates). Test seam.
+	SysCAPath string
 }
 
 // Engine is the §9.5.4 sink. Safe for concurrent use; deduplicates work.
@@ -80,8 +124,26 @@ type Engine struct {
 type crossState struct {
 	TldIDB32 string `json:"tld_id_b32"`
 	CASha256 string `json:"ca_sha256"`
-	NotAfter int64  `json:"not_after"`
+	NotAfter int64  `json:"not_after"` // 0 = nothing installed (quarantine hold)
+	// Status is the §9.5.4 trust state ("" = installed, for pre-v0.16 state
+	// files): "quarantined" while the winning claim is inside the §7.5
+	// contest window, "rotating" while a CA change serves its observation
+	// grace.
+	Status  string     `json:"status,omitempty"`
+	Pending *pendingCA `json:"pending_ca,omitempty"`
 }
+
+// pendingCA records a CA change under a live identity that has NOT yet
+// served its observation grace (rotationPending).
+type pendingCA struct {
+	CASha256 string `json:"ca_sha256"`
+	Since    int64  `json:"since"`
+}
+
+// caAction is the OnOwnerCA decision outcome (decided under the lock,
+// acted on outside it). The actions are declared inside OnOwnerCA, which
+// is the only consumer.
+type caAction int
 
 // New loads (or generates) the installation's local root and the cross-cert
 // state. The root key file is 0600; the root cert is public material.
@@ -229,7 +291,22 @@ func (e *Engine) InstallRoot() []string {
 // cross-cert when missing or near expiry, and installs it. Never returns an
 // error (the resolver calls it asynchronously): problems are logged and the
 // next notification retries.
-func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int64) {
+//
+// claimYoung is the resolver's §7.5 signal: the winning claim is inside the
+// CONTEST_WINDOW (a pin-resolved alias is never young). Two gates protect
+// the install:
+//
+//   - the YOUNG-CLAIM QUARANTINE: while the claim is young, the namespace's
+//     CA is recorded but NOT trusted — a Sybil-witnessed fresh claim gets
+//     DNS answers but no green padlock until the claim has matured past the
+//     contest window. The next resolution after maturity installs.
+//   - the ROTATION OBSERVATION GATE: a CA change under a LIVE installed
+//     binding serves rotationGrace before the swap (loud journal WARN on
+//     first sight, Info on completion/abort). Deterministic derivation +
+//     the 10-year CA window make a live same-identity CA change either the
+//     routine post-expiry re-mint (no grace: the old CA is already dead) or
+//     tampered rrset bytes (grace + noise).
+func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int64, claimYoung bool) {
 	if len(alias) == 0 || len(caDER) == 0 || recordExpires <= 0 {
 		return
 	}
@@ -245,80 +322,190 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 	now := e.opts.Now()
 	caHash := tlsca.Fingerprint(caDER)
 	tldB32 := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
-	e.sweepSpool()
+	present := e.sweepSpool()
 
+	// Decide under the lock; act outside it (minting + installers sleep).
+	const (
+		actNone caAction = iota
+		actInstall
+		actQuarantine
+		actDefer
+	)
+	act := actNone
+	rotateFrom := "" // installed CA the rotation replaces (journal detail)
 	e.mu.Lock()
-	if st, ok := e.state[alias]; ok && st.TldIDB32 == tldB32 && st.CASha256 == caHash {
-		notAfter := time.Unix(st.NotAfter, 0)
-		if now.Add(refreshWithin).Before(notAfter) {
+	st, have := e.state[alias]
+	switch {
+	case !have:
+		if claimYoung {
+			act = actQuarantine
+		} else {
+			act = actInstall
+		}
+	case st.TldIDB32 != tldB32:
+		// identity changed under the alias (§8.3 transfer / §8.6 rotation):
+		// those paths are protocol-gated upstream — install the new binding.
+		act = actInstall
+	case st.CASha256 == caHash:
+		if st.Pending != nil {
+			// The rrset flipped back to the installed CA: rotation aborted.
+			st.Pending = nil
+			st.Status = statusInstalled
+			e.state[alias] = st
 			e.mu.Unlock()
-			return // healthy, fresh, unchanged
+			e.saveState()
+			e.log.Info("tls: CA rotation aborted (previous CA still authoritative)", "alias", alias)
+			return
+		}
+		switch {
+		case statusOf(st.Status) == statusQuarantined:
+			if claimYoung {
+				act = actNone // still inside the window: hold
+			} else {
+				act = actInstall // quarantine lifted: the claim matured
+			}
+		case claimYoung:
+			// installed in an earlier, mature era — claims never re-young
+			act = actNone
+		case st.NotAfter > 0 && now.Add(refreshWithin).Before(time.Unix(st.NotAfter, 0)) && present[alias]:
+			act = actNone // healthy, fresh, unchanged, and the spool agrees
+		default:
+			act = actInstall // near expiry, or the spool file went missing
+		}
+	default:
+		// DIFFERENT CA under the SAME live identity: the rotation gate.
+		if statusOf(st.Status) == statusQuarantined {
+			if claimYoung {
+				// still young: keep holding, note the new bytes
+				e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, Status: statusQuarantined}
+				e.mu.Unlock()
+				e.saveState()
+				e.log.Info("tls: quarantined namespace re-advertised a different CA — still holding", "alias", alias, "ca", caHash[:16])
+				return
+			}
+			act = actInstall // matured between notifications
+			break
+		}
+		installedLive := st.NotAfter > now.Unix()
+		if !installedLive {
+			act = actInstall // the installed CA already expired: routine re-mint
+			break
+		}
+		if st.Pending == nil || st.Pending.CASha256 != caHash {
+			rotateFrom = st.CASha256
+			st.Pending = &pendingCA{CASha256: caHash, Since: now.Unix()}
+			st.Status = statusRotating
+			e.state[alias] = st
+			act = actDefer
+		} else if now.Unix()-st.Pending.Since >= int64(rotationGrace/time.Second) {
+			rotateFrom = st.CASha256
+			st.Pending = nil
+			st.Status = statusInstalled
+			e.state[alias] = st
+			act = actInstall // observed stable across the grace: complete
+		} else {
+			act = actNone // pending, grace not elapsed
 		}
 	}
 	e.mu.Unlock()
 
-	crossDER, err := tlsca.CrossCert(e.rootDER, e.rootKey, caDER, alias, time.Unix(recordExpires, 0), now)
-	if err != nil {
-		e.log.Warn("tls: cross-cert mint failed", "alias", alias, "err", err)
+	switch act {
+	case actNone:
 		return
-	}
-	cross, _ := tlsca.ParseCertDER(crossDER)
-	crossPEM := tlsca.CertPEM(crossDER)
+	case actQuarantine:
+		e.mu.Lock()
+		e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, Status: statusQuarantined}
+		e.mu.Unlock()
+		e.saveState()
+		e.log.Info("tls: cross-cert QUARANTINED — claim inside the §7.5 contest window", "alias", alias,
+			"ca", caHash[:16],
+			"hint", "DNS answers are served but TLS trust waits for the claim to mature; `freens trust ls` shows the hold")
+	case actDefer:
+		e.saveState()
+		e.log.Warn("tls: CA CHANGE under a live identity — rotation deferred (§9.5.4 observation gate)", "alias", alias,
+			"installed_ca", rotateFrom[:16], "new_ca", caHash[:16], "grace", rotationGrace.String(),
+			"hint", "a rotation of your own completes after the grace; anything else — investigate NOW (`freens trust ls`)")
+	default: // actInstall
+		crossDER, err := tlsca.CrossCert(e.rootDER, e.rootKey, caDER, alias, time.Unix(recordExpires, 0), now)
+		if err != nil {
+			e.log.Warn("tls: cross-cert mint failed", "alias", alias, "err", err)
+			return
+		}
+		cross, _ := tlsca.ParseCertDER(crossDER)
+		crossPEM := tlsca.CertPEM(crossDER)
 
-	// 1) Spool (the privileged bridge's source of truth).
-	spool := e.spoolPath(alias)
-	if err := writeAtomic(spool, crossPEM, 0o644); err != nil {
-		e.log.Warn("tls: spool write failed", "alias", alias, "err", err)
-	}
+		// 1) Spool (the privileged bridge's source of truth).
+		spool := e.spoolPath(alias)
+		if err := writeAtomic(spool, crossPEM, 0o644); err != nil {
+			e.log.Warn("tls: spool write failed", "alias", alias, "err", err)
+		}
 
-	// 2) System bundle (root-mode daemons; the bridge covers user-mode).
-	sysOK := false
-	if e.opts.SystemStore {
-		sysOK = e.installSystem(alias, crossPEM)
-	}
+		// 2) System bundle (root-mode daemons; the bridge covers user-mode).
+		sysOK := false
+		if e.opts.SystemStore {
+			sysOK = e.installSystem(alias, crossPEM)
+		}
 
-	// 3) NSS user DBs (Chromium/Firefox).
-	if e.opts.NSSInstall {
-		e.installNSS(alias, crossPEM)
+		// 3) NSS user DBs (Chromium/Firefox).
+		if e.opts.NSSInstall {
+			e.installNSS(alias, crossPEM)
+		}
+		e.mu.Lock()
+		e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, NotAfter: cross.NotAfter.Unix(), Status: statusInstalled}
+		e.installed[alias] = sysOK
+		e.mu.Unlock()
+		if werr := e.saveState(); werr != nil {
+			e.log.Warn("tls: state save failed", "err", werr)
+		}
+		if rotateFrom != "" {
+			e.log.Info("tls: CA rotation completed after observation grace", "alias", alias,
+				"old_ca", rotateFrom[:16], "new_ca", caHash[:16], "not_after", cross.NotAfter.Format(time.RFC3339))
+		} else {
+			e.log.Info("tls: cross-certified namespace", "alias", alias,
+				"ca", caHash[:16], "not_after", cross.NotAfter.Format(time.RFC3339),
+				"system", sysOK, "spool", spool)
+		}
 	}
-	e.mu.Lock()
-	e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, NotAfter: cross.NotAfter.Unix()}
-	e.installed[alias] = sysOK
-	e.mu.Unlock()
-	if werr := e.saveState(); werr != nil {
-		e.log.Warn("tls: state save failed", "err", werr)
-	}
-	e.log.Info("tls: cross-certified namespace", "alias", alias,
-		"ca", caHash[:16], "not_after", cross.NotAfter.Format(time.RFC3339),
-		"system", sysOK, "spool", spool)
 }
 
 // sweepSpool deletes spool cross-certs whose notAfter has passed (or that
-// cannot be parsed). The spool is the privileged bridge's source of truth,
-// so an expired entry there lands in the system CA store — and because a
-// cross-cert shares its owner CA's subject AND its (deterministic) key, a
-// stale copy POISONS the verification of an otherwise-fresh chain: OpenSSL
-// selects the expired same-subject anchor and reports the whole chain
-// expired (found live 2026-09-01: minipc curled its own webui and got
-// "certificate expired" while every cert in the presented chain was valid;
-// the expired Aug-31 spool copy sitting in the system store was the
-// culprit). Cross-certs are lifetime-capped by the apex RECORD's expiry (a
-// 24 h lease), so entries for namespaces a box stops resolving go stale
-// within a day — the sweep is what makes the spool converge to exactly the
-// live set. Cheap (a directory of small certs): called at engine start and
-// on every OnOwnerCA notification, including the dedup fast-path, so
-// expiry cleanup never waits for a re-mint.
-func (e *Engine) sweepSpool() {
+// cannot be parsed), and — the v0.16 liveness half — purges the engine's
+// state, direct system-bundle entry and NSS entries for those aliases too.
+// The spool is the privileged bridge's source of truth, so an expired entry
+// there lands in the system CA store — and because a cross-cert shares its
+// owner CA's subject AND its (deterministic) key, a stale copy POISONS the
+// verification of an otherwise-fresh chain: OpenSSL selects the expired
+// same-subject anchor and reports the whole chain expired (found live
+// 2026-09-01: minipc curled its own webui and got "certificate expired"
+// while every cert in the presented chain was valid; the expired Aug-31
+// spool copy sitting in the system store was the culprit). Cross-certs are
+// lifetime-capped by the apex RECORD's expiry (a 24 h lease), so an expired
+// entry means the alias's lease LAPSED — the resolver refuses the namespace
+// until renewal, and a renewal re-mints + reinstalls from the next
+// OnOwnerCA notification. Purging on expiry therefore converges the spool,
+// the system store and NSS to exactly the live set instead of leaving
+// dead-namespace anchors behind for a later resolution to trip over.
+// Cheap (a directory of small certs): called at engine start, on every
+// OnOwnerCA notification, and from RunSweeper's ticker — expiry cleanup
+// never waits for traffic.
+//
+// Returns the set of aliases with a spool file present AFTER the sweep
+// (the OnOwnerCA dedup fast-path requires it: state that is fresh but
+// whose spool file vanished re-mints instead of silently trusting nothing).
+func (e *Engine) sweepSpool() map[string]bool {
 	entries, err := os.ReadDir(e.spoolDir())
 	if err != nil {
-		return
+		return nil
 	}
 	now := e.opts.Now()
+	present := map[string]bool{}
+	expired := []string{}
 	for _, ent := range entries {
 		name := ent.Name()
 		if !strings.HasPrefix(name, "freens-cross-") || !strings.HasSuffix(name, ".crt") {
 			continue
 		}
+		alias := strings.TrimSuffix(strings.TrimPrefix(name, "freens-cross-"), ".crt")
 		path := filepath.Join(e.spoolDir(), name)
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -328,8 +515,92 @@ func (e *Engine) sweepSpool() {
 		if perr != nil || !cert.NotAfter.After(now) {
 			_ = os.Remove(path)
 			e.log.Info("tls: swept expired spool cross-cert", "file", name)
+			expired = append(expired, alias)
+			continue
+		}
+		present[alias] = true
+	}
+	for _, alias := range expired {
+		e.purgeIfExpired(alias, now)
+	}
+	return present
+}
+
+// purgeIfExpired drops state + direct installs for an alias whose
+// installed cross-cert has expired (the spool file is already gone). A
+// missing state entry, or one whose NotAfter is still in the future (an
+// unparsable spool file from external tinkering — the engine would re-mint
+// on the next notification), is left alone.
+func (e *Engine) purgeIfExpired(alias string, now time.Time) {
+	e.mu.Lock()
+	st, ok := e.state[alias]
+	if !ok || st.NotAfter == 0 || time.Unix(st.NotAfter, 0).After(now) {
+		e.mu.Unlock()
+		return
+	}
+	delete(e.state, alias)
+	delete(e.installed, alias)
+	e.mu.Unlock()
+
+	// Uninstall unconditionally (best-effort, idempotent): the installed
+	// map does not survive a daemon restart, but a stale system/NSS copy
+	// poisons verification exactly the same (the minipc expired-anchor
+	// lesson, found live 2026-09-01).
+	e.uninstallSystem(alias)
+	if e.opts.NSSInstall {
+		e.uninstallNSS(alias)
+	}
+	if err := e.saveState(); err != nil {
+		e.log.Warn("tls: state save failed", "err", err)
+	}
+	e.log.Info("tls: purged expired cross-cert (lease lapsed)", "alias", alias)
+}
+
+// RunSweeper drives the liveness sweep on a timer until stop closes:
+// a box whose users stop resolving a namespace must still converge its
+// trust stores when the namespace's lease lapses (the OnOwnerCA-triggered
+// sweep only runs while the alias is being resolved — exactly when it is
+// NOT dead). Wire with `go tsEngine.RunSweeper(bgStop, 30*time.Minute)` from
+// the daemon (bgStop = the daemon's background-goroutine stop channel).
+func (e *Engine) RunSweeper(stop <-chan struct{}, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			e.sweepSpool()
 		}
 	}
+}
+
+// RemoveAlias purges everything the engine holds for alias — the operator
+// path behind `freens trust remove <alias>` (OnAliasDead with no identity
+// check). Reports whether there was anything to remove.
+func (e *Engine) RemoveAlias(alias string) bool {
+	e.mu.Lock()
+	_, ok := e.state[alias]
+	spool := e.spoolPath(alias)
+	sysOK := e.installed[alias]
+	delete(e.state, alias)
+	delete(e.installed, alias)
+	e.mu.Unlock()
+	if !ok {
+		return false
+	}
+	_ = os.Remove(spool)
+	if sysOK {
+		e.uninstallSystem(alias)
+	}
+	if e.opts.NSSInstall {
+		e.uninstallNSS(alias)
+	}
+	if err := e.saveState(); err != nil {
+		e.log.Warn("tls: state save failed", "err", err)
+	}
+	e.log.Info("tls: cross-cert removed by operator", "alias", alias)
+	return true
 }
 
 // OnAliasDead purges everything the engine installed for alias. A stale
@@ -367,13 +638,20 @@ func (e *Engine) OnAliasDead(alias string, tldID []byte) {
 	e.log.Info("tls: purged cross-cert (alias dead)", "alias", alias)
 }
 
-// Snapshot lists the installed bindings (admin /tls + doctor).
+// Snapshot lists the installed bindings (admin /tls, doctor, `trust ls`).
 type Snapshot struct {
 	Alias    string `json:"alias"`
 	TldIDB32 string `json:"tld_id_b32"`
 	CASha256 string `json:"ca_sha256"`
 	NotAfter int64  `json:"not_after"`
 	System   bool   `json:"system_store"`
+	// Status is "installed", "quarantined" (claim inside the §7.5 contest
+	// window — DNS answers serve, TLS trust waits) or "rotating" (a CA
+	// change is serving its observation grace).
+	Status string `json:"status"`
+	// PendingCASha256 / PendingSince describe an in-grace rotation.
+	PendingCASha256 string `json:"pending_ca_sha256,omitempty"`
+	PendingSince    int64  `json:"pending_since,omitempty"`
 }
 
 func (e *Engine) Snapshot() []Snapshot {
@@ -381,7 +659,19 @@ func (e *Engine) Snapshot() []Snapshot {
 	defer e.mu.Unlock()
 	out := make([]Snapshot, 0, len(e.state))
 	for alias, st := range e.state {
-		out = append(out, Snapshot{alias, st.TldIDB32, st.CASha256, st.NotAfter, e.installed[alias]})
+		snap := Snapshot{
+			Alias:    alias,
+			TldIDB32: st.TldIDB32,
+			CASha256: st.CASha256,
+			NotAfter: st.NotAfter,
+			System:   e.installed[alias],
+			Status:   statusOf(st.Status),
+		}
+		if st.Pending != nil {
+			snap.PendingCASha256 = st.Pending.CASha256
+			snap.PendingSince = st.Pending.Since
+		}
+		out = append(out, snap)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
 	return out
