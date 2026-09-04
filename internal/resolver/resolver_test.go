@@ -20,7 +20,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Test fixtures: a self-certifying freens TLD "foo" with a www.foo A record.
+// Test fixtures: a self-certifying freens TLD "footld" with a www.footld A record.
 // ---------------------------------------------------------------------------
 
 const (
@@ -33,15 +33,15 @@ const (
 type freensWorld struct {
 	tldKP   *crypto.Keypair
 	tldID   []byte
-	tldEnv  *wire.SignedEnvelope // chain[0]: self-certifying TLD "foo"
-	wwwEnv  *wire.SignedEnvelope // chain[1]: www.foo with an A RR
+	tldEnv  *wire.SignedEnvelope // chain[0]: self-certifying TLD "footld"
+	wwwEnv  *wire.SignedEnvelope // chain[1]: www.footld with an A RR
 	wwwIPv4 net.IP
 }
 
 // newFreensWorld builds:
-//   - a TLD keypair whose SHA-256(pk) is the self-certifying tld_id for "foo";
+//   - a TLD keypair whose SHA-256(pk) is the self-certifying tld_id for "footld";
 //   - a TLD record (wire_name = 0x00 || tld_id), owner=signer=tldKP.Public();
-//   - a www.foo record (owner = signer = tldKP.Public() so the direct-sign
+//   - a www.footld record (owner = signer = tldKP.Public() so the direct-sign
 //     authority path verifies: parent.Owner == child.Signer) carrying an A RR.
 //
 // Every envelope is freshly signed, so wire.IsBasicValid / VerifyAuthorityChain
@@ -63,7 +63,7 @@ func newFreensWorld(t *testing.T) *freensWorld {
 	w.wwwIPv4 = net.IPv4(203, 0, 113, 42)
 
 	// TLD record: wire_name = 0x00 || tld_id; labels=nil.
-	tldWireName, err := naming.EncodeWireName(nil, "foo", tldID)
+	tldWireName, err := naming.EncodeWireName(nil, "footld", tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,9 +77,9 @@ func newFreensWorld(t *testing.T) *freensWorld {
 	}
 	w.tldEnv = tldEnv
 
-	// www.foo record: direct-signed by the TLD owner so chain verifies via
+	// www.footld record: direct-signed by the TLD owner so chain verifies via
 	// parent.Owner == child.Signer (no Delegation field needed).
-	wwwWireName, err := naming.EncodeWireName([]string{"www"}, "foo", tldID)
+	wwwWireName, err := naming.EncodeWireName([]string{"www"}, "footld", tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,8 +158,8 @@ func (u *fakeUpstream) Forward(_ context.Context, q *dns.Msg) (*dns.Msg, error) 
 	return m, nil
 }
 
-// configFor builds a *Config that pins "foo" to the world's tld_id and routes
-// "foo" to the given Route (plus "*" → DNSFirst).
+// configFor builds a *Config that pins "footld" to the world's tld_id and routes
+// "footld" to the given Route (plus "*" → DNSFirst).
 func configFor(t *testing.T, w *freensWorld, route Route) *Config {
 	t.Helper()
 	cfg, err := ParseConfig(`[tld-routes]
@@ -168,8 +168,8 @@ func configFor(t *testing.T, w *freensWorld, route Route) *Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.TLDRoutes["foo"] = route
-	cfg.AliasPins = map[string][]byte{"foo": append([]byte(nil), w.tldID...)}
+	cfg.TLDRoutes["footld"] = route
+	cfg.AliasPins = map[string][]byte{"footld": append([]byte(nil), w.tldID...)}
 	return cfg
 }
 
@@ -185,7 +185,7 @@ func newResolver(cfg *Config, lookup RecordLookup, up Upstream) *Resolver {
 // ---------------------------------------------------------------------------
 
 // TestResolveQuestionSuffixRescue locks the [options] suffix-rescue feature
-// (Windows single-label support): "www.foo.lan" — a freens name the OS
+// (Windows single-label support): "www.footld.lan" — a freens name the OS
 // resolver suffixed — answers from freens after upstream NXDOMAINs, with the
 // ORIGINAL qname echoed (a stub discards answers owned by another name).
 // Off by default; explicit-route aliases never rescue; a live upstream
@@ -193,18 +193,18 @@ func newResolver(cfg *Config, lookup RecordLookup, up Upstream) *Resolver {
 func TestResolveQuestionSuffixRescue(t *testing.T) {
 	w := newFreensWorld(t)
 
-	// Base config: "foo" explicitly routed freens-first, "*" dns-first.
+	// Base config: "footld" explicitly routed freens-first, "*" dns-first.
 	mkCfg := func(rescue bool) *Config {
 		cfg, err := ParseConfig(`[tld-routes]
 freens = freens-first
-foo = freens-first
+footld = freens-first
 * = dns-first
 `)
 		if err != nil {
 			t.Fatal(err)
 		}
 		cfg.SuffixRescue = rescue
-		cfg.AliasPins = map[string][]byte{"foo": append([]byte(nil), w.tldID...)}
+		cfg.AliasPins = map[string][]byte{"footld": append([]byte(nil), w.tldID...)}
 		return cfg
 	}
 
@@ -215,7 +215,7 @@ foo = freens-first
 		up := &fakeUpstream{rcode: dns.RcodeNameError} // upstream NXDOMAINs the suffixed name
 		r := newResolver(mkCfg(true), lookup, up)
 
-		q := dns.Question{Name: "www.foo.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		q := dns.Question{Name: "www.footld.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 		if err != nil {
 			t.Fatalf("ResolveQuestion: %v", err)
@@ -230,7 +230,7 @@ foo = freens-first
 		if !a.A.Equal(w.wwwIPv4) {
 			t.Errorf("A.A = %s, want %s", a.A, w.wwwIPv4)
 		}
-		if hdr := a.Header(); hdr.Name != "www.foo.lan." {
+		if hdr := a.Header(); hdr.Name != "www.footld.lan." {
 			t.Errorf("owner = %s; want the ORIGINAL qname echoed", hdr.Name)
 		}
 		if !aa {
@@ -245,7 +245,7 @@ foo = freens-first
 		up := &fakeUpstream{rcode: dns.RcodeNameError}
 		r := newResolver(mkCfg(false), lookup, up)
 
-		q := dns.Question{Name: "www.foo.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		q := dns.Question{Name: "www.footld.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 		_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 		if err != nil {
 			t.Fatalf("ResolveQuestion: %v", err)
@@ -260,11 +260,11 @@ foo = freens-first
 		lookup.put(w.tldEnv)
 		lookup.put(w.wwwEnv)
 		up := &fakeUpstream{rcode: dns.RcodeSuccess, answer: []dns.RR{
-			&dns.A{Hdr: dns.RR_Header{Name: "www.foo.lan.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30}, A: net.IPv4(203, 0, 113, 99)},
+			&dns.A{Hdr: dns.RR_Header{Name: "www.footld.lan.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30}, A: net.IPv4(203, 0, 113, 99)},
 		}}
 		r := newResolver(mkCfg(true), lookup, up)
 
-		q := dns.Question{Name: "www.foo.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		q := dns.Question{Name: "www.footld.lan.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 		if err != nil {
 			t.Fatalf("ResolveQuestion: %v", err)
@@ -281,9 +281,9 @@ foo = freens-first
 	})
 
 	t.Run("freens-first miss borrows the bare name (.freens suffix)", func(t *testing.T) {
-		// "www.foo.freens": the EXPLICIT community-namespace route misses
+		// "www.footld.freens": the EXPLICIT community-namespace route misses
 		// (nobody owns the alias "freens"), upstream NXDOMAINs, and the
-		// rescue borrows the bare "www.foo" — the ".freens" connection
+		// rescue borrows the bare "www.footld" — the ".freens" connection
 		// suffix reads as the project's own TLD.
 		lookup := newFakeLookup()
 		lookup.put(w.tldEnv)
@@ -291,7 +291,7 @@ foo = freens-first
 		up := &fakeUpstream{rcode: dns.RcodeNameError}
 		r := newResolver(mkCfg(true), lookup, up)
 
-		q := dns.Question{Name: "www.foo.freens.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		q := dns.Question{Name: "www.footld.freens.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 		if err != nil {
 			t.Fatalf("ResolveQuestion: %v", err)
@@ -302,7 +302,7 @@ foo = freens-first
 		if a, ok := rrs[0].(*dns.A); !ok || !a.A.Equal(w.wwwIPv4) {
 			t.Fatalf("answer = %v; want the freens address", rrs[0])
 		}
-		if hdr := rrs[0].Header(); hdr.Name != "www.foo.freens." {
+		if hdr := rrs[0].Header(); hdr.Name != "www.footld.freens." {
 			t.Errorf("owner = %s; want the original qname echoed", hdr.Name)
 		}
 		if !aa {
@@ -338,7 +338,7 @@ func TestResolveQuestionFREENSHit(t *testing.T) {
 
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -358,8 +358,8 @@ func TestResolveQuestionFREENSHit(t *testing.T) {
 	}
 	// Header sanity: owner name echoed, type A, class IN, TTL within cap.
 	hdr := a.Header()
-	if hdr.Name != "www.foo." {
-		t.Errorf("header Name = %q, want www.foo.", hdr.Name)
+	if hdr.Name != "www.footld." {
+		t.Errorf("header Name = %q, want www.footld.", hdr.Name)
 	}
 	if hdr.Rrtype != dns.TypeA {
 		t.Errorf("header Rrtype = %d, want A(%d)", hdr.Rrtype, dns.TypeA)
@@ -378,7 +378,7 @@ func TestResolveQuestionFREENSMissNXDOMAIN(t *testing.T) {
 	// Empty lookup → no record at any hop → NXDOMAIN.
 	r := newResolver(configFor(t, w, RouteFREENS), newFakeLookup(), nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -401,7 +401,7 @@ func TestResolveQuestionFREENSMissNODATA(t *testing.T) {
 
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -422,7 +422,7 @@ func TestResolveQuestionFREENSBrokenChain(t *testing.T) {
 	lookup.put(w.wwwEnv) // only the child; no TLD root
 
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -444,7 +444,7 @@ func TestResolveQuestionDENY(t *testing.T) {
 	lookup.put(w.wwwEnv)
 	r := newResolver(configFor(t, w, RouteDENY), lookup, nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -518,11 +518,11 @@ func TestResolveQuestionDNSFirstHit(t *testing.T) {
 	// DNS returns a different IP; DNSFirst must return DNS's answer (NOT
 	// freens's), proving DNS is consulted first.
 	want := net.IPv4(1, 1, 1, 1)
-	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 90}, A: want}
+	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 90}, A: want}
 	up := &fakeUpstream{answer: []dns.RR{rr}, rcode: dns.RcodeSuccess}
 	r := newResolver(configFor(t, w, RouteDNSFirst), lookup, up)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	out, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -545,7 +545,7 @@ func TestResolveQuestionDNSFirstFallthroughToFreens(t *testing.T) {
 	up := &fakeUpstream{rcode: dns.RcodeNameError}
 	r := newResolver(configFor(t, w, RouteDNSFirst), lookup, up)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	out, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -571,7 +571,7 @@ func TestResolveQuestionFREENSFirstHit(t *testing.T) {
 	up := &fakeUpstream{} // should NOT be consulted
 	r := newResolver(configFor(t, w, RouteFREENSFirst), lookup, up)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	out, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -593,11 +593,11 @@ func TestResolveQuestionFREENSFirstFallthroughToDNS(t *testing.T) {
 	// No freens record → miss → fall through to DNS.
 	lookup := newFakeLookup()
 	want := net.IPv4(2, 2, 2, 2)
-	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: want}
+	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: want}
 	up := &fakeUpstream{answer: []dns.RR{rr}, rcode: dns.RcodeSuccess}
 	r := newResolver(configFor(t, w, RouteFREENSFirst), lookup, up)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	out, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -617,13 +617,13 @@ func TestResolveQuestionFREENSFirstFallthroughToDNS(t *testing.T) {
 
 func TestResolveQuestionFreensUnpinnedAlias(t *testing.T) {
 	w := newFreensWorld(t)
-	cfg := &Config{TLDRoutes: map[string]Route{"foo": RouteFREENS, "*": RouteDNSFirst}}
+	cfg := &Config{TLDRoutes: map[string]Route{"footld": RouteFREENS, "*": RouteDNSFirst}}
 	lookup := newFakeLookup()
 	lookup.put(w.tldEnv)
 	lookup.put(w.wwwEnv)
 	r := newResolver(cfg, lookup, nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -641,7 +641,7 @@ func TestResolveQuestionFreensUnpinnedAlias(t *testing.T) {
 func TestResolveQuestionBadName(t *testing.T) {
 	r := newResolver(&Config{TLDRoutes: map[string]Route{"*": RouteFREENSFirst}}, nil, nil)
 	// Empty label in the middle → DecomposeName errors.
-	q := dns.Question{Name: "a..b.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "a..b.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -658,7 +658,7 @@ func TestResolveQuestionBadName(t *testing.T) {
 func TestResolveQuestionTTLClamped(t *testing.T) {
 	w := newFreensWorld(t)
 	// Build a www record whose RR.ttl (86400) exceeds expires-now and the cap.
-	wwwWireName, err := naming.EncodeWireName([]string{"www"}, "foo", w.tldID)
+	wwwWireName, err := naming.EncodeWireName([]string{"www"}, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -682,7 +682,7 @@ func TestResolveQuestionTTLClamped(t *testing.T) {
 	lookup.put(wwwEnv)
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	out, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -729,7 +729,7 @@ func TestServerUDPEndpoint(t *testing.T) {
 	addr := pc.LocalAddr().String()
 
 	q := new(dns.Msg)
-	q.SetQuestion("www.foo.", dns.TypeA)
+	q.SetQuestion("www.footld.", dns.TypeA)
 	q.RecursionDesired = true
 
 	c := &dns.Client{Net: "udp", Timeout: 2 * time.Second, UDPSize: 4096}
@@ -764,7 +764,7 @@ func TestServerUDPEndpoint(t *testing.T) {
 		t.Errorf("server A.A = %s, want %s", a.A, w.wwwIPv4)
 	}
 	// Question is echoed back.
-	if len(resp.Question) != 1 || resp.Question[0].Name != "www.foo." {
+	if len(resp.Question) != 1 || resp.Question[0].Name != "www.footld." {
 		t.Errorf("Question = %v", resp.Question)
 	}
 }
@@ -790,7 +790,7 @@ func TestServerTCPEndpoint(t *testing.T) {
 	t.Cleanup(func() { _ = srv.Shutdown() })
 
 	addr := ln.Addr().String()
-	q := new(dns.Msg).SetQuestion("www.foo.", dns.TypeA)
+	q := new(dns.Msg).SetQuestion("www.footld.", dns.TypeA)
 	c := &dns.Client{Net: "tcp", Timeout: 2 * time.Second}
 
 	var resp *dns.Msg
@@ -882,7 +882,7 @@ func TestDNSUpstreamForwardLoopback(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFreensRRToDNS(t *testing.T) {
-	name := "host.foo."
+	name := "host.footld."
 	expires := int64(fixedNow + 100)
 
 	// A
@@ -977,11 +977,11 @@ func TestServeDNS_AAFlagOnFreensFirstFallthrough(t *testing.T) {
 	t.Run("FREENSFirst_miss_fallthrough", func(t *testing.T) {
 		// Empty lookup → freens NXDOMAIN → fall through to DNS.
 		upstreamIP := net.IPv4(7, 7, 7, 7)
-		rr := &dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: upstreamIP}
+		rr := &dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: upstreamIP}
 		up := &fakeUpstream{answer: []dns.RR{rr}, rcode: dns.RcodeSuccess}
 		r := newResolver(configFor(t, w, RouteFREENSFirst), newFakeLookup(), up)
 
-		q := new(dns.Msg).SetQuestion("www.foo.", dns.TypeA)
+		q := new(dns.Msg).SetQuestion("www.footld.", dns.TypeA)
 		resp := serveDNSOverUDP(t, r, q)
 		if resp.Rcode != dns.RcodeSuccess {
 			t.Fatalf("rcode = %d, want NOERROR (upstream)", resp.Rcode)
@@ -1004,7 +1004,7 @@ func TestServeDNS_AAFlagOnFreensFirstFallthrough(t *testing.T) {
 		lookup.put(w.wwwEnv)
 		r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-		q := new(dns.Msg).SetQuestion("www.foo.", dns.TypeA)
+		q := new(dns.Msg).SetQuestion("www.footld.", dns.TypeA)
 		resp := serveDNSOverUDP(t, r, q)
 		if resp.Rcode != dns.RcodeSuccess {
 			t.Fatalf("rcode = %d, want NOERROR", resp.Rcode)
@@ -1019,7 +1019,7 @@ func TestServeDNS_AAFlagOnFreensFirstFallthrough(t *testing.T) {
 		upstreamIP := net.IPv4(8, 8, 4, 4)
 		rr := &dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 90}, A: upstreamIP}
 		up := &fakeUpstream{answer: []dns.RR{rr}, rcode: dns.RcodeSuccess}
-		// Use the FREENS route config for "foo" but query example.com (which
+		// Use the FREENS route config for "footld" but query example.com (which
 		// falls through to "* = dns-first" → DNS hit → AA false).
 		r := newResolver(configFor(t, w, RouteFREENS), nil, up)
 
@@ -1043,18 +1043,18 @@ func TestServeDNS_AAFlagOnFreensFirstFallthrough(t *testing.T) {
 
 func TestResolveQuestionFREENSFirstNODATAFallthrough(t *testing.T) {
 	w := newFreensWorld(t)
-	// freens has www.foo with an A record only; we ask AAAA → NODATA →
+	// freens has www.footld with an A record only; we ask AAAA → NODATA →
 	// fall through to the fake upstream, which returns a canned AAAA.
 	lookup := newFakeLookup()
 	lookup.put(w.tldEnv)
 	lookup.put(w.wwwEnv)
 
 	v6 := net.ParseIP("2001:db8::1").To16()
-	cannedAAAA := &dns.AAAA{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: v6}
+	cannedAAAA := &dns.AAAA{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 120}, AAAA: v6}
 	up := &fakeUpstream{answer: []dns.RR{cannedAAAA}, rcode: dns.RcodeSuccess}
 	r := newResolver(configFor(t, w, RouteFREENSFirst), lookup, up)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET}
 	out, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -1090,15 +1090,15 @@ func TestResolveQuestionFREENSFirstNODATAFallthrough(t *testing.T) {
 func TestResolveQuestionFreensExpiredIntermediate(t *testing.T) {
 	w := newFreensWorld(t)
 
-	// Build a 3-hop chain TLD → host.foo (EXPIRED) → sub.host.foo, all
+	// Build a 3-hop chain TLD → host.footld (EXPIRED) → sub.host.footld, all
 	// direct-signed by the TLD key (parent.Owner == child.Signer) so
 	// VerifyAuthorityChain passes structurally. Only the intermediate's
 	// Expires is in the past relative to fixedNow.
 
-	// Intermediate host.foo — EXPIRED. Its signature, owner binding, and
+	// Intermediate host.footld — EXPIRED. Its signature, owner binding, and
 	// chain structure are all valid; only its [Created, Expires) window is
 	// in the past.
-	hostWireName, err := naming.EncodeWireName([]string{"host"}, "foo", w.tldID)
+	hostWireName, err := naming.EncodeWireName([]string{"host"}, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1112,9 +1112,9 @@ func TestResolveQuestionFreensExpiredIntermediate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Terminal sub.host.foo — VALID window, carries the A RR we must NOT
+	// Terminal sub.host.footld — VALID window, carries the A RR we must NOT
 	// receive (because its parent delegation is expired).
-	subWireName, err := naming.EncodeWireName([]string{"sub", "host"}, "foo", w.tldID)
+	subWireName, err := naming.EncodeWireName([]string{"sub", "host"}, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1137,11 +1137,11 @@ func TestResolveQuestionFreensExpiredIntermediate(t *testing.T) {
 	// structurally (parent.Owner == child.Signer at every hop), so without
 	// per-hop time checks the resolver would return the stale A record.
 	if !wire.IsBasicValid(subEnv, uint64(fixedNow)) {
-		t.Fatal("fixture: terminal sub.host.foo must be IsBasicValid alone")
+		t.Fatal("fixture: terminal sub.host.footld must be IsBasicValid alone")
 	}
 	// The intermediate is NOT IsBasicValid at fixedNow (expired).
 	if wire.IsBasicValid(hostEnv, uint64(fixedNow)) {
-		t.Fatal("fixture: intermediate host.foo must be EXPIRED at fixedNow")
+		t.Fatal("fixture: intermediate host.footld must be EXPIRED at fixedNow")
 	}
 	chain := []*wire.SignedEnvelope{w.tldEnv, hostEnv, subEnv}
 	if !wire.VerifyAuthorityChain(chain) {
@@ -1154,7 +1154,7 @@ func TestResolveQuestionFreensExpiredIntermediate(t *testing.T) {
 	lookup.put(subEnv)
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-	q := dns.Question{Name: "sub.host.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "sub.host.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -1178,7 +1178,7 @@ func TestResolveQuestionFreensExpiredIntermediate(t *testing.T) {
 // deliberately dead").
 func revokedEnv(t *testing.T, w *freensWorld, labels []string, sequence uint64) *wire.SignedEnvelope {
 	t.Helper()
-	wn, err := naming.EncodeWireName(labels, "foo", w.tldID)
+	wn, err := naming.EncodeWireName(labels, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1215,7 +1215,7 @@ func TestResolveQuestionFREENSRevokedTerminal(t *testing.T) {
 	lookup.put(revokedWWW)
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -1233,11 +1233,11 @@ func TestResolveQuestionFREENSRevokedTerminal(t *testing.T) {
 
 func TestResolveQuestionFREENSRevokedIntermediate(t *testing.T) {
 	w := newFreensWorld(t)
-	// 3-hop chain: TLD → host.foo (REVOKED delegation) → sub.host.foo (live,
+	// 3-hop chain: TLD → host.footld (REVOKED delegation) → sub.host.footld (live,
 	// carries the A RR we must NOT receive).
 	revokedHost := revokedEnv(t, w, []string{"host"}, 1)
 
-	subWireName, err := naming.EncodeWireName([]string{"sub", "host"}, "foo", w.tldID)
+	subWireName, err := naming.EncodeWireName([]string{"sub", "host"}, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1267,7 +1267,7 @@ func TestResolveQuestionFREENSRevokedIntermediate(t *testing.T) {
 	lookup.put(subEnv)
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 
-	q := dns.Question{Name: "sub.host.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "sub.host.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
@@ -1285,7 +1285,7 @@ func TestResolveQuestionFREENSRevokedIntermediate(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFreensRRToDNSMappings(t *testing.T) {
-	name := "host.foo."
+	name := "host.footld."
 	expires := int64(fixedNow + 100)
 	mkRR := func(typ uint64, rdata []byte) *wire.RR {
 		t.Helper()
@@ -1756,22 +1756,22 @@ func (f *fakeClaimLookup) LookupClaim(_ context.Context, alias string, _ int64) 
 	return f.claims[alias], nil
 }
 
-// claimConfig routes "foo" into freens with NO alias pins — the network claim
+// claimConfig routes "footld" into freens with NO alias pins — the network claim
 // layer (§7) must carry the alias on its own.
 func claimConfig() *Config {
 	cfg, err := ParseConfig("[tld-routes]\n* = dns-first\n")
 	if err != nil {
 		panic(err)
 	}
-	cfg.TLDRoutes["foo"] = RouteFREENS
+	cfg.TLDRoutes["footld"] = RouteFREENS
 	return cfg
 }
 
-// resolveFoo runs www.foo. A through a resolver over the given lookup.
-func resolveFoo(t *testing.T, lookup RecordLookup) ([]dns.RR, int, error) {
+// resolveFootld runs www.footld. A through a resolver over the given lookup.
+func resolveFootld(t *testing.T, lookup RecordLookup) ([]dns.RR, int, error) {
 	t.Helper()
 	r := newResolver(claimConfig(), lookup, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	return rrs, rcode, err
 }
@@ -1781,12 +1781,12 @@ func resolveFoo(t *testing.T, lookup RecordLookup) ([]dns.RR, int, error) {
 // runs the full §7 checklist, derives tld_id = SHA-256(claimant_pk), and
 // proceeds with the normal self-certifying chain walk to the A record.
 func TestResolveQuestionFREENSViaNetworkClaim(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
+	w := newClaimedWorld(t, "footld")
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}
@@ -1810,15 +1810,15 @@ func TestResolveQuestionFREENSViaNetworkClaim(t *testing.T) {
 // the freens branch misses (NXDOMAIN), even though the envelope signature is
 // perfectly valid.
 func TestResolveQuestionClaimBrokenWitnessSig(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	broken := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+	w := newClaimedWorld(t, "footld")
+	broken := w.resignWithClaim(t, "footld", func(c *claims.AliasClaim) {
 		c.Witnesses[0].Sig[0] ^= 0xff
 	})
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", broken)
+	lookup.putClaim("footld", broken)
 	lookup.put(w.wwwEnv)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1833,15 +1833,15 @@ func TestResolveQuestionClaimBrokenWitnessSig(t *testing.T) {
 // TestResolveQuestionClaimBelowQuorum: W-1 (valid) witnesses < W → no quorum
 // → NXDOMAIN.
 func TestResolveQuestionClaimBelowQuorum(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	trimmed := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+	w := newClaimedWorld(t, "footld")
+	trimmed := w.resignWithClaim(t, "footld", func(c *claims.AliasClaim) {
 		c.Witnesses = c.Witnesses[:constants.W-1]
 	})
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", trimmed)
+	lookup.putClaim("footld", trimmed)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1851,17 +1851,17 @@ func TestResolveQuestionClaimBelowQuorum(t *testing.T) {
 }
 
 // TestResolveQuestionClaimAliasMismatch: a claim registered for "bar" but
-// served for "foo" must not resolve "foo" (the claim envelope is otherwise
+// served for "footld" must not resolve "footld" (the claim envelope is otherwise
 // fully valid — the alias-match checklist item is what rejects it).
 func TestResolveQuestionClaimAliasMismatch(t *testing.T) {
 	w := newClaimedWorld(t, "bar")
 	lookup := newFakeClaimLookup()
-	// Serve the bar-claim under foo's lookup AND make the chain hops
+	// Serve the bar-claim under footld's lookup AND make the chain hops
 	// resolvable so only the alias check can be failing.
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1873,15 +1873,15 @@ func TestResolveQuestionClaimAliasMismatch(t *testing.T) {
 // TestResolveQuestionClaimBadPoW: a tampered pow_hash (envelope re-signed so
 // only the PoW check can fail) → NXDOMAIN.
 func TestResolveQuestionClaimBadPoW(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	bad := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+	w := newClaimedWorld(t, "footld")
+	bad := w.resignWithClaim(t, "footld", func(c *claims.AliasClaim) {
 		c.PowHash[0] ^= 0xff
 	})
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", bad)
+	lookup.putClaim("footld", bad)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1893,15 +1893,15 @@ func TestResolveQuestionClaimBadPoW(t *testing.T) {
 // TestResolveQuestionClaimClaimantMismatch: claim.TldID pointing at a tld_id
 // that is NOT SHA-256(claimant_pk) (claimant-consistency failure) → NXDOMAIN.
 func TestResolveQuestionClaimClaimantMismatch(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	bad := w.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+	w := newClaimedWorld(t, "footld")
+	bad := w.resignWithClaim(t, "footld", func(c *claims.AliasClaim) {
 		c.TldID[0] ^= 0xff
 	})
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", bad)
+	lookup.putClaim("footld", bad)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1914,7 +1914,7 @@ func TestResolveQuestionClaimClaimantMismatch(t *testing.T) {
 // OTHER than the claimant's TLD key fails the claimant-binding checklist item
 // → NXDOMAIN (an attacker cannot carry someone's claim on their own record).
 func TestResolveQuestionClaimWrongSigner(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
+	w := newClaimedWorld(t, "footld")
 	other, err := crypto.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -1925,10 +1925,10 @@ func TestResolveQuestionClaimWrongSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", env)
+	lookup.putClaim("footld", env)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1942,7 +1942,7 @@ func TestResolveQuestionClaimWrongSigner(t *testing.T) {
 // hop for the TLD still exists via the record map, so the decode/checklist
 // path is exercised, not the hop walk).
 func TestResolveQuestionClaimGarbageField11(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
+	w := newClaimedWorld(t, "footld")
 	rec := *w.tldEnv.Record
 	rec.Claim = []byte{0x44, 0xde, 0xad, 0xbe, 0xef} // valid CBOR bstr, not an AliasClaim
 	env, err := wire.SignRecord(&rec, w.tldKP)
@@ -1950,10 +1950,10 @@ func TestResolveQuestionClaimGarbageField11(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", env)
+	lookup.putClaim("footld", env)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1966,8 +1966,8 @@ func TestResolveQuestionClaimGarbageField11(t *testing.T) {
 // fails IsBasicValid at `now` → NXDOMAIN (a claim cannot outlive the record
 // that carries it).
 func TestResolveQuestionClaimExpiredEnvelope(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	tldWire, err := naming.EncodeWireName(nil, "foo", w.tldID)
+	w := newClaimedWorld(t, "footld")
+	tldWire, err := naming.EncodeWireName(nil, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1981,10 +1981,10 @@ func TestResolveQuestionClaimExpiredEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", expired)
+	lookup.putClaim("footld", expired)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -1997,19 +1997,19 @@ func TestResolveQuestionClaimExpiredEnvelope(t *testing.T) {
 // ALWAYS beats the claim layer. The pin points at world2 while a fully valid
 // claim points at world1; the answer must come from world2.
 func TestResolveQuestionPinWinsOverClaim(t *testing.T) {
-	w1 := newClaimedWorld(t, "foo")
-	w2 := newClaimedWorld(t, "foo") // second, independent TLD for the same alias
+	w1 := newClaimedWorld(t, "footld")
+	w2 := newClaimedWorld(t, "footld") // second, independent TLD for the same alias
 
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", w1.tldEnv) // network says world1
+	lookup.putClaim("footld", w1.tldEnv) // network says world1
 	lookup.put(w1.wwwEnv)
 	lookup.put(w2.tldEnv)
 	lookup.put(w2.wwwEnv)
 
 	cfg := claimConfig()
-	cfg.AliasPins = map[string][]byte{"foo": append([]byte(nil), w2.tldID...)} // pin says world2
+	cfg.AliasPins = map[string][]byte{"footld": append([]byte(nil), w2.tldID...)} // pin says world2
 	r := newResolver(cfg, lookup, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -2030,12 +2030,12 @@ func TestResolveQuestionPinWinsOverClaim(t *testing.T) {
 // extension and no pin keeps the previous pin-only behavior — NXDOMAIN
 // (backward compatibility: the claim path is strictly additive).
 func TestResolveQuestionNoClaimResolver(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
+	w := newClaimedWorld(t, "footld")
 	lookup := newFakeLookup() // plain RecordLookup
 	lookup.put(w.tldEnv)
 	lookup.put(w.wwwEnv)
 
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -2084,22 +2084,22 @@ func newFakeClaimSetLookup(alias string, order []*wire.SignedEnvelope, worlds ..
 }
 
 // TestResolveQuestionClaimSetWinnerOrderIndependent — THE §7.4 verifier-side
-// test: two fully valid competing claims for "foo" (ts=T and ts=T+1, i.e. a
+// test: two fully valid competing claims for "footld" (ts=T and ts=T+1, i.e. a
 // §7.5 SKEW_TOLERANCE race) are offered as a collected set; the resolver must
 // pick the §7.4 deterministic winner — the EARLIEST timestamp — regardless of
 // the order the set arrived in ("This total order is computable by any client
 // from claim contents alone — convergence without consensus", spec lines
 // 613-615).
 func TestResolveQuestionClaimSetWinnerOrderIndependent(t *testing.T) {
-	wEarly := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 101))
-	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 102))
+	wEarly := newClaimedWorldAt(t, "footld", uint64(fixedNow-50), net.IPv4(203, 0, 113, 101))
+	wLate := newClaimedWorldAt(t, "footld", uint64(fixedNow-49), net.IPv4(203, 0, 113, 102))
 
 	for name, order := range map[string][]*wire.SignedEnvelope{
 		"early-first": {wEarly.tldEnv, wLate.tldEnv},
 		"late-first":  {wLate.tldEnv, wEarly.tldEnv},
 	} {
-		lookup := newFakeClaimSetLookup("foo", order, wEarly, wLate)
-		rrs, rcode, err := resolveFoo(t, lookup)
+		lookup := newFakeClaimSetLookup("footld", order, wEarly, wLate)
+		rrs, rcode, err := resolveFootld(t, lookup)
 		if err != nil {
 			t.Fatalf("%s: ResolveQuestion: %v", name, err)
 		}
@@ -2123,8 +2123,8 @@ func TestResolveQuestionClaimSetWinnerOrderIndependent(t *testing.T) {
 // tie) still LOSES to an earlier-ts claim whose pow_hash is higher. The early
 // world is re-mined until that hash relation actually holds.
 func TestResolveQuestionClaimSetEarlierTSBeatsLowerPowHash(t *testing.T) {
-	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-10), net.IPv4(203, 0, 113, 112))
-	wEarly := newClaimedWorldUntil(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 111),
+	wLate := newClaimedWorldAt(t, "footld", uint64(fixedNow-10), net.IPv4(203, 0, 113, 112))
+	wEarly := newClaimedWorldUntil(t, "footld", uint64(fixedNow-50), net.IPv4(203, 0, 113, 111),
 		func(c *claims.AliasClaim) bool {
 			return bytes.Compare(c.PowHash, wLate.claim.PowHash) > 0
 		})
@@ -2136,8 +2136,8 @@ func TestResolveQuestionClaimSetEarlierTSBeatsLowerPowHash(t *testing.T) {
 		"early-first": {wEarly.tldEnv, wLate.tldEnv},
 		"late-first":  {wLate.tldEnv, wEarly.tldEnv},
 	} {
-		lookup := newFakeClaimSetLookup("foo", order, wEarly, wLate)
-		rrs, rcode, err := resolveFoo(t, lookup)
+		lookup := newFakeClaimSetLookup("footld", order, wEarly, wLate)
+		rrs, rcode, err := resolveFootld(t, lookup)
 		if err != nil {
 			t.Fatalf("%s: ResolveQuestion: %v", name, err)
 		}
@@ -2157,16 +2157,16 @@ func TestResolveQuestionClaimSetEarlierTSBeatsLowerPowHash(t *testing.T) {
 // envelope with the EARLIEST timestamp loses (no quorum) and the valid
 // earlier-ts claim wins among the survivors.
 func TestResolveQuestionClaimSetDropsInvalidClaims(t *testing.T) {
-	wValid1 := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 121))
-	wValid2 := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 122))
-	wBroken := newClaimedWorldAt(t, "foo", uint64(fixedNow-90), net.IPv4(203, 0, 113, 120))
-	broken := wBroken.resignWithClaim(t, "foo", func(c *claims.AliasClaim) {
+	wValid1 := newClaimedWorldAt(t, "footld", uint64(fixedNow-50), net.IPv4(203, 0, 113, 121))
+	wValid2 := newClaimedWorldAt(t, "footld", uint64(fixedNow-49), net.IPv4(203, 0, 113, 122))
+	wBroken := newClaimedWorldAt(t, "footld", uint64(fixedNow-90), net.IPv4(203, 0, 113, 120))
+	broken := wBroken.resignWithClaim(t, "footld", func(c *claims.AliasClaim) {
 		c.Witnesses[0].Sig[0] ^= 0xff // earliest ts, but quorum broken → filtered
 	})
 
-	lookup := newFakeClaimSetLookup("foo",
+	lookup := newFakeClaimSetLookup("footld",
 		[]*wire.SignedEnvelope{broken, wValid2.tldEnv, wValid1.tldEnv}, wValid1, wValid2, wBroken)
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
@@ -2181,14 +2181,14 @@ func TestResolveQuestionClaimSetDropsInvalidClaims(t *testing.T) {
 // TestResolveQuestionClaimSetAllInvalidNXDOMAIN: when every collected claim
 // fails the filter, the set path misses like the single path → NXDOMAIN.
 func TestResolveQuestionClaimSetAllInvalidNXDOMAIN(t *testing.T) {
-	w1 := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 131))
-	w2 := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 132))
-	brokenPoW := w1.resignWithClaim(t, "foo", func(c *claims.AliasClaim) { c.PowHash[0] ^= 0xff })
-	brokenWit := w2.resignWithClaim(t, "foo", func(c *claims.AliasClaim) { c.Witnesses[1].Sig[0] ^= 0xff })
+	w1 := newClaimedWorldAt(t, "footld", uint64(fixedNow-50), net.IPv4(203, 0, 113, 131))
+	w2 := newClaimedWorldAt(t, "footld", uint64(fixedNow-49), net.IPv4(203, 0, 113, 132))
+	brokenPoW := w1.resignWithClaim(t, "footld", func(c *claims.AliasClaim) { c.PowHash[0] ^= 0xff })
+	brokenWit := w2.resignWithClaim(t, "footld", func(c *claims.AliasClaim) { c.Witnesses[1].Sig[0] ^= 0xff })
 
-	lookup := newFakeClaimSetLookup("foo",
+	lookup := newFakeClaimSetLookup("footld",
 		[]*wire.SignedEnvelope{brokenPoW, brokenWit}, w1, w2)
-	_, rcode, err := resolveFoo(t, lookup)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
@@ -2206,11 +2206,11 @@ func TestResolveQuestionClaimSetAllInvalidNXDOMAIN(t *testing.T) {
 // 853): the answer RR TTL becomes 60 (the www record says 600) AND the
 // ResponseCache entry derived from it expires after 60 s.
 func TestResolveQuestionContestedWinnerTTLCapped(t *testing.T) {
-	wEarly := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 141))
-	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 142))
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{wLate.tldEnv, wEarly.tldEnv}, wEarly, wLate)
+	wEarly := newClaimedWorldAt(t, "footld", uint64(fixedNow-50), net.IPv4(203, 0, 113, 141))
+	wLate := newClaimedWorldAt(t, "footld", uint64(fixedNow-49), net.IPv4(203, 0, 113, 142))
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{wLate.tldEnv, wEarly.tldEnv}, wEarly, wLate)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
 		t.Fatalf("resolve: rcode=%d len=%d err=%v", rcode, len(rrs), err)
 	}
@@ -2223,7 +2223,7 @@ func TestResolveQuestionContestedWinnerTTLCapped(t *testing.T) {
 	// alias cannot be pinned by the cache past the contest.
 	clock := fixedNow
 	cache := NewResponseCache(16, func() int64 { return clock })
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
 	if _, _, _, ok := cache.get(cacheKeyFor(q)); !ok {
 		t.Fatal("contested entry missing from cache immediately after put")
@@ -2241,11 +2241,11 @@ func TestResolveQuestionContestedWinnerTTLCapped(t *testing.T) {
 // 600 s TTL and the cache entry survives past 60 s.
 func TestResolveQuestionUncontestedWinnerNotCapped(t *testing.T) {
 	old := uint64(fixedNow - constants.ContestWindow - 1000) // final per §7.5(b)
-	wEarly := newClaimedWorldAt(t, "foo", old, net.IPv4(203, 0, 113, 151))
-	wLate := newClaimedWorldAt(t, "foo", old+1, net.IPv4(203, 0, 113, 152))
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{wLate.tldEnv, wEarly.tldEnv}, wEarly, wLate)
+	wEarly := newClaimedWorldAt(t, "footld", old, net.IPv4(203, 0, 113, 151))
+	wLate := newClaimedWorldAt(t, "footld", old+1, net.IPv4(203, 0, 113, 152))
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{wLate.tldEnv, wEarly.tldEnv}, wEarly, wLate)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
 		t.Fatalf("resolve: rcode=%d len=%d err=%v", rcode, len(rrs), err)
 	}
@@ -2256,7 +2256,7 @@ func TestResolveQuestionUncontestedWinnerNotCapped(t *testing.T) {
 	// ...and the §10.4 cache entry outlives the contested 60 s bound.
 	clock := fixedNow
 	cache := NewResponseCache(16, func() int64 { return clock })
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
 	clock += contestedClaimTTLCap + 1
 	if _, _, _, ok := cache.get(cacheKeyFor(q)); !ok {
@@ -2280,20 +2280,20 @@ func TestResolveQuestionContestedCacheReconsultsNetwork(t *testing.T) {
 		{"uncontested (outside CONTEST_WINDOW)", uint64(fixedNow - constants.ContestWindow - 1000), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w1 := newClaimedWorldAt(t, "foo", tc.claimTS, net.IPv4(203, 0, 113, 161))
-			w2 := newClaimedWorldAt(t, "foo", tc.claimTS+1, net.IPv4(203, 0, 113, 162))
-			lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{w2.tldEnv, w1.tldEnv}, w1, w2)
+			w1 := newClaimedWorldAt(t, "footld", tc.claimTS, net.IPv4(203, 0, 113, 161))
+			w2 := newClaimedWorldAt(t, "footld", tc.claimTS+1, net.IPv4(203, 0, 113, 162))
+			lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{w2.tldEnv, w1.tldEnv}, w1, w2)
 
 			clock := fixedNow
 			r := New(claimConfig(), lookup, nil)
 			r.Now = func() int64 { return clock }
 			r.Cache = NewResponseCache(16, func() int64 { return clock })
 
-			// Two server-path queries for www.foo around a 120 s clock jump.
+			// Two server-path queries for www.footld around a 120 s clock jump.
 			query := func() {
 				t.Helper()
 				w := &captureWriter{}
-				r.ServeDNS(w, new(dns.Msg).SetQuestion("www.foo.", dns.TypeA))
+				r.ServeDNS(w, new(dns.Msg).SetQuestion("www.footld.", dns.TypeA))
 				if w.msg == nil || w.msg.Rcode != dns.RcodeSuccess || len(w.msg.Answer) != 1 {
 					t.Fatalf("ServeDNS: resp=%v", w.msg)
 				}
@@ -2340,15 +2340,15 @@ func (w *captureWriter) Hijack()                   {}
 // it serves ONE envelope and the resolver trusts that envelope's claim (here
 // the LATER claim that would lose a §7.4 set race) without any set ordering.
 func TestResolveQuestionClaimResolverOnlyBackcompat(t *testing.T) {
-	wEarly := newClaimedWorldAt(t, "foo", uint64(fixedNow-50), net.IPv4(203, 0, 113, 171))
-	wLate := newClaimedWorldAt(t, "foo", uint64(fixedNow-49), net.IPv4(203, 0, 113, 172))
+	wEarly := newClaimedWorldAt(t, "footld", uint64(fixedNow-50), net.IPv4(203, 0, 113, 171))
+	wLate := newClaimedWorldAt(t, "footld", uint64(fixedNow-49), net.IPv4(203, 0, 113, 172))
 
 	lookup := newFakeClaimLookup() // ClaimResolver only
-	lookup.putClaim("foo", wLate.tldEnv)
+	lookup.putClaim("footld", wLate.tldEnv)
 	lookup.put(wLate.wwwEnv)
 	lookup.put(wEarly.wwwEnv)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}

@@ -311,6 +311,15 @@ type NodeConfig struct {
 	// freens-native (node-key signatures, internal/turn docs); the socket also
 	// answers STUN Binding, so it doubles as a -stun target.
 	TurnServer *turn.ServerConfig
+	// AllowReserved overrides the §7.6 reserved-alias policy (naming/reserved.go):
+	// by default this node REFUSES to co-sign witness attestations for claims
+	// whose alias is a delegated ICANN TLD or an IANA special-use name ("com",
+	// "localhost", …) — no quorum, no claim. The override exists for operators
+	// who deliberately host such a namespace; it is local policy only (other
+	// nodes keep refusing). The gate touches only fresh claim minting:
+	// renewals and re-publishes of an already-held name never re-witness, so
+	// existing holders are unaffected either way.
+	AllowReserved bool
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -328,6 +337,7 @@ type Node struct {
 	conn           net.PacketConn
 	closed         atomic.Bool
 	passive        bool
+	allowReserved  bool          // §7.6 override: witness reserved-alias claims anyway
 	refreshEvery   time.Duration // resolved: >0 = run refresh loop
 	republishEvery time.Duration // resolved: >0 = run republish loop
 	contactIdleTTL time.Duration // resolved: >0 = run the idle sweep
@@ -624,6 +634,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		id:             id,
 		listenAddr:     cfg.ListenAddr,
 		passive:        cfg.Passive,
+		allowReserved:  cfg.AllowReserved,
 		refreshEvery:   refreshEvery,
 		republishEvery: republishEvery,
 		contactIdleTTL: contactIdleTTL,
@@ -1689,6 +1700,17 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	aliasN, aerr := naming.ValidateAlias(alias)
 	if !ok || aerr != nil || len(nonce) == 0 || len(powHash) != constants.SHA256Len {
 		return n.errResp(m, 305, "bad witness args")
+	}
+	// §7.6 reserved-alias gate (naming/reserved.go): a claim on a delegated
+	// ICANN TLD or IANA special-use name is refused BEFORE any crypto work —
+	// this node does not co-sign claims that would put a freens TLD inside
+	// real-DNS namespace (the phishing-with-a-padlock class). NodeConfig.
+	// AllowReserved (-allow-reserved) opts this node out of the policy; the
+	// other witnesses' gates are unchanged. Error family 305 like the other
+	// claim-content refusals: permanent for this claim, not retryable.
+	if naming.IsReservedTLD(aliasN) && !n.allowReserved {
+		n.log.Info("witness refused: reserved alias (spec §7.6)", "alias", aliasN)
+		return n.errResp(m, 305, "reserved alias refused (spec §7.6)")
 	}
 	if len(tldID) != constants.SHA256Len || len(claimant) != constants.Ed25519PublicKeyLen {
 		return n.errResp(m, 305, "bad tld_id/claimant length")

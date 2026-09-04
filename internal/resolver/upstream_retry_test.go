@@ -102,31 +102,31 @@ func TestRefreshFailureLogsTransitionsOnce(t *testing.T) {
 	var logBuf syncWriter
 	r.Logger = testLogger(&logBuf)
 
-	serveOnce(t, r, "www.foo.", dns.TypeA) // fresh walk + cache
+	serveOnce(t, r, "www.footld.", dns.TypeA) // fresh walk + cache
 
 	// Namespace goes dark; the stale serve kicks a refresh → ONE WARN.
 	atomic.StoreInt32(&lookup.fail, 1)
 	base := atomic.LoadInt32(&lookup.attempts)
 	clock.Store(clock.Load() + 601)
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	waitForRefresh(t, &lookup.attempts, base)
 
 	// Another kick within the outage (sweeper/timer) must NOT log again.
 	clock.Store(clock.Load() + 6)
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	waitForRefresh(t, &lookup.attempts, atomic.LoadInt32(&lookup.attempts))
 
 	if n := strings.Count(logBuf.String(), "level=WARN"); n != 1 {
 		t.Fatalf("WARN lines = %d, want exactly 1 (an outage logs once, not per kick):\n%s", n, logBuf.String())
 	}
-	if !strings.Contains(logBuf.String(), "www.foo") {
+	if !strings.Contains(logBuf.String(), "www.footld") {
 		t.Fatalf("WARN should name the name:\n%s", logBuf.String())
 	}
 
 	// Recovery: exactly one INFO, no new WARN.
 	atomic.StoreInt32(&lookup.fail, 0)
 	clock.Store(clock.Load() + 6)
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	waitForRefresh(t, &lookup.attempts, atomic.LoadInt32(&lookup.attempts))
 	if n := strings.Count(logBuf.String(), "level=INFO"); n != 1 {
 		t.Fatalf("INFO lines = %d, want exactly 1 (the recovery):\n%s", n, logBuf.String())

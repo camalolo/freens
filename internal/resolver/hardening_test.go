@@ -60,7 +60,7 @@ func TestServeDNSSingleFlightCollapsesStampede(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			q := new(dns.Msg).SetQuestion("foo.", dns.TypeA)
+			q := new(dns.Msg).SetQuestion("footld.", dns.TypeA)
 			responses <- serveDNSOverUDP(t, r, q)
 		}()
 	}
@@ -91,7 +91,7 @@ func TestServeDNSSingleFlightCollapsesStampede(t *testing.T) {
 	}
 	// The leader cached the outcome: a fresh query is a pure cache hit.
 	before := g.calls.Load()
-	q := new(dns.Msg).SetQuestion("foo.", dns.TypeA)
+	q := new(dns.Msg).SetQuestion("footld.", dns.TypeA)
 	if resp := serveDNSOverUDP(t, r, q); resp.Rcode != dns.RcodeSuccess {
 		t.Fatalf("post-flight query rcode = %d", resp.Rcode)
 	}
@@ -113,7 +113,7 @@ func TestTXTMappingChunksLongRdata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := freensRRToDNS("long.foo.", rr, fixedNow+3600, fixedNow)
+	got := freensRRToDNS("long.footld.", rr, fixedNow+3600, fixedNow)
 	txt, ok := got.(*dns.TXT)
 	if !ok {
 		t.Fatalf("mapping type = %T, want *dns.TXT", got)
@@ -131,7 +131,7 @@ func TestTXTMappingChunksLongRdata(t *testing.T) {
 	// The packing failure this fixes: a message carrying the mapped RR
 	// must Pack cleanly.
 	m := new(dns.Msg)
-	m.SetReply(new(dns.Msg).SetQuestion("long.foo.", dns.TypeTXT))
+	m.SetReply(new(dns.Msg).SetQuestion("long.footld.", dns.TypeTXT))
 	m.Answer = []dns.RR{txt}
 	if _, err := m.Pack(); err != nil {
 		t.Fatalf("Pack with long TXT: %v", err)
@@ -165,7 +165,7 @@ func TestUDPResponseTruncated(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return fixedNow })
 
-	q := new(dns.Msg).SetQuestion("www.foo.", dns.TypeTXT)
+	q := new(dns.Msg).SetQuestion("www.footld.", dns.TypeTXT)
 	resp := serveDNSOverUDP(t, r, q)
 	if resp.Rcode != dns.RcodeSuccess {
 		t.Fatalf("rcode = %d", resp.Rcode)

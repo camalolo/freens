@@ -748,6 +748,56 @@ winner while flagging the name as contested in diagnostics.
 | Claim a human alias               | $0 + PoW electricity + witness round-trips |
 | Mass squatting (1000 aliases)     | 1000 × PoW + witness scrutiny |
 
+### 7.7 Reserved alias policy (reference implementation)
+
+A claim whose alias equals a **delegated ICANN TLD** (the IANA root-zone
+database: `com`, `net`, `de`, IDN TLDs in A-label form, …) or an **IANA
+special-use name** (`localhost`, `invalid`, `test`, `example`, `onion`,
+`local`, `arpa`, `home`) MUST NOT be minted by the reference
+implementation's tooling, and honest nodes MUST refuse to assist it. The
+reference snapshot is compiled into the implementation (a runtime "does
+upstream DNS know this TLD?" check was considered and rejected: it moves
+the gate's trust root into the attack channel — a spoofed NXDOMAIN for
+`com` would disable the gate exactly when it matters — fails badly on
+networks without upstream DNS, and lets honest witnesses disagree on a
+policy that quorum machinery requires to be deterministic). The snapshot
+can only make the gate STRICTER over time; it is refreshed at release
+time from the IANA list. Special-use names are always enumerated by hand:
+the root zone deliberately does not serve them, so no DNS-based check can
+detect them.
+
+Rationale: §9.3's default `dns-first` route keeps such a claim from
+shadowing *live* domains, but the abuse window survives — every name
+under the claimed TLD that upstream answers NXDOMAIN for (typos, expired
+domains, filter-NXDOMAINed names) falls through to freens and is served
+by the claimant **with a §9.5 owner CA**, i.e. a phishing site with a
+green padlock. The cost asymmetry is indefensible: the claim costs one
+flat PoW, and no legitimate use of a TLD-shaped alias exists (a community
+can always pick an unclaimed, non-colliding name).
+
+Enforcement (all local policy; freens has no authority to make it
+protocol law — §1 — so this section binds the reference implementation,
+not the wire format):
+
+1. **Mint**: `register` (CLI and web UI) refuses the alias. The CLI
+   offers `-allow-reserved`; the web UI offers no override and points at
+   the CLI.
+2. **Witness**: the §6.3 witness RPC refuses to co-sign such a claim
+   before any crypto work. Node-local `-allow-reserved` opts out; other
+   nodes keep refusing, so a rogue quorum must consist entirely of
+   override-enabled or malicious nodes.
+3. **Resolve**: the resolver treats a reserved alias as claim-less
+   (NXDOMAIN, no network walk) even if a rogue-witnessed claim IS
+   published — five malicious witnesses cannot make a default node
+   resolve a freens `.com`. The admin face (`/resolve`) behaves
+   identically. `[alias-pins]` are deliberately exempt (explicit operator
+   policy, unreachable by any remote claimant), checked before the gate.
+
+Deliberately NOT gated: renewal, re-publication, recovery, and revocation
+of a name a holder ALREADY has. The gate protects new registrations only;
+it must never strand an existing holder (including one whose alias a
+future root-zone snapshot newly collides with).
+
 ## 8. Ownership Lifecycle
 
 ### 8.1 Create (TLD)
@@ -951,7 +1001,11 @@ Semantics:
 someone claims `com` or a future ICANN string collides with an old
 freens alias), the *default* `dns-first` for `*` guarantees freens
 never silently shadows existing internet names. Users opt into
-`freens`/`freens-first` per TLD deliberately.
+`freens`/`freens-first` per TLD deliberately. Since §7.7, the reference
+implementation additionally refuses to mint, witness, or resolve claims
+on delegated ICANN TLDs and IANA special-use names unless the operator
+explicitly overrides — this routing fallback is the second line of
+defense, not the only one.
 
 ### 9.4 Browser/OS integration path
 

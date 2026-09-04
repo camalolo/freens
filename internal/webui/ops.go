@@ -58,13 +58,27 @@ type RegisterResult struct {
 	RecPaths    []string
 }
 
-// registerError carries a user-facing message (safe to render raw).
-type registerError struct{ msg string }
+// registerError carries a user-facing message (safe to render raw) plus an
+// OPTIONAL cause, so gate errors (§7.6 naming.ErrReserved) stay
+// errors.Is-identifiable to programmatic callers even though the HTTP layer
+// only ever renders the message.
+type registerError struct {
+	msg   string
+	cause error
+}
 
 func (e *registerError) Error() string { return e.msg }
 
+// Unwrap exposes the preserved cause (nil for plain userErr errors).
+func (e *registerError) Unwrap() error { return e.cause }
+
 func userErr(format string, a ...any) error {
 	return &registerError{msg: fmt.Sprintf(format, a...)}
+}
+
+// userErrCause is userErr with the underlying cause preserved for errors.Is.
+func userErrCause(cause error, format string, a ...any) error {
+	return &registerError{msg: fmt.Sprintf(format, a...), cause: cause}
 }
 
 // Register runs the full §7.4/C.1 flow: load-or-generate the owner key,
@@ -90,6 +104,17 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	alias, err := naming.ValidateAlias(in.Alias)
 	if err != nil {
 		return RegisterResult{}, userErr("invalid alias: %v", err)
+	}
+	// §7.6 reserved-alias gate (naming/reserved.go): the web UI has NO
+	// override for a claim on a delegated ICANN TLD / IANA special-use name
+	// — this form is exactly the first-time-user surface the gate protects.
+	// The error points to the CLI flag so a deliberate operator still has a
+	// path (freens register -allow-reserved <alias>).
+	if _, cerr := naming.CheckRegisterable(alias); cerr != nil {
+		if errors.Is(cerr, naming.ErrReserved) {
+			return RegisterResult{}, userErrCause(cerr, "%v", cerr)
+		}
+		return RegisterResult{}, userErr("invalid alias: %v", cerr)
 	}
 	ip := strings.TrimSpace(in.IP)
 	if ip == "" {

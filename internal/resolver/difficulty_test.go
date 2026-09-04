@@ -155,12 +155,12 @@ func buildClaimWorldBelow(t *testing.T, alias string, difficulty, ceiling int) (
 // equals the difficulty recorded in nonce[0]). Gossip 24 is floor 8 in the
 // test scale.
 func TestDifficultyOracleFloorLetsEqualDifficultyPass(t *testing.T) {
-	tldEnv, wwwEnv := buildClaimWorldAt(t, "foo", 8)
+	tldEnv, wwwEnv := buildClaimWorldAt(t, "footld", 8)
 	lookup := &fakeOracle{fakeClaimLookup: *newFakeClaimLookup(), diff: 24}
-	lookup.putClaim("foo", tldEnv)
+	lookup.putClaim("footld", tldEnv)
 	lookup.put(wwwEnv)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}
@@ -179,12 +179,12 @@ func TestDifficultyOracleFloorLetsEqualDifficultyPass(t *testing.T) {
 func TestDifficultyOracleFloorRejectsThenRemineAccepts(t *testing.T) {
 	// Claim mined at 8 with its hash strictly below 10 bits, gossip 26
 	// (floor 10 in the test scale) → effective 10 → PoW fails → NXDOMAIN.
-	loTld, loWww := buildClaimWorldBelow(t, "foo", 8, 10)
+	loTld, loWww := buildClaimWorldBelow(t, "footld", 8, 10)
 	lookup := &fakeOracle{fakeClaimLookup: *newFakeClaimLookup(), diff: 26}
-	lookup.putClaim("foo", loTld)
+	lookup.putClaim("footld", loTld)
 	lookup.put(loWww)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}
@@ -196,12 +196,12 @@ func TestDifficultyOracleFloorRejectsThenRemineAccepts(t *testing.T) {
 	}
 
 	// Re-mine at 10 with the network still at 26 → accepted.
-	hiTld, hiWww := buildClaimWorldAt(t, "foo", 10)
+	hiTld, hiWww := buildClaimWorldAt(t, "footld", 10)
 	lookup2 := &fakeOracle{fakeClaimLookup: *newFakeClaimLookup(), diff: 26}
-	lookup2.putClaim("foo", hiTld)
+	lookup2.putClaim("footld", hiTld)
 	lookup2.put(hiWww)
 
-	rrs2, rcode2, err := resolveFoo(t, lookup2)
+	rrs2, rcode2, err := resolveFootld(t, lookup2)
 	if err != nil {
 		t.Fatalf("ResolveQuestion (re-mined): unexpected err: %v", err)
 	}
@@ -219,12 +219,12 @@ func TestDifficultyOracleFloorRejectsThenRemineAccepts(t *testing.T) {
 // valid D >= POW_DIFFICULTY_INIT recorded with the claim"), never downgraded
 // to the floor.
 func TestDifficultyOracleFloorBelowRecordedDifficulty(t *testing.T) {
-	tldEnv, wwwEnv := buildClaimWorldAt(t, "foo", 10)
+	tldEnv, wwwEnv := buildClaimWorldAt(t, "footld", 10)
 	lookup := &fakeOracle{fakeClaimLookup: *newFakeClaimLookup(), diff: 24} // floor 8
-	lookup.putClaim("foo", tldEnv)
+	lookup.putClaim("footld", tldEnv)
 	lookup.put(wwwEnv)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}
@@ -241,12 +241,12 @@ func TestDifficultyOracleFloorBelowRecordedDifficulty(t *testing.T) {
 // inferred from nonce[0] alone (Appendix A.4's recorded pow_bits), with no
 // network floor. A difficulty-8 claim resolves as before.
 func TestDifficultyNoOracleKeepsLegacyBehavior(t *testing.T) {
-	tldEnv, wwwEnv := buildClaimWorldAt(t, "foo", 8)
+	tldEnv, wwwEnv := buildClaimWorldAt(t, "footld", 8)
 	lookup := newFakeClaimLookup() // Lookup + LookupClaim only — no oracle
-	lookup.putClaim("foo", tldEnv)
+	lookup.putClaim("footld", tldEnv)
 	lookup.put(wwwEnv)
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}
@@ -263,16 +263,16 @@ func TestDifficultyNoOracleKeepsLegacyBehavior(t *testing.T) {
 // floor applies there identically — a below-floor claim drops out of the
 // filter and the alias misses.
 func TestDifficultySetPathFloorRejectsBelowFloor(t *testing.T) {
-	tldEnv, wwwEnv := buildClaimWorldBelow(t, "foo", 8, 10)
+	tldEnv, wwwEnv := buildClaimWorldBelow(t, "footld", 8, 10)
 	lookup := &fakeSetOracle{
 		fakeClaimSetLookup: fakeClaimSetLookup{fakeClaimLookup: *newFakeClaimLookup()},
 		diff:               26, // floor 10 in the test scale
 	}
-	lookup.putClaim("foo", tldEnv)
+	lookup.putClaim("footld", tldEnv)
 	lookup.put(wwwEnv)
 	lookup.set = []*wire.SignedEnvelope{tldEnv} // the §7.4 collected set
 
-	rrs, rcode, err := resolveFoo(t, lookup)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}

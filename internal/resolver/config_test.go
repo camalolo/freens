@@ -23,12 +23,12 @@ doh = https://dns.quad9.net/dns-query
 ; route = freens | dns | freens-first | dns-first | deny
 ; default is dns-first: safe, non-surprising
 *     = dns-first
-foo   = freens
+footld   = freens
 laurent = freens
 example = deny
 
 [alias-pins]            ; pin aliases to TLD IDs, bypassing claims
-; foo = <base32 tld_id>
+; footld = <base32 tld_id>
 `
 
 func TestParseConfigSpecExample(t *testing.T) {
@@ -52,7 +52,7 @@ func TestParseConfigSpecExample(t *testing.T) {
 
 	wantRoutes := map[string]Route{
 		"*":       RouteDNSFirst,
-		"foo":     RouteFREENS,
+		"footld":  RouteFREENS,
 		"laurent": RouteFREENS,
 		"example": RouteDENY,
 	}
@@ -73,9 +73,9 @@ func TestRouteFor(t *testing.T) {
 		alias string
 		want  Route
 	}{
-		{"foo", RouteFREENS},
-		{"FOO", RouteFREENS}, // normalized to lowercase
-		{"Foo", RouteFREENS}, // normalized
+		{"footld", RouteFREENS},
+		{"FOOTLD", RouteFREENS}, // normalized to lowercase
+		{"Footld", RouteFREENS}, // normalized
 		{"laurent", RouteFREENS},
 		{"example", RouteDENY},
 		{"com", RouteDNSFirst},   // falls through to "*"
@@ -90,8 +90,8 @@ func TestRouteFor(t *testing.T) {
 		}
 	}
 	// RouteFor on a nil config never panics and yields the default.
-	if got := RouteFor(nil, "foo"); got != DefaultRoute {
-		t.Errorf("RouteFor(nil, foo) = %q, want %q", got, DefaultRoute)
+	if got := RouteFor(nil, "footld"); got != DefaultRoute {
+		t.Errorf("RouteFor(nil, footld) = %q, want %q", got, DefaultRoute)
 	}
 }
 
@@ -145,12 +145,12 @@ servers = 9.9.9.9 1.1.1.1, , 8.8.8.8
 func TestParseConfigTLDRouteDefaultStarInjected(t *testing.T) {
 	// [tld-routes] present but no "*" entry → DefaultRoute injected.
 	cfg, err := ParseConfig(`[tld-routes]
-foo = freens
+footld = freens
 `)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]Route{"foo": RouteFREENS, "*": DefaultRoute}
+	want := map[string]Route{"footld": RouteFREENS, "*": DefaultRoute}
 	if !reflect.DeepEqual(cfg.TLDRoutes, want) {
 		t.Errorf("TLDRoutes = %v, want %v", cfg.TLDRoutes, want)
 	}
@@ -163,13 +163,13 @@ weird-key = weird-value
 key2 = v
 
 [tld-routes]
-foo = dns
+footld = dns
 `)
 	if err != nil {
 		t.Fatalf("unknown section should not error: %v", err)
 	}
-	if got := cfg.TLDRoutes["foo"]; got != RouteDNS {
-		t.Errorf("foo route = %q, want dns", got)
+	if got := cfg.TLDRoutes["footld"]; got != RouteDNS {
+		t.Errorf("footld route = %q, want dns", got)
 	}
 	if _, ok := cfg.TLDRoutes["*"]; !ok {
 		t.Error("default '*' route missing")
@@ -181,13 +181,13 @@ func TestParseConfigErrors(t *testing.T) {
 		name string
 		text string
 	}{
-		{"bad route token", "[tld-routes]\nfoo = banana\n"},
-		{"bad route token uppercase", "[tld-routes]\nfoo = FREENS-X\n"},
-		{"bad base32 pin", "[alias-pins]\nfoo = not!!!base32!!!\n"},
-		{"wrong pin length", "[alias-pins]\nfoo = AAAAAA\n"}, // decodes to <32 bytes
+		{"bad route token", "[tld-routes]\nfootld = banana\n"},
+		{"bad route token uppercase", "[tld-routes]\nfootld = FREENS-X\n"},
+		{"bad base32 pin", "[alias-pins]\nfootld = not!!!base32!!!\n"},
+		{"wrong pin length", "[alias-pins]\nfootld = AAAAAA\n"}, // decodes to <32 bytes
 		{"invalid alias in tld-routes", "[tld-routes]\nfoo_bar = freens\n"},
-		{"invalid alias in alias-pins", "[alias-pins]\n-foo = AAAAAAAA\n"},
-		{"unterminated section", "[oops\nfoo = dns\n"},
+		{"invalid alias in alias-pins", "[alias-pins]\n-footld = AAAAAAAA\n"},
+		{"unterminated section", "[oops\nfootld = dns\n"},
 		{"malformed line", "this has no equals or colon\n"},
 	}
 	for _, c := range cases {
@@ -214,18 +214,18 @@ func makeTLDIDBytes() []byte {
 func TestAliasPinRoundTrip(t *testing.T) {
 	raw := makeTLDIDBytes()
 	enc := base32.StdEncoding.EncodeToString(raw) // includes padding
-	cfg, err := ParseConfig(fmt.Sprintf("[alias-pins]\nfoo = %s\n", enc))
+	cfg, err := ParseConfig(fmt.Sprintf("[alias-pins]\nfootld = %s\n", enc))
 	if err != nil {
 		t.Fatalf("ParseConfig pin: %v", err)
 	}
-	got := ResolvePin(cfg, "foo")
+	got := ResolvePin(cfg, "footld")
 	if !bytes.Equal(got, raw) {
-		t.Errorf("ResolvePin(foo) = %x, want %x", got, raw)
+		t.Errorf("ResolvePin(footld) = %x, want %x", got, raw)
 	}
 	// Case-insensitive alias lookup.
-	got = ResolvePin(cfg, "FOO")
+	got = ResolvePin(cfg, "FOOTLD")
 	if !bytes.Equal(got, raw) {
-		t.Errorf("ResolvePin(FOO) = %x, want %x (normalized)", got, raw)
+		t.Errorf("ResolvePin(FOOTLD) = %x, want %x (normalized)", got, raw)
 	}
 	// Unpinned alias → nil.
 	if got := ResolvePin(cfg, "bar"); got != nil {
@@ -236,8 +236,8 @@ func TestAliasPinRoundTrip(t *testing.T) {
 		t.Errorf("ResolvePin(UPPER) = %x, want nil", got)
 	}
 	// nil config never panics.
-	if got := ResolvePin(nil, "foo"); got != nil {
-		t.Errorf("ResolvePin(nil, foo) = %x, want nil", got)
+	if got := ResolvePin(nil, "footld"); got != nil {
+		t.Errorf("ResolvePin(nil, footld) = %x, want nil", got)
 	}
 }
 

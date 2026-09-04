@@ -48,9 +48,9 @@ func (e *errLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wi
 // NXDOMAIN), and because SERVFAIL is not §10.4-cacheable, the retry after
 // recovery actually re-queries and succeeds.
 func TestDegradedClaimLookupIsSERVFAILAndUncached(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
+	w := newClaimedWorld(t, "footld")
 	lookup := &flakyClaimLookup{fakeClaimLookup: *newFakeClaimLookup()}
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 
 	clock := int64(fixedNow)
@@ -60,7 +60,7 @@ func TestDegradedClaimLookupIsSERVFAILAndUncached(t *testing.T) {
 	// Degraded window: every claim query answers SERVFAIL.
 	lookup.degraded.Store(true)
 	for i := 0; i < 3; i++ {
-		msg := serveOnce(t, r, "www.foo.", dns.TypeA)
+		msg := serveOnce(t, r, "www.footld.", dns.TypeA)
 		if msg.Rcode != dns.RcodeServerFailure {
 			t.Fatalf("degraded query %d: rcode = %d, want SERVFAIL", i, msg.Rcode)
 		}
@@ -71,7 +71,7 @@ func TestDegradedClaimLookupIsSERVFAILAndUncached(t *testing.T) {
 
 	// Recovery: the very next query resolves (no negative entry to expire).
 	lookup.degraded.Store(false)
-	msg := serveOnce(t, r, "www.foo.", dns.TypeA)
+	msg := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if msg.Rcode != dns.RcodeSuccess || len(msg.Answer) != 1 {
 		t.Fatalf("post-recovery response = rcode %d with %d answers, want success/1", msg.Rcode, len(msg.Answer))
 	}
@@ -88,7 +88,7 @@ func TestDegradedRecordLookupIsSERVFAIL(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock })
 
-	msg := serveOnce(t, r, "www.foo.", dns.TypeA)
+	msg := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if msg.Rcode != dns.RcodeServerFailure {
 		t.Fatalf("degraded record hop: rcode = %d, want SERVFAIL", msg.Rcode)
 	}

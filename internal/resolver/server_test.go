@@ -53,7 +53,7 @@ func TestServerQueryCounterIncrements(t *testing.T) {
 		srv, reg := newCountingServer(t, res)
 
 		fw := &fakeResponseWriter{}
-		srv.handleDNS(fw, new(dns.Msg).SetQuestion("www.foo.", dns.TypeA))
+		srv.handleDNS(fw, new(dns.Msg).SetQuestion("www.footld.", dns.TypeA))
 
 		if len(fw.msgs) != 1 {
 			t.Fatalf("wrote %d msgs, want 1 (exactly one count per query)", len(fw.msgs))
@@ -68,7 +68,7 @@ func TestServerQueryCounterIncrements(t *testing.T) {
 		srv, reg := newCountingServer(t, res)
 
 		fw := &fakeResponseWriter{}
-		srv.handleDNS(fw, new(dns.Msg).SetQuestion("nope.foo.", dns.TypeAAAA))
+		srv.handleDNS(fw, new(dns.Msg).SetQuestion("nope.footld.", dns.TypeAAAA))
 
 		if fw.msgs[0].Rcode != dns.RcodeNameError {
 			t.Fatalf("rcode = %d, want NXDOMAIN", fw.msgs[0].Rcode)
@@ -84,7 +84,7 @@ func TestServerQueryCounterIncrements(t *testing.T) {
 		srv, reg := newCountingServer(t, res)
 
 		fw := &fakeResponseWriter{}
-		srv.handleDNS(fw, new(dns.Msg).SetQuestion("www.foo.", dns.TypeA))
+		srv.handleDNS(fw, new(dns.Msg).SetQuestion("www.footld.", dns.TypeA))
 
 		if fw.msgs[0].Rcode != dns.RcodeServerFailure {
 			t.Fatalf("rcode = %d, want SERVFAIL", fw.msgs[0].Rcode)
@@ -114,7 +114,7 @@ func TestServerQueryCounterIncrements(t *testing.T) {
 		srv, reg := newCountingServer(t, res)
 
 		for i := 0; i < 3; i++ {
-			srv.handleDNS(&fakeResponseWriter{}, new(dns.Msg).SetQuestion("x.foo.", dns.TypeTXT))
+			srv.handleDNS(&fakeResponseWriter{}, new(dns.Msg).SetQuestion("x.footld.", dns.TypeTXT))
 		}
 		if got := exposition(t, reg); !bytes.Contains([]byte(got), []byte(`freens_dns_queries_total{qtype="TXT",status="nxdomain"} 3`)) {
 			t.Errorf("exposition missing aggregated TXT/nxdomain count:\n%s", got)
@@ -130,7 +130,7 @@ func TestServerWithoutQueryCounter(t *testing.T) {
 	srv := NewServer("127.0.0.1:0", "udp", res) // no SetQueryCounter
 
 	fw := &fakeResponseWriter{}
-	srv.handleDNS(fw, new(dns.Msg).SetQuestion("x.foo.", dns.TypeA))
+	srv.handleDNS(fw, new(dns.Msg).SetQuestion("x.footld.", dns.TypeA))
 	if len(fw.msgs) != 1 || fw.msgs[0].Rcode != dns.RcodeNameError {
 		t.Fatalf("passthrough failed: %d msgs, rcode %d", len(fw.msgs), fw.msgs[0].Rcode)
 	}
@@ -144,14 +144,14 @@ func TestResponseCacheMetrics(t *testing.T) {
 	c := NewResponseCache(0, func() int64 { return now })
 	c.SetMetrics(reg)
 
-	key := cacheKeyFor(dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	key := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
 
 	// Miss: empty cache.
 	if _, _, _, ok := c.get(key); ok {
 		t.Fatal("first get should miss")
 	}
 	// Hit: stored freens outcome retrieved.
-	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
+	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
 	c.putFreens(key, []dns.RR{rr}, dns.RcodeSuccess, true)
 	if _, _, _, ok := c.get(key); !ok {
 		t.Fatal("second get should hit")

@@ -48,11 +48,11 @@ func (b *busyClaimSource) LookupClaim(context.Context, string, int64) (*wire.Sig
 	return nil, b.err
 }
 
-// freensOnlyConfig routes "foo" to freens with NO alias pin, so the claim
+// freensOnlyConfig routes "footld" to freens with NO alias pin, so the claim
 // layer (the path the walk refusal arrives on) actually runs.
 func freensOnlyConfig(t *testing.T) *Config {
 	t.Helper()
-	cfg, err := ParseConfig("[tld-routes]\nfoo = freens\n")
+	cfg, err := ParseConfig("[tld-routes]\nfootld = freens\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func freensOnlyConfig(t *testing.T) *Config {
 }
 
 func busyQuestion() dns.Question {
-	return dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	return dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 }
 
 // TestWalkBusyClaimSetSERVFAILNotNXDOMAIN: the §7.4 set-collection refusal
@@ -102,7 +102,7 @@ func TestWalkBusySERVFAILNeverCached(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		fw := &fakeResponseWriter{}
-		r.ServeDNS(fw, new(dns.Msg).SetQuestion("www.foo.", dns.TypeA))
+		r.ServeDNS(fw, new(dns.Msg).SetQuestion("www.footld.", dns.TypeA))
 		if len(fw.msgs) != 1 {
 			t.Fatalf("query %d: %d replies, want 1", i, len(fw.msgs))
 		}
@@ -144,7 +144,7 @@ func startCappedResolver(t *testing.T, max int) (*Resolver, *gatedBusySource) {
 	// well-formed 32-byte tld_id or EncodeWireName rejects hop 0 before the
 	// gated Lookup is ever reached.
 	cfg := freensOnlyConfig(t)
-	cfg.AliasPins["foo"] = make([]byte, 32)
+	cfg.AliasPins["footld"] = make([]byte, 32)
 	r := New(cfg, src, nil)
 	r.MaxConcurrentResolutions = max
 	return r, src
@@ -157,9 +157,9 @@ func startCappedResolver(t *testing.T, max int) (*Resolver, *gatedBusySource) {
 func TestResolutionCapRefusesDistinctQuestions(t *testing.T) {
 	r, src := startCappedResolver(t, 1)
 
-	qA := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
-	qA2 := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET} // identical
-	qB := dns.Question{Name: "other.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	qA := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	qA2 := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET} // identical
+	qB := dns.Question{Name: "other.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 
 	type out struct {
 		rrs []dns.RR
@@ -225,7 +225,7 @@ func TestResolutionCapDisabled(t *testing.T) {
 	r, src := startCappedResolver(t, -1)
 
 	var wg sync.WaitGroup
-	for _, name := range []string{"a.foo.", "b.foo."} {
+	for _, name := range []string{"a.footld.", "b.footld."} {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
@@ -254,9 +254,9 @@ func TestResolutionCapSERVFAILNeverCached(t *testing.T) {
 	r, src := startCappedResolver(t, 1)
 	r.Cache = NewResponseCache(0, nil)
 
-	// Leader holds the only slot on a.foo.
+	// Leader holds the only slot on a.footld.
 	go func() {
-		q := dns.Question{Name: "a.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		q := dns.Question{Name: "a.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 		_, _, _, _ = r.resolveShared(context.Background(), q, cacheKeyFor(q))
 	}()
 	deadline := time.Now().Add(3 * time.Second)
@@ -266,7 +266,7 @@ func TestResolutionCapSERVFAILNeverCached(t *testing.T) {
 	defer close(src.release)
 
 	fw := &fakeResponseWriter{}
-	r.ServeDNS(fw, new(dns.Msg).SetQuestion("b.foo.", dns.TypeA))
+	r.ServeDNS(fw, new(dns.Msg).SetQuestion("b.footld.", dns.TypeA))
 	if len(fw.msgs) != 1 {
 		t.Fatalf("capped query: %d replies, want 1", len(fw.msgs))
 	}

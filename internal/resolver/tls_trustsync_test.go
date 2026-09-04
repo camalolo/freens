@@ -101,16 +101,16 @@ func addTLSCA(t *testing.T, w *claimedWorld, alias string) []byte {
 }
 
 func TestTrustSyncNotifiedOnVerifiedOwnerCA(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	caDER := addTLSCA(t, w, "foo")
+	w := newClaimedWorld(t, "footld")
+	caDER := addTLSCA(t, w, "footld")
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 
 	sync := &captureSync{}
 	r := newResolver(claimConfig(), lookup, nil)
 	r.TLSSync = sync
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
 		t.Fatalf("answer broken by the hook: rcode=%d len=%d err=%v", rcode, len(rrs), err)
@@ -120,8 +120,8 @@ func TestTrustSyncNotifiedOnVerifiedOwnerCA(t *testing.T) {
 		t.Fatalf("unexpected dead signal: %+v", got)
 	}
 	call := sync.cas[0]
-	if call.alias != "foo" {
-		t.Fatalf("alias = %q, want foo", call.alias)
+	if call.alias != "footld" {
+		t.Fatalf("alias = %q, want footld", call.alias)
 	}
 	if !bytesEq(call.caDER, caDER) {
 		t.Fatal("caDER bytes do not match the apex TLSCA RR")
@@ -132,14 +132,14 @@ func TestTrustSyncNotifiedOnVerifiedOwnerCA(t *testing.T) {
 }
 
 func TestTrustSyncSilentWithoutTLSCA(t *testing.T) {
-	w := newClaimedWorld(t, "foo") // no TLSCA in the apex
+	w := newClaimedWorld(t, "footld") // no TLSCA in the apex
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 	sync := &captureSync{}
 	r := newResolver(claimConfig(), lookup, nil)
 	r.TLSSync = sync
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	if _, rcode, _, err := r.ResolveQuestion(context.Background(), q); err != nil || rcode != dns.RcodeSuccess {
 		t.Fatalf("answer broken: rcode=%d err=%v", rcode, err)
 	}
@@ -153,8 +153,8 @@ func TestTrustSyncSilentWithoutTLSCA(t *testing.T) {
 // set has no live winner — the resolver NXDOMAINs with no tld_id, and trust
 // sync must hear the death (purge regardless of identity).
 func TestTrustSyncNotifiedOnRevokedAlias(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	addTLSCA(t, w, "foo")
+	w := newClaimedWorld(t, "footld")
+	addTLSCA(t, w, "footld")
 	// Re-sign the claim carrier as a tombstone (revoke = true, rrset nil).
 	rec := *w.tldEnv.Record
 	b := true
@@ -165,20 +165,20 @@ func TestTrustSyncNotifiedOnRevokedAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", tomb)
+	lookup.putClaim("footld", tomb)
 
 	sync := &captureSync{}
 	r := newResolver(claimConfig(), lookup, nil)
 	r.TLSSync = sync
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
 	_ = rcode // NXDOMAIN or its DNS-first fallthrough is fine; the point is the signal
 	waitFor(t, func() bool { return sync.deadCount() == 1 })
-	if got := sync.deads[0]; got.alias != "foo" {
-		t.Fatalf("dead alias = %q, want foo", got.alias)
+	if got := sync.deads[0]; got.alias != "footld" {
+		t.Fatalf("dead alias = %q, want footld", got.alias)
 	}
 	// Either flavor is correct: a nil tldID (claim layer found no live
 	// winner — purge regardless of identity) or the concrete tldID (the walk
@@ -194,10 +194,10 @@ func TestTrustSyncNotifiedOnRevokedAlias(t *testing.T) {
 // A revoked SUB-name must NOT kill the alias-level CA (the apex is healthy);
 // the owner CA notification still fires.
 func TestTrustSyncKeptOnSubNameRevoke(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	caDER := addTLSCA(t, w, "foo")
-	// host1.foo: revoked (tombstone at the sub-name's K_name).
-	subWire, err := naming.EncodeWireName([]string{"host1"}, "foo", w.tldID)
+	w := newClaimedWorld(t, "footld")
+	caDER := addTLSCA(t, w, "footld")
+	// host1.footld: revoked (tombstone at the sub-name's K_name).
+	subWire, err := naming.EncodeWireName([]string{"host1"}, "footld", w.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,17 +212,17 @@ func TestTrustSyncKeptOnSubNameRevoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 	lookup.put(subTomb)
 
 	sync := &captureSync{}
 	r := newResolver(claimConfig(), lookup, nil)
 	r.TLSSync = sync
-	// www.foo still answers; the TLSCA must be re-notified, no death signal.
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	// www.footld still answers; the TLSCA must be re-notified, no death signal.
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	if _, rcode, _, err := r.ResolveQuestion(context.Background(), q); err != nil || rcode != dns.RcodeSuccess {
-		t.Fatalf("www.foo should still answer: rcode=%d err=%v", rcode, err)
+		t.Fatalf("www.footld should still answer: rcode=%d err=%v", rcode, err)
 	}
 	waitFor(t, func() bool { return sync.caCount() == 1 })
 	if !bytesEq(sync.cas[0].caDER, caDER) {
@@ -234,10 +234,10 @@ func TestTrustSyncKeptOnSubNameRevoke(t *testing.T) {
 	}
 	// And the tombstoned sub-name itself NXDOMAINs (spec §8.5), still without
 	// a death signal for the alias.
-	q2 := dns.Question{Name: "host1.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q2 := dns.Question{Name: "host1.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q2)
 	if err != nil {
-		t.Fatalf("host1.foo: %v", err)
+		t.Fatalf("host1.footld: %v", err)
 	}
 	if rcode != dns.RcodeNameError || len(rrs) != 0 {
 		t.Fatalf("revoked sub-name answered: rcode=%d len=%d", rcode, len(rrs))
@@ -250,15 +250,15 @@ func TestTrustSyncKeptOnSubNameRevoke(t *testing.T) {
 
 // The sink runs asynchronously: a SLOW sink must not delay the DNS answer.
 func TestTrustSyncAsyncNeverBlocks(t *testing.T) {
-	w := newClaimedWorld(t, "foo")
-	addTLSCA(t, w, "foo")
+	w := newClaimedWorld(t, "footld")
+	addTLSCA(t, w, "footld")
 	lookup := newFakeClaimLookup()
-	lookup.putClaim("foo", w.tldEnv)
+	lookup.putClaim("footld", w.tldEnv)
 	lookup.put(w.wwwEnv)
 	sync := &captureSync{delay: 250 * time.Millisecond}
 	r := newResolver(claimConfig(), lookup, nil)
 	r.TLSSync = sync
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	start := time.Now()
 	if _, _, _, err := r.ResolveQuestion(context.Background(), q); err != nil {
 		t.Fatal(err)

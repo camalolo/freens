@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — §7.7 reserved-alias policy: freens can never become ".com"
+
+Prompted by the "what happens if someone registers `com`?" audit. The
+alias IS the TLD in freens, so a claim on a real TLD string would make
+the claimant the owner of the whole freens `.com` namespace — and every
+name under it that upstream DNS answers NXDOMAIN for (typos, expired
+domains, filter-NXDOMAINed names) falls through the §9.3 default route
+straight to the claimant, **with a §9.5 owner CA**: a phishing site with
+a green padlock. The old §9.3 answer (default dns-first never silently
+shadows live domains) closed the accidental-collision hole but not the
+deliberate-abuse one, and the flat PoW gave squatters zero per-alias
+friction.
+
+The reference implementation now refuses at all three enforcement
+points, so a first-time user cannot be misled onto a spoofed site even
+if malicious nodes fully self-witness a claim (5 rogue nodes):
+
+- **Mint**: `freens register` and the web UI register form refuse an
+  alias equal to a delegated ICANN TLD (IANA root-zone snapshot
+  2026090300, embedded — 1445 entries incl. IDN A-labels) or an IANA
+  special-use name (`localhost`, `onion`, `test`, `example`, `invalid`,
+  `local`, `arpa`, `home` — enumerated by hand; no DNS-based check can
+  see them). The gate fires before any keygen/PoW/network work. The CLI
+  has `-allow-reserved` (with a loud warning); the web UI has NO
+  override — its error points at the CLI. The list is a compiled-in
+  snapshot on purpose (a runtime "ask upstream DNS" gate was rejected:
+  spoofable exactly when it matters, fails on upstream-less networks,
+  and leaves witnesses disagreeing on a policy that must be
+  deterministic); it only ever grows, refreshed at release time.
+- **Witness**: the §6.3 witness RPC refuses to co-sign reserved-alias
+  claims before any crypto work (error 305). No quorum, no claim.
+- **Resolve**: `freensResolve` treats a reserved alias as claim-less —
+  NXDOMAIN, no network walk — even if a fully-witnessed claim exists in
+  the network; the admin `/resolve` face behaves identically.
+  `[alias-pins]` win over the gate (operator policy), checked first.
+
+Escapes and non-goals: `-allow-reserved` (CLI flag + daemon flag +
+`[options] allow-reserved = true`) is the single deliberate local
+override for all three gates. Existing holders are NEVER gated —
+renewal/re-publish/recovery/revoke keep working regardless of the list,
+so a future snapshot change cannot strand a name. Spec: new §7.7;
+§9.3's collision policy remains as the second line of defense. Found
+while testing: the resolver suite's canonical test alias `foo` is ITSELF
+a delegated gTLD in the 2026 snapshot — the fixtures now use `footld`
+(and the integration test's `foo` sails through on its alias-pin,
+proving the pin exemption live).
+
 ## Unreleased — "confirmed" now names the address that carried it
 
 Found live on the fleet: a friend's box reached us only through EPHEMERAL

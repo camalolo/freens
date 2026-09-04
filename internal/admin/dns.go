@@ -50,6 +50,24 @@ func (s *Server) SetReloader(fn func() (string, error)) {
 	s.mu.Unlock()
 }
 
+// SetAllowReserved mirrors the daemon's §7.6 override flag into the admin
+// face (naming/reserved.go): with it off (the default), the claim hop of
+// /resolve and its helpers treats a reserved-TLD alias (com, localhost, …)
+// as claim-less — "a node running without -allow-reserved never accepts a
+// freens .com" holds on the admin endpoints too, not just the DNS face.
+func (s *Server) SetAllowReserved(b bool) {
+	s.mu.Lock()
+	s.allowReserved = b
+	s.mu.Unlock()
+}
+
+// allowReservedEnabled reports the §7.6 override state.
+func (s *Server) allowReservedEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.allowReserved
+}
+
 // reloader returns the wired reloader (or nil).
 func (s *Server) reloader() func() (string, error) {
 	s.mu.Lock()

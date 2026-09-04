@@ -24,14 +24,14 @@ import (
 	"github.com/miekg/dns"
 )
 
-// recoveredWorld is the §8.4 fixture for alias "foo":
+// recoveredWorld is the §8.4 fixture for alias "footld":
 //
 //   - R1: the original self-certifying TLD record (owner = signer = K1,
 //     tld_id = SHA-256(K1)) carrying a 2-of-3 §5.4 recovery policy;
 //   - R2: the §8.4 recovery hand-off record (owner = signer = K2 — the NEW
 //     primary signs, unlike §8.3 — sequence 2 = prev + 1, prev_hash =
 //     H_record(R1), policy rotated);
-//   - www2: the www.foo record signed by K2 after the hand-off (authorized
+//   - www2: the www.footld record signed by K2 after the hand-off (authorized
 //     by R2 via parent.Owner == child.Signer);
 //   - evidence: the 2-of-3 declaration over (H(R1), K2, notBefore).
 type recoveredWorld struct {
@@ -79,7 +79,7 @@ func newRecoveredWorld(t *testing.T, notAfterOffset int64) *recoveredWorld {
 		t.Fatal(err)
 	}
 	w.tldID = tldID
-	tldWire, err := naming.EncodeWireName(nil, "foo", tldID)
+	tldWire, err := naming.EncodeWireName(nil, "footld", tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func newRecoveredWorld(t *testing.T, notAfterOffset int64) *recoveredWorld {
 	}
 
 	// www2: the child signed by the new primary after the hand-off.
-	wwwWire, err := naming.EncodeWireName([]string{"www"}, "foo", tldID)
+	wwwWire, err := naming.EncodeWireName([]string{"www"}, "footld", tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,11 +213,11 @@ func (f *fakeEvidenceSource) RecoveryEvidence(_ context.Context, recordHash []by
 	return f.evidence[hex.EncodeToString(recordHash)], nil
 }
 
-// resolveWwwFooRecovered mirrors transfer_accept_test.go's resolveWwwFoo.
+// resolveWwwFooRecovered mirrors transfer_accept_test.go's resolveWwwFootld.
 func resolveWwwFooRecovered(t *testing.T, tldID []byte, lookup RecordLookup) ([]dns.RR, int, bool, error) {
 	t.Helper()
 	r := newResolver(transferConfig(t, tldID), lookup, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	return r.ResolveQuestion(context.Background(), q)
 }
 
@@ -225,7 +225,7 @@ func resolveWwwFooRecovered(t *testing.T, tldID []byte, lookup RecordLookup) ([]
 // record served at K_tld is the recovery record R2 (owner = signer = K2,
 // prev_hash-linked), www is signed by the new primary K2, the source can
 // produce R1 by hash AND the 2-of-3 declaration for R2, and the resolver's
-// clock is past execute_not_before — so www.foo resolves, aa=true.
+// clock is past execute_not_before — so www.footld resolves, aa=true.
 func TestRecoveredTLDAcceptedAfterTimelock(t *testing.T) {
 	w := newRecoveredWorld(t, -60) // timelock elapsed a minute ago
 	src := newFakeEvidenceSource()
@@ -342,7 +342,7 @@ func TestPlainWorldUnchangedWithEvidenceSource(t *testing.T) {
 	src.put(w.tldEnv)
 	src.put(w.wwwEnv)
 
-	rrs, rcode, aa, err := resolveWwwFoo(t, w.tldID, src)
+	rrs, rcode, aa, err := resolveWwwFootld(t, w.tldID, src)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}

@@ -713,6 +713,16 @@ func (s *Server) walkKeyForLabels(ctx context.Context, labels []string, alias st
 // cache-on-fetch) and falls back to a raw iterative GET otherwise. Returns
 // (nil, nil) when no claim is published for the alias.
 func (s *Server) claimTLDID(ctx context.Context, alias string) ([]byte, error) {
+	// §7.6 reserved-alias gate (naming/reserved.go): without this daemon's
+	// -allow-reserved override, a reserved-TLD alias is claim-less here too
+	// — the admin face (/resolve, the CLI `freens resolve`/`get -peers`
+	// paths that ride it) agrees with the DNS face and never accepts a
+	// freens ".com" no matter what the network holds. (nil, nil) is the
+	// established "no claim published" answer, so callers fall through to
+	// their normal miss handling.
+	if !s.allowReservedEnabled() && naming.IsReservedTLD(alias) {
+		return nil, nil
+	}
 	var env *wire.SignedEnvelope
 	var err error
 	if s.lookup != nil {

@@ -192,6 +192,7 @@ func run(args []string) error {
 	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr := f.dhtAddr, f.nodeSeedHex, f.peersCSV, f.peersFile, f.metricsAddr
 	passive, advertiseAddr, stunAddr := f.passive, f.advertiseAddr, f.stunAddr
 	turnAddr, turnRelayAddr, persistDir, idnaFlag := f.turnAddr, f.turnRelayAddr, f.persistDir, f.idna
+	allowReservedFlag := f.allowReserved
 	upnpEnabled := f.upnpEnabled
 
 	// Per-setting precedence everywhere below: an explicitly-passed flag
@@ -267,6 +268,11 @@ func run(args []string) error {
 	if *upstreamCSV != "" {
 		cfg.UpstreamServers = splitCSV(*upstreamCSV)
 	}
+	// §7.6 reserved-alias override: flag > config [options] > default (off).
+	// One effective value drives BOTH gates — the witness side (NodeConfig.
+	// AllowReserved) and the resolver/admin side (cfg.AllowReserved + the
+	// admin Server mirror) — so a node cannot end up with split policy.
+	cfg.AllowReserved = pickBool(set["allow-reserved"], *allowReservedFlag, cfg.AllowReserved, false)
 	applyUpstreamDefault(cfg)
 
 	logger.Info("freens daemon starting",
@@ -275,6 +281,7 @@ func run(args []string) error {
 		"upstream", cfg.UpstreamServers,
 		"load_dir", loadEffective,
 		"idna", naming.IDNANormalizer != nil, // §3.2 U-labels accepted?
+		"allow_reserved", cfg.AllowReserved, // §7.6 override active?
 	)
 
 	// -peers-file: validated and parsed AFTER config/flag validation but
@@ -368,15 +375,16 @@ func run(args []string) error {
 			turnSrvCfg = &turn.ServerConfig{ListenAddr: turnEffective, Log: logger}
 		}
 		node, err := dht.NewNode(dht.NodeConfig{
-			Keypair:    nodeKP,
-			ListenAddr: dhtEffective,
-			Store:      store,
-			Logger:     logger,
-			Passive:    passiveEffective,
-			Advertise:  advertise,
-			Stun:       stunEffective,
-			TurnRelay:  turnRelayEffective,
-			TurnServer: turnSrvCfg,
+			Keypair:       nodeKP,
+			ListenAddr:    dhtEffective,
+			Store:         store,
+			Logger:        logger,
+			Passive:       passiveEffective,
+			Advertise:     advertise,
+			Stun:          stunEffective,
+			TurnRelay:     turnRelayEffective,
+			TurnServer:    turnSrvCfg,
+			AllowReserved: cfg.AllowReserved,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)
@@ -408,6 +416,7 @@ func run(args []string) error {
 		// the "no -peers needed" path. Node-less daemons still serve
 		// status-only.
 		adminSrv = admin.New(node, dhtLookup, version, logger)
+		adminSrv.SetAllowReserved(cfg.AllowReserved) // §7.6: keep the admin face in step with the resolver face
 		go func() {
 			if err := adminSrv.ListenAndServe(home.AdminSock()); err != nil {
 				logger.Warn("admin socket failed", "sock", home.AdminSock(), "error", err)
@@ -1593,7 +1602,7 @@ type flags struct {
 	configPath, listenAddr, dnsAddr, upstreamCSV, loadDir        *string
 	dhtAddr, nodeSeedHex, peersCSV, peersFile, metricsAddr       *string
 	advertiseAddr, stunAddr, turnAddr, turnRelayAddr, persistDir *string
-	passive, idna, upnpEnabled                                   *bool
+	passive, idna, upnpEnabled, allowReserved                    *bool
 }
 
 // defineFlags registers every freens flag on fs and returns their value
@@ -1653,6 +1662,14 @@ func defineFlags(fs *flag.FlagSet) *flags {
 		"punycode (xn--…) ASCII, which strict LDH accepts either way; subdomain labels\n"+
 		"(the part before the alias) stay strict ASCII LDH regardless. Equivalent to\n"+
 		"[options] \"idna = true\" in the config file; an explicit -idna=false overrides it.")
+	f.allowReserved = fs.Bool("allow-reserved", false, "override the §7.6 reserved-alias policy: this daemon may WITNESS (co-sign\n"+
+		"claims for) and RESOLVE freens aliases that equal delegated ICANN TLDs or IANA\n"+
+		"special-use names (com, net, localhost, …). Default OFF: register refuses to mint\n"+
+		"such claims, the node refuses to witness them, and the resolver + admin faces\n"+
+		"treat them as claim-less (NXDOMAIN) even if rogue-witnessed claims exist — so a\n"+
+		"first-time user can never be routed to a spoofed site under a real-TLD-shaped\n"+
+		"freens name. Deliberately local: other nodes keep the default. Equivalent to\n"+
+		"[options] \"allow-reserved = true\"; an explicit -allow-reserved=false overrides it.")
 	return f
 }
 

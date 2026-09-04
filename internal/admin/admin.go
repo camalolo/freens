@@ -95,6 +95,13 @@ type Server struct {
 	dnsResolve func(ctx context.Context, query []byte) ([]byte, error)
 	reloadConf func() (string, error)
 
+	// allowReserved is the §7.6 override mirrored from the daemon's
+	// -allow-reserved flag (SetAllowReserved, same late-wiring idiom): when
+	// false (the default) the claim hop inside /resolve and /publish's
+	// helpers treats a reserved-TLD alias as claim-less — the admin face
+	// agrees with the resolver face on what this node accepts.
+	allowReserved bool
+
 	// jobsMu/jobs/jobSeq are the async-publish registry (jobs.go): POST
 	// /publish {"async":true} runs the keyed put in the background and
 	// hands the caller an id to poll at GET /job/{id}.

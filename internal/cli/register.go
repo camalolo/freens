@@ -27,6 +27,7 @@ import (
 	"context"
 	"encoding/base32"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -76,6 +77,7 @@ func cmdRegister(args []string) error {
 	outKey := fs.String("out-key", "", "where to write a GENERATED owner key (default <home>/keys/<alias>.key; 0600)")
 	outDir := fs.String("out-dir", ".", "directory for the artifacts (<alias>.tld.cbor)")
 	noRecovery := fs.Bool("no-recovery", false, "do NOT generate the default 2-of-3 recovery keyfiles / embed a spec 5.4 policy in the apex record")
+	allowReserved := fs.Bool("allow-reserved", false, "override the §7.6 reserved-alias policy: allow claiming an alias that equals a delegated ICANN TLD or IANA special-use name (com, localhost, …)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -95,6 +97,30 @@ func cmdRegister(args []string) error {
 	}
 	if *alias == "" {
 		return usageErr("register needs an alias: %s register <alias>  (e.g. %s register alice; -ip and -peers default to this machine's outbound IPv4 and the running daemon)", ProgName, ProgName)
+	}
+	// §7.6 reserved-alias gate (naming/reserved.go) — BEFORE any key
+	// generation, PoW mining, or network traffic: an alias equal to a
+	// delegated ICANN TLD or IANA special-use name is refused so a freens
+	// claim can never masquerade as part of real DNS (the freens ".com"
+	// phishing class). -allow-reserved is the deliberate local override;
+	// the web UI has no override, so scripts that must do this come here.
+	// The reserved error is returned WRAPPED AS-IS (not through usageErr)
+	// so callers can errors.Is it against naming.ErrReserved.
+	if !*allowReserved {
+		aliasN, err := naming.CheckRegisterable(*alias)
+		if err != nil {
+			if errors.Is(err, naming.ErrReserved) {
+				return err
+			}
+			return usageErr("%q is not a valid alias: %v", *alias, err)
+		}
+		*alias = aliasN
+	} else if _, verr := naming.ValidateAlias(*alias); verr != nil {
+		// The override skips the reserved-alias gate, never §3.2 syntax.
+		return usageErr("%q is not a valid alias: %v", *alias, verr)
+	}
+	if *allowReserved {
+		fmt.Printf("*** -allow-reserved: claiming a reserved TLD alias (%s) — freens nodes will refuse to witness it and resolvers refuse to resolve it by default (spec §7.6); other freens users will NOT see this namespace\n", *alias)
 	}
 	if *difficulty < constants.PoWDifficultyInit {
 		return usageErr("-difficulty must be >= %d (the network default, Appendix A.4)", constants.PoWDifficultyInit)

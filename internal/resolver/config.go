@@ -72,6 +72,18 @@ type Config struct {
 	// where the OS resolver otherwise never resolves single-label freens
 	// names at all, and pairs it with a "freens" connection suffix.
 	SuffixRescue bool
+
+	// AllowReserved overrides the §7.6 reserved-alias policy
+	// (naming/reserved.go): default OFF, meaning freensResolve treats an
+	// alias that equals a delegated ICANN TLD or an IANA special-use name
+	// ("com", "localhost", …) as claim-less — NXDOMAIN, no network walk —
+	// EVEN IF a (rogue-witnessed) claim for it exists in the network. This
+	// is the resolution-side gate that keeps a first-time user from being
+	// routed to a spoofed site under a real-TLD-shaped freens name.
+	// [options] "allow-reserved = true" or the daemon's -allow-reserved
+	// flag opts in. [alias-pins] are checked BEFORE this gate: an explicit
+	// local pin is the operator's own policy and still resolves.
+	AllowReserved bool
 }
 
 // ParseConfig parses a §9.3 INI config string into a *Config.
@@ -179,6 +191,12 @@ func ParseConfig(text string) (*Config, error) {
 					return nil, err
 				}
 				cfg.SuffixRescue = b
+			case "allow-reserved":
+				b, err := parseConfigBool(value)
+				if err != nil {
+					return nil, err
+				}
+				cfg.AllowReserved = b
 			}
 		case "alias-pins":
 			// No "*" wildcard for pins; every alias must validate.

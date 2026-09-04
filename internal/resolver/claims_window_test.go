@@ -107,13 +107,13 @@ func windowedWorld(t *testing.T, alias string, claimTS uint64, ip net.IP, create
 // at fixedNow-50, window open for 30 d) plus a FRESH re-claimer whose carrier
 // was created at/after the death ⇒ NXDOMAIN for the whole window.
 func TestResolveQuestionReuseWindowLocksAlias(t *testing.T) {
-	tomb := windowedWorld(t, "foo", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 50),
+	tomb := windowedWorld(t, "footld", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 50),
 		fixedNow-200, fixedNow-50, true) // dead 50 s ago: window open
-	fresh := windowedWorld(t, "foo", uint64(fixedNow-10), net.IPv4(203, 0, 113, 51),
+	fresh := windowedWorld(t, "footld", uint64(fixedNow-10), net.IPv4(203, 0, 113, 51),
 		fixedNow-30, fixedNow+3600, true) // created AFTER the death
 
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{tomb.tldEnv, fresh.tldEnv}, tomb, fresh)
-	rrs, rcode, err := resolveFoo(t, lookup)
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{tomb.tldEnv, fresh.tldEnv}, tomb, fresh)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
@@ -129,13 +129,13 @@ func TestResolveQuestionReuseWindowLocksAlias(t *testing.T) {
 // but the surviving claim's carrier was created BEFORE the death (an
 // unbroken renewal chain / live competitor) ⇒ the alias resolves normally.
 func TestResolveQuestionReuseWindowAllowsOverlappingRenewal(t *testing.T) {
-	tomb := windowedWorld(t, "foo", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 52),
+	tomb := windowedWorld(t, "footld", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 52),
 		fixedNow-200, fixedNow-50, true)
-	overlapping := windowedWorld(t, "foo", uint64(fixedNow-10), net.IPv4(203, 0, 113, 53),
+	overlapping := windowedWorld(t, "footld", uint64(fixedNow-10), net.IPv4(203, 0, 113, 53),
 		fixedNow-100, fixedNow+3600, true) // created BEFORE the death
 
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{tomb.tldEnv, overlapping.tldEnv}, tomb, overlapping)
-	rrs, rcode, err := resolveFoo(t, lookup)
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{tomb.tldEnv, overlapping.tldEnv}, tomb, overlapping)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestResolveQuestionReuseWindowAllowsOverlappingRenewal(t *testing.T) {
 // ones the alias was registered with). v0.8.0 refused this and locked every
 // alias whose auto-renewal arrived one tick late.
 func TestResolveQuestionReuseWindowSameIdentityResurrection(t *testing.T) {
-	tomb := windowedWorld(t, "foo", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 60),
+	tomb := windowedWorld(t, "footld", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 60),
 		fixedNow-200, fixedNow-50, true) // dead 50 s ago: window open
 
 	// Re-wrap the TOMBSTONE'S OWN claim (same identity, same witnesses) in
@@ -176,7 +176,7 @@ func TestResolveQuestionReuseWindowSameIdentityResurrection(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The www record under the same (resurrected) identity must resolve.
-	wwwWire, err := naming.EncodeWireName([]string{"www"}, "foo", tomb.tldID)
+	wwwWire, err := naming.EncodeWireName([]string{"www"}, "footld", tomb.tldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,8 +192,8 @@ func TestResolveQuestionReuseWindowSameIdentityResurrection(t *testing.T) {
 	tomb.wwwEnv = freshWWWEnv // the lookup serves the fresh www record
 	tomb.tldEnv = freshTldEnv
 
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{freshTldEnv}, tomb)
-	rrs, rcode, rerr := resolveFoo(t, lookup)
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{freshTldEnv}, tomb)
+	rrs, rcode, rerr := resolveFootld(t, lookup)
 	if rerr != nil {
 		t.Fatalf("ResolveQuestion: %v", rerr)
 	}
@@ -209,13 +209,13 @@ func TestResolveQuestionReuseWindowSameIdentityResurrection(t *testing.T) {
 // tombstone is inert — a fresh claim resolves.
 func TestResolveQuestionReuseWindowCloses(t *testing.T) {
 	delay := int64(constants.AliasReuseDelay)
-	tomb := windowedWorld(t, "foo", uint64(fixedNow-1000-delay), net.IPv4(203, 0, 113, 54),
+	tomb := windowedWorld(t, "footld", uint64(fixedNow-1000-delay), net.IPv4(203, 0, 113, 54),
 		fixedNow-200-delay, fixedNow-50-delay, true) // dead > 30 d ago: window closed
-	fresh := windowedWorld(t, "foo", uint64(fixedNow-10), net.IPv4(203, 0, 113, 55),
+	fresh := windowedWorld(t, "footld", uint64(fixedNow-10), net.IPv4(203, 0, 113, 55),
 		fixedNow-30, fixedNow+3600, true)
 
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{tomb.tldEnv, fresh.tldEnv}, tomb, fresh)
-	rrs, rcode, err := resolveFoo(t, lookup)
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{tomb.tldEnv, fresh.tldEnv}, tomb, fresh)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
@@ -232,13 +232,13 @@ func TestResolveQuestionReuseWindowCloses(t *testing.T) {
 // cost — PoW-valid, claimant-bound, but no attestations) is NOT a tombstone:
 // the alias resolves. Locking must cost a real, once-verified registration.
 func TestResolveQuestionRogueFabricationDoesNotLock(t *testing.T) {
-	fake := windowedWorld(t, "foo", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 56),
+	fake := windowedWorld(t, "footld", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 56),
 		fixedNow-200, fixedNow-50, false) // no quorum: the rogue's "tombstone"
-	fresh := windowedWorld(t, "foo", uint64(fixedNow-10), net.IPv4(203, 0, 113, 57),
+	fresh := windowedWorld(t, "footld", uint64(fixedNow-10), net.IPv4(203, 0, 113, 57),
 		fixedNow-30, fixedNow+3600, true)
 
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{fake.tldEnv, fresh.tldEnv}, fake, fresh)
-	rrs, rcode, err := resolveFoo(t, lookup)
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{fake.tldEnv, fresh.tldEnv}, fake, fresh)
+	rrs, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}
@@ -256,10 +256,10 @@ func TestResolveQuestionRogueFabricationDoesNotLock(t *testing.T) {
 // verifyClaimEnvelope), locked or not; this pins that the tombstone branch
 // adds no failure mode of its own.
 func TestResolveQuestionTombstoneAloneIsNXDOMAIN(t *testing.T) {
-	tomb := windowedWorld(t, "foo", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 58),
+	tomb := windowedWorld(t, "footld", uint64(fixedNow-1000), net.IPv4(203, 0, 113, 58),
 		fixedNow-200, fixedNow-50, true)
-	lookup := newFakeClaimSetLookup("foo", []*wire.SignedEnvelope{tomb.tldEnv}, tomb)
-	_, rcode, err := resolveFoo(t, lookup)
+	lookup := newFakeClaimSetLookup("footld", []*wire.SignedEnvelope{tomb.tldEnv}, tomb)
+	_, rcode, err := resolveFootld(t, lookup)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: %v", err)
 	}

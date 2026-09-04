@@ -24,14 +24,14 @@ import (
 	"github.com/miekg/dns"
 )
 
-// transferredWorld is the §8.3 fixture for alias "foo":
+// transferredWorld is the §8.3 fixture for alias "footld":
 //
 //   - v1: the original self-certifying TLD record (owner = signer = K1,
 //     tld_id = SHA-256(K1));
 //   - v2: the whole-TLD transfer record (owner = K2, signer = K1 — the
 //     previous owner, sequence 2 = prev + 1, prev_hash = H_record(v1),
 //     delegation = K2 "subtree authority follows");
-//   - www2: the www.foo record re-signed by K2 after the hand-off (authorized
+//   - www2: the www.footld record re-signed by K2 after the hand-off (authorized
 //     by v2 via parent.Owner == child.Signer, and by Delegation = K2).
 type transferredWorld struct {
 	k1, k2  *crypto.Keypair
@@ -127,7 +127,7 @@ func newTransferredWorld(t *testing.T, alias string) *transferredWorld {
 	return w
 }
 
-// transferConfig routes "foo" into freens and PINS it to the world's tld_id,
+// transferConfig routes "footld" into freens and PINS it to the world's tld_id,
 // so the tests exercise the pure §3b chain walk (no §7 claim machinery).
 func transferConfig(t *testing.T, tldID []byte) *Config {
 	t.Helper()
@@ -135,17 +135,17 @@ func transferConfig(t *testing.T, tldID []byte) *Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.TLDRoutes["foo"] = RouteFREENS
-	cfg.AliasPins = map[string][]byte{"foo": append([]byte(nil), tldID...)}
+	cfg.TLDRoutes["footld"] = RouteFREENS
+	cfg.AliasPins = map[string][]byte{"footld": append([]byte(nil), tldID...)}
 	return cfg
 }
 
-// resolveWwwFoo runs www.foo. A through a resolver over lookup, pinning
-// "foo" to tldID (the pure §3b chain walk — no §7 claim machinery).
-func resolveWwwFoo(t *testing.T, tldID []byte, lookup RecordLookup) ([]dns.RR, int, bool, error) {
+// resolveWwwFootld runs www.footld. A through a resolver over lookup, pinning
+// "footld" to tldID (the pure §3b chain walk — no §7 claim machinery).
+func resolveWwwFootld(t *testing.T, tldID []byte, lookup RecordLookup) ([]dns.RR, int, bool, error) {
 	t.Helper()
 	r := newResolver(transferConfig(t, tldID), lookup, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	return r.ResolveQuestion(context.Background(), q)
 }
 
@@ -187,9 +187,9 @@ func (f *fakeHistory) LookupByHash(_ context.Context, h []byte) (*wire.SignedEnv
 // record served at K_tld is the transfer record v2 (owner K2, signer K1,
 // prev_hash-linked), the www child is signed by the new owner K2, and the
 // source can produce v1 by hash — so the transfer walk re-establishes
-// self-certification and www.foo resolves, aa=true.
+// self-certification and www.footld resolves, aa=true.
 func TestTransferredTLDAcceptedWithHistory(t *testing.T) {
-	w := newTransferredWorld(t, "foo")
+	w := newTransferredWorld(t, "footld")
 	h := newFakeHistory()
 	h.put(w.v2) // K_tld now serves the transfer record (v1 was superseded)
 	h.put(w.www2)
@@ -197,7 +197,7 @@ func TestTransferredTLDAcceptedWithHistory(t *testing.T) {
 
 	cfg := transferConfig(t, w.tldID)
 	r := newResolver(cfg, h, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -225,14 +225,14 @@ func TestTransferredTLDAcceptedWithHistory(t *testing.T) {
 // transferred root stays rejected — today's pre-§8.3 behavior (NXDOMAIN,
 // still authoritative for the freens namespace).
 func TestTransferredTLDRejectedWithoutHistorySource(t *testing.T) {
-	w := newTransferredWorld(t, "foo")
+	w := newTransferredWorld(t, "footld")
 	lookup := newFakeLookup() // Lookup only — no LookupByHash
 	lookup.put(w.v2)
 	lookup.put(w.www2)
 
 	cfg := transferConfig(t, w.tldID)
 	r := newResolver(cfg, lookup, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, aa, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -252,7 +252,7 @@ func TestTransferredTLDRejectedWithoutHistorySource(t *testing.T) {
 // but cannot produce the predecessor (nil fetch) — the hand-off is
 // unverifiable → NXDOMAIN.
 func TestTransferredTLDRejectedWhenPredecessorMissing(t *testing.T) {
-	w := newTransferredWorld(t, "foo")
+	w := newTransferredWorld(t, "footld")
 	h := newFakeHistory()
 	h.put(w.v2)
 	h.put(w.www2)
@@ -260,7 +260,7 @@ func TestTransferredTLDRejectedWhenPredecessorMissing(t *testing.T) {
 
 	cfg := transferConfig(t, w.tldID)
 	r := newResolver(cfg, h, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -280,7 +280,7 @@ func TestTransferredTLDRejectedWhenPredecessorMissing(t *testing.T) {
 // that is not self-certifying for the tld_id (SHA-256(K3) != tld_id) → the
 // hand-off proves nothing → NXDOMAIN.
 func TestTransferredTLDRejectedWhenPredecessorForeign(t *testing.T) {
-	w := newTransferredWorld(t, "foo")
+	w := newTransferredWorld(t, "footld")
 
 	// The foreign "v1": same name (zero labels, the real tld_id embedded),
 	// owned and signed by an unrelated third key — valid envelope, wrong
@@ -331,7 +331,7 @@ func TestTransferredTLDRejectedWhenPredecessorForeign(t *testing.T) {
 
 	cfg := transferConfig(t, w.tldID)
 	r := newResolver(cfg, h, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -348,7 +348,7 @@ func TestTransferredTLDRejectedWhenPredecessorForeign(t *testing.T) {
 // prev_hash that matches NO obtainable predecessor (first byte flipped), so
 // even with the true v1 in history the walk cannot link v2 to it → NXDOMAIN.
 func TestTransferredTLDTamperedPrevHashRejected(t *testing.T) {
-	w := newTransferredWorld(t, "foo")
+	w := newTransferredWorld(t, "footld")
 
 	// v2t: identical transfer record except a corrupted prev_hash, correctly
 	// re-signed by K1 (the envelope itself stays fully valid).
@@ -371,7 +371,7 @@ func TestTransferredTLDTamperedPrevHashRejected(t *testing.T) {
 
 	cfg := transferConfig(t, w.tldID)
 	r := newResolver(cfg, h, nil)
-	q := dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	rrs, rcode, _, err := r.ResolveQuestion(context.Background(), q)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
@@ -394,7 +394,7 @@ func TestUntransferredTLDStillResolves(t *testing.T) {
 	h.put(w.tldEnv)
 	h.put(w.wwwEnv)
 
-	rrs, rcode, aa, err := resolveWwwFoo(t, w.tldID, h)
+	rrs, rcode, aa, err := resolveWwwFootld(t, w.tldID, h)
 	if err != nil {
 		t.Fatalf("ResolveQuestion: unexpected err: %v", err)
 	}

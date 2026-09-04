@@ -576,6 +576,21 @@ func (r *Resolver) freensResolve(ctx context.Context, labels []string, alias str
 	contested := false
 	degraded := false
 	if len(tldID) == 0 {
+		// §7.6 reserved-alias gate (naming/reserved.go): a delegated ICANN
+		// TLD or IANA special-use alias is treated as claim-less — NXDOMAIN,
+		// no claim walk, AA per the caller's route wrapping — EVEN IF the
+		// network holds a (rogue-witnessed) claim. This is the resolution
+		// half of "a first-time user must never land on a spoofed site under
+		// a real-TLD-shaped freens name": the witness gate keeps OUR nodes
+		// from co-signing such claims, and this gate refuses to ACCEPT one
+		// even if five malicious nodes did. [alias-pins] resolved above are
+		// deliberately exempt (an explicit local pin is operator policy,
+		// never something a remote claimant can plant); [options]
+		// allow-reserved / the daemon -allow-reserved flag opts out.
+		if naming.IsReservedTLD(alias) && (r.Cfg == nil || !r.Cfg.AllowReserved) {
+			r.notifyAliasDead(alias, nil) // purge any trust-sync state for it
+			return nil, dns.RcodeNameError, nil
+		}
 		tldID, contested, degraded = r.resolveAliasClaim(ctx, alias, now)
 		if degraded {
 			// Issue #1: the claim layer could not be interrogated (probe

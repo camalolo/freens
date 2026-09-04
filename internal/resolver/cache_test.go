@@ -84,7 +84,7 @@ func TestServeDNSCacheHitAvoidsResolve(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock })
 
-	first := serveOnce(t, r, "www.foo.", dns.TypeA)
+	first := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if first.Rcode != dns.RcodeSuccess || len(first.Answer) != 1 || !first.Authoritative {
 		t.Fatalf("first response = rcode %d, %d answers, aa %v", first.Rcode, len(first.Answer), first.Authoritative)
 	}
@@ -93,7 +93,7 @@ func TestServeDNSCacheHitAvoidsResolve(t *testing.T) {
 	}
 
 	// Second identical query must be served from cache: no new lookups.
-	second := serveOnce(t, r, "www.foo.", dns.TypeA)
+	second := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if second.Rcode != dns.RcodeSuccess || len(second.Answer) != 1 {
 		t.Fatalf("cached response = rcode %d, %d answers", second.Rcode, len(second.Answer))
 	}
@@ -108,7 +108,7 @@ func TestServeDNSCacheHitAvoidsResolve(t *testing.T) {
 	}
 
 	// A different qtype is a different cache key → re-resolves.
-	_ = serveOnce(t, r, "www.foo.", dns.TypeAAAA) // NODATA, negative-cached
+	_ = serveOnce(t, r, "www.footld.", dns.TypeAAAA) // NODATA, negative-cached
 	if got := atomic.LoadInt32(&lookup.calls); got != 4 {
 		t.Errorf("lookup calls after a different qtype = %d, want 4", got)
 	}
@@ -124,13 +124,13 @@ func TestServeDNSCachedTTLDecays(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock })
 
-	first := serveOnce(t, r, "www.foo.", dns.TypeA)
+	first := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if ttl := first.Answer[0].Header().Ttl; ttl != 600 {
 		t.Fatalf("fresh TTL = %d, want 600", ttl)
 	}
 
 	clock += 200 // 200 s pass; the cached entry must decay to 400.
-	second := serveOnce(t, r, "www.foo.", dns.TypeA)
+	second := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if ttl := second.Answer[0].Header().Ttl; ttl != 400 {
 		t.Errorf("decayed TTL = %d, want 400", ttl)
 	}
@@ -148,7 +148,7 @@ func TestServeDNSNegativeCacheNXDOMAINExpiry(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock })
 
-	first := serveOnce(t, r, "www.foo.", dns.TypeA)
+	first := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if first.Rcode != dns.RcodeNameError || !first.Authoritative {
 		t.Fatalf("first response rcode = %d aa = %v, want NXDOMAIN/aa", first.Rcode, first.Authoritative)
 	}
@@ -158,7 +158,7 @@ func TestServeDNSNegativeCacheNXDOMAINExpiry(t *testing.T) {
 	}
 
 	// Within NegTTL: served from the negative cache, no new lookups.
-	second := serveOnce(t, r, "www.foo.", dns.TypeA)
+	second := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if second.Rcode != dns.RcodeNameError {
 		t.Fatalf("cached negative rcode = %d, want NXDOMAIN", second.Rcode)
 	}
@@ -168,7 +168,7 @@ func TestServeDNSNegativeCacheNXDOMAINExpiry(t *testing.T) {
 
 	// Past NegTTL: the entry expired → re-resolve.
 	clock += int64(constants.NegTTL) + 1
-	third := serveOnce(t, r, "www.foo.", dns.TypeA)
+	third := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if third.Rcode != dns.RcodeNameError {
 		t.Fatalf("re-resolved rcode = %d, want NXDOMAIN", third.Rcode)
 	}
@@ -187,14 +187,14 @@ func TestServeDNSNegativeCacheNODATA(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock })
 
-	first := serveOnce(t, r, "www.foo.", dns.TypeAAAA)
+	first := serveOnce(t, r, "www.footld.", dns.TypeAAAA)
 	if first.Rcode != dns.RcodeSuccess || len(first.Answer) != 0 {
 		t.Fatalf("first response = rcode %d, %d answers (want NODATA)", first.Rcode, len(first.Answer))
 	}
 	callsAfterFirst := atomic.LoadInt32(&lookup.calls)
 
 	// Repeat within NegTTL → cached NODATA, resolver not re-consulted.
-	second := serveOnce(t, r, "www.foo.", dns.TypeAAAA)
+	second := serveOnce(t, r, "www.footld.", dns.TypeAAAA)
 	if second.Rcode != dns.RcodeSuccess || len(second.Answer) != 0 {
 		t.Fatalf("cached NODATA = rcode %d, %d answers", second.Rcode, len(second.Answer))
 	}
@@ -234,13 +234,13 @@ func TestServeDNSDoesNotCacheForwardedDNS(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func testKey(i int) cacheKey {
-	return cacheKey{name: fmt.Sprintf("n%d.foo.", i), qtype: dns.TypeA, qclass: dns.ClassINET}
+	return cacheKey{name: fmt.Sprintf("n%d.footld.", i), qtype: dns.TypeA, qclass: dns.ClassINET}
 }
 
 func testA(t *testing.T, ttl uint32) dns.RR {
 	t.Helper()
 	return &dns.A{
-		Hdr: dns.RR_Header{Name: "n.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+		Hdr: dns.RR_Header{Name: "n.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
 		A:   net.IPv4(203, 0, 113, 1),
 	}
 }
@@ -387,7 +387,7 @@ func TestServeDNSStaleServedWhileRefreshing(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
 
-	first := serveOnce(t, r, "www.foo.", dns.TypeA) // fresh walk, cached
+	first := serveOnce(t, r, "www.footld.", dns.TypeA) // fresh walk, cached
 	if first.Rcode != dns.RcodeSuccess {
 		t.Fatalf("first rcode = %d", first.Rcode)
 	}
@@ -397,7 +397,7 @@ func TestServeDNSStaleServedWhileRefreshing(t *testing.T) {
 	// the validated cache copy with a SHORT ttl, without blocking on the
 	// walk — the refresh runs in the background.
 	clock.Store(clock.Load() + 601)
-	stale := serveOnce(t, r, "www.foo.", dns.TypeA)
+	stale := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if stale.Rcode != dns.RcodeSuccess || len(stale.Answer) != 1 {
 		t.Fatalf("stale response = rcode %d, %d answers", stale.Rcode, len(stale.Answer))
 	}
@@ -411,7 +411,7 @@ func TestServeDNSStaleServedWhileRefreshing(t *testing.T) {
 
 	// The refresh re-cached: the next query is FRESH again (full TTL, no
 	// new walk).
-	fresh := serveOnce(t, r, "www.foo.", dns.TypeA)
+	fresh := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if got := atomic.LoadInt32(&lookup.calls); got != base+2 { // TLD + www hop
 		t.Fatalf("lookup calls = %d, want %d", got, base+2)
 	}
@@ -431,13 +431,13 @@ func TestServeDNSStaleWindowEndsInRealResolve(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
 
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	base := atomic.LoadInt32(&lookup.calls)
 
 	// Past TTL AND the whole stale window: a genuine miss — the walk happens
 	// synchronously again.
 	clock.Store(clock.Load() + 601 + constants.StaleServeSecs + 1)
-	miss := serveOnce(t, r, "www.foo.", dns.TypeA)
+	miss := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if miss.Rcode != dns.RcodeSuccess || miss.Answer[0].Header().Ttl != 600 {
 		t.Fatalf("post-window response = rcode %d ttl %d", miss.Rcode, miss.Answer[0].Header().Ttl)
 	}
@@ -449,14 +449,14 @@ func TestServeDNSStaleWindowEndsInRealResolve(t *testing.T) {
 func TestServeDNSNegativeNeverServesStale(t *testing.T) {
 	w := newFreensWorld(t)
 	lookup := &countingLookup{fakeLookup: newFakeLookup()}
-	lookup.put(w.tldEnv) // www.foo does not exist → NXDOMAIN, negative-cached
+	lookup.put(w.tldEnv) // www.footld does not exist → NXDOMAIN, negative-cached
 
 	var clock atomic.Int64
 	clock.Store(int64(fixedNow))
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
 
-	nx := serveOnce(t, r, "www.foo.", dns.TypeA)
+	nx := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if nx.Rcode != dns.RcodeNameError {
 		t.Fatalf("first rcode = %d", nx.Rcode)
 	}
@@ -465,7 +465,7 @@ func TestServeDNSNegativeNeverServesStale(t *testing.T) {
 	// Past NegTTL: a negative entry must be re-consulted SYNCHRONOUSLY —
 	// serving stale NXDOMAINs would delay revocations and publications.
 	clock.Store(clock.Load() + constants.NegTTL + 1)
-	again := serveOnce(t, r, "www.foo.", dns.TypeA)
+	again := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if again.Rcode != dns.RcodeNameError {
 		t.Fatalf("second rcode = %d", again.Rcode)
 	}
@@ -485,7 +485,7 @@ func TestServeDNSStaleRefreshLearnsRevocation(t *testing.T) {
 	r := newResolver(configFor(t, w, RouteFREENS), lookup, nil)
 	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
 
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	base := atomic.LoadInt32(&lookup.calls)
 
 	// The name gets tombstoned while our cached copy ages out.
@@ -495,7 +495,7 @@ func TestServeDNSStaleRefreshLearnsRevocation(t *testing.T) {
 	// Stale window: the old answer still goes out (bounded), but the
 	// background refresh sees the tombstone…
 	clock.Store(clock.Load() + 601)
-	stale := serveOnce(t, r, "www.foo.", dns.TypeA)
+	stale := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if stale.Rcode != dns.RcodeSuccess {
 		t.Fatalf("stale serve rcode = %d, want the last known good answer", stale.Rcode)
 	}
@@ -504,7 +504,7 @@ func TestServeDNSStaleRefreshLearnsRevocation(t *testing.T) {
 	// …and the NEXT query reflects it: no stale crutch past a fresh
 	// negative.
 	clock.Store(clock.Load() + refreshKickEvery + 1)
-	after := serveOnce(t, r, "www.foo.", dns.TypeA)
+	after := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if after.Rcode != dns.RcodeNameError {
 		t.Fatalf("post-revocation rcode = %d, want NXDOMAIN", after.Rcode)
 	}
@@ -526,7 +526,7 @@ func TestServeDNSStaleSurvivesFailedRefresh(t *testing.T) {
 	// `clock` instead of sleeping, so point r.Now at it too.
 	r.Now = func() int64 { return clock.Load() }
 
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	base := atomic.LoadInt32(&lookup.attempts)
 
 	// Namespace goes UNREACHABLE: the refresh attempt errors out and must
@@ -534,7 +534,7 @@ func TestServeDNSStaleSurvivesFailedRefresh(t *testing.T) {
 	atomic.StoreInt32(&lookup.fail, 1)
 
 	clock.Store(clock.Load() + 601)
-	stale := serveOnce(t, r, "www.foo.", dns.TypeA)
+	stale := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if stale.Rcode != dns.RcodeSuccess {
 		t.Fatalf("stale serve rcode = %d", stale.Rcode)
 	}
@@ -543,7 +543,7 @@ func TestServeDNSStaleSurvivesFailedRefresh(t *testing.T) {
 	// Still inside the window: keep answering with the last known good
 	// data (the outage-resilience point of the whole feature).
 	clock.Store(clock.Load() + refreshKickEvery + 1)
-	still := serveOnce(t, r, "www.foo.", dns.TypeA)
+	still := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if still.Rcode != dns.RcodeSuccess || len(still.Answer) != 1 {
 		t.Fatalf("stale during outage = rcode %d, %d answers — the last known good answer must survive a failed refresh",
 			still.Rcode, len(still.Answer))
@@ -555,7 +555,7 @@ func TestServeDNSStaleSurvivesFailedRefresh(t *testing.T) {
 	base2 := atomic.LoadInt32(&lookup.attempts)
 	clock.Store(clock.Load() + refreshKickEvery + 1)
 	waitForRefresh(t, &lookup.attempts, base2)
-	recovered := serveOnce(t, r, "www.foo.", dns.TypeA)
+	recovered := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if recovered.Rcode != dns.RcodeSuccess || recovered.Answer[0].Header().Ttl != 600 {
 		t.Fatalf("post-recovery = rcode %d ttl %d, want fresh NOERROR ttl 600",
 			recovered.Rcode, recovered.Answer[0].Header().Ttl)
@@ -572,10 +572,10 @@ func TestServeDNSStaleSurvivesFailedRefresh(t *testing.T) {
 func TestResponseCachePersistRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dns-cache.json")
 	c := NewResponseCache(0, func() int64 { return 1_000 })
-	ck := cacheKeyFor(dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
-	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
+	ck := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
 		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
-	nk := cacheKeyFor(dns.Question{Name: "gone.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	nk := cacheKeyFor(dns.Question{Name: "gone.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
 	c.putFreens(nk, nil, dns.RcodeNameError, true)
 
 	if saved, err := c.SaveIfDirty(path); err != nil || !saved {
@@ -625,8 +625,8 @@ func TestResponseCacheLoadCorruptIgnored(t *testing.T) {
 		t.Fatal("corrupt load should error")
 	}
 	// The cache stays fully usable after a failed load.
-	ck := cacheKeyFor(dns.Question{Name: "www.foo.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
-	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.foo.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+	ck := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
+	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
 	if _, _, _, ok := c.get(ck); !ok {
 		t.Fatal("cache unusable after a corrupt load")
@@ -668,7 +668,7 @@ func TestServeDNSPrefetchKeepsHotNamesWarm(t *testing.T) {
 	r.Now = func() int64 { return clock.Load() }
 
 	base := atomic.LoadInt32(&lookup.calls)
-	first := serveOnce(t, r, "www.foo.", dns.TypeA)
+	first := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if first.Rcode != dns.RcodeSuccess || first.Answer[0].Header().Ttl != 50 {
 		t.Fatalf("first = rcode %d ttl %d", first.Rcode, first.Answer[0].Header().Ttl)
 	}
@@ -680,7 +680,7 @@ func TestServeDNSPrefetchKeepsHotNamesWarm(t *testing.T) {
 	// After the refresh the entry is fresh again: the next answer is a
 	// cache hit with the full (short) TTL and NO additional walk.
 	before := atomic.LoadInt32(&lookup.calls)
-	second := serveOnce(t, r, "www.foo.", dns.TypeA)
+	second := serveOnce(t, r, "www.footld.", dns.TypeA)
 	if second.Answer[0].Header().Ttl > 50 {
 		t.Fatalf("post-prefetch ttl = %d, want ≤ 50 (fresh from cache)", second.Answer[0].Header().Ttl)
 	}
@@ -717,21 +717,21 @@ func TestResponseCacheSweepCandidates(t *testing.T) {
 		c.entries[ck].lastHit = hitAt
 		c.mu.Unlock()
 	}
-	put("hot.foo.", 300, sweepAt-60)                                // recently hit, expired → sweep
-	put("warm.foo.", 300, sweepAt-3600)                             // hit an hour ago, expired → sweep
-	put("cold.foo.", 300, sweepAt-100_000)                          // hit >24h ago → NOT in the warm set
-	put("fresh.foo.", 3000, sweepAt-60)                             // still fresh → prefetch covers it
-	c.putFreens(mk("dead.foo.", 60), nil, dns.RcodeNameError, true) // negative → never
+	put("hot.footld.", 300, sweepAt-60)                                // recently hit, expired → sweep
+	put("warm.footld.", 300, sweepAt-3600)                             // hit an hour ago, expired → sweep
+	put("cold.footld.", 300, sweepAt-100_000)                          // hit >24h ago → NOT in the warm set
+	put("fresh.footld.", 3000, sweepAt-60)                             // still fresh → prefetch covers it
+	c.putFreens(mk("dead.footld.", 60), nil, dns.RcodeNameError, true) // negative → never
 
 	got := c.SweepCandidates(sweepAt, 24*3600, 100)
 	names := map[string]bool{}
 	for _, k := range got {
 		names[k.name] = true
 	}
-	if !names["hot.foo."] || !names["warm.foo."] {
+	if !names["hot.footld."] || !names["warm.footld."] {
 		t.Fatalf("warm expired entries missing from the sweep: %v", names)
 	}
-	for _, banned := range []string{"cold.foo.", "fresh.foo.", "dead.foo."} {
+	for _, banned := range []string{"cold.footld.", "fresh.footld.", "dead.footld."} {
 		if names[banned] {
 			t.Fatalf("%s must not be swept (warm-set/fresh/negative rules): %v", banned, names)
 		}
@@ -739,8 +739,8 @@ func TestResponseCacheSweepCandidates(t *testing.T) {
 
 	// Batch limit: most-recently-hit first.
 	limited := c.SweepCandidates(sweepAt, 24*3600, 1)
-	if len(limited) != 1 || limited[0].name != "hot.foo." {
-		t.Fatalf("batch limit picked %v, want [hot.foo.]", limited)
+	if len(limited) != 1 || limited[0].name != "hot.footld." {
+		t.Fatalf("batch limit picked %v, want [hot.footld.]", limited)
 	}
 }
 
@@ -757,7 +757,7 @@ func TestSweepRefreshesRevalidatesWarmSetWithoutQueries(t *testing.T) {
 	r.Now = func() int64 { return clock.Load() }
 
 	// One client query, then SILENCE: no further client queries happen.
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 	base := atomic.LoadInt32(&lookup.calls)
 
 	// The entry ages past its TTL inside the stale window. With zero
@@ -772,7 +772,7 @@ func TestSweepRefreshesRevalidatesWarmSetWithoutQueries(t *testing.T) {
 	// long idle gap is a cache hit, not a walk.
 	clock.Store(clock.Load() + 120)
 	before := atomic.LoadInt32(&lookup.calls)
-	ans := serveOnce(t, r, "www.foo.", dns.TypeA)
+	ans := serveOnce(t, r, "www.footld.", dns.TypeA)
 	// Fresh-from-cache proof: NOT a stale serve (that would carry ttl ≤ 30)
 	// and no walk (asserted above). The exact TTL just reflects the time
 	// since the sweeper's refresh.
@@ -796,7 +796,7 @@ func TestSweepRefreshesLeavesColdEntriesAlone(t *testing.T) {
 	r.Cache = NewResponseCache(0, func() int64 { return clock.Load() })
 	r.Now = func() int64 { return clock.Load() }
 
-	serveOnce(t, r, "www.foo.", dns.TypeA)
+	serveOnce(t, r, "www.footld.", dns.TypeA)
 
 	// More than the warm horizon since the only hit: the entry is outside
 	// the warm set — the sweeper must NOT keep it alive forever.
