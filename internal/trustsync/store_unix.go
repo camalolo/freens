@@ -10,7 +10,6 @@ package trustsync
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 )
 
@@ -39,7 +38,7 @@ func (e *Engine) installSystem(alias string, crossPEM []byte) bool {
 	if err := writeAtomic(path, crossPEM, 0o644); err != nil {
 		return false // EACCES for a user daemon: expected, spool covers it
 	}
-	if err := exec.Command("update-ca-certificates").Run(); err != nil {
+	if err := runBounded("update-ca-certificates"); err != nil {
 		e.log.Debug("tls: update-ca-certificates failed", "alias", alias, "err", err)
 		return true // file placed; a later bridge run completes the refresh
 	}
@@ -48,7 +47,7 @@ func (e *Engine) installSystem(alias string, crossPEM []byte) bool {
 
 func (e *Engine) uninstallSystem(alias string) {
 	_ = os.Remove(e.sysPath(alias))
-	_ = exec.Command("update-ca-certificates").Run()
+	_ = runBounded("update-ca-certificates")
 }
 
 // nssDBs lists the NSS databases certutil should know about: Chromium's
@@ -104,8 +103,8 @@ func (e *Engine) installNSS(alias string, crossPEM []byte) {
 		// is enforced by Chrome's verifier (and OpenSSL); NSS-family
 		// verifiers anchor here too, so keep the cert minimal and
 		// name-constrained (§9.5.4).
-		_ = exec.Command(cu, "-d", db, "-D", "-n", name).Run()
-		if err := exec.Command(cu, "-d", db, "-A", "-n", name, "-t", "C,,", "-i", tmp).Run(); err != nil {
+		_ = runBounded(cu, "-d", db, "-D", "-n", name)
+		if err := runBounded(cu, "-d", db, "-A", "-n", name, "-t", "C,,", "-i", tmp); err != nil {
 			e.log.Debug("tls: NSS add failed", "db", db, "alias", alias, "err", err)
 		}
 	}
@@ -118,7 +117,7 @@ func (e *Engine) uninstallNSS(alias string) {
 	}
 	name := "freens-cross-" + nssSafe(alias)
 	for _, db := range e.nssDBs() {
-		_ = exec.Command(cu, "-d", db, "-D", "-n", name).Run()
+		_ = runBounded(cu, "-d", db, "-D", "-n", name)
 	}
 }
 

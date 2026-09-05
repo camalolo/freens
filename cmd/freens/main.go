@@ -1211,13 +1211,28 @@ func retryPendingPuts(node *dht.Node, logger *slog.Logger) {
 			// Confirm from the NETWORK's view, not the local store: the
 			// incident was precisely "local thinks it's done, network
 			// disagrees". IterativeGet walks the real holders.
-			gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
-			env, gerr := node.IterativeGet(gctx, p.keys[0])
-			gcancel()
-			if gerr == nil && env != nil && p.env.Record != nil && env.Record != nil {
+			//
+			// v0.16.2: EVERY key must confirm, not just keys[0]. The
+			// 2026-09-05 fleet outage: K_tld landed (3/8) while K_claim was
+			// refused by every store (ghost-polluted keyspace) — the confirm
+			// GET'd K_tld only, matched, dropped the entry, and the lapsed
+			// predecessor claim took the namespace offline fleet-wide when
+			// its lease ran out hours later.
+			confirmed = true
+			for _, k := range p.keys {
+				gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+				env, gerr := node.IterativeGet(gctx, k)
+				gcancel()
+				if gerr != nil || env == nil || p.env.Record == nil || env.Record == nil {
+					confirmed = false
+					break
+				}
 				nh, e1 := env.RecordHash()
 				ph, e2 := p.env.RecordHash()
-				confirmed = e1 == nil && e2 == nil && bytes.Equal(nh, ph)
+				if e1 != nil || e2 != nil || !bytes.Equal(nh, ph) {
+					confirmed = false
+					break
+				}
 			}
 		}
 		cancel()

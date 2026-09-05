@@ -14,6 +14,7 @@
 package trustsync
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,7 +24,9 @@ import (
 // runCertutil shells out to Windows' own certutil (System32; no relation
 // to NSS's certutil beyond the name).
 func runCertutil(args ...string) error {
-	return exec.Command("certutil", args...).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "certutil", args...).Run()
 }
 
 // SystemCertPath: the Windows system trust is a certutil store, not a file

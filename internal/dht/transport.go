@@ -87,6 +87,13 @@ const dhtLookupTimeout = 6 * time.Second
 // effectively unavailable and gets evicted (§6.2 failure handling).
 const lookupProbeTimeout = 2 * time.Second
 
+// rescueWalkBudget is the publish walk-rescue's OWN budget (v0.16.2): the
+// rescue runs under a fresh deadline instead of the caller's (possibly
+// ghost-timeout-exhausted) ctx, so the walk that finds the real closest set
+// always gets to run. Still bounded — the rescue may never hang a caller
+// that has already given up.
+const rescueWalkBudget = 60 * time.Second
+
 // defaultRepublishInterval is the default scan period of the §6.4 step 4
 // republish timer (overridable via NodeConfig.RepublishInterval). It is a
 // daemon-level knob, not a spec constant: the spec only fixes WHEN a record is
@@ -2790,22 +2797,32 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 	// targeted in the first place. Bounded: it runs only on the
 	// total-failure path (rare for a warm daemon, the rule for a cold
 	// one-shot node).
-	if stats.Accepted == 0 && ctx.Err() == nil {
+	//
+	// v0.16.2: the rescue walks under its OWN budget, not the caller's —
+	// the round-1 ghost timeouts consume the caller's ctx exactly when the
+	// rescue is needed most, and a walk under an expired parent answers
+	// nothing (found live 2026-09-05: the 04:15 auto-renewals' K_claim puts
+	// reported 0 of 8 with the rescue silently hollowed out; the namespace
+	// died when the predecessor claim's lease lapsed). Fresh 60 s, still
+	// bounded, still total-failure-only.
+	if stats.Accepted == 0 {
+		rctx, rcancel := context.WithTimeout(context.Background(), rescueWalkBudget)
 		tried := make(map[string]bool, len(closest))
 		for _, c := range closest {
 			tried[string(c.NodeID)] = true
 		}
-		reached := n.IterativeFindNode(ctx, key, constants.RReplication)
+		reached := n.IterativeFindNode(rctx, key, constants.RReplication)
 		for _, c := range reached {
 			if tried[string(c.NodeID)] || bytes.Equal(c.NodeID, n.ID()) {
 				continue
 			}
 			tried[string(c.NodeID)] = true
 			stats.Targets++
-			if err := n.putToPeer(ctx, key, envBytes, evidence, c); err == nil {
+			if err := n.putToPeer(rctx, key, envBytes, evidence, c); err == nil {
 				stats.Accepted++
 			}
 		}
+		rcancel()
 	}
 	if stats.Accepted == 0 {
 		return stats, fmt.Errorf("dht: publish accepted by 0 of %d peers", stats.Targets)

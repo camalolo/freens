@@ -33,6 +33,7 @@
 package trustsync
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/base32"
@@ -131,7 +132,25 @@ type crossState struct {
 	// grace.
 	Status  string     `json:"status,omitempty"`
 	Pending *pendingCA `json:"pending_ca,omitempty"`
+	// CAIdentity is the §9.5.1 CA identity (subject-public-key hash, v0.16.2)
+	// the dedup and rotation decisions key on — invariant across the daily
+	// derivation-day cert-byte changes. Empty in pre-v0.16.2 state files
+	// (ca_sha256 held whole-cert bytes): adopted from the first notification
+	// (the installed cross-cert's key is the same deterministic derivation,
+	// so trusting it stays correct).
+	CAIdentity string `json:"ca_identity,omitempty"`
+	// MintedAt throttles re-mints (unix): the cross-cert's own lifetime is
+	// capped by the apex RECORD's expiry, so the end-of-lease window makes
+	// the refreshWithin test true for hours — without a floor, EVERY
+	// resolution re-mints (and re-runs the installers) for the whole window.
+	MintedAt int64 `json:"minted_at,omitempty"`
 }
+
+// mintThrottle is the minimum interval between cross-cert mints for one
+// alias (v0.16.2): the found-live 2026-09-05 churn had the server re-mint
+// — and re-run its certutil NSS installs — on every resolution for the
+// final ~6 h of each record's lease.
+const mintThrottle = time.Hour
 
 // pendingCA records a CA change under a live identity that has NOT yet
 // served its observation grace (rotationPending).
@@ -230,6 +249,21 @@ func (e *Engine) RootPEM() []byte {
 	return tlsca.CertPEM(e.rootDER)
 }
 
+// execTimeout bounds every installer exec (update-ca-certificates, certutil).
+// The certmgr runBounded lesson (v0.15.2) applied to the trust layer: an
+// unbounded child on an automated path turns a hung helper (a locked NSS DB,
+// a serialized bundle refresh) into a hung daemon subsystem — found live
+// 2026-09-05 when the server's re-mint churn kept concurrent
+// update-ca-certificates instances alive for minutes at a time.
+const execTimeout = 30 * time.Second
+
+// runBounded runs an installer helper under execTimeout.
+func runBounded(name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run()
+}
+
 // InstallRoot imports the LOCAL ROOT into this machine's stores — the
 // one-time, per-device step of §9.5.4. Idempotent. Returns a human-readable
 // report (one line per store). The system-bundle attempt is DIRECT only
@@ -246,7 +280,7 @@ func (e *Engine) InstallRoot() []string {
 	// 1) System bundle: direct when possible, else print the recipe.
 	sysPath := "/usr/local/share/ca-certificates/freens-local-root.crt"
 	if err := writeAtomic(sysPath, rootPEM, 0o644); err == nil {
-		if err := exec.Command("update-ca-certificates").Run(); err == nil {
+		if err := runBounded("update-ca-certificates"); err == nil {
 			report = append(report, "system: installed ("+sysPath+")")
 		} else {
 			report = append(report, "system: cert copied — run `sudo update-ca-certificates` to refresh")
@@ -267,14 +301,14 @@ func (e *Engine) InstallRoot() []string {
 	if herr == nil {
 		pki := filepath.Join(home, ".pki", "nssdb")
 		if _, serr := os.Stat(pki); serr != nil {
-			if err := exec.Command(cu, "-N", "-d", "sql:"+pki, "--empty-password").Run(); err == nil {
+			if err := runBounded(cu, "-N", "-d", "sql:"+pki, "--empty-password"); err == nil {
 				report = append(report, "nss: created "+pki)
 			}
 		}
 	}
 	for _, db := range e.nssDBs() {
-		_ = exec.Command(cu, "-d", db, "-D", "-n", "freens-local-root").Run()
-		if err := exec.Command(cu, "-d", db, "-A", "-n", "freens-local-root", "-t", "C,,", "-i", root).Run(); err != nil {
+		_ = runBounded(cu, "-d", db, "-D", "-n", "freens-local-root")
+		if err := runBounded(cu, "-d", db, "-A", "-n", "freens-local-root", "-t", "C,,", "-i", root); err != nil {
 			report = append(report, "nss: FAILED for "+db+": "+err.Error())
 			continue
 		}
@@ -320,7 +354,15 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		return
 	}
 	now := e.opts.Now()
-	caHash := tlsca.Fingerprint(caDER)
+	// caHash is the §9.5.1 CA IDENTITY (key hash), not the whole-cert
+	// fingerprint: the cert bytes change with every derivation day while the
+	// key stays deterministic — byte comparisons read every UTC-midnight
+	// renewal as a rotation and defeat the dedup (found live 2026-09-05).
+	caHash, icerr := tlsca.CAIdentity(caDER)
+	if icerr != nil {
+		e.log.Debug("tls: unparsable owner CA ignored", "alias", alias, "err", icerr)
+		return
+	}
 	tldB32 := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
 	present := e.sweepSpool()
 
@@ -335,6 +377,7 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 	rotateFrom := "" // installed CA the rotation replaces (journal detail)
 	e.mu.Lock()
 	st, have := e.state[alias]
+	legacy := have && st.CAIdentity == "" // pre-v0.16.2 state: bytes hash only
 	switch {
 	case !have:
 		if claimYoung {
@@ -346,7 +389,13 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		// identity changed under the alias (§8.3 transfer / §8.6 rotation):
 		// those paths are protocol-gated upstream — install the new binding.
 		act = actInstall
-	case st.CASha256 == caHash:
+	case legacy || st.CAIdentity == caHash:
+		if legacy {
+			// Adopt the identity; the installed cross-cert anchored the same
+			// deterministic key, so trusting it remains correct.
+			st.CAIdentity = caHash
+			e.state[alias] = st
+		}
 		if st.Pending != nil {
 			// The rrset flipped back to the installed CA: rotation aborted.
 			st.Pending = nil
@@ -367,17 +416,21 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		case claimYoung:
 			// installed in an earlier, mature era — claims never re-young
 			act = actNone
+		case st.MintedAt != 0 && now.Unix()-st.MintedAt < int64(mintThrottle/time.Second):
+			act = actNone // throttled: a healthy re-mint at most once an hour
 		case st.NotAfter > 0 && now.Add(refreshWithin).Before(time.Unix(st.NotAfter, 0)) && present[alias]:
 			act = actNone // healthy, fresh, unchanged, and the spool agrees
 		default:
 			act = actInstall // near expiry, or the spool file went missing
 		}
 	default:
-		// DIFFERENT CA under the SAME live identity: the rotation gate.
+		// DIFFERENT CA IDENTITY under the SAME live identity (alias): the
+		// rotation gate. A different key under the same alias is never a
+		// day-window artifact — this is the tampered/stolen-key shape.
 		if statusOf(st.Status) == statusQuarantined {
 			if claimYoung {
-				// still young: keep holding, note the new bytes
-				e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, Status: statusQuarantined}
+				// still young: keep holding, note the new identity
+				e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, Status: statusQuarantined, CAIdentity: caHash}
 				e.mu.Unlock()
 				e.saveState()
 				e.log.Info("tls: quarantined namespace re-advertised a different CA — still holding", "alias", alias, "ca", caHash[:16])
@@ -414,7 +467,7 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		return
 	case actQuarantine:
 		e.mu.Lock()
-		e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, Status: statusQuarantined}
+		e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, Status: statusQuarantined, CAIdentity: caHash}
 		e.mu.Unlock()
 		e.saveState()
 		e.log.Info("tls: cross-cert QUARANTINED — claim inside the §7.5 contest window", "alias", alias,
@@ -451,7 +504,10 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 			e.installNSS(alias, crossPEM)
 		}
 		e.mu.Lock()
-		e.state[alias] = crossState{TldIDB32: tldB32, CASha256: caHash, NotAfter: cross.NotAfter.Unix(), Status: statusInstalled}
+		e.state[alias] = crossState{
+			TldIDB32: tldB32, CASha256: caHash, NotAfter: cross.NotAfter.Unix(),
+			Status: statusInstalled, CAIdentity: caHash, MintedAt: now.Unix(),
+		}
 		e.installed[alias] = sysOK
 		e.mu.Unlock()
 		if werr := e.saveState(); werr != nil {
@@ -649,6 +705,8 @@ type Snapshot struct {
 	// window — DNS answers serve, TLS trust waits) or "rotating" (a CA
 	// change is serving its observation grace).
 	Status string `json:"status"`
+	// CAIdentity is the stable §9.5.1 CA identity (subject-public-key hash).
+	CAIdentity string `json:"ca_identity,omitempty"`
 	// PendingCASha256 / PendingSince describe an in-grace rotation.
 	PendingCASha256 string `json:"pending_ca_sha256,omitempty"`
 	PendingSince    int64  `json:"pending_since,omitempty"`
@@ -660,12 +718,13 @@ func (e *Engine) Snapshot() []Snapshot {
 	out := make([]Snapshot, 0, len(e.state))
 	for alias, st := range e.state {
 		snap := Snapshot{
-			Alias:    alias,
-			TldIDB32: st.TldIDB32,
-			CASha256: st.CASha256,
-			NotAfter: st.NotAfter,
-			System:   e.installed[alias],
-			Status:   statusOf(st.Status),
+			Alias:      alias,
+			TldIDB32:   st.TldIDB32,
+			CASha256:   st.CASha256,
+			NotAfter:   st.NotAfter,
+			System:     e.installed[alias],
+			Status:     statusOf(st.Status),
+			CAIdentity: st.CAIdentity,
 		}
 		if st.Pending != nil {
 			snap.PendingCASha256 = st.Pending.CASha256

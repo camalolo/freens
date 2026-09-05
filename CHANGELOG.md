@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — v0.16.2: the fleet-log pass — false renewal confirms, the hollowed rescue, rotation-gate day-roll false alarms, re-mint churn, bounded installer execs
+
+The 2026-09-05 morning fleet-log review caught a real outage chain and
+the code that let it happen (all fixed; fleet-verified before commit):
+
+- **cli/daemon: the pending-renewal confirm checked only K_tld.**
+  `retryPendingPuts` verified the network held `keys[0]` — so when the
+  K_tld leg landed (3/8) while the K_claim leg was refused by every
+  store it reached (0/8, ghost-polluted claim keyspace), the confirm
+  matched, the pending entry was dropped, and the network kept serving
+  the LAPSED predecessor claim. Hours later the predecessor's lease ran
+  out and the namespace went NXDOMAIN fleet-wide (minipc 08:59–10:09,
+  nanopi from ~10:00) while both owners' local bookkeeping said
+  "fresh" — the phantom-freshness class again, this time with a
+  false-confirm instead of a silent put. Every key must now confirm.
+- **dht: the publish walk-rescue runs under its own 60 s budget.**
+  The rescue reused the caller's ctx — which the round-1 ghost timeouts
+  had just consumed, exactly when the rescue was needed most — so the
+  walk answered nothing and `targets` stayed 8. Fresh bounded deadline.
+- **tlsca+trustsync: CA dedup and the rotation gate key on the CA
+  IDENTITY (subject-public-key hash), not whole-cert bytes.** The owner
+  CA's cert bytes change with every derivation DAY (the §9.5.1 window
+  truncates to the UTC day) while the key stays deterministic — so the
+  byte comparison read every UTC-midnight renewal as a CA rotation:
+  minipc's routine 10:10 renewal tripped the gate with a WARN and a
+  needless 1 h grace. Day-window re-mints now dedupe silently; the gate
+  fires only on a real key change. Pre-v0.16.2 state files adopt the
+  identity from the first notification (the installed cross-cert
+  anchored the same key).
+- **trustsync: re-mints throttled to one per hour per alias.** The
+  cross-cert's life is capped by the apex RECORD's expiry, so the final
+  ~6 h of every lease made the refresh test permanently true — the
+  server re-minted (and re-ran its certutil NSS installs) on EVERY
+  resolution for the whole window, soaking the box.
+- **trustsync: every installer exec is bounded (30 s)** —
+  update-ca-certificates and certutil had no deadline; concurrent
+  instances serialized for minutes at a time on the box that runs
+  certutil. (The boxes without certutil never wedged — which is what
+  pinned the correlation.)
+
 ## Unreleased — v0.16.1: the walk returns only candidates that ANSWERED (the rescue's missing half)
 
 - **dht: `IterativeFindNode` excludes failed probes from its result.**

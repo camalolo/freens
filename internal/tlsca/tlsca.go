@@ -359,3 +359,21 @@ func KeyPEM(keyDER []byte) []byte {
 func Fingerprint(der []byte) string {
 	return fmt.Sprintf("%x", sha256.Sum256(der))
 }
+
+// CAIdentity returns the stable identity of an owner-CA certificate: the
+// SHA-256 of its SubjectPublicKeyInfo. Unlike the whole-cert fingerprint it
+// is INVARIANT across the daily derivation-day window changes (caValidUntil
+// truncates NotBefore to the UTC day, so the CERT BYTES — and their
+// signature — differ every day while the KEY stays the same deterministic
+// derivation). Consumers that need to answer "is this the same CA?" for
+// dedup, rotation gates or trust decisions MUST compare identities, not
+// bytes: a byte comparison reads every UTC-midnight renewal as a CA
+// rotation (found live 2026-09-05: minipc's routine renewal tripped the
+// §9.5.4 rotation gate with a benign same-key re-mint).
+func CAIdentity(der []byte) (string, error) {
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrTLSCA, err)
+	}
+	return Fingerprint(c.RawSubjectPublicKeyInfo), nil
+}

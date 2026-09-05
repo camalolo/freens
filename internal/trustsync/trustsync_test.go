@@ -161,15 +161,25 @@ func TestOnOwnerCARotationGate(t *testing.T) {
 	}
 	oldCrossFP := tlsca.Fingerprint(pe0) // spool holds the CROSS-cert: fingerprint its bytes
 
-	// A different derivation day ⇒ different cert bytes ⇒ a new ca_sha256.
-	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	// A DIFFERENT SEED under the same alias: a different CA identity — the
+	// tampered/stolen-key shape the §9.5.4 rotation gate exists for. (A
+	// different derivation DAY with the same seed is NOT a rotation: the
+	// key is deterministic, only the day-window bytes change — that path
+	// dedupes, see TestSameKeyDifferentDayDedupes.)
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 8), "bob", clock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(ca1) == string(ca2) {
-		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+		t.Skip("CA bytes identical across seeds (test invariant broken)")
 	}
-	newFP := tlsca.Fingerprint(ca2)
+	newFP, icerr := tlsca.CAIdentity(ca2)
+	if icerr != nil {
+		t.Fatal(icerr)
+	}
+	if id1, _ := tlsca.CAIdentity(ca1); id1 == newFP {
+		t.Fatal("fixture: different seeds produced the same CA identity")
+	}
 
 	// First sight of the new CA: DEFERRED — old cross-cert stays installed.
 	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800, false)
@@ -233,12 +243,12 @@ func TestOnOwnerCARotationAbortsOnRevert(t *testing.T) {
 	e.OnOwnerCA("bob", []byte{1}, ca1, expires, false)
 	orig := e.Snapshot()[0]
 
-	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 8), "bob", clock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(ca1) == string(ca2) {
-		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+		t.Skip("CA bytes identical across seeds (test invariant broken)")
 	}
 	e.OnOwnerCA("bob", []byte{1}, ca2, expires+172800, false) // pending
 	e.OnOwnerCA("bob", []byte{1}, ca1, expires, false)        // flip back
@@ -269,18 +279,18 @@ func TestOnOwnerCARotationFastPathWhenExpired(t *testing.T) {
 	// 1-hour record ⇒ the cross-cert (capped by it) dies in 1 hour too.
 	e.OnOwnerCA("bob", []byte{1}, ca1, clock.Add(time.Hour).Unix(), false)
 
-	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 8), "bob", clock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(ca1) == string(ca2) {
-		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+		t.Skip("CA bytes identical across seeds (test invariant broken)")
 	}
 
 	clock = clock.Add(2 * time.Hour) // the installed cross-cert is now expired
 	e.OnOwnerCA("bob", []byte{1}, ca2, clock.Add(24*time.Hour).Unix(), false)
 	got := e.Snapshot()[0]
-	if got.CASha256 != tlsca.Fingerprint(ca2) {
+	if id, _ := tlsca.CAIdentity(ca2); got.CASha256 != id {
 		t.Fatal("expired-anchor CA change served the grace instead of the fast path")
 	}
 	if got.Status != statusInstalled || got.PendingCASha256 != "" {
@@ -341,19 +351,19 @@ func TestQuarantineHoldsAcrossCAChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 8), "bob", clock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(ca1) == string(ca2) {
-		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+		t.Skip("CA bytes identical across seeds (test invariant broken)")
 	}
 	expires := clock.Add(24 * time.Hour).Unix()
 
 	e.OnOwnerCA("bob", []byte{1}, ca1, expires, true)
 	e.OnOwnerCA("bob", []byte{1}, ca2, expires, true) // young + different CA
-	if s := e.Snapshot()[0]; s.Status != statusQuarantined || s.CASha256 != tlsca.Fingerprint(ca2) {
-		t.Fatalf("young CA-flip state = %+v", s)
+	if id, _ := tlsca.CAIdentity(ca2); (func() bool { s := e.Snapshot()[0]; return s.Status != statusQuarantined || s.CASha256 != id })() {
+		t.Fatalf("young CA-flip state = %+v", e.Snapshot()[0])
 	}
 	if _, err := os.Stat(e.spoolPath("bob")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("young CA-flip reached the spool")
@@ -362,7 +372,7 @@ func TestQuarantineHoldsAcrossCAChange(t *testing.T) {
 	// Maturity: the currently-advertised CA installs (no grace on top).
 	e.OnOwnerCA("bob", []byte{1}, ca2, expires, false)
 	got := e.Snapshot()[0]
-	if got.Status != statusInstalled || got.CASha256 != tlsca.Fingerprint(ca2) {
+	if id, _ := tlsca.CAIdentity(ca2); got.Status != statusInstalled || got.CASha256 != id {
 		t.Fatalf("post-maturity state = %+v", got)
 	}
 }
@@ -644,4 +654,129 @@ func mustCA(t *testing.T, seed []byte, alias string, now time.Time) []byte {
 	t.Helper()
 	der, _ := ownerCA(t, seed, alias, now)
 	return der
+}
+
+// TestSameKeyDifferentDayDedupes: the v0.16.2 identity fix — the owner CA's
+// cert BYTES change with every derivation day (caValidUntil truncates the
+// window to the UTC day) while the KEY stays deterministic. A next-day
+// notification must dedupe like the same CA, NOT trip the rotation gate and
+// NOT re-mint (found live: minipc's routine renewal tripped the gate at
+// 10:10 with a benign same-key re-mint).
+func TestSameKeyDifferentDayDedupes(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	expires := clock.Add(24 * time.Hour).Unix()
+
+	caDay1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.OnOwnerCA("bob", []byte{1}, caDay1, expires, false)
+	before := e.Snapshot()[0]
+
+	// Next UTC day: different bytes, SAME key ⇒ same identity.
+	caDay2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(caDay1) == string(caDay2) {
+		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+	}
+	id1, _ := tlsca.CAIdentity(caDay1)
+	id2, _ := tlsca.CAIdentity(caDay2)
+	if id1 != id2 {
+		t.Fatal("fixture: identity changed across derivation days (the invariant CAIdentity must protect is broken)")
+	}
+
+	e.OnOwnerCA("bob", []byte{1}, caDay2, expires, false)
+	after := e.Snapshot()[0]
+	if after.Status != statusInstalled || after.PendingCASha256 != "" {
+		t.Fatalf("day-roll notification tripped the rotation gate: %+v", after)
+	}
+	if after.NotAfter != before.NotAfter {
+		t.Fatal("day-roll notification re-minted the cross-cert")
+	}
+}
+
+// TestMintThrottle: inside the last refreshWithin of the record's lease the
+// refresh test is permanently true — the throttle is what stops a re-mint
+// (and the installer exec storm) on EVERY resolution.
+func TestMintThrottle(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", clock)
+	// 7 h lease: inside refreshWithin (6 h) from the first minute.
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
+
+	// A second notification minutes later: throttled, no re-mint.
+	clock = clock.Add(5 * time.Minute)
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
+	if got := e.Snapshot()[0].NotAfter; got != e.Snapshot()[0].NotAfter {
+		t.Fatal("unreachable")
+	}
+	minted := e.Snapshot()[0]
+	if minted.Status != statusInstalled {
+		t.Fatalf("throttled notification changed state: %+v", minted)
+	}
+
+	// An hour later: the throttle lifts, the refresh re-mint runs — and the
+	// internal bookkeeping carries the fresh MintedAt stamp.
+	clock = clock.Add(mintThrottle + time.Minute)
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
+	if got := e.Snapshot()[0]; got.Status != statusInstalled {
+		t.Fatalf("post-throttle refresh did not install: %+v", got)
+	}
+	e.mu.Lock()
+	mintedAt := e.state["bob"].MintedAt
+	e.mu.Unlock()
+	if mintedAt != clock.Unix() {
+		t.Fatalf("post-throttle re-mint did not stamp MintedAt: %d != %d", mintedAt, clock.Unix())
+	}
+}
+
+// TestLegacyStateMigratesToIdentity: a pre-v0.16.2 state entry (ca_sha256 =
+// whole-cert bytes, no ca_identity) adopts the identity from the first
+// notification WITHOUT tripping the rotation gate — the installed
+// cross-cert anchored the same deterministic key.
+func TestLegacyStateMigratesToIdentity(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	caDay1, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.OnOwnerCA("bob", []byte{1}, caDay1, clock.Add(24*time.Hour).Unix(), false)
+	// Hand-roll a legacy state file: drop ca_identity + minted_at.
+	legacy := map[string]crossState{
+		"bob": {TldIDB32: e.Snapshot()[0].TldIDB32, CASha256: tlsca.Fingerprint(caDay1), NotAfter: e.Snapshot()[0].NotAfter},
+	}
+	e.mu.Lock()
+	e.state = legacy
+	e.mu.Unlock()
+	if err := e.saveState(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next day's bytes: the legacy entry must adopt, not rotate.
+	caDay2, _, err := tlsca.OwnerCA(ownerSeed(t, 7), "bob", clock.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(caDay1) == string(caDay2) {
+		t.Skip("CA bytes identical across derivation days (test invariant broken)")
+	}
+	e.OnOwnerCA("bob", []byte{1}, caDay2, clock.Add(24*time.Hour).Unix(), false)
+	got := e.Snapshot()[0]
+	if got.Status != statusInstalled || got.PendingCASha256 != "" {
+		t.Fatalf("legacy migration tripped the rotation gate: %+v", got)
+	}
+	if got.CAIdentity == "" {
+		t.Fatal("legacy entry did not adopt the CA identity")
+	}
 }
