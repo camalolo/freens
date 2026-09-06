@@ -2,7 +2,11 @@ package dht
 
 import (
 	"bytes"
+	"math/rand"
+	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
@@ -356,5 +360,85 @@ func TestRoutingTableAllContactsOrder(t *testing.T) {
 	}
 	if rt.Size() != 3 {
 		t.Fatalf("Size = %d, want 3", rt.Size())
+	}
+}
+
+// TestClosestNoNestedLockDeadlock is the v0.16.4 regression: Closest MUST
+// not acquire any rt lock while holding its own — the old capacity probe
+// called rt.Size() under the read lock, and Go's RLock is only
+// conditionally reentrant: a writer queued in the microseconds between the
+// two acquisitions made the reader block on its own outstanding read, the
+// writer block behind it, and the table freeze permanently (the
+// 2026-09-05/06 fleet wedge — the Y-shaped dump of a writer at Add plus
+// readers blocked at every RLock site matched this precisely).
+//
+// The bed is deliberately loaded so writer/reader interleavings reliably
+// hit the old critical section; if the reader ever stalls, stacks are
+// printed instead of a bare hang.
+func TestClosestNoNestedLockDeadlock(t *testing.T) {
+	var self [32]byte
+	for i := range self {
+		self[i] = byte(i)
+	}
+	rt, err := NewRoutingTable(self[:], 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fill many buckets so Closest's sorted gather is non-trivial.
+	for b := 0; b < numBuckets/4; b++ {
+		for k := 0; k < 8; k++ {
+			var id [32]byte
+			copy(id[:], self[:])
+			id[0] ^= byte(b)
+			id[1] = byte(k)
+			_, _ = rt.Add(&NodeContact{NodeID: id[:], Addr: "127.0.0.1:1", LastSeen: 1})
+		}
+	}
+	target := self[:]
+
+	stop := make(chan struct{})
+	for w := 0; w < 3; w++ {
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var id [32]byte
+				rand.Read(id[:])
+				_, _ = rt.Add(&NodeContact{NodeID: id[:], Addr: "127.0.0.1:2", LastSeen: 1})
+				rt.Remove(id[:])
+				_ = rt.PromoteAlt(id[:], "127.0.0.1:2")
+			}
+		}()
+	}
+	readerDone := make(chan struct{})
+	readerCalls := new(int64)
+	go func() {
+		defer close(readerDone)
+		last := time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = rt.Closest(target, 8)
+			atomic.AddInt64(readerCalls, 1)
+			_ = last
+		}
+	}()
+
+	// Let writers and the reader race for a real epoch.
+	time.Sleep(2 * time.Second)
+	close(stop)
+	select {
+	case <-readerDone:
+		t.Logf("reader+writers survived the contention epoch (%d Closest calls)", atomic.LoadInt64(readerCalls))
+	case <-time.After(20 * time.Second):
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("Closest deadlocked under writer contention; goroutines:\n%s", buf[:n])
 	}
 }

@@ -465,11 +465,30 @@ func (rt *RoutingTable) Get(nodeID []byte) *NodeContact {
 // typically 8-20 (found in the 2026-09-04 audit). The sort and the surviving
 // clones both hold the read lock: contact structs are mutated in place by
 // probation/exchange updates, so touching them unlocked would race.
+//
+// v0.16.4: NO rt method may be called from inside this critical section.
+// The original capacity probe called rt.Size() under RLock — and RLock is
+// only CONDITIONALLY reentrant in Go: if a writer queues in the microseconds
+// between the two acquisitions, the nested RLock blocks THIS goroutine while
+// its outer RLock is still held, the queued writer then waits forever for
+// the reader to drain, and every later reader blocks behind the writer —
+// a permanent routing-table freeze. That interleaving is exactly what
+// wedged the fleet on 2026-09-05/06 (the ~10 000-goroutine serving wedge;
+// the flight leader's walk self-deadlocked inside Closest→Size, and the Y-
+// shaped dump — a writer at Add plus readers at every RLock — matched the
+// RWMutex writer-preference state perfectly). The capacity is now computed
+// in-lock from the buckets themselves; the lock is deferred so not even a
+// panic can strand the table.
 func (rt *RoutingTable) Closest(target []byte, n int) []*NodeContact {
 	rt.mu.RLock()
-	ptrs := make([]*NodeContact, 0, rt.Size())
-	for _, b := range rt.Buckets {
-		ptrs = append(ptrs, b.Nodes...)
+	defer rt.mu.RUnlock()
+	total := 0
+	for i := range rt.Buckets {
+		total += len(rt.Buckets[i].Nodes)
+	}
+	ptrs := make([]*NodeContact, 0, total)
+	for i := range rt.Buckets {
+		ptrs = append(ptrs, rt.Buckets[i].Nodes...)
 	}
 	sort.SliceStable(ptrs, func(i, j int) bool {
 		return CompareDistance(target, ptrs[i].NodeID, ptrs[j].NodeID) < 0
@@ -484,7 +503,6 @@ func (rt *RoutingTable) Closest(target []byte, n int) []*NodeContact {
 	for i := 0; i < n; i++ {
 		out[i] = ptrs[i].clone()
 	}
-	rt.mu.RUnlock()
 	return out
 }
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — v0.16.4: THE routing-table deadlock fix (Closest nested its own read lock)
+
+The wedge that took down the server twice and nanopi once — root-caused
+at last by static analysis against the live SIGQUIT dump.
+
+- **dht: `RoutingTable.Closest` no longer calls `rt.Size()` under its own
+  read lock.** Go's RWMutex read lock is only CONDITIONALLY reentrant: a
+  writer queued in the microseconds between Closest's `RLock` and Size's
+  `RLock` made the reader block on its own outstanding read, the writer
+  wait forever behind it, and every later reader block behind the writer —
+  a permanent table freeze. The shape matched the Y-shaped live dump
+  exactly (a writer blocked at `Add`, readers blocked at every RLock site,
+  the flight leader's walk self-deadlocked and the unbounded followers
+  doing the rest). Repro'd deterministically: a contention test that loads
+  the table, races writers against Closest, and fails with a goroutine
+  dump; verified with the OLD nested call re-injected — it deadlocks in
+  seconds (the watchdog prints the same Y-shape). `Closest` now computes
+  its capacity in-lock from the buckets and uses deferred unlock, so not
+  even a panic can strand the table. The only nested acquisition in the
+  package.
+- Threat to your own future wedges: `GET /debug/goroutines` (v0.16.3)
+  plus the goroutine-count tripwire in AGENTS.md.
+
 ## Unreleased — v0.16.3: the wedged-serving containment (flight followers bounded, live goroutine dumps)
 
 - **resolver: a stalled single-flight no longer captures every future
