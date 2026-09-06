@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — v0.16.3: the wedged-serving containment (flight followers bounded, live goroutine dumps)
+
+- **resolver: a stalled single-flight no longer captures every future
+  resolution of its name.** A flight leader wedged inside a
+  context-BLIND wait (the routing-table mutex deadlock found live
+  2026-09-05, see below) used to strand every concurrent and future
+  resolution of that cache key forever: `<-f.done` had no bound, and the
+  refresh path kicks once per 5 s — one dead leader accrued ~10 000
+  parked goroutines on nanopi (15 h), grinding the scheduler until every
+  serving path starved (the admin-socket + DNS timeouts). Followers now
+  join under THEIR ctx, reap the corpse on expiry (the next caller
+  re-leads), and answer SERVFAIL (never cached) — the blast radius of a
+  wedged leader is now ONE name SERVFAILing, self-healing on the next
+  call, instead of the whole box dying in hours.
+- **admin: `GET /debug/goroutines` on the local socket** — a live
+  runtime.Stack dump; the wedged-box diagnosis used to require a SIGQUIT
+  (killing the daemon and racing journal rotation). The workshop tool
+  the incidents kept needing.
+- **dht (known open): the routing-table RWMutex deadlock isn't fixed in
+  this release — it needs its OWNER identified from a live dump** (the
+  nanopi SIGQUIT proved the lock was held ~18 h, blocking AllContacts
+  readers and every Add writer, but rotation ate the owner's stack).
+  With the follower bound above, the next occurrence degrades cleanly
+  and `/debug/goroutines` hands us the owner immediately.
+
 ## Unreleased — v0.16.2: the fleet-log pass — false renewal confirms, the hollowed rescue, rotation-gate day-roll false alarms, re-mint churn, bounded installer execs
 
 The 2026-09-05 morning fleet-log review caught a real outage chain and

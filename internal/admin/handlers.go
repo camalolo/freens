@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,9 +69,30 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /store", s.handleStore)
 	mux.HandleFunc("GET /difficulty", s.handleDifficulty)
 	mux.HandleFunc("GET /tls", s.handleTLS)
+	// v0.16.3: live goroutine dump — the post-incident diagnostic a wedged
+	// serving path used to need a SIGQUIT for (killing the daemon and
+	// racing journal rotation). Local admin socket only.
+	mux.HandleFunc("GET /debug/goroutines", s.handleDebugGoroutines)
 	mux.HandleFunc("POST /dns-query", s.handleDNSQuery)
 	mux.HandleFunc("POST /reload", s.handleReload)
 	return s.logRequests(mux)
+}
+
+// handleDebugGoroutines dumps every goroutine stack (runtime.Stack all).
+// Text/plain: the raw scheduler view, not JSON. Used from the admin socket
+// when a serving path looks wedged — one curl replaces the SIGQUIT dance.
+func (s *Server) handleDebugGoroutines(w http.ResponseWriter, r *http.Request) {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(buf)
 }
 
 // SetTLSProvider wires the §9.5 trust-sync snapshot source (nil disables

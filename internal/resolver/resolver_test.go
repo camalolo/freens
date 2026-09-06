@@ -2359,3 +2359,45 @@ func TestResolveQuestionClaimResolverOnlyBackcompat(t *testing.T) {
 		t.Errorf("legacy single-claim path resolved %s, want the SERVED envelope's claimant (%s)", a.A, wLate.wwwIPv4)
 	}
 }
+
+// TestFlightReapOnStaleLeader locks the v0.16.3 wedge containment: a
+// flight whose leader never completes (wedged inside a context-blind wait,
+// found live 2026-09-05 with ~10 000 parked refresh goroutines) must not
+// capture every future resolution of the name. A follower whose ctx
+// expires reaps the corpse; the next caller re-leads and completes.
+func TestFlightReapOnStaleLeader(t *testing.T) {
+	w := newClaimedWorld(t, "footld")
+	lookup := newFakeClaimLookup()
+	lookup.putClaim("footld", w.tldEnv)
+	lookup.put(w.wwwEnv)
+	r := newResolver(claimConfig(), lookup, nil)
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	ck := cacheKey{name: q.Name, qtype: q.Qtype, qclass: q.Qclass}
+
+	// The corpse: a flight entry whose leader never closes done (exactly
+	// what a leader stuck on the routing-table mutex looks like).
+	corpse := &resFlight{done: make(chan struct{})}
+	r.flightMu.Lock()
+	r.flights = map[cacheKey]*resFlight{ck: corpse}
+	r.flightMu.Unlock()
+
+	// A follower with a tiny budget must SERVFAIL and reap — not park.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, rcode, _, err := r.resolveShared(ctx, q, ck)
+	cancel()
+	if err == nil || rcode != dns.RcodeServerFailure {
+		t.Fatalf("stale-leader join: rcode=%d err=%v, want SERVFAIL", rcode, err)
+	}
+	r.flightMu.Lock()
+	_, still := r.flights[ck]
+	r.flightMu.Unlock()
+	if still {
+		t.Fatal("corpse flight was not reaped")
+	}
+
+	// The next caller re-leads and resolves normally (the name is real).
+	rrs, rcode, _, err := r.resolveShared(context.Background(), q, ck)
+	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
+		t.Fatalf("re-lead after reap: rcode=%d len=%d err=%v", rcode, len(rrs), err)
+	}
+}

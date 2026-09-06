@@ -367,11 +367,43 @@ func New(cfg *Config, freens RecordLookup, upstream Upstream) *Resolver {
 // the cap gets an immediate SERVFAIL-class error instead of unbounded
 // concurrent resolutions; followers never consume slots — joining an
 // in-flight resolution is free by design.
+// errFlightStale is the follower-side verdict when a flight's leader does
+// not complete within the follower's context — SERVFAIL, never cached.
+var errFlightStale = errors.New("resolver: in-flight resolution did not complete in time")
+
+// reapCorpseFlight removes a flight entry when the join-caller's ctx
+// expired first — the leader went missing inside a context-blind wait, so
+// the flight must stop capturing future resolutions (the next caller
+// re-leads). Only reaps when the entry still points at THIS flight (a
+// newer leader may have taken the slot).
+func (r *Resolver) reapCorpseFlight(ck cacheKey, f *resFlight) {
+	r.flightMu.Lock()
+	if cur, ok := r.flights[ck]; ok && cur == f {
+		delete(r.flights, ck)
+	}
+	r.flightMu.Unlock()
+}
+
 func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKey) ([]dns.RR, int, bool, error) {
 	r.flightMu.Lock()
 	if f, ok := r.flights[ck]; ok {
 		r.flightMu.Unlock()
-		<-f.done
+		// Join the in-flight resolution. v0.16.3: the join is bound by THIS
+		// caller's context — before this fix, a corpse flight (a leader
+		// wedged inside a context-BLIND wait, e.g. a routing-table mutex)
+		// captured every future resolution of the name forever: with the
+		// refresh path kicking once per refreshKickEvery seconds, a single
+		// dead leader accrued one never-exiting goroutine per kick — found
+		// live 2026-09-05 with ~10 000 parked refresh goroutines grinding
+		// the daemon's scheduler to a halt and every serving path starved.
+		// A follower whose ctx expires reaps the corpse so the next caller
+		// re-leads (SERVFAIL, never cached, so clients simply retry).
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			r.reapCorpseFlight(ck, f)
+			return nil, dns.RcodeServerFailure, false, errFlightStale
+		}
 		return f.rrs, f.rcode, f.aa, f.err
 	}
 	// Leader path: lazily build the semaphore, then acquire a slot
