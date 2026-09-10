@@ -25,8 +25,23 @@ Description=freens TLS trust bridge (§9.5 cross-cert spool watcher)
 Documentation=https://github.com/camalolo/freens
 
 [Path]
-PathExistsGlob=%SPoolDir%/freens-cross-*.crt
-PathModified=%SPoolDir%/freens-cross-*.crt
+# Trigger on CONTENT CHANGES of the spool directory — install, refresh and
+# purge all converge (deleting a spool file is a directory event too).
+# NOT the two-liner this used to be:
+#   PathExistsGlob=<spool>/freens-cross-*.crt
+#   PathModified=<spool>/freens-cross-*.crt
+# PathModified= with a glob NEVER fires on systemd 252 (the glob dir-watch
+# silently drops IN_MODIFY/IN_MOVED_TO — verified live by mv/append/cp
+# tests), so PathExistsGlob was doing ALL the syncing, by RE-FIRING after
+# every service completion while the glob still matches: a permanent
+# oneshot loop the moment the daemon writes its first spool file (found
+# live 2026-09-10: the server ran ~88k update-ca-certificates rounds in
+# ~15 h — ~1.6/s, load pegged by the java CA hook — and minipc armed the
+# same loop on its next spool rewrite). DirectoryNotEmpty= is the same
+# disease: it re-checks "non-empty" on re-arm and the spool is never
+# empty. PathChanged= on the LITERAL directory is event-driven and never
+# re-checks on re-arm: one sync per spool change, no loop.
+PathChanged=%SPoolDir%
 Unit=freens-trust.service
 TriggerLimitIntervalSec=10s
 TriggerLimitBurst=64

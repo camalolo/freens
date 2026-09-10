@@ -55,6 +55,20 @@ func TestTrustBridgeRepairsStaleUnits(t *testing.T) {
 	if !strings.Contains(string(gotPu), "TriggerLimitBurst=64") {
 		t.Error("repaired path unit lacks the trigger cap")
 	}
+	// The 2026-09-10 live incident: the old PathExistsGlob+PathModified
+	// shape loops (~1.6/s oneshot re-fires, ~88k runs/15 h on the server)
+	// because PathModified-glob never fires and PathExistsGlob re-fires on
+	// every re-arm. The repaired unit must watch the spool DIRECTORY and
+	// carry neither of the loop lines.
+	if !strings.Contains(string(gotPu), "PathChanged=") {
+		t.Error("repaired path unit does not watch the spool directory (PathChanged)")
+	}
+	for _, line := range strings.Split(string(gotPu), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "PathExistsGlob") || strings.HasPrefix(trimmed, "PathModified") {
+			t.Errorf("repaired path unit still carries the loop shape (directive %q)", trimmed)
+		}
+	}
 }
 
 func TestTrustBridgeIdempotent(t *testing.T) {
