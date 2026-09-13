@@ -34,6 +34,16 @@ func cmdRenew(args []string) error {
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
+	// stdlib flag stops at the first non-flag argument, so anything after
+	// it lands in fs.Args() verbatim — including misordered flags
+	// (`renew a b -force` would try to renew a name literally called
+	// "-force"). Fail loudly instead: the flags are real, they just came
+	// after a name.
+	for _, a := range fs.Args() {
+		if strings.HasPrefix(a, "-") {
+			return usageErr("flags must come BEFORE the names (got %q after a name)", a)
+		}
+	}
 	names := append(lead, fs.Args()...)
 	if len(names) == 0 {
 		names = keychainAliases()

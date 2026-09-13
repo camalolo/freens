@@ -21,3 +21,7 @@ AGENTS.md
 freens.exe
 freens-cli.exe
 freens-web.exe
+
+# stray build artifacts (the throwaway re-attest probe, debug binaries)
+reattprobe
+*.debug

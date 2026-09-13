@@ -134,9 +134,21 @@ func (s *Server) Shutdown() error {
 // dns.Server (no Server wrapper required). It resolves via ResolveMsg and
 // writes the response with the datagram framing rules (UDP truncation, see
 // writeReply).
+//
+// The context carries a hard per-query deadline (same cap as the admin
+// socket's requestCap): the resolve path fans into a single-flight whose
+// followers escape a wedged leader ONLY via ctx.Done() — a bare
+// context.Background() here would park one handler goroutine per query
+// forever behind a context-blind leader (the v0.16.3 wedge class), and
+// enough parked leaders exhaust the resolve semaphore.
 func (r *Resolver) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
-	writeReply(w, r.ResolveMsg(context.Background(), m))
+	ctx, cancel := context.WithTimeout(context.Background(), serveQueryCap)
+	defer cancel()
+	writeReply(w, r.ResolveMsg(ctx, m))
 }
+
+// serveQueryCap bounds one client-facing DNS query's total server-side work.
+const serveQueryCap = 30 * time.Second
 
 // ResolveMsg answers one DNS query message and returns the response message
 // (never nil; the echoed question + rcode/answers/AA per §9.2). It is the

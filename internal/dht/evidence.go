@@ -336,8 +336,17 @@ func (l *DHTLookup) LookupEvidence(ctx context.Context, recordHash []byte) (*wir
 // iterativeGetEvidence performs the §8.4 evidence analogue of IterativeGet:
 // an iterative Kademlia lookup on recordHash, querying ALPHA=3 contacts per
 // round in parallel, merging closer contacts, and returning the first
-// "evidence" arg any peer offers. Returns (nil, nil) when no reachable peer
-// has evidence for the hash.
+// "evidence" arg any peer offers.
+//
+// It carries the same walk disciplines as IterativeGetDetailed: the walker
+// itself and recently-penalized corpses are skipped as candidates, a
+// fully-dead round widens the next batch (ALPHA → 2·ALPHA → … ≤ K), and the
+// miss is CLASSIFIED — (nil, nil) only when every reachable holder answered
+// (a clean "not held"); when probes failed the walk returns ErrDegradedMiss
+// so callers refuse to treat it as an authoritative miss. LookupEvidence's
+// callers treat a bare nil as "the §8.4 hop is unprovable" — a
+// churn/partition turning that into an NXDOMAIN-class miss is exactly the
+// issue-#1 failure mode the degraded classification exists to prevent.
 func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]byte, error) {
 	shortlist := append([]*NodeContact(nil), n.rt.Closest(recordHash, constants.K)...)
 	if len(shortlist) == 0 {
@@ -350,6 +359,8 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 	}
 	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
+	batchSize := constants.Alpha
+	probesFailed := 0
 	for round := 0; round < maxLookupRounds; round++ {
 		// Nearest-first so the ALPHA un-queried we pick are the closest.
 		sort.SliceStable(shortlist, func(i, j int) bool {
@@ -357,15 +368,22 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 		})
 		var batch []*NodeContact
 		for _, c := range shortlist {
-			if !queried[string(c.NodeID)] {
-				batch = append(batch, c)
-				if len(batch) >= constants.Alpha {
-					break
-				}
+			if queried[string(c.NodeID)] {
+				continue
+			}
+			if bytes.Equal(c.NodeID, n.id) {
+				continue // the walker itself: its answer is the local view, not the network's
+			}
+			if n.penalized(c.NodeID, n.now()) {
+				continue // recently-failed corpse: skip as a candidate
+			}
+			batch = append(batch, c)
+			if len(batch) >= batchSize {
+				break
 			}
 		}
 		if len(batch) == 0 {
-			break // every known contact queried: converged.
+			break // every known contact queried or penalized: converged.
 		}
 
 		type res struct {
@@ -388,10 +406,16 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 		}
 		wg.Wait()
 
+		roundAnswered := 0
 		for i, r := range results {
-			// Kademlia failure handling (§6.2), as in IterativeGet.
+			// Kademlia failure handling (§6.2), as in IterativeGet: a
+			// parent-context cancellation is not a peer failure, and a
+			// failed-over node skips the corpse penalty.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
-				n.probeFailed(batch[i])
+				probesFailed++
+				n.markDeadUnlessPromoted(batch[i], n.now())
+			} else if r.err == nil {
+				roundAnswered++
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)
@@ -403,6 +427,16 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 				return r.raw, nil
 			}
 		}
+		// Adaptive batch, same rationale as IterativeGet (issue #1).
+		if roundAnswered == 0 {
+			batchSize *= 2
+			if batchSize > constants.K {
+				batchSize = constants.K
+			}
+		}
+	}
+	if probesFailed > 0 {
+		return nil, ErrDegradedMiss
 	}
 	return nil, nil
 }

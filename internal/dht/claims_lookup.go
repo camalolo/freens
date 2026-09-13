@@ -243,11 +243,12 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 			}
 			// §6.2 failure handling, identical to IterativeGet: evict a
 			// contact whose probe failed (unless the caller cancelled) and
-			// penalize it for deadPenaltyWindow so later walks skip it.
+			// penalize it for deadPenaltyWindow so later walks skip it —
+			// unless it failed over to a fresher address, in which case the
+			// ID-keyed penalty would hide a probably-alive node.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
 				probesFailed++
-				n.probeFailed(batch[i])
-				n.markDead(batch[i].NodeID, n.now())
+				n.markDeadUnlessPromoted(batch[i], n.now())
 				continue
 			}
 			if r.err == nil {

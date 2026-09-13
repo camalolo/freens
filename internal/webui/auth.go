@@ -241,8 +241,12 @@ func sessionFromRequest(r *http.Request) string {
 }
 
 // setSessionCookie writes the session cookie (HttpOnly, SameSite=Lax,
-// path=/, 24 h).
-func setSessionCookie(w http.ResponseWriter, sid string) {
+// path=/, 24 h). Secure is set whenever the server is TLS-capable (the
+// mixed-dialect listener): a cookie without it rides the plaintext 308
+// face on any induced http:// request, handing the session to a passive
+// eavesdropper — HSTS only protects AFTER the first plaintext response.
+// Plain-HTTP installs (no issuable leaf) keep the cookie working.
+func (s *Server) setSessionCookie(w http.ResponseWriter, sid string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    sid,
@@ -250,13 +254,14 @@ func setSessionCookie(w http.ResponseWriter, sid string) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
+		Secure:   s.tlsActive.Load(),
 	})
 }
 
 // clearSessionCookie expires the session cookie.
-func clearSessionCookie(w http.ResponseWriter) {
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteLaxMode, MaxAge: -1,
+		SameSite: http.SameSiteLaxMode, MaxAge: -1, Secure: s.tlsActive.Load(),
 	})
 }

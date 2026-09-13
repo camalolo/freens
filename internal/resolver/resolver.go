@@ -293,6 +293,29 @@ const refreshKickEvery = 5
 // path already returned; this only decides when the goroutine gives up).
 const refreshTimeout = 60 * time.Second
 
+// The refresh bookkeeping maps are keyed by cache key and consulted only
+// within seconds of a query for the same name — an entry for a name nobody
+// has asked about in refreshBookkeepingTTL is pure ballast (its throttle
+// window is refreshKickEvery, its WARN-once purpose lapses), so they are
+// pruned wholesale once refreshBookkeepingCap keys pile up. Without this
+// both maps grow forever with every distinct name ever queried twice.
+const (
+	refreshBookkeepingCap = 4096 // match the answer cache's cap
+	refreshBookkeepingTTL = 300  // seconds since the last kick for that key
+)
+
+// pruneRefreshBookkeepingLocked drops stale entries from refreshes (and
+// their failing partners). Called with flightMu held, only when the map
+// reached the cap — amortized O(1) per insert.
+func (r *Resolver) pruneRefreshBookkeepingLocked(now int64) {
+	for ck, last := range r.refreshes {
+		if now-last > refreshBookkeepingTTL {
+			delete(r.refreshes, ck)
+			delete(r.refreshFailing, ck)
+		}
+	}
+}
+
 // kickRefresh revalidates a stale cache entry in the background: the
 // caller has already ANSWERED the query from the stale copy, so this is
 // best-effort by construction. resolveShared provides the single-flight
@@ -317,6 +340,9 @@ func (r *Resolver) kickRefresh(q dns.Question, ck cacheKey) {
 		return
 	}
 	r.refreshes[ck] = now
+	if len(r.refreshes) >= refreshBookkeepingCap {
+		r.pruneRefreshBookkeepingLocked(now)
+	}
 	r.flightMu.Unlock()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
@@ -1351,14 +1377,18 @@ func freensRRToDNS(name string, rr *wire.RR, expires, now int64) dns.RR {
 		if len(rr.Rdata) == 0 {
 			return &dns.TXT{Hdr: hdr, Txt: []string{""}}
 		}
-		txt := make([]string, 0, (len(rr.Rdata)+254)/255)
-		for len(rr.Rdata) > 0 {
-			n := len(rr.Rdata)
+		// rr is a pointer INTO the envelope returned by the store — shared
+		// with every other consumer until eviction — so chunk over a local
+		// copy; reslicing rr.Rdata would consume the stored record.
+		rdata := rr.Rdata
+		txt := make([]string, 0, (len(rdata)+254)/255)
+		for len(rdata) > 0 {
+			n := len(rdata)
 			if n > 255 {
 				n = 255
 			}
-			txt = append(txt, string(rr.Rdata[:n]))
-			rr.Rdata = rr.Rdata[n:]
+			txt = append(txt, string(rdata[:n]))
+			rdata = rdata[n:]
 		}
 		return &dns.TXT{Hdr: hdr, Txt: txt}
 	case wire.RRTypeNS:

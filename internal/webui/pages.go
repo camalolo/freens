@@ -631,14 +631,14 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusSeeOther)
 		return
 	}
-	setSessionCookie(w, sid)
+	s.setSessionCookie(w, sid)
 	s.log.Info("webui: login", "remote", ip)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.auth.dropSession(sessionFromRequest(r))
-	clearSessionCookie(w)
+	s.clearSessionCookie(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -688,7 +688,7 @@ func (s *Server) handleBootstrapPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid, _ := s.auth.checkPassword(remoteIP(r), p1)
-	setSessionCookie(w, sid)
+	s.setSessionCookie(w, sid)
 	s.log.Info("webui: admin password set", "remote", remoteIP(r))
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }

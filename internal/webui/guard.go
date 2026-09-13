@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -91,6 +92,37 @@ func requireCSRF(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sameSite guards the auth POSTs (/login, /bootstrap). They run BEFORE a
+// session — and therefore before requireCSRF's header check — exists, so a
+// cross-site form post could reach them with nothing to stop it: an
+// attacker page could plant an admin password on a fresh install (or on the
+// documented "delete the hash file to re-open bootstrap" recovery path),
+// then simply log in. Browsers attach Fetch Metadata to every request they
+// make, and an Origin to every form POST, so: Sec-Fetch-Site cross-site (or
+// same-site — all this UI's forms are same-origin) is refused; without
+// metadata, a mismatching Origin is refused. No metadata and no Origin is
+// not a browser form post (curl, scripts, tests) — allowed.
+func sameSite(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch v := strings.TrimSpace(strings.ToLower(r.Header.Get("Sec-Fetch-Site"))); v {
+		case "same-origin", "none":
+			next(w, r)
+			return
+		case "same-site", "cross-site":
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
+			return
+		}
+		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || u.Host == "" || u.Host != r.Host {
+				http.Error(w, "cross-site request refused", http.StatusForbidden)
+				return
+			}
+		}
+		next(w, r)
+	}
 }
 
 // logRequests is a compact one-line access log (Info level: this server has

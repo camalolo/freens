@@ -98,6 +98,14 @@ type EnvelopeStore struct {
 	mu       sync.Mutex
 	entries  map[[constants.SHA256Len]byte]*entry
 
+	// bytes is the running sum of the entries' cached sizes — maintained at
+	// every insert/replace/delete so the byte budget never needs a full-map
+	// scan. It runs on the readLoop goroutine (hPut), where a per-put O(n)
+	// recount (and the cap overflow's O(m·n) re-scan) stalled reply delivery
+	// for the whole node; the history/evidence tables already kept running
+	// counters (historyBytes/evidenceBytes) — this brings entries in line.
+	bytes int
+
 	// history retains superseded envelopes (§8.3) keyed by THEIR OWN H_record
 	// (not by DHT key): the displaced incumbent on every winning Put, plus
 	// everything dropped by the expired/LRU sweeps. Bounded by historyMax
@@ -297,10 +305,13 @@ func (s *EnvelopeStore) PutWithEvidence(key []byte, env *wire.SignedEnvelope, no
 	// §8.3 retention: the displaced incumbent — alive loser of the winner
 	// check, or an already-dead envelope the newcomer recycles the slot from —
 	// becomes audit history keyed by its own H_record.
+	prevSize := 0
 	if cur, ok := s.entries[k]; ok {
+		prevSize = cur.size
 		s.retainHistoryLocked(cur)
 	}
 	s.entries[k] = &entry{env: env, size: len(b), lastAccess: now}
+	s.bytes += len(b) - prevSize
 
 	// --- rule 4: post-accept eviction sweeps (§6.4 step 4 + §12) --------
 	// Expired-first (may drop the just-put key iff IT is past grace — an
@@ -355,6 +366,7 @@ func (s *EnvelopeStore) Get(key []byte, now int64) (*wire.SignedEnvelope, error)
 		// §8.3 history like every other envelope leaving the live map.
 		s.retainHistoryLocked(e)
 		delete(s.entries, k)
+		s.bytes -= e.size
 		return nil, nil
 	}
 	e.lastAccess = now
@@ -393,10 +405,12 @@ func (s *EnvelopeStore) Remove(key []byte) bool {
 	copy(k[:], key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.entries[k]; !ok {
+	e, ok := s.entries[k]
+	if !ok {
 		return false
 	}
 	delete(s.entries, k)
+	s.bytes -= e.size
 	return true
 }
 
@@ -567,14 +581,11 @@ func (s *EnvelopeStore) aliveLocked(e *entry, now int64) bool {
 	return now < int64(e.env.Record.Expires)+int64(constants.ExpiryGrace)
 }
 
-// totalBytesLocked returns the sum of cached per-entry sizes. Caller must hold
-// s.mu.
+// totalBytesLocked returns the live map's total cached byte size — O(1): the
+// running counter s.bytes, maintained at every entry insert/replace/delete.
+// Caller must hold s.mu.
 func (s *EnvelopeStore) totalBytesLocked() int {
-	total := 0
-	for _, e := range s.entries {
-		total += e.size
-	}
-	return total
+	return s.bytes
 }
 
 // evictExpiredLocked drops every entry past expires + ExpiryGrace and returns
@@ -587,6 +598,7 @@ func (s *EnvelopeStore) evictExpiredLocked(now int64) int {
 		if !s.aliveLocked(e, now) {
 			s.retainHistoryLocked(e)
 			delete(s.entries, k)
+			s.bytes -= e.size
 			evicted++
 		}
 	}
@@ -617,11 +629,15 @@ func (s *EnvelopeStore) enforceCapLocked(now int64, protected [constants.SHA256L
 		if !s.aliveLocked(e, now) {
 			s.retainHistoryLocked(e)
 			delete(s.entries, k)
+			s.bytes -= e.size
 			evicted++
 		}
 	}
 	// --- then LRU until under cap (or nothing evictable remains) ---------
-	for s.totalBytesLocked() > s.maxBytes && len(s.entries) > 1 {
+	// The budget check reads the running counter (O(1)) and each eviction
+	// decrements it — the pre-counter shape recomputed a full-map sum per
+	// iteration, making shedding m entries O(m·n) on the readLoop.
+	for s.bytes > s.maxBytes && len(s.entries) > 1 {
 		var lruKey [constants.SHA256Len]byte
 		var lruLast int64
 		found := false
@@ -645,6 +661,7 @@ func (s *EnvelopeStore) enforceCapLocked(now int64, protected [constants.SHA256L
 			break
 		}
 		s.retainHistoryLocked(s.entries[lruKey])
+		s.bytes -= s.entries[lruKey].size
 		delete(s.entries, lruKey)
 		evicted++
 	}

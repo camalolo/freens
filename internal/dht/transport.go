@@ -1183,22 +1183,6 @@ func (n *Node) evictionLoop(ctx context.Context) {
 	}
 }
 
-// evictCandidate performs the §6.2 ping-oldest check for newcomer c, whose
-// bucket was full when the request was scheduled:
-//
-//   - Re-add c first: the table may have changed while the request waited
-//     (contact evicted elsewhere, bucket drained). A nil return from
-//     rtAddOrIgnore means c was inserted or refreshed — done.
-//   - Otherwise ping the CURRENT oldest (head) of c's bucket with the
-//     maintenance deadline. Any verified response proves the oldest is live
-//     (readLoop→learnPeer refreshes it as a side effect, moving it to the
-//     tail): keep it, drop c — the §6.2 rule favors retained, live contacts.
-//   - On timeout / unreachable, remove the oldest and insert c in the freed
-//     slot. A shutdown cancellation (ctx.Err) is NOT a peer failure: never
-//     evict for it.
-//
-// The ping runs on the maintenance goroutine, so its response is delivered by
-// the still-running readLoop — no self-deadlock with sendQuery.
 // probeFailed implements §6.2 probe-failure handling with a grace for
 // directly-confirmed contacts. The probe budget is 2s (lookupProbeTimeout)
 // on a real network — NAT mapping churn, PPPoE jitter, a busy peer — and
@@ -1216,7 +1200,12 @@ func (n *Node) evictionLoop(ctx context.Context) {
 // one already demoted by an earlier miss — is removed exactly as before,
 // so genuinely dead peers still converge within a probe round (or the
 // idle sweep), not the full TTL.
-func (n *Node) probeFailed(c *NodeContact) {
+//
+// Returns true when the node FAILED OVER to a fresher alternate address:
+// it is probably alive at that address, so callers must NOT also apply the
+// ID-keyed dead penalty (or drop it from walk results) — that would hide a
+// reachable node behind the corpse marking.
+func (n *Node) probeFailed(c *NodeContact) (promoted bool) {
 	if live := n.rt.Get(c.NodeID); live != nil {
 		// Failover first: another known address for this node takes over
 		// as preferred before we give up on the node. Only addresses with
@@ -1236,17 +1225,30 @@ func (n *Node) probeFailed(c *NodeContact) {
 			if n.rt.PromoteAlt(live.NodeID, a.Addr) {
 				n.log.Debug("dht: probe missed, switched to alternate address",
 					"addr", c.Addr, "next", a.Addr)
-				return
+				return true
 			}
 		}
 		if live.ConfirmedAt > 0 {
 			n.rt.Demote(c.NodeID)
 			n.log.Debug("dht: probe missed, demoted confirmed contact", "addr", c.Addr)
-			return
+			return false
 		}
 	}
 	n.rt.Remove(c.NodeID)
 	n.log.Debug("dht: evicted unresponsive contact", "addr", c.Addr)
+	return false
+}
+
+// markDeadUnlessPromoted applies the walks' deadPenaltyWindow penalty —
+// unless probeFailed just failed the node over to a fresher address, in
+// which case the penalty (keyed by NodeID) would hide a probably-alive
+// contact from this and the next walks for 30 s, defeating the multi-homed
+// failover that just happened beside it.
+func (n *Node) markDeadUnlessPromoted(c *NodeContact, now int64) {
+	if n.probeFailed(c) {
+		return
+	}
+	n.markDead(c.NodeID, now)
 }
 
 // evictCandidate implements §6.4 step 3: a newcomer arrived at a full
@@ -2319,8 +2321,10 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 			// corpse in their {nodes} lists until they probe it themselves.
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
 				stats.ProbesFailed++
-				n.probeFailed(batch[i])
-				n.markDead(batch[i].NodeID, n.now())
+				// A node that just FAILED OVER to a fresher address skips the
+				// ID-keyed penalty — hiding it for 30 s would defeat the
+				// multi-homed failover probeFailed just performed.
+				n.markDeadUnlessPromoted(batch[i], n.now())
 			} else if r.err == nil {
 				roundAnswered++
 			}
@@ -2419,8 +2423,12 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		wg.Wait()
 		for i, r := range results {
 			if r.err != nil && !errors.Is(r.err, context.Canceled) && ctx.Err() == nil {
-				n.probeFailed(batch[i])
-				failed[string(batch[i].NodeID)] = true
+				// A node that FAILED OVER to a fresher address is not a
+				// corpse: leave it in the result (v0.16's contract is "the
+				// closest REACHED contacts", and it is reachable there).
+				if !n.probeFailed(batch[i]) {
+					failed[string(batch[i].NodeID)] = true
+				}
 			}
 			for _, nc := range r.nodes {
 				n.learnContact(nc)
@@ -2559,9 +2567,12 @@ func (n *Node) learnContact(c *NodeContact) {
 	}
 	c.LastSeen = n.now()
 	isNew := n.rt.Get(c.NodeID) == nil
-	// c.ConfirmedAt is left as the caller set it (0 from {nodes} parsing);
-	// AddOrRefresh keeps the stored entry's confirmation untouched.
-	n.learn(c)
+	// Table ownership starts HERE: learn hands the contact to the routing
+	// table BY REFERENCE and later refreshes mutate it in place under
+	// rt.mu (AddOrRefresh / learnPeer) — so give the table a private copy
+	// and keep the caller's struct exclusively ours for the unlocked reads
+	// below. Reading the table-owned pointer here raced those writes.
+	n.learn(c.clone())
 	if isNew && c.ConfirmedAt == 0 {
 		// Confirm-on-learn (2026-09-01): a newly learned, never-confirmed
 		// contact is probed right away. The newcomer bootstrap path taught
@@ -2571,7 +2582,12 @@ func (n *Node) learnContact(c *NodeContact) {
 		// sat with 8 known / 0 confirmed peers and a witness collection
 		// that could not find a quorum. Learning now carries its own
 		// liveness check; the reply path confirms via learnPeer.
-		go n.confirmContact(c.clone())
+		// Dedup BEFORE spawning (the marker is consumed by
+		// confirmContact's deferred Delete): one walk fan-out should not
+		// briefly spawn a goroutine per contact just to no-op.
+		if _, busy := confirmInflight.LoadOrStore(string(c.NodeID), struct{}{}); !busy {
+			go n.confirmContact(c.clone())
+		}
 	}
 }
 
@@ -2584,10 +2600,9 @@ var confirmInflight sync.Map
 // preferred misses, so the stored address follows to wherever the peer is
 // actually reachable. Best-effort: the reply path (learnPeer) does the
 // confirming; a total miss just leaves the contact to the idle sweep.
+// Callers claim the confirmInflight marker FIRST — this function only
+// releases it.
 func (n *Node) confirmContact(c *NodeContact) {
-	if _, busy := confirmInflight.LoadOrStore(string(c.NodeID), struct{}{}); busy {
-		return
-	}
 	defer confirmInflight.Delete(string(c.NodeID))
 
 	cands := []string{c.Addr}
@@ -3436,6 +3451,49 @@ func (l *DHTLookup) freshLocked(key []byte, env *wire.SignedEnvelope, now int64)
 	return now < fa+cacheFreshness(env)
 }
 
+// fetchedAtCap bounds the fetch-stamp table: without a bound it grew by one
+// entry per distinct key ever fetched from the network, forever — including
+// keys whose envelope has long left the bounded store.
+const fetchedAtCap = 4096
+
+// stampFetchedAt records a successful network fetch of key at now, and —
+// once the table crosses fetchedAtCap — prunes stamps whose envelope is no
+// longer alive in the store. A stamp is only ever CONSULTED alongside a
+// store-alive envelope (freshLocked runs only on a cached hit), and a
+// re-fetch re-stamps, so a stamp without its envelope can never be read
+// again: pure ballast. ABSENCE, by contrast, means "authoritative-local,
+// always fresh" — which is why stamps are pruned only when the store really
+// dropped the envelope, never on age.
+func (l *DHTLookup) stampFetchedAt(key []byte, now int64) {
+	var k [constants.SHA256Len]byte
+	copy(k[:], key)
+	l.mu.Lock()
+	l.fetchedAt[k] = now
+	if len(l.fetchedAt) < fetchedAtCap {
+		l.mu.Unlock()
+		return
+	}
+	keys := make([][constants.SHA256Len]byte, 0, len(l.fetchedAt))
+	for kk := range l.fetchedAt {
+		keys = append(keys, kk)
+	}
+	l.mu.Unlock()
+	var dead [][constants.SHA256Len]byte
+	for _, kk := range keys {
+		if !l.store.Has(kk[:], now) {
+			dead = append(dead, kk)
+		}
+	}
+	if len(dead) == 0 {
+		return
+	}
+	l.mu.Lock()
+	for _, kk := range dead {
+		delete(l.fetchedAt, kk)
+	}
+	l.mu.Unlock()
+}
+
 // Lookup returns the winning SignedEnvelope for wireName: a fresh local hit
 // first; a stale network-cached hit triggers re-validation via an iterative
 // GET (on fetch failure the stale copy is served — offline resilience, the
@@ -3463,11 +3521,7 @@ func (l *DHTLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wi
 		// Cache the fetched envelope locally (verifySignature=true defensively
 		// re-checks the signature before storing) and stamp its fetch time.
 		_, _ = l.store.Put(key, env, now, true)
-		l.mu.Lock()
-		var k [constants.SHA256Len]byte
-		copy(k[:], key)
-		l.fetchedAt[k] = now
-		l.mu.Unlock()
+		l.stampFetchedAt(key, now)
 		return env, nil
 	}
 	// Miss. A stale cached copy is still served (offline resilience —
@@ -3595,11 +3649,7 @@ func (l *DHTLookup) LookupClaim(ctx context.Context, alias string, now int64) (*
 		// path MAY cache"; verifySignature=true defensively re-checks it) and
 		// stamp its fetch time so freshness tracking applies to it too.
 		_, _ = l.store.Put(key, env, now, true)
-		l.mu.Lock()
-		var k [constants.SHA256Len]byte
-		copy(k[:], key)
-		l.fetchedAt[k] = now
-		l.mu.Unlock()
+		l.stampFetchedAt(key, now)
 		return env, nil
 	}
 	// The walk did not produce a newer envelope. Serve the cached copy only

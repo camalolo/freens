@@ -138,6 +138,33 @@ func TestTXTMappingChunksLongRdata(t *testing.T) {
 	}
 }
 
+// TestTXTMappingDoesNotMutateSharedRR: freensRRToDNS receives a pointer into
+// the envelope returned by the DHT store — shared with every other consumer
+// until eviction — so chunking must never write back through it. The
+// pre-fix code resliced rr.Rdata in place; the SECOND conversion then saw an
+// consumed record and served Txt: [""].
+func TestTXTMappingDoesNotMutateSharedRR(t *testing.T) {
+	long := strings.Repeat("freens", 111) // 666 bytes
+	rr, err := wire.TXT(long, 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte(nil), rr.Rdata...)
+	for i := 0; i < 2; i++ {
+		got := freensRRToDNS("long.footld.", rr, fixedNow+3600, fixedNow)
+		txt, ok := got.(*dns.TXT)
+		if !ok {
+			t.Fatalf("conversion %d: type = %T, want *dns.TXT", i, got)
+		}
+		if joined := strings.Join(txt.Txt, ""); joined != long {
+			t.Fatalf("conversion %d: chunked rdata = %d bytes, want %d", i, len(joined), len(long))
+		}
+		if string(rr.Rdata) != string(before) {
+			t.Fatalf("conversion %d mutated the shared RR: rdata now %d bytes, want %d", i, len(rr.Rdata), len(before))
+		}
+	}
+}
+
 // TestUDPResponseTruncated: an answer larger than the 512-byte UDP budget is
 // truncated with TC set (client retries over TCP) instead of vanishing as an
 // oversized datagram.

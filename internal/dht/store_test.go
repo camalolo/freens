@@ -746,3 +746,71 @@ func makeChainedEnvAt(t *testing.T, sequence uint64, prevHash []byte, ownerKP *c
 	}
 	return env
 }
+
+// TestEnvelopeStoreByteCounterTracksEntries: the running byte counter behind
+// SizeBytes (O(1) per put on readLoop) must never drift from the ground
+// truth — the sum of per-entry cached sizes. Exercises every mutation site:
+// fresh insert, same-key replacement, Remove, lazy Get eviction, the
+// expired sweep, and LRU cap shedding.
+func TestEnvelopeStoreByteCounterTracksEntries(t *testing.T) {
+	kp := mustKeypair(t)
+	clock := int64(1500)
+	s := NewEnvelopeStore(1<<10, func() int64 { return clock }) // tiny cap: LRU shedding kicks in
+
+	check := func(stage string) {
+		t.Helper()
+		// Ground truth: Get every present key (lazily sweeping dead ones —
+		// exactly what SizeBytes has always counted) then sum the survivors.
+		for _, k := range s.Keys() {
+			s.Get(k, clock)
+		}
+		var want int
+		for _, e := range s.Entries(clock) {
+			want += envBytes(t, e.Env)
+		}
+		if got := s.SizeBytes(); got != want {
+			t.Fatalf("%s: SizeBytes() = %d, ground truth = %d — counter drifted", stage, got, want)
+		}
+	}
+
+	envs := make([]*wire.SignedEnvelope, 12)
+	for i := range envs {
+		envs[i] = makeEnv(t, uint64(i+1), 1000, 2000, kp)
+		if _, err := s.Put(keyN(byte(i+1)), envs[i], clock, true); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	check("after fresh inserts")
+
+	// Replacement: higher sequence wins the same key.
+	envs[0] = makeEnv(t, 99, 1000, 2000, kp)
+	if ok, err := s.Put(keyN(1), envs[0], clock, true); err != nil || !ok {
+		t.Fatalf("replace put: ok=%v err=%v", ok, err)
+	}
+	check("after same-key replacement")
+
+	// Administrative Remove.
+	s.Remove(keyN(2))
+	check("after Remove")
+
+	// Lazy Get eviction: key 3 expires (clock jumps past 2000+grace) and a
+	// Get sweeps it.
+	clock = int64(2000 + constants.ExpiryGrace + 1)
+	s3 := keyN(3)
+	if got, _ := s.Get(s3, clock); got != nil {
+		t.Fatalf("expected key 3 dead after expiry")
+	}
+	check("after lazy Get eviction")
+
+	// Cap shedding: stuff fresh entries until the LRU loop runs (the store
+	// cap is 1 KiB; each envelope is ~100 bytes, so 20 crossings force
+	// repeated shedding — including m-entry overflow in one put).
+	clock = 3000
+	for i := 0; i < 20; i++ {
+		big := makeEnv(t, uint64(200+i), 1000, 9000, kp)
+		if _, err := s.Put(keyN(byte(50+i)), big, clock, true); err != nil {
+			t.Fatalf("cap put %d: %v", i, err)
+		}
+	}
+	check("after LRU cap shedding")
+}

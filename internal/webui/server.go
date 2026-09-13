@@ -13,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/camalolo/freens/internal/admin"
@@ -61,6 +63,13 @@ type Server struct {
 	shutMu       sync.Mutex
 	shuttingDown bool
 	oneshots     map[*oneShotListener]struct{}
+
+	// tlsActive flips true when serve() runs the mixed-dialect (TLS)
+	// listener: session cookies are then marked Secure so they never ride
+	// the plaintext face. Atomic because handlers read it while serve() may
+	// still be racing the listen path (and tests drive handlers without
+	// serve() at all, where the zero value = plain HTTP is correct).
+	tlsActive atomic.Bool
 
 	// jobs: at most a handful; keyed by id. The register job is the only
 	// long-running one (PoW + witnesses can take ~1 min).
@@ -161,10 +170,12 @@ func (s *Server) routes() {
 		s.mux.Handle(pattern, s.logRequests(http.HandlerFunc(h)))
 	}
 	authPage("GET /login", s.handleLoginPage)
-	s.mux.Handle("POST /login", s.logRequests(http.HandlerFunc(s.handleLoginPost)))
+	// The auth POSTs sit BEFORE any session, so requireCSRF's header gate
+	// cannot cover them — sameSite does (see guard.go).
+	s.mux.Handle("POST /login", s.logRequests(http.HandlerFunc(sameSite(s.handleLoginPost))))
 	s.mux.Handle("GET /logout", s.logRequests(http.HandlerFunc(s.handleLogout)))
 	authPage("GET /bootstrap", s.handleBootstrapPage)
-	s.mux.Handle("POST /bootstrap", s.logRequests(http.HandlerFunc(s.handleBootstrapPost)))
+	s.mux.Handle("POST /bootstrap", s.logRequests(http.HandlerFunc(sameSite(s.handleBootstrapPost))))
 
 	// Pages (auth + gate).
 	page := func(pattern string, h http.HandlerFunc) {
@@ -274,7 +285,11 @@ func (s *Server) serve(cert *tls.Certificate) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	plainSrv := &http.Server{
-		Handler:           http.HandlerFunc(s.redirectToTLS),
+		// Through the SAME CIDR gate as the main mux: pre-fix, the
+		// plaintext face sat outside it, so a WAN-reachable box answered
+		// any internet scanner with a redirect + fingerprint instead of a
+		// 403.
+		Handler:           s.gate(http.HandlerFunc(s.redirectToTLS)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	tlsConf := &tls.Config{
@@ -282,6 +297,7 @@ func (s *Server) serve(cert *tls.Certificate) error {
 		MinVersion:   tls.VersionTLS12,
 	}
 	s.httpSrv, s.httpSrvPlain, s.masterLn = tlsSrv, plainSrv, ln
+	s.tlsActive.Store(true) // Secure session cookies from the first response
 	s.boundAddr = ln.Addr().String()
 	if s.gateOpen {
 		cidrs := make([]string, 0, len(s.allow))
@@ -314,14 +330,62 @@ func (s *Server) isShuttingDown() bool {
 }
 
 // redirectToTLS answers plaintext HTTP with a 308 to the same URL over
-// https (the Host header the visitor typed is preserved), with HSTS set
-// so the browser upgrades itself from then on. The response closes the
+// https (the Host header the visitor typed is preserved — it is the only
+// way to land them on the name the leaf cert covers), with HSTS set so the
+// browser upgrades itself from then on. The response closes the
 // connection — a redirect has nothing to keep alive.
+//
+// The echoed host is strictly validated (host[:port], no scheme, no
+// userinfo, no whitespace/control characters) and the redirect target is
+// rebuilt from the parsed pieces, so a crafted Host can only ever produce
+// a Location to a syntactically valid host — never header content.
 func (s *Server) redirectToTLS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 	w.Header().Set("Connection", "close")
-	target := "https://" + r.Host + r.URL.RequestURI()
+	hostport := r.Host
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		// No port (the common case) — SplitHostPort errors; take Host whole.
+		host, port = hostport, ""
+	}
+	if !validRedirectHost(host) {
+		http.Error(w, "400 bad request", http.StatusBadRequest)
+		return
+	}
+	target := "https://" + host
+	if port != "" {
+		target += ":" + port
+	}
+	target += r.URL.RequestURI()
 	http.Redirect(w, r, target, http.StatusPermanentRedirect)
+}
+
+// validRedirectHost accepts literal IPs and hostname labels only — the two
+// forms a visitor can legitimately have typed. Anything with characters
+// outside that grammar (spaces, @, /, scheme separators) is refused rather
+// than echoed into the Location header.
+func validRedirectHost(h string) bool {
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(h, "."), ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '-' || c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // routeConn sniffs one accepted connection and hands it to the right

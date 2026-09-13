@@ -820,3 +820,21 @@ func tarNames(t *testing.T, path string) []string {
 	}
 	return names
 }
+
+// TestRenewRejectsFlagsAfterNames: stdlib flag stops at the first
+// positional, so `renew alice bob -force` used to try to renew a name
+// literally called "-force" (the live 2026-09-02 shape). It must fail
+// loudly instead.
+func TestRenewRejectsFlagsAfterNames(t *testing.T) {
+	err := cmdRenew([]string{"alice", "bob", "-force"})
+	if err == nil {
+		t.Fatal("renew alice bob -force: nil error, want the flag-order refusal")
+	}
+	if !strings.Contains(err.Error(), "-force") || !strings.Contains(err.Error(), "BEFORE") {
+		t.Errorf("error %q does not name the misordered flag / the rule", err)
+	}
+	err = cmdRenew([]string{"alice", "-peers", "127.0.0.1:15353#abcd", "-force"})
+	if err == nil {
+		t.Fatal("renew alice -peers … -force: nil error, want the flag-order refusal")
+	}
+}
