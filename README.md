@@ -23,7 +23,7 @@
 
 [![CI](https://github.com/camalolo/freens/actions/workflows/ci.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/ci.yml)
 [![Nightly fuzz](https://github.com/camalolo/freens/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camalolo/freens/actions/workflows/fuzz.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
 
 freens is a decentralized, permissionless naming system that maps
 human-readable names to signed resource records (IP addresses, TXT, etc.)
@@ -256,5 +256,9 @@ signing key produces identical signatures in either implementation.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). `specifications.md` is the normative protocol
-specification and lives in this repository.
+[PolyForm Noncommercial 1.0.0](LICENSE) — free to use, modify, and
+redistribute for **noncommercial purposes only** (personal projects, research,
+education, charities, government); commercial use requires a separate license
+from the author. Versions of this project tagged **v0.16.5 and earlier** were
+distributed under the MIT license and remain MIT-licensed. `specifications.md`
+is the normative protocol specification and lives in this repository.
