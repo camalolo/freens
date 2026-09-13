@@ -1408,8 +1408,17 @@ func (n *Node) advertiseableNodes(contacts []*NodeContact) []any {
 //     collector merges the competing claims instead of settling for whatever
 //     one envelope a node happened to keep).
 //
-//   - `nodes`: the K closest contacts on a store miss (§6.4 GET), absent on a
-//     hit.
+//   - `nodes`: the K closest contacts — ALWAYS, on a hit and on a miss
+//     (v0.16.6 amendment, spec §6.4). Pre-amendment a store hit answered
+//     `{envelope}` alone, and that blindness was the root of the
+//     stale-replica class found live 2026-09-13: a walker whose early
+//     probes landed on nodes caching a LAPSED predecessor got those
+//     envelopes with no closer contacts, never learned the true closest
+//     set, and converged on the stale pocket while warm tables reached
+//     the fresh holders — the keyspace split into views that differed by
+//     box. Nodes on a hit cost a few hundred bytes per reply and let
+//     every walk converge identically no matter what its probes hit
+//     first.
 //
 //   - Audit fallback (§8.3 transfer chains): on a store miss with len(key)==32
 //     the store's superseded-envelope history is consulted by the key — which
@@ -1454,10 +1463,13 @@ func (n *Node) hGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 			evidenceFor = h
 		}
 	} else {
-		// Miss: return the closest known contacts so the requester iterates.
-		args["nodes"] = n.advertiseableNodes(n.rt.Closest(key, constants.K))
 		evidenceFor = key
 	}
+	// §6.4 {nodes}: returned on EVERY get — hit or miss (see the doc
+	// comment; the hit-shape blindness was the 2026-09-13 keyspace-split
+	// root). Closest known contacts so the requester iterates toward the
+	// true closest set from wherever its probes landed.
+	args["nodes"] = n.advertiseableNodes(n.rt.Closest(key, constants.K))
 	// §8.4 evidence piggyback: whatever recovery evidence this node retained
 	// for the record the response is about rides along, so verifiers can
 	// re-check the §8.4 quorum without a second round trip (LookupEvidence).
@@ -2820,7 +2832,16 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 	// reported 0 of 8 with the rescue silently hollowed out; the namespace
 	// died when the predecessor claim's lease lapsed). Fresh 60 s, still
 	// bounded, still total-failure-only.
-	if stats.Accepted == 0 {
+	//
+	// v0.16.6: the rescue also fires on strict-minority acceptance
+	// (< ½ of targets) — the 2026-09-13 camalolo incident published at 4/8
+	// (half the closest set were corpses/stale-shape contacts), left the
+	// other half of the keyspace on lapsed predecessors, and a visiting box
+	// split onto the stale view. A walk costs one bounded 60 s budget per
+	// publish; renewals are once-a-day per name, so the coverage is worth
+	// more than the walk. Republishing to already-accepting stores is
+	// idempotent (sameStoredRecord → accepted).
+	if stats.Accepted*2 < stats.Targets {
 		rctx, rcancel := context.WithTimeout(context.Background(), rescueWalkBudget)
 		tried := make(map[string]bool, len(closest))
 		for _, c := range closest {
@@ -3494,6 +3515,30 @@ func (l *DHTLookup) stampFetchedAt(key []byte, now int64) {
 	l.mu.Unlock()
 }
 
+// expiredWinner self-heals the stale-replica pocket (found live 2026-09-13,
+// the camalolo keyspace split): a GET whose best envelope is ALREADY EXPIRED
+// means the walk converged on holders serving a lapsed predecessor (within
+// the holders' ExpiryGrace) while the current closest set holds a fresher
+// generation. Serving it is guaranteed NXDOMAIN (the §7.4 checklist rejects
+// expired envelopes), so the walk gets ONE warm-and-retry: a real
+// IterativeFindNode toward the key (which is what teaches the table the TRUE
+// closest set — the one piece a pocket-blind walk never learned), then a
+// re-GET under a fresh budget (v0.16.2 lesson: a walk under the exhausted
+// parent answers nothing). Any §6.4-better result replaces the expired one;
+// otherwise the original envelope/error return unchanged.
+func (l *DHTLookup) expiredWinner(ctx context.Context, key []byte, env *wire.SignedEnvelope, gerr error) (*wire.SignedEnvelope, error) {
+	if l.node == nil {
+		return env, gerr
+	}
+	wctx, cancel := context.WithTimeout(context.Background(), rescueWalkBudget)
+	defer cancel()
+	l.node.IterativeFindNode(wctx, key, constants.K)
+	if e2, _, err2 := l.node.IterativeGetDetailed(wctx, key); err2 == nil && e2 != nil && wire.EnvelopeWins(e2, env) {
+		return e2, nil
+	}
+	return env, gerr
+}
+
 // Lookup returns the winning SignedEnvelope for wireName: a fresh local hit
 // first; a stale network-cached hit triggers re-validation via an iterative
 // GET (on fetch failure the stale copy is served — offline resilience, the
@@ -3517,6 +3562,12 @@ func (l *DHTLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wi
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
 	env, _, gerr := l.node.IterativeGetDetailed(c, key)
+	if env != nil && env.Record != nil && now >= int64(env.Record.Expires) {
+		// Stale-replica pocket (see expiredWinner): the walk's best is
+		// already expired — guaranteed NXDOMAIN if served. Warm-and-retry
+		// once before giving up.
+		env, gerr = l.expiredWinner(ctx, key, env, gerr)
+	}
 	if env != nil {
 		// Cache the fetched envelope locally (verifySignature=true defensively
 		// re-checks the signature before storing) and stamp its fetch time.
@@ -3644,6 +3695,12 @@ func (l *DHTLookup) LookupClaim(ctx context.Context, alias string, now int64) (*
 	c, cancel := context.WithTimeout(ctx, dhtLookupTimeout)
 	defer cancel()
 	env, _, gerr := l.node.IterativeGetDetailed(c, key)
+	if env != nil && env.Record != nil && now >= int64(env.Record.Expires) {
+		// Stale-replica pocket (see expiredWinner): the walk's best claim
+		// is already expired — the §7.4 checklist will NXDOMAIN it. One
+		// warm-and-retry before giving up.
+		env, gerr = l.expiredWinner(ctx, key, env, gerr)
+	}
 	if env != nil {
 		// Cache the fetched claim envelope locally (§6.4 "nodes along the lookup
 		// path MAY cache"; verifySignature=true defensively re-checks it) and

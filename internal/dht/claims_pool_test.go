@@ -152,13 +152,14 @@ func TestHGetEnvelopesOnStoreHit(t *testing.T) {
 	if resp.Y != wire.MsgTypeResponse {
 		t.Fatalf("get answered with y=%v, want a response", resp.Y)
 	}
-	// Legacy field: the store winner, and no `nodes` on a hit.
+	// Legacy field: the store winner. v0.16.6: a hit ALSO carries `nodes`
+	// (the pocket-blind hit shape was the keyspace-split root).
 	eb, ok := resp.A["envelope"].([]byte)
 	if !ok || len(eb) == 0 {
 		t.Fatal("response lacks the legacy `envelope` bstr")
 	}
-	if _, hasNodes := resp.A["nodes"]; hasNodes {
-		t.Error("store hit must not carry `nodes`")
+	if nodes, _ := resp.A["nodes"].([]any); len(nodes) == 0 {
+		t.Error("store hit must carry `nodes` (§6.4 v0.16.6 amendment)")
 	}
 	// Extension: `envelopes` is an array of bstr, best-first.
 	arr, ok := resp.A["envelopes"].([]any)

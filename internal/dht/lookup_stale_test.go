@@ -202,20 +202,20 @@ func TestStandaloneDiscoverySeesTrueClosestSet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	// The blindness, documented: with only the stale peer known, the get is
-	// answered from its store (no {nodes} on a store hit) and returns the
-	// lapsed copy — exactly what sequence discovery used to base on.
-	blind, err := client.IterativeGet(ctx, kTld)
+	// v0.16.6: the blindness is GONE — the stale peer's store HIT carries
+	// {nodes}, so the very first get learns the live storer and
+	// EnvelopeWins picks seq 5 in one shot (the phantom-21 sequence
+	// discovery can no longer base on a lone stale store hit).
+	first, err := client.IterativeGet(ctx, kTld)
 	if err != nil {
-		t.Fatalf("pre-fix get: %v", err)
+		t.Fatalf("first get: %v", err)
 	}
-	if blind == nil || blind.Record.Sequence != 1 {
-		t.Fatalf("precondition: blind get = %v, want the stale peer's seq-1 copy", blind)
+	if first == nil || first.Record.Sequence != 5 {
+		t.Fatalf("first get = %v, want the live storer's seq 5 — hits must carry {nodes}", first)
 	}
 
-	// The fix's shape: find_node first (always carries {nodes} — the table
-	// learns the true storer), THEN the get races both and EnvelopeWins
-	// picks the max sequence.
+	// The v0.15.1 shape (kept as belt-and-braces): find_node first, THEN
+	// the get races both and EnvelopeWins picks the max sequence.
 	client.IterativeFindNode(ctx, kTld, constants.RReplication)
 	got, err := client.IterativeGet(ctx, kTld)
 	if err != nil {

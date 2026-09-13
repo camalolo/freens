@@ -451,7 +451,7 @@ Methods:
 |--------------|----------------------------------------------|-----------------------------------------------|
 | `ping`       | `{}`                                         | `{}`                                          |
 | `find_node`  | `{target: bstr(32)}`                         | `{nodes: [(ip, port, node_id, pk), ...]}` — K closest |
-| `get`        | `{key: bstr(32)}`                            | `{envelope: SignedEnvelope}` or `{nodes: [...]}` |
+| `get`        | `{key: bstr(32)}`                            | `{envelope: SignedEnvelope, nodes: [...]}` — v0.16.6 amendment: `nodes` rides on EVERY get, hit or miss (pre-amendment a store hit answered `{envelope}` alone, which blinded iterative walks whose early probes landed on stale-replica holders and let a keyspace split into per-box views) |
 | `put`        | `{token: bstr, envelope: SignedEnvelope}`    | `{}`                                          |
 | `witness`    | `{claim_prefix_hash, claimant, ts, alias, tld_id, nonce, pow_hash}` | `{attestation: sig, difficulty}` (Section 7.4) |
 
