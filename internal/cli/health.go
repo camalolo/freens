@@ -14,6 +14,8 @@ package cli
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -393,9 +395,9 @@ func cmdDoctor(args []string) error {
 						stale++
 						warn("TLS cross-cert %s EXPIRED %s ago — https to %s fails until re-minted: resolve the name once (e.g. `dig %s`) while the daemon runs",
 							x.Alias, now.Sub(na).Round(time.Hour), x.Alias, x.Alias)
-					case !x.SystemStore:
+					case !systemTrustCurrent(x):
 						stale++
-						warn("TLS cross-cert %s not installed to the system store — https from curl/other apps fails: run `freens trust-install` (or the trust bridge)",
+						warn("TLS cross-cert %s not current in the system store — https from curl/other apps fails: run `freens trust-install` (or check the trust bridge)",
 							x.Alias)
 					}
 				}
@@ -442,7 +444,39 @@ func cmdDoctor(args []string) error {
 	}
 	fmt.Println("doctor: all checks passed")
 	return nil
-} // runDoctorFixes is doctor --fix: repair the two things a user can't fix
+}
+
+// systemTrustCurrent reports whether the system CA store actually holds a
+// CURRENT cross-cert for the alias — the OUTCOME, not the daemon's belief
+// about it. The daemon's SystemStore flag only reflects installs the
+// DAEMON performed; on a bridge-managed box (freens-trust.path) the
+// systemd unit does the copying and the daemon cannot see it, which made
+// every namespace look uninstalled (found live 2026-09-14 on nanopi).
+// Linux reads the store directly (world-readable): the file must exist,
+// parse, and not be expired. Windows keeps no file-based store the CLI can
+// inspect — there the daemon's flag is authoritative (its LocalSystem
+// service performs the installs itself).
+func systemTrustCurrent(x admin.TLSCross) bool {
+	if goosWindows {
+		return x.SystemStore
+	}
+	path := filepath.Join("/usr/local/share/ca-certificates", "freens-cross-"+x.Alias+".crt")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	// Store files are PEM; fall back to raw DER for safety.
+	if block, _ := pem.Decode(b); block != nil {
+		b = block.Bytes
+	}
+	cert, err := x509.ParseCertificate(b)
+	if err != nil {
+		return false
+	}
+	return time.Now().Before(cert.NotAfter)
+}
+
+// runDoctorFixes is doctor --fix: repair the two things a user can't fix
 // wrong — the daemon not running (re-run setup: idempotent, ends with
 // systemctl enable --now) and the OS resolver not pointing at the daemon
 // (the same wiring setup performs, interactive sudo on a TTY). Everything
