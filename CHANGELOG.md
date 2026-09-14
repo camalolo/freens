@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.16.6 — the hardening pass + the keyspace-split fixes (fleet-soaked 2026-09-13/14)
+
+Two dev rolls (8837f23, d8837e1) soaked on the 3-box fleet through a full
+renewal cycle each before tagging: zero warnings in 20 h, all three
+auto-renewals network-confirmed, honest k-of-R throughout.
+
+**Data-corruption / correctness**
+
+- **resolver: TXT chunking chunked a LOCAL copy** — it resliced the RR
+  inside the envelope pointer returned by the DHT store, consuming the
+  stored rdata for every later consumer (the first >255-byte TXT serve
+  emptied the record store-wide until eviction, and concurrent serves
+  raced on the slice header).
+- **resolver: ServeDNS carries a 30 s per-query deadline** — the bare
+  context.Background() defeated the v0.16.3 single-flight corpse-reap on
+  the client-facing path; one context-blind leader would park a handler
+  goroutine per query until the resolve semaphore starved.
+- **dht: learnContact hands the routing table a private contact copy** —
+  it read the table-owned pointer unlocked after learn() while in-place
+  refreshes mutated it under the lock (torn clones, panics).
+- **dht: EnvelopeStore keeps a running byte counter** — SizeBytes is O(1);
+  the per-put double full-map scan and the O(m·n) cap-shedding re-scan no
+  longer stall the readLoop (the v0.15.3 Closest lesson, applied to puts).
+
+**The keyspace-split class** (2026-09-13 fleet incident: a 4/8 renewal
+publish left a visiting box's walk converging on stale-replica holders
+serving the lapsed predecessor — §7.4 rightly NXDOMAINed, per-box views
+split; healed only by an explicit-peer publish THROUGH the stuck box):
+
+- **dht: hGet carries {nodes} on EVERY get, hit included** (spec §6.4
+  amended) — the hit-shape blindness was the root: a walker landing in a
+  stale pocket never learned the true closest set.
+- **dht: expired-winner self-heal** — a GET whose best envelope is already
+  expired warms the table with one IterativeFindNode toward the key and
+  re-GETs once under a fresh 60 s budget, instead of handing the resolver
+  a guaranteed checklist rejection.
+- **dht: the publish walk-rescue fires on strict-minority acceptance**
+  (< ½ of targets), not just zero — a 4/8 renewal no longer
+  publishes-and-prays.
+
+**Security**
+
+- **webui: session cookie Secure under the TLS listener** — the cookie no
+  longer rides the plaintext 308 face (HSTS only protects after the first
+  plaintext response).
+- **webui: /login + /bootstrap POSTs carry a same-site check** (Fetch
+  Metadata, Origin fallback) — they run before any session, so
+  requireCSRF's header gate could not cover them; a cross-site form post
+  could plant an admin password during the bootstrap window.
+- **webui: the plaintext 308 face sits behind the same CIDR gate** and
+  strictly validates Host before echoing it into Location — a
+  WAN-reachable box no longer answers internet scanners with a redirect +
+  fingerprint, and a crafted Host can no longer smuggle Location content.
+
+**Bounded state / robustness**
+
+- resolver refreshes/refreshFailing pruned past 4096 keys; dht fetchedAt
+  prunes stamps whose envelope left the store (absence means
+  authoritative — never pruned on age).
+- dht: iterativeGetEvidence carries the full walk disciplines (skip
+  self/penalized corpses, adaptive batch, ErrDegradedMiss classification);
+  probeFailed reports failover so a promoted node skips the ID-keyed dead
+  penalty and stays in walk results.
+- cli: renew rejects flags after names instead of renewing a name
+  literally called "-force" (the live 2026-09-02 shape).
+- repo: the committed reattprobe ELF (5.7 MB) is gone.
+
+**Operations**
+
+- nanopi now runs the freens-trust bridge (installed 2026-09-13) — the
+  recurring "system CA store ages out until someone re-copies the spool"
+  gap is closed; the bridge's checkend filter copies only unexpired
+  cross-certs.
+
 ## Unreleased — v0.16.4: THE routing-table deadlock fix (Closest nested its own read lock)
 
 The wedge that took down the server twice and nanopi once — root-caused
