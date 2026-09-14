@@ -366,10 +366,45 @@ func cmdDoctor(args []string) error {
 				warn("TLS: no namespaces cross-certified yet — resolve a freens name with a TLSCA record (§9.5.5: first https visit may need one retry)")
 			} else {
 				names := make([]string, 0, len(cross))
+				stale := 0
+				now := time.Now()
 				for _, x := range cross {
 					names = append(names, x.Alias)
+					// Expiry watch (v0.16.7): a cross-cert's whole lifecycle
+					// is "expires ~daily → traffic re-mints it", so an
+					// expired entry is NORMAL between visits — but it is
+					// exactly the state that turned into a post-upgrade
+					// "verify=19" mystery on 2026-09-14 (nanopi: cert swept
+					// at 12:17, nothing resolved the name until 21:40
+					// because the TLS checks used --resolve literal IPs,
+					// which BYPASS the resolver). Surface it where an
+					// operator looks BEFORE upgrade day: expired or
+					// never-installed entries warn with the one-command
+					// fix. Quarantined/rotating states have their own
+					// §9.5.4 semantics — not staleness, skip them.
+					if x.Status == "quarantined" || x.Status == "rotating" {
+						continue
+					}
+					na := time.Unix(x.NotAfter, 0)
+					switch {
+					case x.NotAfter == 0:
+						// older daemon, no expiry data: skip silently
+					case na.Before(now):
+						stale++
+						warn("TLS cross-cert %s EXPIRED %s ago — https to %s fails until re-minted: resolve the name once (e.g. `dig %s`) while the daemon runs",
+							x.Alias, now.Sub(na).Round(time.Hour), x.Alias, x.Alias)
+					case !x.SystemStore:
+						stale++
+						warn("TLS cross-cert %s not installed to the system store — https from curl/other apps fails: run `freens trust-install` (or the trust bridge)",
+							x.Alias)
+					}
 				}
-				fmt.Printf("✔ TLS: %d namespace(s) cross-certified: %s\n", len(cross), strings.Join(names, ", "))
+				if stale == 0 {
+					fmt.Printf("✔ TLS: %d namespace(s) cross-certified: %s\n", len(cross), strings.Join(names, ", "))
+				} else {
+					fmt.Printf("✔ TLS: %d namespace(s) cross-certified (%d stale, see above): %s\n",
+						len(cross), stale, strings.Join(names, ", "))
+				}
 			}
 		}
 	}

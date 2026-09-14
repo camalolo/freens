@@ -55,6 +55,7 @@ import (
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/webui"
+	"github.com/miekg/dns"
 )
 
 // githubOwnerRepo is the release source for self-upgrade. Everything else
@@ -711,6 +712,47 @@ func waitDaemonBack(d time.Duration) {
 	}
 }
 
+// waitDNSBack polls the daemon's DNS relay until it ANSWERS (any rcode) a
+// query for the box's first keychain alias. Both NOERROR and NXDOMAIN
+// count — the face is serving; SERVFAIL (degraded walk) and transport
+// errors keep the poll running. Best-effort exactly like waitDaemonBack:
+// prints and warns, never fails the upgrade.
+func waitDNSBack(d time.Duration) {
+	aliases := keychainAliases()
+	if len(aliases) == 0 {
+		return // nothing owned: nothing to prove
+	}
+	name := dns.Fqdn(aliases[0])
+	q := new(dns.Msg)
+	q.SetQuestion(name, dns.TypeA)
+	q.RecursionDesired = true
+	payload, err := q.Pack()
+	if err != nil {
+		return
+	}
+	c := &admin.Client{Sock: home.AdminSock(), Timeout: 5 * time.Second}
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		respRaw, qerr := c.DNSQuery(ctx, payload)
+		cancel()
+		if qerr == nil && len(respRaw) > 0 {
+			resp := new(dns.Msg)
+			if uerr := resp.Unpack(respRaw); uerr == nil {
+				if resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError {
+					fmt.Printf("dns face answering: %s -> %s\n", aliases[0], dns.RcodeToString[resp.Rcode])
+					return
+				}
+				// SERVFAIL etc.: the face answers but resolution is
+				// degraded — keep polling until the deadline.
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Fprintf(os.Stderr, "%s: warning: DNS face did not settle for %s within %s — likely still converging (one more query re-checks); `freens doctor` if it persists\n",
+		ProgName, aliases[0], d)
+}
+
 // waitWebUIBack polls the webui's own /healthz until it reports the freshly
 // installed version. The daemon's version says nothing about the UI process
 // (the footer even renders the DAEMON's stamp), so a webui left running a
@@ -950,6 +992,15 @@ func cmdUpgrade(args []string) error {
 	if wasAlive {
 		fmt.Println("health check:")
 		waitDaemonBack(20 * time.Second)
+		// The DNS-face gate (v0.16.7): the admin socket proves the process
+		// is alive; it says nothing about SERVING — the post-upgrade
+		// window's recurring hiccup was a daemon that looked healthy while
+		// its resolver was still converging (the 2026-09-14 nanopi roll:
+		// "upgrade complete" on every box while names needed another
+		// query to answer). Bounded + warn-only: the daemon-side boot
+		// lease warm-up makes this window short; the gate makes a long one
+		// VISIBLE at upgrade time instead of in the morning logs.
+		waitDNSBack(30 * time.Second)
 		if webWasUp {
 			// The daemon's version says nothing about the UI process:
 			// a webui serving a renamed-aside old image survived two

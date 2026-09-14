@@ -571,6 +571,13 @@ func run(args []string) error {
 	if dhtNode != nil && !passiveEffective {
 		renewStop = make(chan struct{})
 		go renewLoop(dhtNode, store, logger, renewStop)
+		// Boot lease warm-up (see bootLeaseWarmup): warms both keyspaces of
+		// every keychain name and network-verifies/re-publishes own leases
+		// NOW instead of letting the post-restart window run cold until the
+		// first hourly verify. Runs alongside the ping sweep; the walks
+		// themselves are the warm-up, and renewVerifyFresh degrades
+		// honestly if the table is still cold.
+		go bootLeaseWarmup(dhtNode, store, logger)
 	}
 
 	// Upstream wiring: plaintext UDP/TCP to the configured servers, or —
@@ -1274,16 +1281,23 @@ func warmupPingSweep(node *dht.Node, book []dht.Peer, logger *slog.Logger) {
 	logger.Info("warmup ping sweep complete", "contacts", len(book))
 }
 
-// renewOnce is one auto-renewal pass (split out so a future -renew-now flag
-// or admin RPC can trigger it on demand).
-func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
-	// The keychain map: owner public key -> keypair (skip .recN recovery
-	// keyfiles — they recover, they do not renew).
+// keychainOwner is one keychain OWNER key (the .recN recovery keys are
+// skipped — they recover, they do not renew).
+type keychainOwner struct {
+	alias string
+	kp    *crypto.Keypair
+}
+
+// loadOwnerKeypairs reads the keychain: owner keyfile alias + keypair,
+// keyed by public-key hex. Shared by the auto-renew pass and the boot
+// lease warm-up (identical keyfile semantics: hex seed or
+// passphrase-encrypted via FREENS_PASSPHRASE — a service cannot prompt).
+func loadOwnerKeypairs(logger *slog.Logger) map[string]keychainOwner {
+	owners := make(map[string]keychainOwner)
 	entries, err := os.ReadDir(home.KeysDir())
 	if err != nil {
-		return // no keychain: a relay node, nothing to renew
+		return owners // no keychain: a relay node, nothing to renew
 	}
-	owners := make(map[string]*crypto.Keypair)
 	encrypted := 0
 	envPass, envOK := os.LookupEnv("FREENS_PASSPHRASE")
 	for _, e := range entries {
@@ -1318,15 +1332,102 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			logger.Debug("auto-renew: unparseable keyfile", "file", name)
 			continue
 		}
-		owners[hex.EncodeToString(kp.Public())] = kp
+		owners[hex.EncodeToString(kp.Public())] = keychainOwner{
+			alias: strings.TrimSuffix(name, ".key"),
+			kp:    kp,
+		}
 	}
 	if encrypted > 0 {
 		logger.Info("auto-renew: skipping passphrase-protected key(s) (the daemon cannot prompt)",
 			"count", encrypted,
 			"hint", "renew manually or set FREENS_PASSPHRASE for the service")
 	}
-	if len(owners) == 0 {
+	return owners
+}
+
+// bootLeaseWarmup runs RIGHT AFTER boot (background, non-passive nodes):
+// it warms the two keyspaces of every keychain name and network-verifies
+// every own envelope the persisted store holds, re-publishing any lease
+// the network lost. Without it the post-restart window was the fleet's
+// recurring upgrade hiccup: the first query ate a cold walk (client-side
+// timeouts), and a renewal whose publish died with the old process stayed
+// lost until the first hourly verify — surfacing hours later as an
+// NXDOMAIN that looked like an upgrade bug (2026-09-13/14). Bounded and
+// best-effort: every walk carries its own timeout, failures log and move
+// on. NOT a renewal: ShouldRenew still governs re-signing; this only
+// verifies and re-publishes what is already signed (the renewVerifyFresh
+// heal path — idempotent republish).
+func bootLeaseWarmup(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
+	ownerMap := loadOwnerKeypairs(logger)
+	if len(ownerMap) == 0 {
 		return
+	}
+	// (a) Keyspace walks: one IterativeFindNode toward K_tld and K_claim
+	// per keychain name — the table learns the true closest sets now, so
+	// the first real query (and the verify below) converges in one round
+	// instead of starting cold. Works with or without a persisted store.
+	for _, o := range ownerMap {
+		tid, err := crypto.TldID(o.kp.Public())
+		if err != nil {
+			continue
+		}
+		wn, err := naming.EncodeWireName(nil, o.alias, tid)
+		if err != nil {
+			continue
+		}
+		kTld, err := dht.KeyForWireName(wn)
+		if err != nil {
+			continue
+		}
+		kClaim, err := dht.KeyForClaim(o.alias)
+		if err != nil {
+			continue
+		}
+		for _, k := range [][]byte{kTld, kClaim} {
+			wctx, wcancel := context.WithTimeout(context.Background(), 20*time.Second)
+			node.IterativeFindNode(wctx, k, constants.K)
+			wcancel()
+		}
+	}
+	// (b) Lease verification: every own envelope is checked against the
+	// NETWORK's copy at BOTH its keys (renewVerifyLast is empty at boot, so
+	// every name verifies); a lost lease is re-published immediately via
+	// the renewVerifyFresh heal path instead of at the first hourly tick.
+	now := store.Now()
+	verified := 0
+	for _, ent := range store.Entries(now) {
+		env := ent.Env
+		if env == nil || env.Record == nil || env.IsRevoked() {
+			continue
+		}
+		if _, mine := ownerMap[hex.EncodeToString(env.Signer)]; !mine {
+			continue // not ours: cached/relayed records are their owners' business
+		}
+		keys, err := dht.StorageKeys(env)
+		if err != nil {
+			continue
+		}
+		for i := range keys {
+			renewVerifyFreshAt(node, logger, env, i)
+		}
+		verified++
+	}
+	if verified > 0 {
+		logger.Info("boot lease warm-up complete", "names_verified", verified)
+	}
+}
+
+// renewOnce is one auto-renewal pass (split out so a future -renew-now flag
+// or admin RPC can trigger it on demand).
+func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
+	// The keychain map: owner public key -> keypair.
+	ownerMap := loadOwnerKeypairs(logger)
+	if len(ownerMap) == 0 {
+		return
+	}
+	owners := make(map[string]*crypto.Keypair, len(ownerMap))
+	for pkHex, o := range ownerMap {
+		owners[pkHex] = o.kp
 	}
 
 	now := store.Now()
@@ -1433,10 +1534,18 @@ var renewVerifyLast sync.Map
 // network-confirmed retry loop. Degraded walks are skipped (inconclusive,
 // not evidence) — the next window re-checks.
 func renewVerifyFresh(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvelope) {
+	renewVerifyFreshAt(node, logger, env, 0)
+}
+
+// renewVerifyFreshAt is renewVerifyFresh against storage key index keyIdx
+// (0 = K_tld, 1 = K_claim on claim-bearing envelopes) — the boot lease
+// warm-up verifies BOTH keyspaces; the hourly pass keeps checking K_tld
+// (its K_claim coverage is the confirm-retry loop's).
+func renewVerifyFreshAt(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvelope, keyIdx int) {
 	if env == nil || env.Record == nil {
 		return
 	}
-	nameKey := hex.EncodeToString(env.Record.Name)
+	nameKey := hex.EncodeToString(env.Record.Name) + "/" + fmt.Sprint(keyIdx)
 	nowS := time.Now().Unix()
 	if v, ok := renewVerifyLast.Load(nameKey); ok &&
 		nowS-v.(int64) < int64(renewVerifyInterval/time.Second) {
@@ -1445,11 +1554,11 @@ func renewVerifyFresh(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvel
 	renewVerifyLast.Store(nameKey, nowS)
 
 	keys, err := dht.StorageKeys(env)
-	if err != nil || len(keys) == 0 {
+	if err != nil || len(keys) == 0 || keyIdx >= len(keys) {
 		return
 	}
 	gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	netEnv, err := node.IterativeGet(gctx, keys[0])
+	netEnv, err := node.IterativeGet(gctx, keys[keyIdx])
 	gcancel()
 	if errors.Is(err, dht.ErrDegradedMiss) || errors.Is(err, dht.ErrWalkBusy) {
 		logger.Debug("auto-renew: lease verification inconclusive (degraded walk)",
