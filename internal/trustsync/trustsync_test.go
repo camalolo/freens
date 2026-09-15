@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -778,5 +779,79 @@ func TestLegacyStateMigratesToIdentity(t *testing.T) {
 	}
 	if got.CAIdentity == "" {
 		t.Fatal("legacy entry did not adopt the CA identity")
+	}
+}
+
+// TestKeeperRemembersAcrossPurgeAndRemovesOnOperatorIntent: the keeper set
+// is grow-only — a namespace the box has ever trusted stays tracked after
+// the liveness sweep purges its expired cross-cert (so RunKeeper re-mints
+// it), and leaves ONLY via RemoveAlias (`freens trust remove`).
+func TestKeeperRemembersAcrossPurgeAndRemovesOnOperatorIntent(t *testing.T) {
+	opts := testOpts(t)
+	e := mustEngine(t, opts)
+
+	// Seed the keeper the way OnOwnerCA does.
+	e.noteKeeper("camalolo")
+	e.noteKeeper("nanopi")
+	if _, err := os.Stat(filepath.Join(opts.HomeDir, "tls", "keeper.json")); err != nil {
+		t.Fatalf("keeper.json not persisted: %v", err)
+	}
+
+	// A FRESH engine over the same home (the restart shape) reloads the set.
+	e2 := mustEngine(t, opts)
+	e2.mu.Lock()
+	_, hasCamalolo := e2.keeper["camalolo"]
+	_, hasNanopi := e2.keeper["nanopi"]
+	e2.mu.Unlock()
+	if !hasCamalolo || !hasNanopi {
+		t.Fatalf("keeper set lost across engine restart: camalolo=%v nanopi=%v", hasCamalolo, hasNanopi)
+	}
+
+	// An operator removal forgets the namespace from the keeper too.
+	if !e2.RemoveAlias("nanopi") {
+		t.Fatal("RemoveAlias reported nothing removed")
+	}
+	e2.mu.Lock()
+	_, stillThere := e2.keeper["nanopi"]
+	e2.mu.Unlock()
+	if stillThere {
+		t.Fatal("nanopi still in the keeper set after trust remove")
+	}
+}
+
+// TestKeeperTickResolvesEachTrackedNamespace: the tick drives resolve once
+// per tracked alias (sorted), records the attempt, and persists it.
+func TestKeeperTickResolvesEachTrackedNamespace(t *testing.T) {
+	opts := testOpts(t)
+	e := mustEngine(t, opts)
+	e.mu.Lock()
+	e.keeper = map[string]int64{"zeta": 0, "alpha": 0}
+	e.mu.Unlock()
+
+	var mu sync.Mutex
+	got := []string{}
+	fail := map[string]bool{"zeta": true}
+	e.keeperTick(func(alias string) error {
+		mu.Lock()
+		got = append(got, alias)
+		mu.Unlock()
+		if fail[alias] {
+			return errors.New("degraded walk")
+		}
+		return nil
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 || got[0] != "alpha" || got[1] != "zeta" {
+		t.Fatalf("resolve calls = %v, want [alpha zeta] (sorted, one each)", got)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.keeper["alpha"] == 0 {
+		t.Error("alpha's attempt time was not recorded")
+	}
+	if e.keeper["zeta"] != 0 {
+		t.Error("a FAILED refresh must not update the attempt time (retry next tick)")
 	}
 }
