@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.17.0 — the design corrections: unlease-capped trust, reachability-defined replicas
+
+Two structural fixes that DELETE the recurring failure classes instead of
+babysitting them (the v0.16.7 compensators existed to keep the daily
+clocks running; this release removes two of the clocks).
+
+**§9.5.4 amendment: cross-certs carry the owner-CA's own validity window.**
+The previous rule minted visitor trust with `NotAfter =
+min(record.expires, now + TLS_CROSSCERT_TTL)` — chaining trust to the 24 h
+lease. Every decay incident in the fleet's history traces to that clock:
+a cross-cert lived ~half a day, the liveness sweep purged it on expiry,
+and nothing re-minted it until someone resolved the name — so quiet boxes
+failed TLS (verify=19) on their next real use, and the v0.16.7 trust
+keeper existed purely to keep the clock wound. Ownership changes are
+already enforced at the record layer, which every resolution re-verifies
+(rotation observation gate, tombstones, young-claim quarantine) — the
+trust-layer expiry duplicated that revocation and bought only a narrow
+stolen-key latency on boxes that never resolve the name again. The
+cross-cert now inherits the owner CA's own deterministic window (10 y).
+Deleted with the decay: the trust keeper. Kept: the sweep (it migrates
+the short-cert vintage off the boxes and purges on death evidence —
+`OnAliasDead` — plus pre-v0.17 state), the rotation gate, quarantine,
+`trust ls`/`trust remove`. Residual window (an unobserved dead name
+keeps its anchor; exploiting it requires the old key) documented in the
+spec.
+
+**§6.4 implementation amendment: the replica set is defined by
+reachability.** Publishes targeted `rt.Closest(key, R)` — a routing
+table routinely polluted with dead contacts — so a renewal could accept
+4/8 with the other half of the keyspace left on lapsed predecessors
+(the 2026-09-13 and 2026-09-15 keyspace splits, healed each time by an
+explicit-peer publish THROUGH the stuck box). Puts now go to the nodes
+that ANSWERED a real node-walk (answer-filtered since v0.16.1): dead
+contacts can no longer occupy put slots, the walk warms the exact
+keyspace it targets, and the walk-rescue remains as a bounded backstop
+for degraded walks. Ghost-polluted tables can no longer produce a
+partially-replicated renewal by construction.
+
 ## v0.16.6 — the hardening pass + the keyspace-split fixes (fleet-soaked 2026-09-13/14)
 
 Two dev rolls (8837f23, d8837e1) soaked on the 3-box fleet through a full

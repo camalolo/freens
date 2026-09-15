@@ -2804,7 +2804,17 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 	if err != nil {
 		return PublishStats{KeyHex: hex.EncodeToString(key)}, err
 	}
-	closest := n.rt.Closest(key, constants.RReplication)
+	// v0.17.0: the replica set is defined by REACHABILITY, not by table
+	// membership. Puts go to the contacts that ANSWERED a real node-walk
+	// (IterativeFindNode is answer-filtered since v0.16.1 — corpses cannot
+	// occupy put slots), retiring at the root the old failure shape where
+	// half the closest-set was dead and every publish needed a rescue
+	// afterwards. The walk also warms the exact keyspace it targets.
+	// Islands (walk reached nothing) fall back to the table round.
+	closest := n.IterativeFindNode(ctx, key, constants.RReplication)
+	if len(closest) == 0 {
+		closest = n.rt.Closest(key, constants.RReplication)
+	}
 	stats := PublishStats{KeyHex: hex.EncodeToString(key), Targets: len(closest)}
 	if len(closest) == 0 {
 		return stats, ErrNoPeers
@@ -2814,39 +2824,20 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 			stats.Accepted++
 		}
 	}
-	// Walk-rescue (v0.15.5): zero acceptances from the local-table round
-	// means the table VIEW around key is suspect — a cold standalone node's
-	// bootstrap table is polluted with ghost one-shot contacts, and every
-	// put to them times out while the namespace is perfectly healthy (found
-	// live 2026-09-04: standalone renew reported "accepted by 0 of 8" on a
-	// resolving fleet). Rescue once with a REAL walk: IterativeFindNode
-	// returns the closest REACHED contacts, which is what a put should have
-	// targeted in the first place. Bounded: it runs only on the
-	// total-failure path (rare for a warm daemon, the rule for a cold
-	// one-shot node).
+	// Walk-rescue (v0.15.5, backstop): a PARTIAL acceptance still means the
+	// view around key was incomplete — the walk above can be degraded by
+	// probe failures (issue #1), and the §6.4 lease semantics make a
+	// half-replicated publish poisonous (stale pockets, the 2026-09-13/15
+	// keyspace splits). Rescue once with a fresh-budget walk and put to
+	// whoever else it reaches.
 	//
-	// v0.16.2: the rescue walks under its OWN budget, not the caller's —
-	// the round-1 ghost timeouts consume the caller's ctx exactly when the
-	// rescue is needed most, and a walk under an expired parent answers
-	// nothing (found live 2026-09-05: the 04:15 auto-renewals' K_claim puts
-	// reported 0 of 8 with the rescue silently hollowed out; the namespace
-	// died when the predecessor claim's lease lapsed). Fresh 60 s, still
-	// bounded, still total-failure-only.
-	//
-	// v0.16.6: the rescue also fires on strict-minority acceptance
-	// (< ½ of targets) — the 2026-09-13 camalolo incident published at 4/8
-	// (half the closest set were corpses/stale-shape contacts), left the
-	// other half of the keyspace on lapsed predecessors, and a visiting box
-	// split onto the stale view. A walk costs one bounded 60 s budget per
-	// publish; renewals are once-a-day per name, so the coverage is worth
-	// more than the walk. Republishing to already-accepting stores is
-	// idempotent (sameStoredRecord → accepted).
-	// v0.16.7: ANY partial acceptance rescues — the 2026-09-15 10:01
-	// camalolo renewal published at exactly 4/8, which the < ½ threshold
-	// let through untouched, and it split the keyspace again (minipc and
-	// nanopi stayed on the lapsed side for ~12 h until an explicit-peer
-	// publish healed them). "Accepted by every target we tried" is the
-	// only clean signal; anything less is worth one bounded walk.
+	// v0.16.6: the rescue fires on ANY partial acceptance, not just zero —
+	// the 2026-09-15 10:01 camalolo renewal published at exactly 4/8, left
+	// the other half of the keyspace on lapsed predecessors, and a visiting
+	// box split onto the stale view. With walk-first targeting this is a
+	// rare degraded-walk path; the bounded 60 s budget keeps it honest, and
+	// republishing to already-accepting stores is idempotent
+	// (sameStoredRecord → accepted).
 	if stats.Accepted < stats.Targets {
 		rctx, rcancel := context.WithTimeout(context.Background(), rescueWalkBudget)
 		tried := make(map[string]bool, len(closest))

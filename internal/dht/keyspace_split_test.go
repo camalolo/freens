@@ -198,12 +198,11 @@ func TestExpiredWinnerReturnsUnchangedWithoutHelp(t *testing.T) {
 	}
 }
 
-// TestPublishRescueOnMinorityAcceptance: a publish accepted by a MINORITY
-// of its closest set (here 3 of 8 — the rest ghosts, the 2026-09-13 shape)
-// must fire the walk-rescue too, and the walk's newly reached contacts must
-// be put to. Fixture: a's closest-8 = 5 ghosts (b's real address behind
-// fabricated IDs — puts silently dropped) + 3 live peers; a 4th live peer
-// (e) is reachable ONLY through the rescue walk (b advertises it).
+// TestPublishTargetsOnlyReachedNodes: with walk-first targeting (v0.17), a
+// polluted table cannot waste put slots — the fixture's 5 ghosts (the
+// 2026-09-13 shape) are never put to; the publish lands on the live peers
+// the walk reached, including the 4th live peer (e) that is reachable ONLY
+// through the walk (b advertises it).
 func TestPublishRescueOnMinorityAcceptance(t *testing.T) {
 	alias := "minorityrescue"
 	env, _, _ := tombstoneFixture(t, alias, uint64(time.Now().Unix()), time.Now().Unix(), time.Now().Unix()+3600, true, false)
@@ -271,13 +270,14 @@ func TestPublishRescueOnMinorityAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publish = %v (stats %+v)", err, stats)
 	}
-	// 3 accepted locally → minority (6 < 8) → rescue must have run and put
-	// to e (the walk's discovery), lifting targets past the local table.
-	if stats.Targets <= constants.RReplication {
-		t.Errorf("targets = %d, want > %d — the minority rescue did not run (stats %+v)",
-			stats.Targets, constants.RReplication, stats)
+	// Every put slot went to a REACHED node — and reached nodes answer, so
+	// targets and accepted must match exactly. The ghost cluster is invisible.
+	if stats.Targets != stats.Accepted {
+		t.Errorf("targets = %d, accepted = %d — slots were spent on unreachable contacts (stats %+v)",
+			stats.Targets, stats.Accepted, stats)
 	}
 	if stats.Accepted < 4 {
-		t.Errorf("accepted = %d, want ≥ 4 (the walk-reached 4th peer) (stats %+v)", stats.Accepted, stats)
+		t.Errorf("accepted = %d, want ≥ 4 (the three live peers + the walk-discovered 4th) (stats %+v)",
+			stats.Accepted, stats)
 	}
 }

@@ -767,38 +767,14 @@ func run(args []string) error {
 	// bgStop ends the background goroutines (gauge refresh, SIGHUP reload)
 	// during shutdown so no reload ever races the teardown below.
 	bgStop := make(chan struct{})
-	// §9.5.4 trust liveness sweeper (v0.16): expired cross-certs purge
-	// spool + state + system + NSS installs even when nothing resolves the
-	// namespace anymore — trust must converge to exactly the live set.
+	// §9.5.4 trust liveness sweeper (v0.16): converges trust stores toward
+	// the live set. v0.17.0: cross-certs carry the owner CA's own (10 y)
+	// validity, so expiry no longer fires — the sweep's remaining jobs are
+	// the pre-v0.17 short-cert vintage and OnAliasDead-driven convergence.
+	// (The v0.16.7 trust keeper was deleted WITH the decay that motivated
+	// it: nothing re-mints on a clock any more.)
 	if trustEngine != nil {
 		go trustEngine.RunSweeper(bgStop, 30*time.Minute)
-		// §9.5.4 trust keeper (v0.16.7): the sweeper's purge is only half
-		// the quiet-box lifecycle — a cross-cert lives ~half a day, the
-		// sweep removes it on expiry, and nothing re-minted it until
-		// someone resolved the name again, so a box idle for a day failed
-		// TLS with ssl_verify=19 on its next real use (found live on every
-		// fleet box, 2026-09-14/15). The keeper re-resolves each remembered
-		// namespace every 4 h — one resolver query apiece, through the same
-		// serving path as a client query — so cross-certs re-mint long
-		// before expiry, forever. Grow-only set; `freens trust remove` is
-		// the only way out.
-		if res != nil {
-			go trustEngine.RunKeeper(bgStop, 4*time.Hour, func(alias string) error {
-				q := new(dns.Msg)
-				q.SetQuestion(dns.Fqdn(alias), dns.TypeA)
-				q.RecursionDesired = true
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer cancel()
-				resp := res.ResolveMsg(ctx, q)
-				if resp == nil {
-					return fmt.Errorf("no answer")
-				}
-				if resp.Rcode == dns.RcodeServerFailure {
-					return fmt.Errorf("servfail (degraded walk?) — retry next tick")
-				}
-				return nil
-			})
-		}
 	}
 	// Proactive refresh sweeper: names hit in the last 24 h keep being
 	// revalidated in the background even with zero client queries — from

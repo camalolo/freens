@@ -89,19 +89,24 @@ func TestPublishRescuesGhostTableWithWalk(t *testing.T) {
 		}
 	}
 
-	// The ghost round-1 puts cost one honest RPCTimeout each (messages
-	// addressed to a fabricated ID are silently dropped by design —
-	// anti-amplification), so the budget covers 8×5 s plus the walk.
+	// v0.17.0: puts target the WALK's reached set, so the ghost cluster
+	// never occupies put slots at all — the publish lands on the live
+	// peers the walk reached, and every reached target accepted.
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	stats, err := a.publishKeyedStats(ctx, key, env, nil)
 	if err != nil {
-		t.Fatalf("publish = %v (stats %+v) — the walk-rescue did not engage", err, stats)
+		t.Fatalf("publish = %v (stats %+v)", err, stats)
 	}
 	if stats.Accepted == 0 {
-		t.Fatalf("accepted = 0 after rescue (stats %+v)", stats)
+		t.Fatalf("accepted = 0 (stats %+v)", stats)
 	}
-	if stats.Targets <= constants.RReplication {
-		t.Errorf("targets = %d, want > the %d local-table contacts (the walk added candidates)", stats.Targets, constants.RReplication)
+	if stats.Targets > constants.RReplication {
+		t.Errorf("targets = %d, want ≤ %d (walk-reached live nodes only — ghosts must not get slots)",
+			stats.Targets, constants.RReplication)
+	}
+	if stats.Targets != stats.Accepted {
+		t.Errorf("targets = %d, accepted = %d — put slots were spent on unreachable contacts",
+			stats.Targets, stats.Accepted)
 	}
 }

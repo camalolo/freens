@@ -163,11 +163,22 @@ func LocalRoot(now time.Time) (der []byte, key *ecdsa.PrivateKey, err error) {
 
 // CrossCert mints the §9.5.4 constrained intermediate: the local root
 // cross-signs the FOREIGN owner-CA public key (ownerCADER) with
-// permittedSubtrees dNSName { alias, *.alias } and NotAfter =
-// min(recordExpires, now + TLS_CROSSCERT_TTL). The browser enforces the
-// constraint from this intermediate — the enforcement point of the whole
-// design (a stolen owner CA can then only misrepresent its own namespace).
-func CrossCert(rootDER []byte, rootKey *ecdsa.PrivateKey, ownerCADER []byte, alias string, recordExpires, now time.Time) ([]byte, error) {
+// permittedSubtrees dNSName { alias, *.alias } and the owner CA's OWN
+// validity window (v0.17.0: the cross-cert is no longer lease-capped —
+// see the spec amendment). The browser enforces the constraint from this
+// intermediate — the enforcement point of the whole design (a stolen
+// owner CA can then only misrepresent its own namespace).
+//
+// Why not cap at the record's lease any more: ownership lives in the
+// RECORD (TLSCA RR + revocation + §7.5 quarantine + the rotation gate),
+// and every resolution re-verifies it — capping the cross-cert at 24 h
+// duplicated that revocation at the trust layer and made every visitor's
+// trust decay daily (the fleet's recurring quiet-box verify=19 class).
+// A name that dies stops being RESOLVED; OnAliasDead purges its trust on
+// that evidence. The residual window — an unobserved dead name keeping
+// its anchor — is documented in §9.5.4 and requires the old key to
+// exploit.
+func CrossCert(rootDER []byte, rootKey *ecdsa.PrivateKey, ownerCADER []byte, alias string, now time.Time) ([]byte, error) {
 	ownerCA, err := x509.ParseCertificate(ownerCADER)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse owner CA: %v", ErrTLSCA, err)
@@ -175,19 +186,19 @@ func CrossCert(rootDER []byte, rootKey *ecdsa.PrivateKey, ownerCADER []byte, ali
 	if err := ValidateOwnerCA(ownerCA, alias); err != nil {
 		return nil, err
 	}
-	notAfter := recordExpires
-	if cap := now.Add(time.Duration(constants.TLSCrossCertTTLSec) * time.Second); notAfter.After(cap) {
-		notAfter = cap
+	if !ownerCA.NotAfter.After(now) {
+		return nil, fmt.Errorf("%w: owner CA expired at %s", ErrTLSCA, ownerCA.NotAfter.Format(time.RFC3339))
 	}
-	if !notAfter.After(now) {
-		return nil, fmt.Errorf("%w: record already expired at %s", ErrTLSCA, recordExpires.Format(time.RFC3339))
-	}
+	// Anchor the window to the owner CA's OWN validity (deterministic per
+	// its derivation-day): a re-mint is stable across days, and the
+	// cross-cert can never outlive the CA it endorses.
+	notBefore, notAfter := ownerCA.NotBefore, ownerCA.NotAfter
 	ownerSub := ownerCA.RawSubject
 	tpl := &x509.Certificate{
 		SerialNumber:          serial("freens-cross-cert", ownerCA.RawSubjectPublicKeyInfo),
 		Subject:               ownerCA.Subject,
 		RawSubject:            ownerSub,
-		NotBefore:             now.Add(-time.Hour),
+		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,

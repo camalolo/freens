@@ -120,7 +120,6 @@ type Engine struct {
 	rootKey   *ecdsa.PrivateKey
 	state     map[string]crossState // alias → installed binding
 	installed map[string]bool       // alias → directly written to system store
-	keeper    map[string]int64      // alias → last keeper refresh attempt (grow-only)
 }
 
 type crossState struct {
@@ -182,7 +181,6 @@ func New(opts Options) (*Engine, error) {
 		log:       opts.Logger,
 		state:     map[string]crossState{},
 		installed: map[string]bool{},
-		keeper:    map[string]int64{},
 	}
 	tlsDir := filepath.Join(opts.HomeDir, "tls")
 	if err := os.MkdirAll(tlsDir, 0o700); err != nil {
@@ -197,7 +195,6 @@ func New(opts Options) (*Engine, error) {
 	}
 	e.rootDER, e.rootKey = rootDER, rootKey
 	e.loadState()
-	e.loadKeeper()
 	e.sweepSpool()
 	return e, nil
 }
@@ -205,8 +202,6 @@ func New(opts Options) (*Engine, error) {
 func (e *Engine) tlsDir() string    { return filepath.Join(e.opts.HomeDir, "tls") }
 func (e *Engine) spoolDir() string  { return filepath.Join(e.tlsDir(), "spool") }
 func (e *Engine) statePath() string { return filepath.Join(e.tlsDir(), "cross.json") }
-
-func (e *Engine) keeperPath() string { return filepath.Join(e.tlsDir(), "keeper.json") }
 
 func (e *Engine) loadOrCreateRoot() ([]byte, *ecdsa.PrivateKey, error) {
 	keyPath := filepath.Join(e.tlsDir(), "root.key")
@@ -484,7 +479,10 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 			"installed_ca", rotateFrom[:16], "new_ca", caHash[:16], "grace", rotationGrace.String(),
 			"hint", "a rotation of your own completes after the grace; anything else — investigate NOW (`freens trust ls`)")
 	default: // actInstall
-		crossDER, err := tlsca.CrossCert(e.rootDER, e.rootKey, caDER, alias, time.Unix(recordExpires, 0), now)
+		// v0.17.0: the cross-cert carries the owner CA's own validity — no
+		// lease cap. recordExpires still gates the CALL (a resolution of a
+		// live record reached us); it no longer bounds the trust.
+		crossDER, err := tlsca.CrossCert(e.rootDER, e.rootKey, caDER, alias, now)
 		if err != nil {
 			e.log.Warn("tls: cross-cert mint failed", "alias", alias, "err", err)
 			return
@@ -515,7 +513,6 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		}
 		e.installed[alias] = sysOK
 		e.mu.Unlock()
-		e.noteKeeper(alias)
 		if werr := e.saveState(); werr != nil {
 			e.log.Warn("tls: state save failed", "err", werr)
 		}
@@ -637,162 +634,31 @@ func (e *Engine) RunSweeper(stop <-chan struct{}, interval time.Duration) {
 	}
 }
 
-// loadKeeper / saveKeeper persist the keeper set (alias → last attempt,
-// unix seconds). The set is grow-only: every namespace this box has EVER
-// cross-certified stays in it until `freens trust remove` — including
-// after the liveness sweep purges the (expired) cross-cert state. That is
-// what lets RunKeeper re-mint a namespace the box went quiet on.
-func (e *Engine) loadKeeper() {
-	b, err := os.ReadFile(e.keeperPath())
-	if err != nil {
-		// First boot of the keeper: seed from the CURRENT state so an
-		// upgrade does not forget namespaces the box already trusts.
-		e.mu.Lock()
-		now := e.opts.Now().Unix()
-		for alias := range e.state {
-			e.keeper[alias] = now
-		}
-		e.mu.Unlock()
-		return
-	}
-	var m map[string]int64
-	if json.Unmarshal(b, &m) == nil && m != nil {
-		e.mu.Lock()
-		e.keeper = m
-		// Seed anything the state holds that the file does not know yet.
-		now := e.opts.Now().Unix()
-		for alias := range e.state {
-			if _, ok := e.keeper[alias]; !ok {
-				e.keeper[alias] = now
-			}
-		}
-		e.mu.Unlock()
-	}
-}
-
-func (e *Engine) saveKeeper() error {
-	e.mu.Lock()
-	b, err := json.Marshal(e.keeper)
-	e.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	return writeAtomic(e.keeperPath(), b, 0o600)
-}
-
-// noteKeeper records alias in the keeper set (grow-only). Called from
-// OnOwnerCA on every install/refresh.
-func (e *Engine) noteKeeper(alias string) {
-	e.mu.Lock()
-	_, ok := e.keeper[alias]
-	if !ok {
-		e.keeper[alias] = e.opts.Now().Unix()
-	}
-	e.mu.Unlock()
-	if !ok {
-		_ = e.saveKeeper()
-	}
-}
-
-// RunKeeper drives the §9.5 trust keeper until stop closes: every
-// interval, re-resolve each remembered namespace through resolve (the
-// daemon passes its own resolver's query path — the resolution fires the
-// OnOwnerCA hook, which re-verifies and re-mints the cross-cert). This is
-// the durable fix for the "quiet box" class found live 2026-09-15: a
-// cross-cert lives ~half a day, the liveness sweep purges it on expiry,
-// and nothing re-mints it until someone resolves the name again — so
-// every box that went quiet for a day failed TLS verification with
-// ssl_verify=19 on its next real use. The keeper keeps them fresh
-// forever: one resolver query per namespace per tick, skipped when the
-// walk is not worth it (the resolve failures are the resolver's business
-// — degraded walks retry next tick). Wire with
-//
-//	go tsEngine.RunKeeper(bgStop, 4*time.Hour, resolveFn)
-//
-// next to RunSweeper. resolve returns an error only for logging.
-func (e *Engine) RunKeeper(stop <-chan struct{}, interval time.Duration, resolve func(alias string) error) {
-	// Refresh shortly after boot too (the boot-time cross-certs of a box
-	// that was off for days are the stalest ones) — but let the daemon
-	// finish its own boot warm-up first.
-	select {
-	case <-stop:
-		return
-	case <-time.After(2 * time.Minute):
-	}
-	e.keeperTick(resolve)
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-			e.keeperTick(resolve)
-		}
-	}
-}
-
-func (e *Engine) keeperTick(resolve func(alias string) error) {
-	e.mu.Lock()
-	aliases := make([]string, 0, len(e.keeper))
-	for alias := range e.keeper {
-		aliases = append(aliases, alias)
-	}
-	e.mu.Unlock()
-	if len(aliases) == 0 {
-		return
-	}
-	sort.Strings(aliases)
-	refreshed := 0
-	for _, alias := range aliases {
-		if err := resolve(alias); err != nil {
-			e.log.Debug("tls: keeper refresh failed (retries next tick)",
-				"alias", alias, "err", err)
-			continue
-		}
-		refreshed++
-		e.mu.Lock()
-		e.keeper[alias] = e.opts.Now().Unix()
-		e.mu.Unlock()
-	}
-	if refreshed > 0 {
-		e.log.Info("tls: keeper refreshed cross-certs", "namespaces", refreshed, "tracked", len(aliases))
-	}
-	_ = e.saveKeeper()
-}
 
 // RemoveAlias purges everything the engine holds for alias — the operator
 // path behind `freens trust remove <alias>` (OnAliasDead with no identity
-// check). Reports whether there was anything to remove. Also forgets the
-// keeper entry: an operator removal is the ONLY way a namespace leaves the
-// keeper set (the sweep's expiry purge deliberately does not — the whole
-// point of the keeper is to re-mint after exactly that kind of purge).
+// check). Reports whether there was anything to remove.
 func (e *Engine) RemoveAlias(alias string) bool {
 	e.mu.Lock()
 	_, ok := e.state[alias]
 	spool := e.spoolPath(alias)
 	sysOK := e.installed[alias]
-	_, inKeeper := e.keeper[alias]
 	delete(e.state, alias)
 	delete(e.installed, alias)
-	delete(e.keeper, alias)
 	e.mu.Unlock()
-	if !ok && !inKeeper {
+	if !ok {
 		return false
 	}
-	if ok {
-		_ = os.Remove(spool)
-		if sysOK {
-			e.uninstallSystem(alias)
-		}
-		if e.opts.NSSInstall {
-			e.uninstallNSS(alias)
-		}
-		if err := e.saveState(); err != nil {
-			e.log.Warn("tls: state save failed", "err", err)
-		}
+	_ = os.Remove(spool)
+	if sysOK {
+		e.uninstallSystem(alias)
 	}
-	_ = e.saveKeeper()
+	if e.opts.NSSInstall {
+		e.uninstallNSS(alias)
+	}
+	if err := e.saveState(); err != nil {
+		e.log.Warn("tls: state save failed", "err", err)
+	}
 	e.log.Info("tls: cross-cert removed by operator", "alias", alias)
 	return true
 }

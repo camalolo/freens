@@ -1224,8 +1224,21 @@ daemon cross-certifies the owner CA:
 cross-cert, signed by the LOCAL ROOT:
     subject public key   = owner-CA public key (from the TLSCA RR)
     nameConstraints      = permittedSubtrees dNSName { <alias>, *.<alias> }
-    NotAfter             = min(record.expires, now + TLS_CROSSCERT_TTL)
+    validity window      = the owner-CA's own window (v0.17.0 amendment)
 ```
+
+(v0.17.0 amendment: the cross-cert is NO LONGER lease-capped. The
+previous rule — `NotAfter = min(record.expires, now + TLS_CROSSCERT_TTL)`
+— chained every visitor's trust to the 24 h lease and made trust decay
+unless the name kept being resolved; quiet boxes failed TLS on their
+next real use. Ownership changes are already enforced at the RECORD
+layer, which every resolution re-verifies: a new TLSCA RR rides the
+rotation observation gate above, revocation is a tombstone, and young
+claims are quarantined. The cross-cert now carries the owner-CA's own
+validity window — deterministic, like the CA — and a namespace's trust
+is purged on death EVIDENCE (`OnAliasDead`: no surviving claim), not on
+a clock. The residual window — an unobserved dead name keeping its
+anchor — requires the old owner key to exploit and is accepted.)
 
 and installs it into the OS and browser trust stores. Cross-certs are
 keyed by alias → tld_id; if a different tld_id wins §7.4 screening
@@ -1520,7 +1533,8 @@ cross-certificates are name-constrained to a single namespace, so a
 compromised owner CA degrades only that owner's visitors, and WebPKI
 names are unreachable by construction. Revocation is rotation
 (§8.3/§8.6): a new owner key implies a new derived CA, and stale
-cross-certs expire within `TLS_CROSSCERT_TTL`. A first-visit
+cross-certs are replaced when the record rotates (v0.17.0: they carry
+the owner-CA lifetime and no longer expire on a clock). A first-visit
 TOFU-style latency window is inherent (§9.5.5).
 
 ## 11. Ownership versus Identity
@@ -1677,7 +1691,7 @@ of magnitude cheaper to run.
 | `NODE_STORAGE_MAX`    | 256 MiB  | per-node envelope storage cap              |
 | `TLS_CA_VALIDITY`     | 10 y     | owner-CA and local-root cert lifetime (§9.5) |
 | `TLS_LEAF_TTL`        | 604800 s | max leaf certificate lifetime (§9.5)       |
-| `TLS_CROSSCERT_TTL`   | 604800 s | max cross-cert lifetime, ≤ record expiry (§9.5) |
+| `TLS_CROSSCERT_TTL`   | —        | RETIRED v0.17.0: cross-certs carry the owner-CA window (§9.5) |
 
 ### A.4 Difficulty retargeting
 

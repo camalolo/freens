@@ -107,8 +107,7 @@ func TestCrossCertChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recordExpires := now.Add(24 * time.Hour)
-	crossDER, err := CrossCert(rootDER, rootKey, caDER, "bob", recordExpires, now)
+	crossDER, err := CrossCert(rootDER, rootKey, caDER, "bob", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,30 +148,19 @@ func TestCrossCertChain(t *testing.T) {
 		t.Fatal("name constraint not enforced: bank.com leaf verified")
 	}
 
-	// Cross-cert lifetime is capped by the record expiry, not the 7 d ceiling.
+	// v0.17.0: the cross-cert inherits the owner CA's OWN validity window —
+	// no lease cap, no 7 d ceiling (trust follows the record on every
+	// resolution; expiry-duplication at the trust layer is gone).
 	cross := mustParse(t, crossDER)
-	if diff := cross.NotAfter.Sub(recordExpires); diff < -time.Second || diff > time.Second {
-		t.Fatalf("cross-cert NotAfter = %s, want capped at record expiry %s", cross.NotAfter, recordExpires)
-	}
-
-	// A short record expiry wins over the ceiling.
-	short := now.Add(2 * time.Hour)
-	cross2DER, err := CrossCert(rootDER, rootKey, caDER, "bob", short, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := mustParse(t, cross2DER).NotAfter; got.Sub(short) > time.Second {
-		t.Fatalf("short-record cross-cert NotAfter = %s, want ≤ %s", got, short)
-	}
-
-	// An already-expired record is refused.
-	if _, err := CrossCert(rootDER, rootKey, caDER, "bob", now.Add(-time.Minute), now); !errors.Is(err, ErrTLSCA) {
-		t.Fatalf("expired record accepted: %v", err)
+	ca := mustParse(t, caDER)
+	if !cross.NotAfter.Equal(ca.NotAfter) || !cross.NotBefore.Equal(ca.NotBefore) {
+		t.Fatalf("cross-cert window = [%s, %s], want the owner CA's [%s, %s]",
+			cross.NotBefore, cross.NotAfter, ca.NotBefore, ca.NotAfter)
 	}
 
 	// A foreign CA whose CN doesn't match the alias is refused (mismatched
 	// constraint would be the worst kind of bug).
-	if _, err := CrossCert(rootDER, rootKey, caDER, "alice", recordExpires, now); !errors.Is(err, ErrTLSCA) {
+	if _, err := CrossCert(rootDER, rootKey, caDER, "alice", now); !errors.Is(err, ErrTLSCA) {
 		t.Fatalf("CN/alias mismatch accepted: %v", err)
 	}
 }

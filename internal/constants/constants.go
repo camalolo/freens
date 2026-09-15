@@ -107,7 +107,10 @@ const (
 	TLSCADeriveInfo    = "freens-tls-ca-v1" // HKDF info for §9.5.1 owner-CA derivation
 	TLSCAValidityDays  = 3650               // TLS_CA_VALIDITY: owner-CA / local-root cert lifetime (10 y)
 	TLSLeafTTLSec      = 604800             // TLS_LEAF_TTL: max leaf certificate lifetime (7 d)
-	TLSCrossCertTTLSec = 604800             // TLS_CROSSCERT_TTL: max cross-cert lifetime (7 d; ≤ record expiry)
+	// TLS_CROSSCERT_TTL: RETIRED in v0.17.0 — cross-certs carry the
+	// owner-CA's own validity window instead of a lease-capped lifetime
+	// (spec §9.5.4 amendment). Kept as documentation of the wire history.
+	TLSCrossCertTTLSec = 604800
 	TLSCAResponseTTL   = 3600               // rrset TTL carried by the TLSCA RR itself (capped by record expiry)
 )
 

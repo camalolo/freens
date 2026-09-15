@@ -4,13 +4,14 @@
 package trustsync
 
 import (
+	crand "crypto/rand"
 	"crypto/ecdsa"
 	"crypto/x509"
 	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -277,7 +278,6 @@ func TestOnOwnerCARotationFastPathWhenExpired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 1-hour record ⇒ the cross-cert (capped by it) dies in 1 hour too.
 	e.OnOwnerCA("bob", []byte{1}, ca1, clock.Add(time.Hour).Unix(), false)
 
 	ca2, _, err := tlsca.OwnerCA(ownerSeed(t, 8), "bob", clock)
@@ -287,6 +287,15 @@ func TestOnOwnerCARotationFastPathWhenExpired(t *testing.T) {
 	if string(ca1) == string(ca2) {
 		t.Skip("CA bytes identical across seeds (test invariant broken)")
 	}
+
+	// v0.17: a minted cross-cert no longer expires on its own, so force the
+	// installed anchor into the expired state — the vintage/legacy shape
+	// the fast path exists for.
+	e.mu.Lock()
+	st := e.state["bob"]
+	st.NotAfter = clock.Unix() - 1
+	e.state["bob"] = st
+	e.mu.Unlock()
 
 	clock = clock.Add(2 * time.Hour) // the installed cross-cert is now expired
 	e.OnOwnerCA("bob", []byte{1}, ca2, clock.Add(24*time.Hour).Unix(), false)
@@ -396,6 +405,19 @@ func TestSweepPurgesExpiredStateAndSystem(t *testing.T) {
 	e.OnOwnerCA("gone", []byte{1}, caGone, clock.Add(time.Hour).Unix(), false)
 	e.OnOwnerCA("live", []byte{1}, caLive, clock.Add(24*time.Hour).Unix(), false)
 
+	// v0.17: "gone" carries the PRE-v0.17 vintage on disk — a lease-capped
+	// cert already past its validity, exactly what upgraded boxes hold for
+	// the first days. The sweep's expiry purge exists for this vintage
+	// (v0.17 certs themselves do not expire in practice).
+	if err := os.WriteFile(e.spoolPath("gone"), mkVintageExpired(t, e, "gone", clock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	st := e.state["gone"]
+	st.NotAfter = clock.Add(-time.Minute).Unix()
+	e.state["gone"] = st
+	e.mu.Unlock()
+
 	goneSys := e.SystemCertPath("gone")
 	if _, err := os.Stat(goneSys); err != nil {
 		t.Fatalf("fixture: system copy missing: %v", err)
@@ -435,13 +457,11 @@ func TestRunSweeperStopsAndSweeps(t *testing.T) {
 	opts := testOpts(t)
 	opts.Now = func() time.Time { return time.Unix(0, clockNano.Load()) }
 	e := mustEngine(t, opts)
-	seed := ownerSeed(t, 9)
 	now := time.Unix(0, clockNano.Load())
-	der, err := tlsca.CrossCert(e.rootDER, e.rootKey, mustCA(t, seed, "gone", now), "gone", now.Add(time.Hour), now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(e.spoolPath("gone"), tlsca.CertPEM(der), 0o644); err != nil {
+	// v0.17 vintage: the sweep's expiry purge targets the PRE-v0.17
+	// short-cert vintage (CrossCert no longer mints anything expiring).
+	der := mkVintageExpired(t, e, "gone", now)
+	if err := os.WriteFile(e.spoolPath("gone"), der, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -605,25 +625,23 @@ func TestSweepSpoolRemovesExpired(t *testing.T) {
 	e := mustEngine(t, opts)
 	seed := ownerSeed(t, 9)
 
-	// Mint three cross-certs the way OnOwnerCA would: fresh, soon-to-expire,
-	// and garbage. Only the fresh one may survive the sweep.
+	// Mint three spool entries: a fresh v0.17 cross-cert, a PRE-v0.17
+	// short-cert vintage already past its validity, and garbage. Only the
+	// fresh one may survive the sweep.
 	now := clock
-	mk := func(alias string, notAfter time.Time) []byte {
-		der, err := tlsca.CrossCert(e.rootDER, e.rootKey, mustCA(t, seed, alias, now), alias, notAfter, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return tlsca.CertPEM(der)
+	freshDER, err := tlsca.CrossCert(e.rootDER, e.rootKey, mustCA(t, seed, "fresh", now), "fresh", now)
+	if err != nil {
+		t.Fatal(err)
 	}
 	writeSpool := func(alias string, pem []byte) {
 		if err := os.WriteFile(e.spoolPath(alias), pem, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	writeSpool("fresh", mk("fresh", now.Add(time.Hour)))
-	writeSpool("stale", mk("stale", now.Add(50*time.Millisecond)))
+	writeSpool("fresh", freshDER)
+	writeSpool("stale", mkVintageExpired(t, e, "stale", now))
 	writeSpool("junk", []byte("not a pem at all"))
-	clock = clock.Add(time.Minute) // a day passes for the sweep
+	clock = clock.Add(time.Minute) // a minute passes; the vintage is past
 
 	// The sweep runs inside OnOwnerCA — a (deduped) notification is the
 	// realistic trigger.
@@ -642,12 +660,52 @@ func TestSweepSpoolRemovesExpired(t *testing.T) {
 
 	// And at engine start: a stale entry written behind a running engine's
 	// back is cleaned by the NEXT engine (every daemon restart).
-	writeSpool("stale2", mk("stale2", now.Add(50*time.Millisecond)))
+	writeSpool("stale2", mkVintageExpired(t, e, "stale2", now))
 	clock = clock.Add(time.Hour)
 	e2 := mustEngine(t, opts)
 	if _, err := os.Stat(e2.spoolPath("stale2")); !os.IsNotExist(err) {
 		t.Errorf("start-time sweep left an expired entry (err=%v)", err)
 	}
+}
+
+// mkVintageExpired mints a PRE-v0.17-shaped cross-cert whose validity has
+// already passed — the short-lived vintage real boxes still carry on disk
+// after upgrading. CrossCert itself no longer mints lease-capped certs, so
+// the sweep's expiry purge is exercised against exactly that vintage.
+func mkVintageExpired(t *testing.T, e *Engine, alias string, now time.Time) []byte {
+	t.Helper()
+	root, err := tlsca.ParseCertPEM(mustRootPEM(t, e))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := tlsca.ParseCertPEM(tlsca.CertPEM(mustCA(t, ownerSeed(t, 9), alias, now)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(7),
+		Subject:               ca.Subject,
+		RawSubject:            ca.RawSubject,
+		NotBefore:             now.Add(-2 * time.Hour),
+		NotAfter:              now.Add(-time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true,
+		PermittedDNSDomains:   []string{alias, "*." + alias},
+		SignatureAlgorithm:    x509.ECDSAWithSHA256,
+	}
+	der, err := x509.CreateCertificate(crand.Reader, tpl, root, ca.PublicKey, e.rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tlsca.CertPEM(der)
+}
+
+// mustRootPEM renders the engine's local root as PEM.
+func mustRootPEM(t *testing.T, e *Engine) []byte {
+	t.Helper()
+	return tlsca.CertPEM(e.rootDER)
 }
 
 // mustCA derives just the CA bytes.
@@ -701,41 +759,49 @@ func TestSameKeyDifferentDayDedupes(t *testing.T) {
 	}
 }
 
-// TestMintThrottle: inside the last refreshWithin of the record's lease the
-// refresh test is permanently true — the throttle is what stops a re-mint
-// (and the installer exec storm) on EVERY resolution.
+// TestMintThrottle: the throttle stops a re-mint (and the installer exec
+// storm) on EVERY resolution — inside the throttle nothing re-mints; with
+// v0.17 certs a HEALTHY cert never re-mints at all (deterministic 10 y
+// window — churn would be pointless); a MISSING spool file is what forces
+// the re-mint once the throttle lifts.
 func TestMintThrottle(t *testing.T) {
 	clock := time.Now()
 	opts := testOpts(t)
 	opts.Now = func() time.Time { return clock }
 	e := mustEngine(t, opts)
 	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", clock)
-	// 7 h lease: inside refreshWithin (6 h) from the first minute.
 	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
 
 	// A second notification minutes later: throttled, no re-mint.
 	clock = clock.Add(5 * time.Minute)
 	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
-	if got := e.Snapshot()[0].NotAfter; got != e.Snapshot()[0].NotAfter {
-		t.Fatal("unreachable")
-	}
 	minted := e.Snapshot()[0]
 	if minted.Status != statusInstalled {
 		t.Fatalf("throttled notification changed state: %+v", minted)
 	}
 
-	// An hour later: the throttle lifts, the refresh re-mint runs — and the
-	// internal bookkeeping carries the fresh MintedAt stamp.
+	// An hour later, healthy and present: still no re-mint — a
+	// deterministic cert gains nothing from churn.
 	clock = clock.Add(mintThrottle + time.Minute)
 	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
-	if got := e.Snapshot()[0]; got.Status != statusInstalled {
-		t.Fatalf("post-throttle refresh did not install: %+v", got)
-	}
 	e.mu.Lock()
 	mintedAt := e.state["bob"].MintedAt
 	e.mu.Unlock()
+	if mintedAt == clock.Unix() {
+		t.Fatal("healthy cert re-minted after the throttle — pointless churn")
+	}
+
+	// The spool file vanishing is the real re-mint trigger once the
+	// throttle has lifted (the state-fresh-but-spool-vanished case).
+	if err := os.Remove(e.spoolPath("bob")); err != nil {
+		t.Fatal(err)
+	}
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(7*time.Hour).Unix(), false)
+	e.mu.Lock()
+	mintedAt = e.state["bob"].MintedAt
+	e.mu.Unlock()
 	if mintedAt != clock.Unix() {
-		t.Fatalf("post-throttle re-mint did not stamp MintedAt: %d != %d", mintedAt, clock.Unix())
+		t.Fatalf("missing-spool re-mint did not stamp MintedAt: %d != %d", mintedAt, clock.Unix())
 	}
 }
 
@@ -782,76 +848,3 @@ func TestLegacyStateMigratesToIdentity(t *testing.T) {
 	}
 }
 
-// TestKeeperRemembersAcrossPurgeAndRemovesOnOperatorIntent: the keeper set
-// is grow-only — a namespace the box has ever trusted stays tracked after
-// the liveness sweep purges its expired cross-cert (so RunKeeper re-mints
-// it), and leaves ONLY via RemoveAlias (`freens trust remove`).
-func TestKeeperRemembersAcrossPurgeAndRemovesOnOperatorIntent(t *testing.T) {
-	opts := testOpts(t)
-	e := mustEngine(t, opts)
-
-	// Seed the keeper the way OnOwnerCA does.
-	e.noteKeeper("camalolo")
-	e.noteKeeper("nanopi")
-	if _, err := os.Stat(filepath.Join(opts.HomeDir, "tls", "keeper.json")); err != nil {
-		t.Fatalf("keeper.json not persisted: %v", err)
-	}
-
-	// A FRESH engine over the same home (the restart shape) reloads the set.
-	e2 := mustEngine(t, opts)
-	e2.mu.Lock()
-	_, hasCamalolo := e2.keeper["camalolo"]
-	_, hasNanopi := e2.keeper["nanopi"]
-	e2.mu.Unlock()
-	if !hasCamalolo || !hasNanopi {
-		t.Fatalf("keeper set lost across engine restart: camalolo=%v nanopi=%v", hasCamalolo, hasNanopi)
-	}
-
-	// An operator removal forgets the namespace from the keeper too.
-	if !e2.RemoveAlias("nanopi") {
-		t.Fatal("RemoveAlias reported nothing removed")
-	}
-	e2.mu.Lock()
-	_, stillThere := e2.keeper["nanopi"]
-	e2.mu.Unlock()
-	if stillThere {
-		t.Fatal("nanopi still in the keeper set after trust remove")
-	}
-}
-
-// TestKeeperTickResolvesEachTrackedNamespace: the tick drives resolve once
-// per tracked alias (sorted), records the attempt, and persists it.
-func TestKeeperTickResolvesEachTrackedNamespace(t *testing.T) {
-	opts := testOpts(t)
-	e := mustEngine(t, opts)
-	e.mu.Lock()
-	e.keeper = map[string]int64{"zeta": 0, "alpha": 0}
-	e.mu.Unlock()
-
-	var mu sync.Mutex
-	got := []string{}
-	fail := map[string]bool{"zeta": true}
-	e.keeperTick(func(alias string) error {
-		mu.Lock()
-		got = append(got, alias)
-		mu.Unlock()
-		if fail[alias] {
-			return errors.New("degraded walk")
-		}
-		return nil
-	})
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(got) != 2 || got[0] != "alpha" || got[1] != "zeta" {
-		t.Fatalf("resolve calls = %v, want [alpha zeta] (sorted, one each)", got)
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.keeper["alpha"] == 0 {
-		t.Error("alpha's attempt time was not recorded")
-	}
-	if e.keeper["zeta"] != 0 {
-		t.Error("a FAILED refresh must not update the attempt time (retry next tick)")
-	}
-}
