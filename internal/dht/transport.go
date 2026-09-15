@@ -2841,7 +2841,13 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 	// publish; renewals are once-a-day per name, so the coverage is worth
 	// more than the walk. Republishing to already-accepting stores is
 	// idempotent (sameStoredRecord → accepted).
-	if stats.Accepted*2 < stats.Targets {
+	// v0.16.7: ANY partial acceptance rescues — the 2026-09-15 10:01
+	// camalolo renewal published at exactly 4/8, which the < ½ threshold
+	// let through untouched, and it split the keyspace again (minipc and
+	// nanopi stayed on the lapsed side for ~12 h until an explicit-peer
+	// publish healed them). "Accepted by every target we tried" is the
+	// only clean signal; anything less is worth one bounded walk.
+	if stats.Accepted < stats.Targets {
 		rctx, rcancel := context.WithTimeout(context.Background(), rescueWalkBudget)
 		tried := make(map[string]bool, len(closest))
 		for _, c := range closest {
