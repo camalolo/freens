@@ -4,8 +4,8 @@
 package trustsync
 
 import (
-	crand "crypto/rand"
 	"crypto/ecdsa"
+	crand "crypto/rand"
 	"crypto/x509"
 	"errors"
 	"math/big"
@@ -847,4 +847,3 @@ func TestLegacyStateMigratesToIdentity(t *testing.T) {
 		t.Fatal("legacy entry did not adopt the CA identity")
 	}
 }
-

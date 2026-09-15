@@ -634,7 +634,6 @@ func (e *Engine) RunSweeper(stop <-chan struct{}, interval time.Duration) {
 	}
 }
 
-
 // RemoveAlias purges everything the engine holds for alias — the operator
 // path behind `freens trust remove <alias>` (OnAliasDead with no identity
 // check). Reports whether there was anything to remove.
