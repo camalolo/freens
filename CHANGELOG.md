@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.18.0 — one reconciler: the envelope-state healing mechanisms consolidated
+
+**The invariant, stated once:** local envelope state reconciles toward
+network truth. The reconciler runs at boot and on a timer; the network
+GET is the referee; re-put is idempotent (§6.4 sameStoredRecord →
+accepted).
+
+Envelope-state healing had grown into SIX mechanisms, each a variant of
+"compare my envelopes with the network's, re-put if diverged", each added
+after a separate incident, all overlapping: (1) the renewPending queue +
+retryPendingPuts (v0.14.1 publish losses — and the queue's in-memory
+state CAUSED the v0.14.2 incident by dying with the old process); (2)
+renewVerifyFresh / renewVerifyFreshAt + the renewVerifyLast throttle
+(v0.14.3 phantom-freshness verify; K_tld only until v0.16.7 added the
+per-key variant); (3) bootLeaseWarmup (v0.16.7) — which already WAS a
+reconciler, just one that ran exactly once; (4) renewOnce / renewLoop,
+the renewal scan entangled with verification and with the queue; (5) the
+publish walk-rescue (kept as-is — a bounded backstop, not a loop); (6)
+expiredWinner self-heal (kept as-is — a read-path concern).
+
+v0.18 replaces 1-4 with ONE loop: the first tick runs immediately at
+daemon start (the boot lease warm-up's keyspace walks live on as the boot
+tick's warm-up), then it ticks every 10 minutes. Per tick, two passes —
+the RENEWAL SCAN (today's renewOnce: ShouldRenew → re-sign sequence+1 →
+publish with honest k-of-R logging → install locally) followed by the
+RECONCILIATION (network-GET BOTH storage keys of every own envelope via
+dht.StorageKeys; re-PUT the EXISTING signed envelope when the network is
+missing it or holds an older generation; a healthy result arms the 1 h
+per-(name,key) throttle, a repair or an inconclusive walk leaves the next
+tick free to re-check).
+
+A renewal no longer carries its own confirm/retry machinery: the next
+tick's GET is the confirmation, and a mismatch re-puts — attempts are
+bounded by the tick cadence, so the give-up counter, the 12-attempt
+ceiling, and the queue-wiped-by-restart failure mode are all gone.
+
+The incident scars survive as invariants, unchanged by the
+consolidation: confirmation is against the NETWORK, never the local store
+(phantom freshness); BOTH keys are verified per envelope (the K_claim leg
+failed silently twice); the reconciler never re-signs (a re-signed
+duplicate of sequence N is a different envelope — sequence monotonicity
+demands re-puts); ShouldRenew still governs re-signing and only there;
+passive nodes (§6.1) never run the loop; honest k-of-R acceptance logging
+stays; passphrase-encrypted keyfiles are skipped exactly as before. The
+boot tick keeps the "boot lease warm-up complete" journal line (fleet
+runbooks grep for it). The repair log lines now say "reconciler:" (the
+old "auto-renew verify:" prefix is gone; renewals keep "auto-renew:").
+Daemon-internal refactor: no wire changes; mixed-version fleets
+interoperate unchanged.
+
 ## v0.17.0 — the design corrections: unlease-capped trust, reachability-defined replicas
 
 Two structural fixes that DELETE the recurring failure classes instead of

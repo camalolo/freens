@@ -145,6 +145,46 @@ func TestRenewOnceStoresRenewalLocally(t *testing.T) {
 	}
 }
 
+// TestRenewOncePublishFailureRetriesNextTick: with the v0.18 confirm-retry
+// queue deleted, a publish that lands nowhere (no peers — the walk-rescue
+// fallback found nobody) must NOT update the local store, so ShouldRenew
+// keeps firing and the NEXT tick re-signs sequence+1 afresh — no phantom
+// freshness, no queue to wipe on restart. Once a peer exists, the retry
+// lands the renewal at both stores.
+func TestRenewOncePublishFailureRetriesNextTick(t *testing.T) {
+	kp := renewKeychain(t)
+	daemon, daemonStore := renewTestNode(t) // starts with NO peers
+
+	now := time.Now().Unix()
+	env, key := nearExpiryRecord(t, kp, 7, now)
+	if ok, err := daemonStore.Put(key, env, now, false); !ok || err != nil {
+		t.Fatalf("seeding the near-expiry record: %v, %v", ok, err)
+	}
+
+	// Tick 1: the publish cannot land anywhere.
+	renewOnce(daemon, daemonStore, renewTestLogger())
+
+	got, err := daemonStore.Get(key, time.Now().Unix())
+	if err != nil || got == nil || got.Record.Sequence != 7 {
+		t.Fatalf("local store advanced on a failed publish (phantom freshness): seq=%v, %v", got, err)
+	}
+
+	// Tick 2: a peer exists now — the retry re-signs sequence+1 and lands
+	// it locally AND on the network.
+	peer, peerStore := renewTestNode(t)
+	connectTestPair(t, daemon, peer)
+	renewOnce(daemon, daemonStore, renewTestLogger())
+
+	got, err = daemonStore.Get(key, time.Now().Unix())
+	if err != nil || got == nil || got.Record.Sequence != 8 {
+		t.Fatalf("retry tick did not store the renewal locally: seq=%v, %v", got, err)
+	}
+	peerGot, err := peerStore.Get(key, time.Now().Unix())
+	if err != nil || peerGot == nil || peerGot.Record.Sequence != 8 {
+		t.Fatalf("retry tick did not reach the network: seq=%v, %v", peerGot, err)
+	}
+}
+
 // TestStorePutIdenticalRecordAccepted: a put whose record is ALREADY stored
 // (identical envelope — the replica-refresh case) must report success, not
 // refusal, while a strictly newer record still wins and a stale re-put of

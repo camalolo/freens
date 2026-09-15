@@ -558,26 +558,17 @@ func run(args []string) error {
 		go peerbookLoop(dhtNode, bookStop, logger)
 	}
 
-	// Auto-renewal (the lease half of "ownership = liveness"): every 10
-	// minutes, scan the store for envelopes signed by a KEYCHAIN key (the
-	// user's own names — apexes, sub-names, claim copies) whose remaining
-	// lifetime is inside the renewal threshold, and re-sign + republish
-	// them at sequence+1 with a fresh window. This is what makes "keep
-	// the daemon running and your names stay alive" literally true: the
-	// §6.4 republish loop alone cannot extend an expiry baked into a
-	// signature. Skipped in passive mode (§6.1: no put) and when no
-	// keychain keys exist (a pure relay/witness node owns nothing).
-	var renewStop chan struct{}
+	// THE RECONCILER (v0.18 "one reconciler"): the single envelope-state
+	// healing loop. First tick immediately at boot (the old boot lease
+	// warm-up: keyspace walks + network-verify of every own envelope),
+	// then every 10 minutes: renewal scan (renewOnce) + network
+	// reconciliation of both storage keys per own envelope. Skipped in
+	// passive mode (§6.1: no put at all) and on node-less daemons — see
+	// reconcileLoop for the incident-scar invariants it preserves.
+	var reconcilerStop chan struct{}
 	if dhtNode != nil && !passiveEffective {
-		renewStop = make(chan struct{})
-		go renewLoop(dhtNode, store, logger, renewStop)
-		// Boot lease warm-up (see bootLeaseWarmup): warms both keyspaces of
-		// every keychain name and network-verifies/re-publishes own leases
-		// NOW instead of letting the post-restart window run cold until the
-		// first hourly verify. Runs alongside the ping sweep; the walks
-		// themselves are the warm-up, and renewVerifyFresh degrades
-		// honestly if the table is still cold.
-		go bootLeaseWarmup(dhtNode, store, logger)
+		reconcilerStop = make(chan struct{})
+		go reconcileLoop(dhtNode, store, logger, reconcilerStop)
 	}
 
 	// Upstream wiring: plaintext UDP/TCP to the configured servers, or —
@@ -940,8 +931,8 @@ func run(args []string) error {
 	if bookStop != nil {
 		close(bookStop)
 	}
-	if renewStop != nil {
-		close(renewStop)
+	if reconcilerStop != nil {
+		close(reconcilerStop)
 	}
 	// Final persistence AFTER the servers (and the DHT node) have stopped, so
 	// the snapshot reflects every record the resolver cached during shutdown.
@@ -1156,109 +1147,79 @@ func confirmedPeers(contacts []*dht.NodeContact, now int64) []dht.Peer {
 	return out
 }
 
-// renewLoop keeps the user's own names alive: every 10 minutes it scans the
-// store for envelopes SIGNED BY A KEYCHAIN KEY whose remaining lifetime is
-// inside renewal.ShouldRenew, re-signs them (sequence+1, fresh 24 h window)
-// and republishes at every legitimate key (dht.StorageKeys: K_tld/K_name
-// plus K_claim for claim-carrying records). Owner-private keys live in
-// ~/.freens/keys (0600, same user as the daemon) — the loop reads them to
-// sign, exactly like the CLI would, and never exposes them further.
+// reconcileInterval is the reconciler tick cadence (a var so tests can
+// shrink it).
+var reconcileInterval = 10 * time.Minute
+
+// reconcileLoop is THE envelope-state healing mechanism (v0.18 "one
+// reconciler"): local envelope state reconciles toward network truth. The
+// first tick runs immediately at daemon start (this is the old boot lease
+// warm-up — the boot/timer split is gone), then the loop ticks every 10
+// minutes. Each tick runs two passes:
 //
-// Two conservatisms: a record that is REVOKED is never renewed (deliberate
-// death), and a renewal that fails to publish anywhere is retried on the
-// next tick. The retry is not left to ShouldRenew alone: a renewal renews
-// BOTH carriers of a name (K_tld + K_claim), and when only one key's put
-// fails while the other succeeds, the fresh local copy resets ShouldRenew —
-// the failed leg would silently wait a full lease before anyone re-signed
-// it (v0.14.0 fleet incident: "accepted by 0 of 7 peers" at one tick, then
-// 24 h of NXDOMAIN while peers served the expired predecessor). Unconfirmed
-// puts therefore land in renewPending and are re-published — no re-sign,
-// the envelope is already good — until the network's own GET confirms them.
-type renewPendingPut struct {
-	env      *wire.SignedEnvelope
-	keys     [][]byte
-	attempts int
-}
-
-// renewPendingMaxAttempts bounds the retry loop: 12 ticks ≈ 2 h of retries
-// per envelope. A network that cannot accept a put in 2 h needs the operator
-// (doctor), not an infinite background hammer.
-const renewPendingMaxAttempts = 12
-
-var renewPending = struct {
-	sync.Mutex
-	m map[string]*renewPendingPut // hex(key) -> pending put
-}{m: map[string]*renewPendingPut{}}
-
-func renewLoop(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, stop <-chan struct{}) {
-	t := time.NewTicker(10 * time.Minute)
-	defer t.Stop()
+//	(a) RENEWAL SCAN — renewOnce: re-sign at sequence+1 whatever
+//	    renewal.ShouldRenew says is due (the ONLY re-signing anywhere in
+//	    the loop), publish with honest per-key acceptance logging, and
+//	    install the fresh envelope in the local store.
+//	(b) RECONCILIATION — reconcileLeases: network-GET BOTH storage keys
+//	    (dht.StorageKeys) of every own envelope and re-PUT the EXISTING
+//	    signed envelope (never a re-sign) when the network is missing it
+//	    or holds an older generation.
+//
+// The network GET is the referee; re-put is idempotent (§6.4
+// sameStoredRecord → accepted). A renewal therefore needs NO confirm/retry
+// machinery of its own: the next tick's GET is the confirmation, and a
+// mismatch re-puts — attempts are bounded by the tick cadence, so there is
+// no give-up counter and no in-memory pending queue to lose on restart
+// (the v0.14.2 incident: the queue died with the old process and took the
+// unconfirmed renewal with it).
+//
+// This consolidates the v0.14-v0.17 healing stack — the renewPending queue
+// + retryPendingPuts (v0.14.1), the hourly renewVerifyFresh /
+// renewVerifyFreshAt network verify (v0.14.3 / v0.16.7), the boot lease
+// warm-up (v0.16.7) and the renewLoop timer — which were overlapping
+// variants of the same compare-and-re-put idea, each added after a
+// separate incident. The incident scars survive as invariants:
+//   - confirmation is against the NETWORK, never the local store (the
+//     phantom-freshness class — ShouldRenew only looks locally);
+//   - BOTH keys are verified per envelope (the K_claim leg failed
+//     silently twice: v0.14.0, v0.16.2);
+//   - the reconciler re-publishes the EXISTING signed envelope — never
+//     re-signs (a re-signed duplicate of sequence N is a different
+//     envelope the §6.4 winner rule refuses or hash-tie-breaks; sequence
+//     monotonicity demands re-puts);
+//   - renewal.ShouldRenew still governs re-signing; the reconciliation
+//     pass never re-signs;
+//   - passive nodes (§6.1: no puts at all) never run it — the run()
+//     caller gates on -passive;
+//   - honest k-of-R acceptance logging (logPublishStats) on every put;
+//   - passphrase-encrypted keyfiles are skipped by loadOwnerKeypairs
+//     exactly as before (a daemon cannot prompt).
+func reconcileLoop(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, stop <-chan struct{}) {
+	boot := true
 	for {
+		reconcileTick(node, store, logger, boot)
+		boot = false
 		select {
-		case <-t.C:
-			retryPendingPuts(node, logger)
-			renewOnce(node, store, logger)
 		case <-stop:
 			return
+		case <-time.After(reconcileInterval):
 		}
 	}
 }
 
-// retryPendingPuts re-publishes unconfirmed renewals and drops the entries
-// the network now reflects (the §6.4 GET returns the exact envelope).
-func retryPendingPuts(node *dht.Node, logger *slog.Logger) {
-	renewPending.Lock()
-	defer renewPending.Unlock()
-	if len(renewPending.m) == 0 {
-		return
+// reconcileTick is one reconciler pass: on the boot tick, the keyspace
+// warm-up walks; then the renewal scan (a); then reconciliation (b).
+func reconcileTick(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, boot bool) {
+	ownerMap := loadOwnerKeypairs(logger)
+	if len(ownerMap) == 0 {
+		return // no keychain: a relay node, nothing to renew or reconcile
 	}
-	for kHex, p := range renewPending.m {
-		p.attempts++
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := node.PublishKeyedAt(ctx, p.keys, p.env)
-		var confirmed bool
-		if err == nil {
-			// Confirm from the NETWORK's view, not the local store: the
-			// incident was precisely "local thinks it's done, network
-			// disagrees". IterativeGet walks the real holders.
-			//
-			// v0.16.2: EVERY key must confirm, not just keys[0]. The
-			// 2026-09-05 fleet outage: K_tld landed (3/8) while K_claim was
-			// refused by every store (ghost-polluted keyspace) — the confirm
-			// GET'd K_tld only, matched, dropped the entry, and the lapsed
-			// predecessor claim took the namespace offline fleet-wide when
-			// its lease ran out hours later.
-			confirmed = true
-			for _, k := range p.keys {
-				gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
-				env, gerr := node.IterativeGet(gctx, k)
-				gcancel()
-				if gerr != nil || env == nil || p.env.Record == nil || env.Record == nil {
-					confirmed = false
-					break
-				}
-				nh, e1 := env.RecordHash()
-				ph, e2 := p.env.RecordHash()
-				if e1 != nil || e2 != nil || !bytes.Equal(nh, ph) {
-					confirmed = false
-					break
-				}
-			}
-		}
-		cancel()
-		switch {
-		case confirmed:
-			delete(renewPending.m, kHex)
-			logger.Info("auto-renew: pending publish confirmed by the network", "sequence", p.env.Record.Sequence)
-		case p.attempts >= renewPendingMaxAttempts:
-			delete(renewPending.m, kHex)
-			logger.Warn("auto-renew: publish unconfirmed after repeated retries — run `freens renew -force <name>` (or check connectivity)",
-				"sequence", p.env.Record.Sequence, "attempts", p.attempts)
-		default:
-			logger.Warn("auto-renew: publish not yet confirmed network-wide; will retry",
-				"sequence", p.env.Record.Sequence, "attempt", p.attempts, "err", err)
-		}
+	if boot {
+		warmKeyspaces(node, ownerMap, logger)
 	}
+	renewOnce(node, store, logger)
+	reconcileLeases(node, store, ownerMap, logger, boot)
 }
 
 // warmupPingSweep pings the learned peerbook contacts right after boot so
@@ -1292,9 +1253,9 @@ type keychainOwner struct {
 }
 
 // loadOwnerKeypairs reads the keychain: owner keyfile alias + keypair,
-// keyed by public-key hex. Shared by the auto-renew pass and the boot
-// lease warm-up (identical keyfile semantics: hex seed or
-// passphrase-encrypted via FREENS_PASSPHRASE — a service cannot prompt).
+// keyed by public-key hex. Shared by both reconciler passes (identical
+// keyfile semantics: hex seed or passphrase-encrypted via
+// FREENS_PASSPHRASE — a service cannot prompt).
 func loadOwnerKeypairs(logger *slog.Logger) map[string]keychainOwner {
 	owners := make(map[string]keychainOwner)
 	entries, err := os.ReadDir(home.KeysDir())
@@ -1348,27 +1309,15 @@ func loadOwnerKeypairs(logger *slog.Logger) map[string]keychainOwner {
 	return owners
 }
 
-// bootLeaseWarmup runs RIGHT AFTER boot (background, non-passive nodes):
-// it warms the two keyspaces of every keychain name and network-verifies
-// every own envelope the persisted store holds, re-publishing any lease
-// the network lost. Without it the post-restart window was the fleet's
-// recurring upgrade hiccup: the first query ate a cold walk (client-side
-// timeouts), and a renewal whose publish died with the old process stayed
-// lost until the first hourly verify — surfacing hours later as an
-// NXDOMAIN that looked like an upgrade bug (2026-09-13/14). Bounded and
-// best-effort: every walk carries its own timeout, failures log and move
-// on. NOT a renewal: ShouldRenew still governs re-signing; this only
-// verifies and re-publishes what is already signed (the renewVerifyFresh
-// heal path — idempotent republish).
-func bootLeaseWarmup(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
-	ownerMap := loadOwnerKeypairs(logger)
-	if len(ownerMap) == 0 {
-		return
-	}
-	// (a) Keyspace walks: one IterativeFindNode toward K_tld and K_claim
-	// per keychain name — the table learns the true closest sets now, so
-	// the first real query (and the verify below) converges in one round
-	// instead of starting cold. Works with or without a persisted store.
+// warmKeyspaces runs one IterativeFindNode toward K_tld and K_claim of
+// every keychain name — the reconciler's BOOT tick only (afterwards the
+// verification GETs walk those same keyspaces anyway). The table learns
+// the true closest sets now, so the first real query, the first renewal
+// publish, and the first reconciliation converge in one round instead of
+// starting cold (the post-restart window that motivated the v0.16.7 boot
+// lease warm-up; the walks live on here). Works with or without a
+// persisted store; bounded and best-effort, failures just move on.
+func warmKeyspaces(node *dht.Node, ownerMap map[string]keychainOwner, logger *slog.Logger) {
 	for _, o := range ownerMap {
 		tid, err := crypto.TldID(o.kp.Public())
 		if err != nil {
@@ -1392,10 +1341,32 @@ func bootLeaseWarmup(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logg
 			wcancel()
 		}
 	}
-	// (b) Lease verification: every own envelope is checked against the
-	// NETWORK's copy at BOTH its keys (renewVerifyLast is empty at boot, so
-	// every name verifies); a lost lease is re-published immediately via
-	// the renewVerifyFresh heal path instead of at the first hourly tick.
+}
+
+// reconcileVerifyInterval: how often a (name, storage key) pair that came
+// back HEALTHY is re-verified (a var so tests can shrink it). The
+// 2026-09-02 camalolo incident: the local bookkeeping said "fresh until
+// 12:17" while the network had lost the envelope entirely — every
+// non-owner resolver NXDOMAINed the name for hours and nothing on the
+// owner noticed, because ShouldRenew only looks at the LOCAL store. One
+// network GET per own (name, key) per interval is the cheap antidote.
+var reconcileVerifyInterval = 60 * time.Minute
+
+// reconcileVerifyLast rate-limits the per-(name, key) verification:
+// hex(wire name) + "/" + storage-key index -> unix second of the last
+// HEALTHY check. Only a healthy result arms the throttle: an inconclusive
+// walk or a repair leaves the key open, so the NEXT tick re-checks it —
+// the ticks are the confirmation, and a repaired lease is proven
+// network-held within one cadence instead of an hour later.
+var reconcileVerifyLast sync.Map
+
+// reconcileLeases is the reconciler's pass (b): every own envelope in the
+// store is checked against the NETWORK at BOTH its storage keys
+// (dht.StorageKeys — the K_claim leg is the one that historically failed
+// silently), re-putting the exact local envelope on a mismatch.
+// Cached/relayed records are their owners' business; a REVOKED envelope is
+// deliberate death and is never resurrected.
+func reconcileLeases(node *dht.Node, store *dht.EnvelopeStore, ownerMap map[string]keychainOwner, logger *slog.Logger, boot bool) {
 	now := store.Now()
 	verified := 0
 	for _, ent := range store.Entries(now) {
@@ -1411,17 +1382,91 @@ func bootLeaseWarmup(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logg
 			continue
 		}
 		for i := range keys {
-			renewVerifyFreshAt(node, logger, env, i)
+			reconcileLeaseAt(node, logger, env, keys, i)
 		}
 		verified++
 	}
-	if verified > 0 {
+	if boot {
+		// The boot-tick completion line fleet runbooks grep for (formerly
+		// the boot lease warm-up's marker — same words, new owner).
 		logger.Info("boot lease warm-up complete", "names_verified", verified)
 	}
 }
 
-// renewOnce is one auto-renewal pass (split out so a future -renew-now flag
-// or admin RPC can trigger it on demand).
+// reconcileLeaseAt reconciles ONE storage key (keyIdx into keys) of an own
+// envelope against the network: the network's walk (the local store
+// EXCLUDED — an owner counting its own copy would "confirm" itself
+// forever) must offer the same envelope, or the lease is re-published on
+// the spot. Degraded walks are skipped (inconclusive, not evidence) — the
+// next tick re-checks. A healthy result arms the 1 h per-(name,key)
+// throttle; a repair leaves it open.
+func reconcileLeaseAt(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvelope, keys [][]byte, keyIdx int) {
+	if env == nil || env.Record == nil || keyIdx >= len(keys) {
+		return
+	}
+	nameKey := hex.EncodeToString(env.Record.Name) + "/" + fmt.Sprint(keyIdx)
+	nowS := time.Now().Unix()
+	if v, ok := reconcileVerifyLast.Load(nameKey); ok &&
+		nowS-v.(int64) < int64(reconcileVerifyInterval/time.Second) {
+		return
+	}
+	gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	netEnv, err := node.IterativeGet(gctx, keys[keyIdx])
+	gcancel()
+	if errors.Is(err, dht.ErrDegradedMiss) || errors.Is(err, dht.ErrWalkBusy) {
+		logger.Debug("reconciler: lease verification inconclusive (degraded walk)",
+			"sequence", env.Record.Sequence, "key_index", keyIdx)
+		return
+	}
+	healthy := err == nil && netEnv != nil && netEnv.Record != nil
+	if healthy {
+		nh, e1 := netEnv.RecordHash()
+		lh, e2 := env.RecordHash()
+		healthy = e1 == nil && e2 == nil && bytes.Equal(nh, lh)
+	}
+	if healthy {
+		reconcileVerifyLast.Store(nameKey, nowS)
+		logger.Debug("reconciler: lease verified on the network",
+			"sequence", env.Record.Sequence, "key_index", keyIdx)
+		return
+	}
+	// The network is missing the lease or holds an older/different
+	// generation: re-publish the EXISTING signed envelope (no re-sign —
+	// it is still valid and sequence-correct, and §6.4 makes the re-put
+	// idempotent: sameStoredRecord → accepted). The throttle entry stays
+	// open: the next tick's GET re-checks the repair, so no give-up
+	// counter and no pending queue are needed — attempts are bounded by
+	// the tick cadence.
+	netSeq := int64(-1)
+	if netEnv != nil && netEnv.Record != nil {
+		netSeq = int64(netEnv.Record.Sequence)
+	}
+	logger.Warn("reconciler: network missing (or holding an older) lease; re-publishing the existing envelope",
+		"sequence", env.Record.Sequence, "network_sequence", netSeq, "key_index", keyIdx, "get_err", err)
+	pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stats, perr := node.PublishKeyedAtStats(pctx, keys, env)
+	pcancel()
+	logPublishStats(logger, "reconciler", stats, perr)
+}
+
+// renewOnce is the reconciler's RENEWAL SCAN (pass (a); split out so a
+// future -renew-now flag or admin RPC can trigger it on demand): it scans
+// the store for envelopes SIGNED BY A KEYCHAIN KEY whose remaining
+// lifetime is inside renewal.ShouldRenew, re-signs them (sequence+1,
+// fresh 24 h window) and republishes them at every legitimate key
+// (dht.StorageKeys: K_tld/K_name plus K_claim for claim-carrying
+// records). Owner-private keys live in <home>/keys (0600, same user as
+// the daemon) — the scan reads them to sign, exactly like the CLI would,
+// and never exposes them further.
+//
+// Conservatisms: a record that is REVOKED is never renewed (deliberate
+// death), and a renewal that fails to publish anywhere is retried by the
+// NEXT tick — the local store is only updated after a publish attempt
+// succeeds, so ShouldRenew keeps firing until the re-sign sticks. What is
+// gone since v0.18 is the confirm/retry queue: pass (b)'s network GETs
+// are the confirmation (network missing/older → the existing envelope is
+// re-put, idempotently), and a publish that lands nowhere just means the
+// next tick re-signs afresh.
 func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 	// The keychain map: owner public key -> keypair.
 	ownerMap := loadOwnerKeypairs(logger)
@@ -1446,8 +1491,7 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			continue // not ours: cached/relayed records are their owners' business
 		}
 		if !renewal.ShouldRenew(now, int64(env.Record.Created), int64(env.Record.Expires)) {
-			renewVerifyFresh(node, logger, env)
-			continue
+			continue // fresh: pass (b) verifies the network's copy, this pass never re-signs
 		}
 		fresh, err := renewal.RenewEnvelope(env, kp, now)
 		if err != nil {
@@ -1463,12 +1507,7 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		cancel()
 		logPublishStats(logger, "auto-renew", stats, err)
 		if err != nil {
-			logger.Warn("auto-renew: publish failed (queued for network-confirmed retry)", "error", err)
-			renewPending.Lock()
-			for _, k := range keys {
-				renewPending.m[hex.EncodeToString(k)] = &renewPendingPut{env: fresh, keys: keys}
-			}
-			renewPending.Unlock()
+			logger.Warn("auto-renew: publish failed (the next tick re-signs and retries)", "error", err)
 			continue
 		}
 		// §8.3 re-attestation (v2 amendment): best-effort re-notarization
@@ -1486,16 +1525,6 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 			}
 			rcancel()
 		}
-		// The publish reporting success does not mean every holder has it —
-		// the K_tld put can land while the K_claim put silently reaches
-		// nobody until the next lease (the incident above). Queue the keys
-		// for NETWORK-CONFIRMED retry; confirmation drops them within a
-		// tick or two when propagation is healthy.
-		renewPending.Lock()
-		for _, k := range keys {
-			renewPending.m[hex.EncodeToString(k)] = &renewPendingPut{env: fresh, keys: keys}
-		}
-		renewPending.Unlock()
 		// The renewal must BELIEVE what it told the network: install the
 		// fresh envelope in the local store too. Without this the next
 		// tick re-reads the stale sequence here, re-signs the SAME
@@ -1505,6 +1534,8 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		// ten minutes while the network record slowly starves toward
 		// expiry (found live 2026-08-31 on the seed box; a TLSCA-less
 		// pre-upgrade record renewed this way never gains the binding).
+		// Any residual under-replication is pass (b)'s business: its next
+		// GET finds the network stale and re-puts THIS exact envelope.
 		for _, k := range keys {
 			_, _ = store.Put(k, fresh, now, false) // signed above
 		}
@@ -1515,89 +1546,6 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 	if renewed > 0 {
 		logger.Info("auto-renew pass complete", "renewed", renewed)
 	}
-}
-
-// renewVerifyInterval: how often the pass re-verifies that the NETWORK
-// still holds each apparently-fresh lease (a var so tests can shrink it).
-// The 2026-09-02 camalolo incident: the local bookkeeping said "fresh
-// until 12:17" while the network had lost the envelope entirely — every
-// non-owner resolver NXDOMAINed the name for hours and nothing on the
-// owner noticed, because ShouldRenew only looks at the LOCAL store. One
-// network GET per own name per interval is the cheap antidote.
-var renewVerifyInterval = 60 * time.Minute
-
-// renewVerifyLast rate-limits the per-name verification: name (hex wire
-// name) -> unix second of the last attempt.
-var renewVerifyLast sync.Map
-
-// renewVerifyFresh re-checks an own record that ShouldRenew considers
-// fresh: the network's walk (local store EXCLUDED — an owner counting its
-// own copy would "confirm" itself forever) must offer the same envelope,
-// or the lease is re-published on the spot and queued for the
-// network-confirmed retry loop. Degraded walks are skipped (inconclusive,
-// not evidence) — the next window re-checks.
-func renewVerifyFresh(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvelope) {
-	renewVerifyFreshAt(node, logger, env, 0)
-}
-
-// renewVerifyFreshAt is renewVerifyFresh against storage key index keyIdx
-// (0 = K_tld, 1 = K_claim on claim-bearing envelopes) — the boot lease
-// warm-up verifies BOTH keyspaces; the hourly pass keeps checking K_tld
-// (its K_claim coverage is the confirm-retry loop's).
-func renewVerifyFreshAt(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvelope, keyIdx int) {
-	if env == nil || env.Record == nil {
-		return
-	}
-	nameKey := hex.EncodeToString(env.Record.Name) + "/" + fmt.Sprint(keyIdx)
-	nowS := time.Now().Unix()
-	if v, ok := renewVerifyLast.Load(nameKey); ok &&
-		nowS-v.(int64) < int64(renewVerifyInterval/time.Second) {
-		return
-	}
-	renewVerifyLast.Store(nameKey, nowS)
-
-	keys, err := dht.StorageKeys(env)
-	if err != nil || len(keys) == 0 || keyIdx >= len(keys) {
-		return
-	}
-	gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	netEnv, err := node.IterativeGet(gctx, keys[keyIdx])
-	gcancel()
-	if errors.Is(err, dht.ErrDegradedMiss) || errors.Is(err, dht.ErrWalkBusy) {
-		logger.Debug("auto-renew: lease verification inconclusive (degraded walk)",
-			"sequence", env.Record.Sequence)
-		return
-	}
-	healthy := err == nil && netEnv != nil && netEnv.Record != nil
-	if healthy {
-		nh, e1 := netEnv.RecordHash()
-		lh, e2 := env.RecordHash()
-		healthy = e1 == nil && e2 == nil && bytes.Equal(nh, lh)
-	}
-	if healthy {
-		logger.Debug("auto-renew: fresh lease verified on the network",
-			"sequence", env.Record.Sequence)
-		return
-	}
-	// The network is missing the lease or holds an older/different
-	// generation: re-publish the EXISTING local envelope (no re-sign — it
-	// is still valid and sequence-correct) and let the confirmed-retry
-	// loop finish the job.
-	netSeq := int64(-1)
-	if netEnv != nil && netEnv.Record != nil {
-		netSeq = int64(netEnv.Record.Sequence)
-	}
-	logger.Warn("auto-renew: network lost a supposedly-fresh lease; re-publishing",
-		"sequence", env.Record.Sequence, "network_sequence", netSeq, "get_err", err)
-	pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	stats, perr := node.PublishKeyedAtStats(pctx, keys, env)
-	pcancel()
-	logPublishStats(logger, "auto-renew verify", stats, perr)
-	renewPending.Lock()
-	for _, k := range keys {
-		renewPending.m[hex.EncodeToString(k)] = &renewPendingPut{env: env, keys: keys}
-	}
-	renewPending.Unlock()
 }
 
 // logPublishStats turns dht.PublishStats into one log line per key — the
