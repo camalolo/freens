@@ -21,7 +21,7 @@ CONVERGE_WAIT="${CONVERGE_WAIT:-45}"   # seconds between restart and checks
 DIG_WAIT="${DIG_WAIT:-8}"              # per-dig timeout
 
 die() { echo "fleet-upgrade: $*" >&2; exit 1; }
-remote() { # remote <box> <command…>
+remote() { # remote <box> <command…> — run through the box's freens CLI
     local box=$1; shift
     local var="FLEET_BOXES_CMD_${box//-/_}"
     local cmd="${!var:-freens}"
@@ -29,6 +29,17 @@ remote() { # remote <box> <command…>
         env FREENS_HOME="${FLEET_LOCAL_HOME:-$HOME/.local/share/freens}" $cmd "$@"
     else
         ssh -o ControlPath=none "$box" "$cmd $*"
+    fi
+}
+onbox() { # onbox <box> <shell-command…> — run a PLAIN SHELL command on the
+          # box (digs, curls: NOT through the freens CLI — the v0.18.0 roll
+          # found the checks running as `freens sh -c …` and failing on
+          # every box while the upgrades themselves were green).
+    local box=$1; shift
+    if [ "$box" = "${FLEET_LOCAL_BOX:-}" ]; then
+        bash -c "$*"
+    else
+        ssh -o ControlPath=none "$box" "$*"
     fi
 }
 
@@ -68,7 +79,7 @@ for box in $FLEET_BOXES; do
     # verification alias. A timeout here is the cold-walk/wedge tripwire.
     for name in "$first_alias"; do
         [ -n "$name" ] || continue
-        ans=$(remote "$box" sh -c "dig @127.0.0.1 -p 5300 $name +time=$DIG_WAIT +tries=1 +short 2>/dev/null | head -1")
+        ans=$(onbox "$box" "dig @127.0.0.1 -p 5300 $name +time=$DIG_WAIT +tries=1 +short 2>/dev/null | head -1")
         if [ -n "$ans" ]; then
             printf "  %-12s %s (%s)\n" "dns $name:" "ANSWER" "$ans"
         else
@@ -79,7 +90,7 @@ for box in $FLEET_BOXES; do
     # TLS through the OS path (system trust + resolver): exactly what an
     # application experiences. www.<alias> exercises the §9.5 chain.
     if [ -n "$first_alias" ]; then
-        tls=$(remote "$box" sh -c "curl -s -o /dev/null -w '%{http_code}/v%{ssl_verify_result}' --max-time 15 https://www.$first_alias/ 2>/dev/null")
+        tls=$(onbox "$box" "curl -s -o /dev/null -w '%{http_code}/v%{ssl_verify_result}' --max-time 15 https://www.$first_alias/ 2>/dev/null")
         printf "  %-12s %s\n" "tls www:" "$tls"
         case "$tls" in
             200/v0) ;;
