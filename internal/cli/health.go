@@ -278,9 +278,15 @@ func cmdDoctor(args []string) error {
 	// walks are skipped as inconclusive).
 	if len(aliases) > 0 && c != nil && !warming {
 		a := aliases[0]
-		ctx, cancel := adminCtx()
-		r, nerr := c.ResolveNetwork(ctx, a)
-		cancel()
+		// The network view walks BOTH storage keys; in a keyspace with
+		// young one-shot contacts those legs can legitimately take tens of
+		// seconds (each dead probe costs its budget), so this check gets a
+		// dedicated budget just under the daemon's 30 s request cap instead
+		// of the shared admin timeout — a slow-but-honest walk is a PASS,
+		// not a warning.
+		nvCtx, nvCancel := context.WithTimeout(context.Background(), 29*time.Second)
+		r, nerr := c.ResolveNetwork(nvCtx, a)
+		nvCancel()
 		nv := func() *admin.NetworkView {
 			if r != nil {
 				return r.Network

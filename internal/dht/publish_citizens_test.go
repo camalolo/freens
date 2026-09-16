@@ -58,7 +58,7 @@ func TestCitizensSelection(t *testing.T) {
 	// never-confirmed: advertisement-only knowledge — not a put target.
 	add(citizenFixture(t, rtNode, 5, "127.0.0.1:20005", now-60, 0, now-3600), "never-confirmed")
 
-	got := rt.Citizens(now, putCitizenMinAge, putConfirmMaxAge)
+	got := rt.Citizens(now)
 	if len(got) != 2 {
 		t.Fatalf("Citizens returned %d contacts, want 2 (legacy + aged): %+v", len(got), got)
 	}
@@ -160,5 +160,85 @@ func TestPublishTargetsSparseTableFallsBackToWalk(t *testing.T) {
 	}
 	if !sawB {
 		t.Fatal("sparse table: the only live peer did not make the target set")
+	}
+}
+
+// TestWalkBatchPrefersCitizens pins the walk-round ordering (the fast-walk
+// half of the 2026-09-17 ghost-flood fix): probe slots go to long-confirmed
+// citizens before unproven contacts regardless of hash distance, penalized
+// corpses are skipped outright, and the width caps the batch.
+func TestWalkBatchPrefersCitizens(t *testing.T) {
+	a, _ := startTestNode(t, nil)
+	defer a.Close()
+
+	now := time.Now().Unix()
+	key := []byte("walkbatchwalkbatchwalkbatchwalkb00")
+
+	// six young ghosts, closest to the key (the old picker took these first)
+	for i := 0; i < 6; i++ {
+		if _, err := a.rt.Add(citizenFixture(t, a, i+1, "127.0.0.1:1", now-120, now-120, now-120)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// two citizens, far from the key by every measure that matters
+	citizenIDs := make([][]byte, 0, 2)
+	for i := 0; i < 2; i++ {
+		c := citizenFixture(t, a, 60+i, "127.0.0.1:2200"+string(rune('0'+i)), now-60, now-60, now-3600)
+		if _, err := a.rt.Add(c); err != nil {
+			t.Fatal(err)
+		}
+		citizenIDs = append(citizenIDs, c.NodeID)
+	}
+
+	shortlist := a.rt.Closest(key, 16)
+	queried := make(map[string]bool)
+
+	batch := a.walkBatch(shortlist, queried, key, now, lookupRoundWidth)
+	if len(batch) != lookupRoundWidth {
+		t.Fatalf("batch = %d, want width %d", len(batch), lookupRoundWidth)
+	}
+	if !bytes.Equal(batch[0].NodeID, citizenIDs[0]) || !bytes.Equal(batch[1].NodeID, citizenIDs[1]) {
+		t.Fatal("citizens did not lead the batch")
+	}
+	for _, c := range batch[2:] {
+		if c.Addr == "127.0.0.1:2200"+string(rune('0'+0)) || c.Addr == "127.0.0.1:2201" {
+			t.Fatalf("citizen %s duplicated in filler", c.Addr)
+		}
+	}
+
+	// citizens queried: the next round is the young filler — discovery
+	// still happens, just after the proven peers.
+	for _, id := range citizenIDs {
+		queried[string(id)] = true
+	}
+	batch2 := a.walkBatch(shortlist, queried, key, now, lookupRoundWidth)
+	if len(batch2) == 0 {
+		t.Fatal("filler round empty")
+	}
+	for _, c := range batch2 {
+		if bytes.Equal(c.NodeID, citizenIDs[0]) || bytes.Equal(c.NodeID, citizenIDs[1]) {
+			t.Fatal("queried citizen re-probed")
+		}
+	}
+
+	// a penalized corpse is skipped outright (the retry-last tier: its
+	// retry schedule is the deadUntil window, not the next round)
+	corpse := citizenFixture(t, a, 90, "127.0.0.1:1", now-120, now-120, now-120)
+	if _, err := a.rt.Add(corpse); err != nil {
+		t.Fatal(err)
+	}
+	shortlist = append(shortlist, corpse)
+	a.markDeadUnlessPromoted(corpse, now)
+	for _, c := range shortlist {
+		queried[string(c.NodeID)] = false
+	}
+	for _, id := range citizenIDs {
+		queried[string(id)] = false
+	}
+	batch3 := a.walkBatch(shortlist, queried, key, now, lookupRoundWidth)
+	for _, c := range batch3 {
+		if bytes.Equal(c.NodeID, corpse.NodeID) {
+			t.Fatal("penalized corpse got a probe slot")
+		}
 	}
 }

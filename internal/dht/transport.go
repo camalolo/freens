@@ -2276,7 +2276,7 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
 	var bestEnv *wire.SignedEnvelope
-	batchSize := constants.Alpha
+	batchSize := lookupRoundWidth
 
 	for round := 0; round < maxLookupRounds; round++ {
 		// Nearest-first so the ALPHA un-queried we pick are the closest.
@@ -2284,22 +2284,7 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 			return CompareDistance(key, shortlist[i].NodeID, shortlist[j].NodeID) < 0
 		})
 		now := n.now()
-		var batch []*NodeContact
-		for _, c := range shortlist {
-			if queried[string(c.NodeID)] {
-				continue
-			}
-			if bytes.Equal(c.NodeID, n.id) {
-				continue // the walker itself: peers re-advertise it back, but its answer is the local view, not the network's
-			}
-			if n.penalized(c.NodeID, now) {
-				continue // recently-failed corpse: skip as a candidate
-			}
-			batch = append(batch, c)
-			if len(batch) >= batchSize {
-				break
-			}
-		}
+		batch := n.walkBatch(shortlist, queried, key, now, batchSize)
 		if len(batch) == 0 {
 			break // every known contact queried or penalized: converged.
 		}
@@ -2422,16 +2407,7 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 		sort.SliceStable(shortlist, func(i, j int) bool {
 			return CompareDistance(target, shortlist[i].NodeID, shortlist[j].NodeID) < 0
 		})
-		var batch []*NodeContact
-		for _, c := range shortlist {
-			if queried[string(c.NodeID)] || bytes.Equal(c.NodeID, n.id) {
-				continue // queried, or the walker itself re-advertised back by a peer
-			}
-			batch = append(batch, c)
-			if len(batch) >= constants.Alpha {
-				break
-			}
-		}
+		batch := n.walkBatch(shortlist, queried, target, n.now(), lookupRoundWidth)
 		if len(batch) == 0 {
 			break
 		}
@@ -2817,6 +2793,57 @@ type PublishStats struct {
 	Accepted int    // stores that accepted the put
 }
 
+// citizenNow is the replica-target citizenship predicate for a single
+// contact (see RoutingTable.Citizens): directly confirmed, confirmation and
+// last exchange both fresh, and known for at least putCitizenMinAge — or a
+// legacy/restored entry with no birth stamp. A one-shot ghost cannot fake
+// the span; a continuously-confirming daemon passes without noticing.
+func citizenNow(c *NodeContact, now int64) bool {
+	if c == nil || c.ConfirmedAt == 0 {
+		return false
+	}
+	if now-c.ConfirmedAt > putConfirmMaxAge || now-c.LastSeen > putConfirmMaxAge {
+		return false
+	}
+	return c.FirstSeen == 0 || now-c.FirstSeen >= putCitizenMinAge
+}
+
+// lookupRoundWidth is the walk's per-round probe width. Kademlia's ALPHA=3
+// is a politeness constant for crowded networks; probes within a round are
+// parallel (correlated by txid) and each is a tiny datagram, so a
+// small-network walk spends its round on the whole citizen set at once and
+// converges in one or two rounds instead of ALPHA × rounds of serial churn.
+const lookupRoundWidth = 8
+
+// walkBatch picks the next probe batch from the walk's shortlist.
+//
+// Ordering (the 2026-09-17 ghost-flood lessons): CITIZENS first, then
+// unproven contacts, each class closest-first — a round spends its slots on
+// the long-confirmed before it burns probe budgets on young one-shot
+// contacts whose first probe usually finds a corpse. Penalized (recently
+// failed) contacts are skipped outright: they are the "retry last" tier,
+// and the deadUntil window IS their retry schedule.
+func (n *Node) walkBatch(shortlist []*NodeContact, queried map[string]bool, key []byte, now int64, size int) []*NodeContact {
+	var batch []*NodeContact
+	for _, c := range shortlist {
+		if queried[string(c.NodeID)] || bytes.Equal(c.NodeID, n.id) || n.penalized(c.NodeID, now) {
+			continue
+		}
+		batch = append(batch, c)
+	}
+	sort.SliceStable(batch, func(i, j int) bool {
+		ci, cj := citizenNow(batch[i], now), citizenNow(batch[j], now)
+		if ci != cj {
+			return ci // citizens before unproven filler
+		}
+		return CompareDistance(key, batch[i].NodeID, batch[j].NodeID) < 0
+	})
+	if len(batch) > size {
+		batch = batch[:size]
+	}
+	return batch
+}
+
 // publishTargets assembles the replica set for a keyed publish.
 //
 // v0.17.0: the replica set is defined by REACHABILITY, not by table
@@ -2842,7 +2869,7 @@ type PublishStats struct {
 // citizens yet — a fresh bootstrap), and the walk-rescue below remains
 // the backstop that reaches whoever else is alive.
 func (n *Node) publishTargets(ctx context.Context, key []byte, now int64) []*NodeContact {
-	closest := n.rt.Citizens(now, putCitizenMinAge, putConfirmMaxAge)
+	closest := n.rt.Citizens(now)
 	if len(closest) > 0 {
 		sort.Slice(closest, func(i, j int) bool {
 			return CompareDistance(key, closest[i].NodeID, closest[j].NodeID) < 0

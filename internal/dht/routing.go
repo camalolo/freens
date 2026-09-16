@@ -542,22 +542,15 @@ func (rt *RoutingTable) AllContacts() []*NodeContact {
 // landed a fleet renewal at accepted=1/11 while the unreached LAN fleet
 // expired into NXDOMAIN pockets. Returns cloned contacts, unordered. Safe
 // for concurrent use.
-func (rt *RoutingTable) Citizens(now, minAge, maxFresh int64) []*NodeContact {
+func (rt *RoutingTable) Citizens(now int64) []*NodeContact {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	var out []*NodeContact
 	for _, b := range rt.Buckets {
 		for _, c := range b.Nodes {
-			if c.ConfirmedAt == 0 {
-				continue
+			if citizenNow(c, now) {
+				out = append(out, c.clone())
 			}
-			if now-c.ConfirmedAt > maxFresh || now-c.LastSeen > maxFresh {
-				continue
-			}
-			if c.FirstSeen != 0 && now-c.FirstSeen < minAge {
-				continue
-			}
-			out = append(out, c.clone())
 		}
 	}
 	return out
