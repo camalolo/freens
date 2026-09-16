@@ -7,6 +7,7 @@ package webui
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -44,13 +45,13 @@ func (s *Server) startJob(label string, run func(ctx context.Context, progress f
 	if len(s.jobs) > maxJobsRetained {
 		cutoff := time.Now().Add(-time.Hour)
 		for id, j := range s.jobs {
-			if j.Done && j.Started.Before(cutoff) {
+			if done, _ := j.state(); done && j.Started.Before(cutoff) {
 				delete(s.jobs, id)
 			}
 		}
 	}
 	s.jobSeq++
-	j := &job{ID: itoa(s.jobSeq), Label: label, Started: time.Now()}
+	j := &job{ID: strconv.Itoa(s.jobSeq), Label: label, Started: time.Now()}
 	s.jobs[j.ID] = j
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -91,8 +92,10 @@ func (s *Server) job(id string) *job {
 }
 
 func (s *Server) runningLocked() *job {
+	// Caller holds jobsMu. Done is still read through j.state(): the
+	// runner owns it under j.mu, and jobsMu does not cover it.
 	for _, j := range s.jobs {
-		if !j.Done {
+		if done, _ := j.state(); !done {
 			return j
 		}
 	}
@@ -100,7 +103,8 @@ func (s *Server) runningLocked() *job {
 }
 
 // latestJob returns the most recently started job (finished or not) for the
-// register page's re-attach.
+// register page's re-attach. Only the runner-IMMUTABLE fields (ID/Label/
+// Started — all set before the job enters the map) are read here.
 func (s *Server) latestJob() *job {
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
@@ -137,9 +141,10 @@ func (s *Server) recentJobs() []recentJob {
 		if i == 5 {
 			break
 		}
+		done, jobErr := j.state() // snapshot the runner-owned fields under j.mu
 		state := "running"
-		if j.Done {
-			if j.Err != "" {
+		if done {
+			if jobErr != "" {
 				state = "failed"
 			} else {
 				state = "done"
@@ -165,6 +170,17 @@ type jobView struct {
 	JobError  string
 	JobResult *RegisterResult
 	JobSteps  []jobStepView
+}
+
+// state snapshots the runner-owned fields (Done/Err) under the job's own
+// mutex. The runner writes them in its final critical section; readers that
+// hold only jobsMu (recentJobs, runningLocked, the startJob pruner) must go
+// through here — two mutexes guarding one field is exactly the shape -race
+// flags on every dashboard render.
+func (j *job) state() (done bool, errText string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.Done, j.Err
 }
 
 // viewOf snapshots j's render state under its mutex (the runner writes
@@ -222,27 +238,6 @@ func (s *Server) fragment(w http.ResponseWriter, name string, data any) {
 // ops builds the operations environment (kept per-call: cheap).
 func (s *Server) ops() *opsEnv {
 	return &opsEnv{keysDir: s.keysDir, d: s.d}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ctxBg is a background context alias for version() display calls.

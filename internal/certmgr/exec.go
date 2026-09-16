@@ -22,6 +22,12 @@ type ExecResult struct {
 // discovery) all funnel through here.
 var execRunner = func(ctx context.Context, name string, args ...string) (ExecResult, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// A forked grandchild inheriting our pipes (a deploy hook that spawns a
+	// daemon, a wrapper script) keeps Stdout/Stderr open after the direct
+	// child exits or the ctx fires; without WaitDelay, cmd.Run blocks on
+	// the pipe copy until the pipes close — potentially forever. Close the
+	// pipes under our feet 2 s after the child is done or cancelled.
+	cmd.WaitDelay = 2 * time.Second
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()

@@ -25,14 +25,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/claims"
-	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
+	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/securekey"
 	"github.com/camalolo/freens/internal/wire"
 )
@@ -58,6 +58,20 @@ var keyFileRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.key$`
 // zero — matching register's generation).
 var recFileRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.rec([1-9][0-9]*)\.key$`)
 
+// validAliasShape re-checks a regex-extracted alias against the single
+// source of truth, naming.ValidateAlias. The three regexes below re-encode
+// the §3.2 alias shape by hand (they predate it and must stay loose enough
+// to match filenames), so a match alone is not proof: "123.key" matches the
+// pattern but "123" is an all-numeric alias §3.2 forbids. Minimal-risk
+// choice: post-match validation instead of deriving the pattern from a
+// naming constant (naming imports nothing from keychain, so there is no
+// cycle — but a shared pattern constant would freeze the regex shape and
+// touch every call site; the validator call is the smaller diff).
+func validAliasShape(alias string) bool {
+	_, err := naming.ValidateAlias(alias)
+	return err == nil
+}
+
 // Aliases lists the aliases that have an owner key in keysDir (sorted) —
 // the "which namespaces can I manage" answer.
 func Aliases(keysDir string) []string {
@@ -70,7 +84,7 @@ func Aliases(keysDir string) []string {
 		if e.IsDir() {
 			continue
 		}
-		if m := keyFileRe.FindStringSubmatch(e.Name()); m != nil {
+		if m := keyFileRe.FindStringSubmatch(e.Name()); m != nil && validAliasShape(m[1]) {
 			aliases = append(aliases, m[1])
 		}
 	}
@@ -130,63 +144,13 @@ func Save(path string, kp *crypto.Keypair, passphrase string) error {
 			return err
 		}
 	}
-	return writeFileAtomic(path, data)
-}
-
-// writeFileAtomic durably replaces path with data: write a temp file in
-// the SAME directory, fsync it, rename it over path, then fsync the
-// directory so the rename itself survives a crash. Any failure before the
-// rename removes the temp file (no litter, path untouched — the old bytes
-// stay intact).
-func writeFileAtomic(path string, data []byte) (err error) {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			os.Remove(tmp.Name()) // best effort: no temp litter on failure
-		}
-	}()
-	if _, err = tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err = os.Chmod(tmp.Name(), 0o600); err != nil {
-		return err
-	}
-	if err = os.Rename(tmp.Name(), path); err != nil {
-		return err
-	}
-	// fsync the directory so the rename itself survives a crash. Windows
-	// has no directory-sync concept: opening the dir succeeds but Sync
-	// fails with ERROR_ACCESS_DENIED (found live on the desktop test box
-	// during the v0.11.0 setup run), so there the rename stays at the
-	// mercy of NTFS metadata journaling — the durable-rename guarantee is
-	// best-effort, the WRITE still succeeded.
-	d, derr := os.Open(dir)
-	if derr != nil {
-		if runtime.GOOS == "windows" {
-			return nil
-		}
-		return derr
-	}
-	defer d.Close()
-	if serr := d.Sync(); serr != nil {
-		if runtime.GOOS == "windows" {
-			return nil
-		}
-		return serr
-	}
-	return nil
+	// The ALWAYS-0600 rule lives in the perm argument: atomicfile.Write
+	// chmods the temp file before the rename, so a looser pre-existing
+	// keyfile is still replaced by a 0600 one. The Windows directory-sync
+	// fallback story (no dir-fsync concept there — ERROR_ACCESS_DENIED;
+	// best-effort durability, the WRITE still succeeded) is encoded inside
+	// atomicfile itself — see its durability note.
+	return atomicfile.Write(path, data, 0o600)
 }
 
 // IsEncryptedPath reports whether the keyfile at path carries the FREENSK1
@@ -234,6 +198,9 @@ func Inventory(keysDir string) []KeyInfo {
 			info.Kind = "recovery"
 		default:
 			continue
+		}
+		if !validAliasShape(info.Alias) {
+			continue // filename-shaped like a key, alias not §3.2-valid
 		}
 		info.Encrypted = IsEncryptedPath(info.Path)
 		out = append(out, info)
@@ -286,9 +253,16 @@ func BuildBackup(w io.Writer, keysDir string) ([]string, error) {
 	}
 	var files []string
 	for _, e := range entries {
-		if !e.IsDir() && backupEntryRe.MatchString(e.Name()) {
-			files = append(files, e.Name())
+		if e.IsDir() || !backupEntryRe.MatchString(e.Name()) {
+			continue
 		}
+		// The regex shape-checks the FILENAME; the alias stem inside it must
+		// still pass the §3.2 validator (all-numeric "aliases" match the
+		// regex but are not names this tool would ever have minted).
+		if !validAliasShape(backupEntryRe.FindStringSubmatch(e.Name())[1]) {
+			continue
+		}
+		files = append(files, e.Name())
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("nothing to back up (no key files in %s)", keysDir)
@@ -455,12 +429,13 @@ func base32Decode(s string) ([]byte, error) {
 }
 
 // difficultyOf reads the difficulty from the nonce[0] convention (Appendix
-// A.4); falls back to the network default.
+// A.4); falls back to the network default. Single-sourced from
+// claims.InferDifficultyOf so the keychain follows the same RETUNABLE
+// baseline the claims package verifies against (the frozen
+// constants.PoWDifficultyInit copy here silently diverged under demo
+// retuning).
 func difficultyOf(c *claims.AliasClaim) int {
-	if len(c.Nonce) > 0 && int(c.Nonce[0]) >= constants.PoWDifficultyInit {
-		return int(c.Nonce[0])
-	}
-	return constants.PoWDifficultyInit
+	return claims.InferDifficultyOf(c)
 }
 
 // SaveReusableClaim parks c for alias (best effort — failures are

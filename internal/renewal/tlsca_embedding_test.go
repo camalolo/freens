@@ -147,3 +147,109 @@ func TestRenewNoClaimNoTLSCA(t *testing.T) {
 		t.Fatalf("claim-less apex gained %d TLSCA RRs, want 0", got)
 	}
 }
+
+// foreignTLSCARR builds a TLSCA RR whose cert derives from a DIFFERENT key
+// (the "foreign binding" an attacker or stale template could inject).
+func foreignTLSCARR(t *testing.T, alias string, now time.Time) *wire.RR {
+	t.Helper()
+	fk, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _, err := tlsca.OwnerCA(fk.Seed(), alias, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr, err := wire.NewRR(wire.RRTypeTLSCA, 300, der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rr
+}
+
+// garbageTLSCARR builds a TLSCA RR whose rdata is not a certificate at all.
+func garbageTLSCARR(t *testing.T) *wire.RR {
+	t.Helper()
+	rr, err := wire.NewRR(wire.RRTypeTLSCA, 300, []byte("this is not a DER certificate"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rr
+}
+
+// TestEnsureTLSCADropsForeignSlotsBesideGoodBinding: a good SameCA TLSCA in
+// the rrset used to SHORT-CIRCUIT the sweep, leaving any foreign/garbage
+// TLSCA RRs authorized beside it. Every non-SameCA TLSCA slot must go.
+func TestEnsureTLSCADropsForeignSlotsBesideGoodBinding(t *testing.T) {
+	now := time.Now().Unix()
+	nowT := time.Unix(now, 0)
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := buildClaimedApex(t, "bob", kp, 3, uint64(now-3600), uint64(now+1000))
+	good, err := RenewEnvelope(env, kp, now) // carries exactly one SameCA TLSCA
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodRR := tlscaRRs(good)[0]
+
+	// good + foreign + garbage
+	good.Record.RRset = append(good.Record.RRset,
+		foreignTLSCARR(t, "bob", nowT), garbageTLSCARR(t))
+	EnsureTLSCA(good.Record, kp, uint64(now))
+
+	rrs := tlscaRRs(good)
+	if len(rrs) != 1 {
+		t.Fatalf("after EnsureTLSCA: %d TLSCA RRs remain, want 1 (foreign/garbage must drop)", len(rrs))
+	}
+	if !bytes.Equal(rrs[0].Rdata, goodRR.Rdata) {
+		t.Fatal("the surviving TLSCA is not the SameCA binding")
+	}
+	// The A record survived untouched, first.
+	if good.Record.RRset[0].Type != wire.RRTypeA {
+		t.Fatalf("first RR type = %d, want A", good.Record.RRset[0].Type)
+	}
+}
+
+// TestEnsureTLSCAReplacesAllForeignSlots: with NO SameCA binding present,
+// every foreign/garbage TLSCA slot is replaced by exactly ONE fresh
+// derivation (first slot's position), and non-TLSCA RRs survive.
+func TestEnsureTLSCAReplacesAllForeignSlots(t *testing.T) {
+	now := time.Now().Unix()
+	nowT := time.Unix(now, 0)
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := buildClaimedApex(t, "bob", kp, 3, uint64(now-3600), uint64(now+1000))
+	wantDER, _, err := tlsca.OwnerCA(kp.Seed(), "bob", nowT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCert, err := tlsca.ParseCertDER(wantDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env.Record.RRset = append(env.Record.RRset,
+		foreignTLSCARR(t, "bob", nowT), garbageTLSCARR(t))
+	EnsureTLSCA(env.Record, kp, uint64(now))
+
+	rrs := tlscaRRs(env)
+	if len(rrs) != 1 {
+		t.Fatalf("after EnsureTLSCA: %d TLSCA RRs remain, want 1", len(rrs))
+	}
+	// OwnerCA re-derivation is randomized per call (ECDSA), so identity is
+	// key+subject (SameCA), never bytes.
+	gotCert, err := tlsca.ParseCertDER(rrs[0].Rdata)
+	if err != nil {
+		t.Fatalf("surviving TLSCA rdata not a DER cert: %v", err)
+	}
+	if !tlsca.SameCA(gotCert, wantCert, nowT) {
+		t.Fatal("the surviving TLSCA is not the fresh owner-CA derivation")
+	}
+	if env.Record.RRset[0].Type != wire.RRTypeA {
+		t.Fatalf("first RR type = %d, want A (non-TLSCA RRs survive)", env.Record.RRset[0].Type)
+	}
+}

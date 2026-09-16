@@ -82,23 +82,6 @@ func TestVerifyMemoLengthRejections(t *testing.T) {
 	}
 }
 
-func TestVerifyMemoStatsAndSlots(t *testing.T) {
-	kp, _ := Generate()
-	msg := []byte("stats probe")
-	sig := kp.Sign(msg)
-
-	h0, m0 := VerifyCacheStats()
-	Verify(kp.Public(), sig, msg) // miss (or collision-overwrite miss)
-	Verify(kp.Public(), sig, msg) // hit
-	h1, m1 := VerifyCacheStats()
-	if h1-h0 != 1 {
-		t.Errorf("hits delta = %d, want 1", h1-h0)
-	}
-	if m1-m0 != 1 {
-		t.Errorf("misses delta = %d, want 1", m1-m0)
-	}
-}
-
 func TestVerifyMemoSlotIndexInBounds(t *testing.T) {
 	for i := 0; i < 256; i++ {
 		var k [32]byte

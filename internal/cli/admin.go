@@ -63,9 +63,6 @@ func publishCtx() (context.Context, context.CancelFunc) {
 // pretty-printer in dht.go.
 type adminResolved = admin.Resolved
 
-// adminRR aliases admin.RR (one resolved resource record).
-type adminRR = admin.RR
-
 // transport is the resolved network access mode of a live-network
 // subcommand: exactly one of client (daemon) or peers (standalone) is set.
 type transport struct {

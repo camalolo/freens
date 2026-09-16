@@ -430,3 +430,25 @@ func TestServerClientRoundTripIPv6(t *testing.T) {
 		t.Fatalf("reflexive address %v, want IPv6 with a port", got)
 	}
 }
+
+// TestReadErrPause — the serve loop's consecutive-error discipline: the
+// first couple of errors cost nothing (transient churn, e.g. a spurious
+// ICMP wakeup), a longer streak draws the small backoff sleep (no busy-spin
+// on a persistently erroring socket), and a very long streak gives the
+// socket up entirely.
+func TestReadErrPause(t *testing.T) {
+	t.Parallel()
+	for _, errs := range []int{0, 1, 2} {
+		if d, giveUp := readErrPause(errs); d != 0 || giveUp {
+			t.Fatalf("readErrPause(%d) = (%v, %v), want (0, false)", errs, d, giveUp)
+		}
+	}
+	for _, errs := range []int{readErrBackoffAt, 50, readErrGiveUpAfter - 1} {
+		if d, giveUp := readErrPause(errs); d != readErrBackoff || giveUp {
+			t.Fatalf("readErrPause(%d) = (%v, %v), want (%v, false)", errs, d, giveUp, readErrBackoff)
+		}
+	}
+	if d, giveUp := readErrPause(readErrGiveUpAfter); !giveUp {
+		t.Fatalf("readErrPause(%d) = (%v, false), want give-up", readErrGiveUpAfter, d)
+	}
+}

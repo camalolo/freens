@@ -241,6 +241,12 @@ func ValidateOwnerCA(cert *x509.Certificate, alias string) error {
 // {"laurent", "*.laurent"}): SANs, EKU serverAuth, lifetime ≤ TLS_LEAF_TTL,
 // fresh key (returned alongside, PKCS#8 DER). Signed by the owner CA.
 func Leaf(caDER []byte, caKey *ecdsa.PrivateKey, names []string, now time.Time) (certDER, keyDER []byte, err error) {
+	if len(names) == 0 {
+		// names[0] is the leaf's CN — an empty list would panic. Leaf runs
+		// on renewal paths and in async callers: surface a caller bug as an
+		// error, never a crash.
+		return nil, nil, fmt.Errorf("%w: leaf requires at least one SAN name", ErrTLSCA)
+	}
 	ca, err := x509.ParseCertificate(caDER)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: parse CA: %v", ErrTLSCA, err)

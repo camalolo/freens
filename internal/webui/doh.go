@@ -213,13 +213,13 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 			d.ClientURL = "https://" + alias + ":" + port + "/dns-query"
 		}
 	}
-	if c := s.aliveAdmin(); c != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		if _, err := c.Reload(ctx); err == nil {
-			d.DaemonReload = true
-		}
-	}
+	// GET must not mutate the daemon: the hot-apply stays in the POST
+	// handler (handleSettingsDoHPost). Pre-fix every Settings RENDER issued
+	// a real POST /reload — a write side effect on a read path, plus a
+	// stall up to the request budget on a slow daemon. The flag is now a
+	// cheap liveness probe (a unix-socket dial, no HTTP): a running daemon
+	// is one that CAN hot-apply upstream changes when the operator saves.
+	d.DaemonReload = admin.Alive(s.sock)
 	s.render(w, http.StatusOK, "settings", d)
 }
 

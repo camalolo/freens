@@ -15,9 +15,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
@@ -27,6 +29,12 @@ import (
 
 func renewTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// renewOnceForTest runs one renewal scan with the keychain loaded the way
+// reconcileTick does (once per tick, shared with the reconciliation pass).
+func renewOnceForTest(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
+	renewOnce(node, store, loadOwnerKeypairs(logger), logger)
 }
 
 // renewTestNode boots one DHT node on loopback with an inspectable store.
@@ -123,7 +131,7 @@ func TestRenewOnceStoresRenewalLocally(t *testing.T) {
 		t.Fatalf("seeding the near-expiry record: %v, %v", ok, err)
 	}
 
-	renewOnce(daemon, daemonStore, renewTestLogger())
+	renewOnceForTest(daemon, daemonStore, renewTestLogger())
 
 	got, err := daemonStore.Get(key, time.Now().Unix())
 	if err != nil || got == nil {
@@ -138,7 +146,7 @@ func TestRenewOnceStoresRenewalLocally(t *testing.T) {
 	}
 
 	// Pass 2: the local record is fresh now — the sequence must NOT move.
-	renewOnce(daemon, daemonStore, renewTestLogger())
+	renewOnceForTest(daemon, daemonStore, renewTestLogger())
 	got, err = daemonStore.Get(key, time.Now().Unix())
 	if err != nil || got == nil || got.Record.Sequence != 8 {
 		t.Fatalf("second pass moved the stalled sequence: seq=%v, %v", got, err)
@@ -162,7 +170,7 @@ func TestRenewOncePublishFailureRetriesNextTick(t *testing.T) {
 	}
 
 	// Tick 1: the publish cannot land anywhere.
-	renewOnce(daemon, daemonStore, renewTestLogger())
+	renewOnceForTest(daemon, daemonStore, renewTestLogger())
 
 	got, err := daemonStore.Get(key, time.Now().Unix())
 	if err != nil || got == nil || got.Record.Sequence != 7 {
@@ -173,7 +181,7 @@ func TestRenewOncePublishFailureRetriesNextTick(t *testing.T) {
 	// it locally AND on the network.
 	peer, peerStore := renewTestNode(t)
 	connectTestPair(t, daemon, peer)
-	renewOnce(daemon, daemonStore, renewTestLogger())
+	renewOnceForTest(daemon, daemonStore, renewTestLogger())
 
 	got, err = daemonStore.Get(key, time.Now().Unix())
 	if err != nil || got == nil || got.Record.Sequence != 8 {
@@ -233,4 +241,109 @@ func renewTestKeypair(t *testing.T) *crypto.Keypair {
 		t.Fatal(err)
 	}
 	return kp
+}
+
+// nearExpiryClaimRecord is nearExpiryRecord for a CLAIM-BEARING apex: the
+// same §7.4-valid fixture recipe as reconcile's claimBearingRecord (floor
+// PoW + W witness attestations, so a K_claim put passes the storing node's
+// screen) but inside ShouldRenew's final window. Returns the envelope plus
+// BOTH storage keys (K_tld + K_claim) — a claim-bearing name occupies two
+// store entries.
+func nearExpiryClaimRecord(t *testing.T, kp *crypto.Keypair, seq uint64, now int64) (*wire.SignedEnvelope, [][]byte) {
+	t.Helper()
+	prevD := claims.PoWDifficultyInit.Load()
+	claims.PoWDifficultyInit.Store(8)
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(prevD) })
+
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wn, err := naming.EncodeWireName(nil, "camalolo", tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claims.MineAliasClaim("camalolo", kp, uint64(now), 8, 2_000_000, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph, err := claim.PrefixHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < constants.W; i++ {
+		wkp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := claims.NewWitnessAttestation(wkp, uint64(now)+uint64(i), ph)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim.Witnesses = append(claim.Witnesses, w)
+	}
+	cb, err := claim.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := now - int64(constants.RecordDefaultTTL)
+	expires := now + int64(constants.RecordDefaultTTL)/10
+	rec, err := wire.NewRecord(wn, kp.Public(), seq, uint64(created), uint64(expires))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Claim = cb
+	env, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := dht.StorageKeys(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("claim-bearing fixture must have 2 storage keys, got %d", len(keys))
+	}
+	return env, keys
+}
+
+// TestRenewOnceDedupsClaimBearingName: a claim-bearing name occupies TWO
+// store entries (K_tld + K_claim, one envelope) — the scan used to renew
+// EACH entry, re-signing a byte-identical duplicate at the same sequence
+// every cycle (benign but noisy, and it burned an acceptance slot; seen
+// live 2026-09-16). One tick, one name → exactly one renewal.
+func TestRenewOnceDedupsClaimBearingName(t *testing.T) {
+	kp := renewKeychain(t)
+	daemon, daemonStore := renewTestNode(t)
+	peer, peerStore := renewTestNode(t)
+	connectTestPair(t, daemon, peer)
+
+	now := time.Now().Unix()
+	env, keys := nearExpiryClaimRecord(t, kp, 7, now)
+	for i, k := range keys {
+		if ok, err := daemonStore.Put(k, env, now, false); !ok || err != nil {
+			t.Fatalf("seeding the near-expiry record at key %d: %v, %v", i, ok, err)
+		}
+	}
+	logger, buf := renewTestLoggerBuf()
+
+	renewOnceForTest(daemon, daemonStore, logger)
+
+	if n := strings.Count(buf.String(), "auto-renewed record"); n != 1 {
+		t.Fatalf("claim-bearing name renewed %d times in one tick, want 1:\n%s", n, buf.String())
+	}
+	if n := strings.Count(buf.String(), "auto-renew pass complete"); n != 1 {
+		t.Fatalf("pass-complete line count = %d, want 1:\n%s", n, buf.String())
+	}
+	// The renewal is stored locally AND landed on the network at BOTH keys.
+	for i, k := range keys {
+		got, err := daemonStore.Get(k, time.Now().Unix())
+		if err != nil || got == nil || got.Record.Sequence != 8 {
+			t.Fatalf("key %d: local renewal missing: %v, %v", i, got, err)
+		}
+		pg, err := peerStore.Get(k, time.Now().Unix())
+		if err != nil || pg == nil || pg.Record.Sequence != 8 {
+			t.Fatalf("key %d: network renewal missing: %v, %v", i, pg, err)
+		}
+	}
 }

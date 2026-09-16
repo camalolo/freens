@@ -165,37 +165,24 @@ func TestPeerbookBestEffort(t *testing.T) {
 	}
 }
 
-func TestContactsToPeers(t *testing.T) {
+// TestPeerbookSaveLeavesNoLitter: SavePeerbook writes through atomicfile
+// (temp+rename inside peers/), so a successful save leaves exactly
+// book.json behind — no stray book.json.tmp from the old hand-rolled dance.
+func TestPeerbookSaveLeavesNoLitter(t *testing.T) {
 	t.Setenv("FREENS_HOME", t.TempDir())
-
-	goodPK := testPK(3)
-	contacts := []*dht.NodeContact{
-		{NodeID: testPK(1), PublicKey: append([]byte(nil), goodPK...), Addr: "203.0.113.2:15353", LastSeen: 1},
-		nil, // skipped
-		{NodeID: testPK(2), PublicKey: nil, Addr: "x:1"},             // bad key: skipped
-		{NodeID: testPK(3), PublicKey: goodPK, Addr: ""},             // no addr: skipped
-		{NodeID: testPK(4), PublicKey: []byte("short"), Addr: "y:2"}, // bad key: skipped
-	}
-	peers := ContactsToPeers(contacts)
-	if len(peers) != 1 {
-		t.Fatalf("ContactsToPeers returned %d peers, want 1: %+v", len(peers), peers)
-	}
-	if peers[0].Addr != "203.0.113.2:15353" || string(peers[0].PublicKey) != string(goodPK) {
-		t.Fatalf("ContactsToPeers = %+v, want the one well-formed contact", peers[0])
-	}
-	// Copy semantics: mutating the source contact's key must not affect it.
-	contacts[0].PublicKey[0] ^= 0xff
-	if peers[0].PublicKey[0] == contacts[0].PublicKey[0] {
-		t.Fatal("ContactsToPeers aliased the contact's key bytes")
-	}
-
-	// End-to-end: contacts -> peers -> SavePeerbook -> LoadPeerbook keeps
-	// the PUBLIC KEY (what AddPeer needs), not the Node ID.
+	peers := []dht.Peer{{Addr: "203.0.113.2:15353", PublicKey: testPK(1)}}
 	if err := SavePeerbook(peers, 1); err != nil {
-		t.Fatalf("SavePeerbook: %v", err)
+		t.Fatal(err)
 	}
-	back := LoadPeerbook()
-	if len(back) != 1 || string(back[0].PublicKey) != string(goodPK) || back[0].Addr != "203.0.113.2:15353" {
-		t.Fatalf("round trip = %+v, want addr+public key preserved", back)
+	entries, err := os.ReadDir(PeersDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "book.json" {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("peers dir after save = %v, want exactly [book.json] (no temp litter)", names)
 	}
 }

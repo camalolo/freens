@@ -70,6 +70,22 @@ type allocation struct {
 	mu      sync.Mutex
 	perms   map[string]*net.UDPAddr // peer addr string → addr
 	expires time.Time
+	// timer is the ONE armed expiry timer for this allocation. Every
+	// refresh stops the previous timer before arming a new one — a
+	// long-lived allocation refreshed every few minutes must not accrue a
+	// dormant AfterFunc closure per refresh, each pinning the allocation.
+	// A stale timer that still fires (a race with its own replacement) is
+	// harmless: expire re-checks identity and expires under the locks.
+	timer *time.Timer
+}
+
+// stopTimer stops the allocation's armed expiry timer, if any.
+// Caller holds a.mu.
+func (a *allocation) stopTimer() {
+	if a.timer != nil {
+		a.timer.Stop()
+		a.timer = nil
+	}
 }
 
 // hasPerm reports whether peer is permitted. Caller holds a.mu or accepts a
@@ -175,6 +191,9 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	for _, a := range s.allocs {
 		a.relay.Close() // ends each relayLoop
+		a.mu.Lock()
+		a.stopTimer() // nothing left to expire
+		a.mu.Unlock()
 	}
 	s.allocs = make(map[string]*allocation)
 	s.perIP = make(map[string]int)
@@ -356,7 +375,7 @@ func (s *Server) handleAllocate(m *message, raddr *net.UDPAddr) {
 
 	// Expire unless Refreshed; the timer re-checks under the alloc lock so
 	// a Refresh that just extended wins the race.
-	time.AfterFunc(lt, func() { s.expire(raddr.String(), a) })
+	s.armExpiry(a, raddr.String(), lt)
 	s.wg.Add(1)
 	go s.relayLoop(a)
 
@@ -414,6 +433,18 @@ func (s *Server) grantLifetime(requested uint32) time.Duration {
 	return lt
 }
 
+// armExpiry (re)arms the allocation's expiry timer: any previous timer is
+// stopped first, so an allocation pins exactly ONE dormant closure no
+// matter how many Refreshes extend it. The callback re-checks identity and
+// expiry under the locks (see expire), so even a timer that fires in a
+// race with its own replacement stays a harmless no-op.
+func (s *Server) armExpiry(a *allocation, key string, lt time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopTimer()
+	a.timer = time.AfterFunc(lt, func() { s.expire(key, a) })
+}
+
 // expire removes the allocation if its lifetime has actually elapsed.
 func (s *Server) expire(key string, a *allocation) {
 	s.mu.Lock()
@@ -430,6 +461,7 @@ func (s *Server) expire(key string, a *allocation) {
 	}
 	delete(s.allocs, key)
 	s.decPerIP(a.client.IP.String())
+	a.stopTimer() // the fired timer or a stale sibling: keep state clean
 	a.mu.Unlock()
 	_ = a.relay.Close()
 	s.mu.Unlock()
@@ -458,6 +490,9 @@ func (s *Server) handleRefresh(m *message, raddr *net.UDPAddr) {
 		delete(s.allocs, raddr.String())
 		s.decPerIP(raddr.IP.String())
 		s.mu.Unlock()
+		a.mu.Lock()
+		a.stopTimer()
+		a.mu.Unlock()
 		_ = a.relay.Close()
 		resp := newMessage(methodRefresh, classSuccess)
 		resp.txid = m.txid
@@ -472,7 +507,7 @@ func (s *Server) handleRefresh(m *message, raddr *net.UDPAddr) {
 	a.mu.Lock()
 	a.expires = time.Now().Add(lt)
 	a.mu.Unlock()
-	time.AfterFunc(lt, func() { s.expire(raddr.String(), a) })
+	s.armExpiry(a, raddr.String(), lt) // replaces, never stacks, the timer
 	resp := newMessage(methodRefresh, classSuccess)
 	resp.txid = m.txid
 	resp.add(attrLifetime, be32(uint32(lt/time.Second)))
@@ -556,6 +591,15 @@ func (s *Server) relayLoop(a *allocation) {
 			return // closed (expiry/release/Close)
 		}
 		if peer == nil || !a.hasPerm(peer) {
+			continue
+		}
+		if n > maxDataPayload {
+			// ReadFromUDP TRUNCATED an oversized datagram into buf;
+			// relaying the cut-down bytes would hand the client a
+			// corrupted payload (or one its parseMessage silently
+			// drops). Drop it — real DHT datagrams are far smaller
+			// (≤ ~1232 B), so a legitimate one never trips this.
+			s.log.Debug("turn: oversized peer datagram dropped", "bytes", n, "budget", maxDataPayload, "peer", peer.String())
 			continue
 		}
 		m := newMessage(methodData, classIndication)

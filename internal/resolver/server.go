@@ -300,7 +300,7 @@ type DNSUpstream struct {
 // retry against the same server.
 func (u *DNSUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 	if u == nil || len(u.Servers) == 0 {
-		return nil, errors.New("resolver: no upstream servers configured")
+		return nil, errNoUpstream
 	}
 	net0 := u.Net
 	if net0 == "" {
@@ -414,6 +414,17 @@ type DoHUpstream struct {
 	bootMu  sync.Mutex
 	bootIPs []net.IP
 	bootAt  time.Time
+
+	// Shared-client state: the default client (with its bootstrap-pinning
+	// transport) is built ONCE per upstream — lazily, on the first Forward —
+	// and reused for every query. Per-query construction paid a full
+	// TCP+TLS handshake on every forwarded miss and left each discarded
+	// transport's idle connections parked until IdleConnTimeout (~90 s).
+	// Timeout is baked in at build time; the field is config, fixed at
+	// construction (hot-swaps replace the whole UpstreamRef value), so the
+	// once-built client keeps the exact per-request timeout semantics.
+	httpOnce sync.Once
+	httpCL   *http.Client
 }
 
 // bootstrapRefresh is how long a pinned DoH-endpoint IP stays trusted before
@@ -427,11 +438,7 @@ func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	if u == nil || u.URL == "" {
 		return nil, errors.New("resolver: no DoH URL configured")
 	}
-	timeout := u.Timeout
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	client := u.httpClient(timeout)
+	client := u.httpClient()
 	payload, err := q.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("resolver: pack query for DoH: %w", err)
@@ -461,15 +468,32 @@ func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	return out, nil
 }
 
-// httpClient builds the request client. A caller-supplied Client (the test
-// seam, or an embedder with special transport needs) wins untouched;
-// otherwise the client gets a transport whose dialer pins the endpoint host
-// to Fallback-resolved IPs (see the bootstrap-loop note on DoHUpstream).
-func (u *DoHUpstream) httpClient(timeout time.Duration) *http.Client {
+// httpClient returns the client DoH requests go out on. A caller-supplied
+// Client (the test seam, or an embedder with special transport needs) wins
+// untouched; otherwise ONE shared client is built lazily (sync.Once) and
+// reused for every query: its transport pools the HTTPS connections instead
+// of re-paying a TCP+TLS handshake per forwarded query, and no per-query
+// transport is discarded to linger for IdleConnTimeout. The per-query
+// timeout stays Client.Timeout (the transport is never used without it).
+func (u *DoHUpstream) httpClient() *http.Client {
 	if u.Client != nil {
 		return u.Client
 	}
-	t := &http.Transport{
+	u.httpOnce.Do(func() {
+		timeout := u.Timeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		u.httpCL = &http.Client{Timeout: timeout, Transport: u.newTransport()}
+	})
+	return u.httpCL
+}
+
+// newTransport builds the shared transport: the same settings the previous
+// per-query transport carried, with a dialer that pins the endpoint host to
+// Fallback-resolved IPs (see the bootstrap-loop note on DoHUpstream).
+func (u *DoHUpstream) newTransport() *http.Transport {
+	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          4,
@@ -478,7 +502,6 @@ func (u *DoHUpstream) httpClient(timeout time.Duration) *http.Client {
 		ExpectContinueTimeout: time.Second,
 		DialContext:           u.dialContext,
 	}
-	return &http.Client{Timeout: timeout, Transport: t}
 }
 
 // dialContext is the transport's connection dialer: the DoH endpoint's
@@ -507,14 +530,24 @@ func (u *DoHUpstream) dialContext(ctx context.Context, network, addr string) (ne
 }
 
 // bootstrapIPs returns pinned IPs for host, resolving (re-pinning) them via
-// the Fallback servers when the cache is empty or stale.
+// the Fallback servers when the cache is empty or stale. The resolution —
+// up to ~20 s of plaintext DNS with retries — runs OUTSIDE bootMu
+// (double-checked: re-check-and-store under the lock afterwards), so
+// concurrent DoH forwards are never serialized behind one bootstrap lookup
+// on the cache's hot path.
 func (u *DoHUpstream) bootstrapIPs(ctx context.Context, host string) ([]net.IP, error) {
 	u.bootMu.Lock()
-	defer u.bootMu.Unlock()
 	if len(u.bootIPs) > 0 && time.Since(u.bootAt) < bootstrapRefresh {
-		return u.bootIPs, nil
+		ips := u.bootIPs
+		u.bootMu.Unlock()
+		return ips, nil
 	}
+	u.bootMu.Unlock()
+
 	ips, err := u.resolveViaFallback(ctx, host)
+
+	u.bootMu.Lock()
+	defer u.bootMu.Unlock()
 	if err != nil || len(ips) == 0 {
 		if len(u.bootIPs) > 0 {
 			return u.bootIPs, nil // stale beats dark

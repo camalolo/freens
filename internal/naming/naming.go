@@ -120,12 +120,6 @@ func ValidateAlias(alias string) (string, error) {
 	return s, nil
 }
 
-// IsValidAlias reports whether ValidateAlias succeeds.
-func IsValidAlias(alias string) bool {
-	_, err := ValidateAlias(alias)
-	return err == nil
-}
-
 // ValidateLabel normalizes and validates a single DNS-style label. Unlike an
 // alias, all-numeric labels are allowed (subdomains may be numeric).
 func ValidateLabel(label string) (string, error) {

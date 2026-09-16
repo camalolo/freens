@@ -43,8 +43,8 @@ func (r *UpstreamRef) Get() Upstream {
 	return r.u
 }
 
-// errNoUpstream mirrors DNSUpstream's "nothing configured" answer for an
-// empty ref.
+// errNoUpstream is THE shared "nothing configured" sentinel: DNSUpstream.Forward
+// (no servers) and UpstreamRef.Forward (an empty ref) answer with it.
 var errNoUpstream = errors.New("resolver: no upstream servers configured")
 
 // Forward implements Upstream by delegating to the current value. nil ⇒ the

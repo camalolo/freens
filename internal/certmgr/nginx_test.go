@@ -274,6 +274,9 @@ func TestValidateFailureRestoresBackup(t *testing.T) {
 	if err == nil {
 		t.Fatal("install should fail when validation fails")
 	}
+	if !strings.Contains(err.Error(), "config restored") {
+		t.Fatalf("error must truthfully report the successful restore: %v", err)
+	}
 	after, _ := os.ReadFile(app)
 	if string(before) != string(after) {
 		t.Fatalf("config not restored after failed validation:\n%s", after)
@@ -281,6 +284,121 @@ func TestValidateFailureRestoresBackup(t *testing.T) {
 	// The backup itself survives so the operator can diff.
 	if _, err := os.Stat(app + ".freens-pre"); err != nil {
 		t.Fatalf("backup gone: %v", err)
+	}
+}
+
+// TestValidateFailureRestoreFailureReported: when the restore itself fails
+// (here: the backup vanished mid-flight), the error must say the config is
+// left broken instead of claiming a restore that never happened.
+func TestValidateFailureRestoreFailureReported(t *testing.T) {
+	f := newNginxFixture(t)
+	e := newTestEnv(t)
+	now := time.Unix(1_700_000_000, 0)
+	app := filepath.Join(f.root, "sites-enabled", "app")
+
+	f.failOn = "-t"
+	base := f.env.Runner
+	f.env.Runner = func(ctx context.Context, name string, args ...string) (ExecResult, error) {
+		line := name + " " + strings.Join(args, " ")
+		if strings.Contains(line, " -t ") {
+			os.Remove(app + ".freens-pre") // the restore has nothing to read
+		}
+		return base(ctx, name, args...)
+	}
+	_, err := f.env.Install(e.home, e.keysDir, "www.camalolo", "", InstallOpts{}, now)
+	if err == nil {
+		t.Fatal("install should fail when validation fails")
+	}
+	if !strings.Contains(err.Error(), "RESTORE FAILED") || !strings.Contains(err.Error(), app) {
+		t.Fatalf("restore failure not reported honestly: %v", err)
+	}
+	if strings.Contains(err.Error(), "config restored") {
+		t.Fatalf("error claims a restore that failed: %v", err)
+	}
+}
+
+// TestInstallAppliesMultipleBlocksBottomUp: one file, two matching server
+// blocks (the common :80 + :443 twin vhost with the same server_name).
+// Edits must apply BOTTOM-UP — top-down, the first edit's inserted lines
+// shift every later block's recorded range and the next edit splices into
+// the wrong place (found live: our ssl_certificate ended up paired with the
+// foreign key and a stray `listen 443 ssl` landed in the :80 block).
+func TestInstallAppliesMultipleBlocksBottomUp(t *testing.T) {
+	f := newNginxFixture(t)
+	app := filepath.Join(f.root, "sites-enabled", "app")
+	twin := `server {
+    listen 80;
+    server_name twin.camalolo;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name twin.camalolo;
+    ssl_certificate /etc/ssl/old.crt;
+    ssl_certificate_key /etc/ssl/old.key;
+    root /var/www/tls;
+}
+`
+	if err := os.WriteFile(app, []byte(twin), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := newTestEnv(t)
+	now := time.Unix(1_700_000_000, 0)
+
+	res, err := f.env.Install(e.home, e.keysDir, "twin.camalolo", "", InstallOpts{Force: true}, now)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if len(res.Matched) != 2 {
+		t.Fatalf("matched = %v, want both twin blocks", res.Matched)
+	}
+
+	b, err := os.ReadFile(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	certPath := filepath.Join(ExportDir(e.home), "twin.camalolo.crt")
+	keyPath := filepath.Join(ExportDir(e.home), "twin.camalolo.key")
+	if got := strings.Count(text, "ssl_certificate "+certPath+";"); got != 2 {
+		t.Fatalf("our ssl_certificate lines = %d, want 2 (one per block):\n%s", got, text)
+	}
+	if got := strings.Count(text, "ssl_certificate_key "+keyPath+";"); got != 2 {
+		t.Fatalf("our ssl_certificate_key lines = %d, want 2:\n%s", got, text)
+	}
+	if strings.Contains(text, "/etc/ssl/old") {
+		t.Fatalf("foreign cert lines survived:\n%s", text)
+	}
+	// Exactly one listener ADDED (the :80 block needed it); the :443 block
+	// keeps its own — a third means an edit spliced outside its block.
+	if got := strings.Count(text, "listen 443 ssl;"); got != 2 {
+		t.Fatalf("listen 443 ssl lines = %d, want 2:\n%s", got, text)
+	}
+	// Structural re-scan: each block parses with exactly its own pair.
+	blocks, err := scanFile(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("rescan found %d blocks:\n%s", len(blocks), text)
+	}
+	for i, blk := range blocks {
+		if !blk.ListensSSL {
+			t.Errorf("block %d lost its TLS listener", i)
+		}
+		if len(blk.CertPaths) != 1 || blk.CertPaths[0] != certPath {
+			t.Errorf("block %d cert paths = %v, want [%s]", i, blk.CertPaths, certPath)
+		}
+		if len(blk.KeyPaths) != 1 || blk.KeyPaths[0] != keyPath {
+			t.Errorf("block %d key paths = %v, want [%s]", i, blk.KeyPaths, keyPath)
+		}
+	}
+	if !f.called("-t") {
+		t.Fatalf("validate never ran: %v", f.calls)
 	}
 }
 
@@ -497,6 +615,158 @@ func TestInstallCloneDryRunAndMissingSource(t *testing.T) {
 	}
 	if _, serr := os.Stat(srcFile); serr != nil {
 		t.Fatal("source vanished?!")
+	}
+}
+
+// TestCloneFailedValidateCleansUpThroughSudo: a clone written through the
+// sudo path (`sudo -n install` → a root-owned file in a root-owned tree)
+// that nginx -t rejects must be removed through the SAME privilege path —
+// the daemon user's direct unlink is refused, and a rejected clone left in
+// the config tree bricks every nginx reload/restart while the message
+// claims "(removed)". Realistic trigger: the transform copies only the
+// server{} block, so a vhost depending on http-level directives (map /
+// limit_req_zone / upstream) fails validation.
+func TestCloneFailedValidateCleansUpThroughSudo(t *testing.T) {
+	root := t.TempDir()
+	avail := filepath.Join(root, "sites-available")
+	enabled := filepath.Join(root, "sites-enabled")
+	if err := os.MkdirAll(avail, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(enabled, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The source vhost uses a variable defined by an http-level map: the
+	// clone cannot carry the map, so a REAL nginx -t would reject it — the
+	// exact shape that used to leak rejected clones into the tree.
+	src := `server {
+    listen 443 ssl;
+    server_name camalolo.com;
+    ssl_certificate /etc/letsencrypt/live/camalolo.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/camalolo.com/privkey.pem;
+    proxy_pass http://$src_backend; # defined by an http-level map
+}
+`
+	srcFile := filepath.Join(avail, "camalolo.com")
+	if err := os.WriteFile(srcFile, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../sites-available/camalolo.com", filepath.Join(enabled, "camalolo.com")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nginx.conf"),
+		[]byte("events { }\nhttp {\n    include "+enabled+"/*;\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unwritable tree (the root-owned /etc/nginx shape) forces the clone
+	// through `sudo -n install` instead of the direct write.
+	if err := os.Chmod(avail, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(enabled, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	// Restore BEFORE t.TempDir's own cleanup (LIFO) so it can remove the tree.
+	t.Cleanup(func() { os.Chmod(avail, 0o755); os.Chmod(enabled, 0o755) })
+	if pf, perr := os.CreateTemp(avail, "probe*"); perr == nil {
+		pf.Close()
+		os.Remove(pf.Name())
+		t.Skip("running as root: cannot simulate an unwritable config tree")
+	}
+
+	f := &nginxFixture{t: t, root: root, env: &NginxEnv{
+		Binary:   "nginx",
+		ConfPath: filepath.Join(root, "nginx.conf"),
+	}}
+	tCalls := 0
+	f.env.Runner = func(ctx context.Context, name string, args ...string) (ExecResult, error) {
+		line := name + " " + strings.Join(args, " ")
+		f.calls = append(f.calls, line)
+		if strings.Contains(line, " -t ") {
+			tCalls++
+			if tCalls == 1 {
+				// The clone is rejected…
+				return ExecResult{Stderr: `nginx: [emerg] unknown "src_backend" variable`}, errors.New("exit 1")
+			}
+			// …the post-cleanup re-validation finds the tree healthy again.
+		}
+		return ExecResult{}, nil
+	}
+
+	// Simulate the privileged helper through the SAME seam the product code
+	// uses for sudo (execRunner): install places the file, ln links, rm
+	// removes. The stub is not actually root, so each op briefly re-grants
+	// the directory permission it is emulating root for.
+	realExec := execRunner
+	privileged := func(dir string, fn func() error) error {
+		os.Chmod(dir, 0o755)
+		defer os.Chmod(dir, 0o555)
+		return fn()
+	}
+	execRunner = func(ctx context.Context, name string, args ...string) (ExecResult, error) {
+		line := name + " " + strings.Join(args, " ")
+		f.calls = append(f.calls, line)
+		switch {
+		case name == "sudo" && strings.Contains(line, " install "):
+			staged, dest := args[len(args)-2], args[len(args)-1]
+			b, rerr := os.ReadFile(staged)
+			if rerr != nil {
+				return ExecResult{}, rerr
+			}
+			return ExecResult{}, privileged(filepath.Dir(dest), func() error {
+				return os.WriteFile(dest, b, 0o644)
+			})
+		case name == "sudo" && strings.Contains(line, " ln "):
+			return ExecResult{}, privileged(filepath.Dir(args[len(args)-1]), func() error {
+				return os.Symlink(args[len(args)-2], args[len(args)-1])
+			})
+		case name == "sudo" && strings.Contains(line, " rm "):
+			return ExecResult{}, privileged(filepath.Dir(args[len(args)-1]), func() error {
+				return os.Remove(args[len(args)-1])
+			})
+		}
+		return realExec(ctx, name, args...)
+	}
+	t.Cleanup(func() { execRunner = realExec })
+	oldSudo := sudoAvailable
+	sudoAvailable = func() bool { return true }
+	t.Cleanup(func() { sudoAvailable = oldSudo; resetSudoCache() })
+
+	e := newTestEnv(t)
+	_, err := f.env.Install(e.home, e.keysDir, "www.camalolo", "",
+		InstallOpts{CloneFrom: "camalolo.com"}, time.Unix(1_700_000_000, 0))
+	if err == nil {
+		t.Fatal("clone should fail when validation rejects it")
+	}
+	if !strings.Contains(err.Error(), "removed") {
+		t.Fatalf("error should report the clean removal: %v", err)
+	}
+
+	real := filepath.Join(avail, "freens-www.camalolo")
+	link := filepath.Join(enabled, "freens-www.camalolo")
+	for _, p := range []string{real, link} {
+		if _, serr := os.Stat(p); !os.IsNotExist(serr) {
+			t.Errorf("rejected clone left behind: %s (err=%v)", p, serr)
+		}
+	}
+	// The removal ran through the sudo seam, and the tree was re-validated
+	// afterwards (second nginx -t, AFTER the rm).
+	rmIdx, lastT := -1, -1
+	for i, c := range f.calls {
+		if strings.Contains(c, " rm -f -- "+real) {
+			rmIdx = i
+		}
+		if strings.Contains(c, " -t ") {
+			lastT = i
+		}
+	}
+	if rmIdx < 0 {
+		t.Errorf("removal did not go through sudo rm: %v", f.calls)
+	}
+	if tCalls != 2 || lastT < rmIdx {
+		t.Errorf("nginx -t not re-run after cleanup (t=%d, rm@%d, last -t@%d): %v",
+			tCalls, rmIdx, lastT, f.calls)
 	}
 }
 

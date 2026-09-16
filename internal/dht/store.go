@@ -30,7 +30,7 @@
 // import internal/crypto (signature verification is delegated to
 // SignedEnvelope.VerifySignature in package wire). A single sync.Mutex guards
 // every public method; internal "*Locked" helpers run with the lock already
-// held so Put may EvictExpired + enforceCap re-entrantly without self-deadlock.
+// held so Put may sweep + enforce the cap re-entrantly without self-deadlock.
 package dht
 
 import (
@@ -44,6 +44,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/wire"
@@ -131,9 +132,9 @@ type EnvelopeStore struct {
 // NewEnvelopeStore constructs an empty EnvelopeStore. If maxBytes <= 0 it
 // defaults to constants.NodeStorageMax (256 MiB). If nowFn is nil it defaults
 // to time.Now().Unix(); tests inject a deterministic clock. The injected clock
-// is used only by callers that read s.nowFn; the Put/Get/Has/EvictExpired
-// methods on this type take an explicit now argument and never touch the wall
-// clock, which keeps every test deterministic.
+// is used only by callers that read s.nowFn; the Put/Get/Has methods on this
+// type take an explicit now argument and never touch the wall clock, which
+// keeps every test deterministic.
 func NewEnvelopeStore(maxBytes int, nowFn func() int64) *EnvelopeStore {
 	if maxBytes <= 0 {
 		maxBytes = constants.NodeStorageMax
@@ -188,7 +189,7 @@ func (s *EnvelopeStore) Now() int64 { return s.nowFn() }
 //     empty, so the newcomer is accepted unconditionally (re-creation after
 //     expiry+grace).
 //  4. On acceptance: cache len(env.Bytes()), set lastAccess = now, then run
-//     EvictExpired(now) followed by enforceCap(now, protected=key). The
+//     evictExpiredLocked(now) followed by enforceCap(now, protected=key). The
 //     post-accept sweeps MAY evict other entries but never the just-put key
 //     (a single oversized entry that alone exceeds the cap is retained rather
 //     than evicted in an infinite loop).
@@ -374,9 +375,9 @@ func (s *EnvelopeStore) Get(key []byte, now int64) (*wire.SignedEnvelope, error)
 }
 
 // Has reports whether an ALIVE entry is stored under key at time now. It is
-// non-mutating: it does NOT lazily evict a dead entry (use Get or EvictExpired
-// for that); it simply reports false for a dead or absent key. A wrong-length
-// key reports false.
+// non-mutating: it does NOT lazily evict a dead entry (use Get for that); it
+// simply reports false for a dead or absent key. A wrong-length key reports
+// false.
 func (s *EnvelopeStore) Has(key []byte, now int64) bool {
 	if len(key) != constants.SHA256Len {
 		return false
@@ -394,9 +395,11 @@ func (s *EnvelopeStore) Has(key []byte, now int64) bool {
 
 // Remove unconditionally drops the entry for key and returns true iff
 // something was removed. Not on the §6.4 critical path; provided for
-// administration and testability. A wrong-length key reports false. Unlike the
-// eviction sweeps, Remove does NOT retain the envelope in the §8.3 history —
-// it is an explicit administrative drop, not an organic supersession.
+// administration and testability (the cold-walk integration benchmark uses it
+// to drop a node's cached copies per iteration). A wrong-length key reports
+// false. Unlike the eviction sweeps, Remove does NOT retain the envelope in
+// the §8.3 history — it is an explicit administrative drop, not an organic
+// supersession.
 func (s *EnvelopeStore) Remove(key []byte) bool {
 	if len(key) != constants.SHA256Len {
 		return false
@@ -414,27 +417,9 @@ func (s *EnvelopeStore) Remove(key []byte) bool {
 	return true
 }
 
-// EvictExpired removes every entry past expires + ExpiryGrace at time now and
-// returns the count evicted. This is the "expired envelopes first" half of the
-// §12 eviction policy and the §6.4 step 4 sweep.
-func (s *EnvelopeStore) EvictExpired(now int64) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.evictExpiredLocked(now)
-}
-
-// SizeBytes returns the total cached wire bytes (the sum of len(Bytes()) over
-// all live entries, computed from the per-entry size cache).
-func (s *EnvelopeStore) SizeBytes() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.totalBytesLocked()
-}
-
 // Count returns the number of entries currently held. Entries that are past
-// expires + ExpiryGrace but not yet swept (by Get, EvictExpired, or a Put) are
-// still counted here; they are removed lazily on the next access. Call
-// EvictExpired first if an exact "live" count is required.
+// expires + ExpiryGrace but not yet swept (by Get or a Put) are still counted
+// here; they are removed lazily on the next access.
 func (s *EnvelopeStore) Count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -494,10 +479,10 @@ func (s *EnvelopeStore) Entries(now int64) []StoreEntry {
 // the format the daemon's -load seeding and freens-cli make-record produce, so
 // a persisted directory can be re-seeded on the next start (the §6.4 winner
 // rule makes re-seeding idempotent). dir is created if missing. Each file is
-// written to a temp file in dir and atomically renamed into place, so a crash
-// mid-write never leaves a torn envelope. Returns the number of envelopes
-// written. An envelope whose encoding fails is skipped (it stays in the
-// in-process store); directory/write errors abort with the count so far.
+// written through the shared atomicfile helper (temp in dir, fsync, rename —
+// a crash mid-write never leaves a torn envelope). Returns the number of
+// envelopes written. An envelope whose encoding fails is skipped (it stays in
+// the in-process store); directory/write errors abort with the count so far.
 func (s *EnvelopeStore) PersistTo(dir string) (int, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, fmt.Errorf("dht: persist mkdir %q: %w", dir, err)
@@ -509,22 +494,8 @@ func (s *EnvelopeStore) PersistTo(dir string) (int, error) {
 			continue
 		}
 		final := filepath.Join(dir, hex.EncodeToString(e.Key)+".cbor")
-		tmp, err := os.CreateTemp(dir, "."+hex.EncodeToString(e.Key)+".tmp-*")
-		if err != nil {
-			return written, fmt.Errorf("dht: persist temp file in %q: %w", dir, err)
-		}
-		if _, err := tmp.Write(b); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist write %q: %w", tmp.Name(), err)
-		}
-		if err := tmp.Close(); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist close %q: %w", tmp.Name(), err)
-		}
-		if err := os.Rename(tmp.Name(), final); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist rename %q: %w", final, err)
+		if err := atomicfile.Write(final, b, 0o600); err != nil {
+			return written, fmt.Errorf("dht: persist write %q: %w", final, err)
 		}
 		written++
 	}
@@ -579,13 +550,6 @@ func (s *EnvelopeStore) aliveLocked(e *entry, now int64) bool {
 		return false
 	}
 	return now < int64(e.env.Record.Expires)+int64(constants.ExpiryGrace)
-}
-
-// totalBytesLocked returns the live map's total cached byte size — O(1): the
-// running counter s.bytes, maintained at every entry insert/replace/delete.
-// Caller must hold s.mu.
-func (s *EnvelopeStore) totalBytesLocked() int {
-	return s.bytes
 }
 
 // evictExpiredLocked drops every entry past expires + ExpiryGrace and returns
@@ -740,7 +704,7 @@ func (s *EnvelopeStore) HistoryEntries() []StoreEntry {
 
 // PersistHistoryTo writes every retained audit-history envelope as
 // <H_record hex>.cbor into dir (created if missing), using the same
-// temp-file-then-rename atomic write as [EnvelopeStore.PersistTo]. Files are
+// atomicfile write as [EnvelopeStore.PersistTo]. Files are
 // named by H_record — a DIFFERENT digest namespace than the live files'
 // storage keys — so one directory can hold both. Returns the number written.
 func (s *EnvelopeStore) PersistHistoryTo(dir string) (int, error) {
@@ -754,22 +718,8 @@ func (s *EnvelopeStore) PersistHistoryTo(dir string) (int, error) {
 			continue
 		}
 		final := filepath.Join(dir, hex.EncodeToString(e.Key)+".cbor")
-		tmp, err := os.CreateTemp(dir, "."+hex.EncodeToString(e.Key)+".tmp-*")
-		if err != nil {
-			return written, fmt.Errorf("dht: persist-history temp file in %q: %w", dir, err)
-		}
-		if _, err := tmp.Write(b); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-history write %q: %w", tmp.Name(), err)
-		}
-		if err := tmp.Close(); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-history close %q: %w", tmp.Name(), err)
-		}
-		if err := os.Rename(tmp.Name(), final); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-history rename %q: %w", tmp.Name(), err)
+		if err := atomicfile.Write(final, b, 0o600); err != nil {
+			return written, fmt.Errorf("dht: persist-history write %q: %w", final, err)
 		}
 		written++
 	}

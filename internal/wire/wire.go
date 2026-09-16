@@ -45,7 +45,7 @@ import (
 // as the EMPTY container — e.g. a nil []byte becomes empty bstr (0x40), not
 // CBOR null (0xf6). This matches the Python reference (which emits b""/[] and
 // never null) and keeps RR.Rdata, Record.RRset, etc. wire-stable when callers
-// reach a nil via TXT(""), NewRR(typ,ttl,nil), etc.
+// reach a nil via NewRR(typ, ttl, []byte("")) or NewRR(typ, ttl, nil), etc.
 var canonicalEM = func() cbor.EncMode {
 	opts := cbor.CoreDetEncOptions()
 	opts.NilContainers = cbor.NilContainerAsEmpty // nil []byte -> empty bstr (0x40), nil slice/map -> empty container
@@ -163,16 +163,6 @@ func AAAA(ip6 []byte, ttl uint64) (*RR, error) {
 		return nil, fmt.Errorf("wire: AAAA rdata must be exactly 16 bytes, got %d", len(ip6))
 	}
 	return NewRR(RRTypeAAAA, ttl, ip6)
-}
-
-// TXT builds a TXT record whose rdata is the UTF-8 bytes of text.
-//
-// The spec RECOMMENDS NFC normalization of human-supplied text; the Go port
-// does not perform NFC normalization (it would require golang.org/x/text, which
-// is outside this package's import budget). Callers that need canonical
-// normalization should normalize before calling TXT.
-func TXT(text string, ttl uint64) (*RR, error) {
-	return NewRR(RRTypeTXT, ttl, []byte(text))
 }
 
 // ---------------------------------------------------------------------------

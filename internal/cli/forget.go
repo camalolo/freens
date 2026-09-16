@@ -120,6 +120,17 @@ func cmdForget(args []string) error {
 		}
 		fmt.Printf("%s: nothing published — pruning the keychain files\n", displayName)
 	case cur.IsRevoked():
+		// Same destructive gate as the sibling branches: the name is dead
+		// already, but the files being pruned are still the ONLY copies of
+		// the keys (and un-revoking later needs them), so confirm like the
+		// live and nothing-published branches do.
+		if !*yes && sysIsTerminal() {
+			fmt.Printf("forget %s — already revoked, and this DELETES the owner + recovery keys from this machine (un-revoking later needs the key you are deleting).\nProceed? [y/N] ", displayName)
+			var answer string
+			if _, err := fmt.Scanln(&answer); err != nil || (answer != "y" && answer != "Y" && answer != "yes") {
+				return usageErr("forget aborted")
+			}
+		}
 		fmt.Printf("%s: already revoked — pruning the keychain files\n", displayName)
 	default:
 		if !*yes && sysIsTerminal() {

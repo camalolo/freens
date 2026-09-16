@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/wire"
@@ -57,8 +56,10 @@ func (l *DHTLookup) LookupByHash(ctx context.Context, h []byte) (*wire.SignedEnv
 	// H_record must equal the key it is stored under, or it is not the
 	// predecessor being asked for. Get applies the liveness window; a
 	// superseded predecessor retrieved this way is normally well within it,
-	// and an expired one is servable by some peer's history instead.
-	if env, _ := l.store.Get(h, time.Now().Unix()); env != nil {
+	// and an expired one is servable by some peer's history instead. The
+	// store's INJECTED clock (not the wall clock) keeps the liveness window
+	// consistent with every other store access.
+	if env, _ := l.store.Get(h, l.store.Now()); env != nil {
 		if got, err := env.RecordHash(); err == nil && bytes.Equal(got, h) {
 			return env, nil
 		}

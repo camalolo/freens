@@ -94,6 +94,12 @@ func (h *DoHHandler) readQuery(w http.ResponseWriter, r *http.Request) ([]byte, 
 			http.Error(w, "malformed dns parameter", http.StatusBadRequest)
 			return nil, false
 		}
+		// Same cap as the POST body: a GET's base64-decoded payload is
+		// otherwise unbounded (the URL is capped by servers, not by us).
+		if len(payload) > maxDoHQueryBytes {
+			http.Error(w, "query too large", http.StatusRequestEntityTooLarge)
+			return nil, false
+		}
 		return payload, true
 	case http.MethodPost:
 		if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, DoHContentType) {

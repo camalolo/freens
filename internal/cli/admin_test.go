@@ -34,6 +34,8 @@ type stubAdmin struct {
 	rawPublish     [][]byte
 	getKey         []byte               // when set, /get serves getEnv (base64)
 	getEnv         *wire.SignedEnvelope // when getKey matches
+	failGet        bool                 // when set, /get answers 500 (transport failure, not a miss)
+	accepted       int                  // /publish "accepted" answer (default 2: both keys landed)
 	statusJSON     string               // when set, served instead of the default /status body
 	peersJSON      string               // when set, served by /peers
 	storeJSON      string               // when set, served by /store
@@ -85,8 +87,21 @@ func startStubAdmin(t *testing.T, sock string, resolve map[string]string) *stubA
 		s.rawPublish = append(s.rawPublish, body)
 		if env := decodeStubEnvelope(body); env != nil {
 			s.published = append(s.published, env)
+			// The admin protocol publishes BOTH legs at POST /publish — the
+			// claim leg is the same path with {"claim":true}. Track it
+			// separately so tests can count the K_claim walks.
+			var probe struct {
+				Claim bool `json:"claim"`
+			}
+			if json.Unmarshal(body, &probe) == nil && probe.Claim {
+				s.publishedClaim = append(s.publishedClaim, env)
+			}
 		}
-		fmt.Fprint(w, `{"accepted":2}`)
+		accepted := s.accepted
+		if accepted == 0 {
+			accepted = 2 // the claim-bearing default: both keys landed
+		}
+		fmt.Fprintf(w, `{"accepted":%d}`, accepted)
 	})
 	mux.HandleFunc("/publish-claim", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -110,6 +125,11 @@ func startStubAdmin(t *testing.T, sock string, resolve map[string]string) *stubA
 		fmt.Fprint(w, `{"entries":[],"count":0}`)
 	})
 	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+		if s.failGet {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":"walk exploded"}`)
+			return
+		}
 		var gj struct {
 			Key string `json:"key"`
 		}

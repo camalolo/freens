@@ -254,6 +254,12 @@ func TestSettingsPageRendersWhenOff(t *testing.T) {
 	if !strings.Contains(body, "No keychain name yet") {
 		t.Error("page should explain the missing name")
 	}
+	// The fixture's daemon answers: the page reports the live-apply state
+	// WITHOUT having issued a reload (GET /settings is a pure read — the
+	// reload lives in the POST handler).
+	if !strings.Contains(body, "Applied live") {
+		t.Error("page with a live daemon does not say changes apply live")
+	}
 }
 
 // getBody is uclient.get plus the body text (the auth pages' GET only

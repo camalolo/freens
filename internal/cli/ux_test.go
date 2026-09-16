@@ -7,6 +7,7 @@ package cli
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
@@ -464,6 +465,65 @@ func TestRevokeUnknownAlias(t *testing.T) {
 	}
 }
 
+// TestRevokeRefusesTombstoneOnCleanMiss: a CLEAN discovery miss (nothing
+// reachable at the key) must not mint a seq-1 tombstone — that copy loses
+// the §6.4 winner race against a name that is live elsewhere (a pocketed
+// vantage hides it), while the CLI prints REVOKED. Refuse; publish nothing.
+func TestRevokeRefusesTombstoneOnCleanMiss(t *testing.T) {
+	h := tempHome(t)
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), nil) // /get answers 404: clean miss
+	kp := mustTestKeypair(t)
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+	oldTerm := sysIsTerminal
+	sysIsTerminal = func() bool { return false }
+	t.Cleanup(func() { sysIsTerminal = oldTerm })
+
+	out, err := captureStdout(t, func() error { return cmdRevoke([]string{"alice", "-yes"}) })
+	if err == nil {
+		t.Fatalf("revoke on a clean miss must refuse:\n%s", out)
+	}
+	for _, want := range []string{"nothing is published", "seq-1 tombstone", "pocketed vantage"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q missing %q", err, want)
+		}
+	}
+	if len(stub.published) != 0 {
+		t.Errorf("the refusal must publish nothing (published %d)", len(stub.published))
+	}
+	if strings.Contains(out, "REVOKED") {
+		t.Errorf("the refusal must not print REVOKED:\n%s", out)
+	}
+}
+
+// TestRevokeWalkFailureStillErrors: a discovery TRANSPORT failure keeps
+// erroring (it is not a miss) — the pre-existing discipline the clean-miss
+// refusal must not swallow.
+func TestRevokeWalkFailureStillErrors(t *testing.T) {
+	h := tempHome(t)
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
+	stub.failGet = true // /get answers 500: walk failure, not a miss
+	kp := mustTestKeypair(t)
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+	oldTerm := sysIsTerminal
+	sysIsTerminal = func() bool { return false }
+	t.Cleanup(func() { sysIsTerminal = oldTerm })
+
+	out, err := captureStdout(t, func() error { return cmdRevoke([]string{"alice", "-yes"}) })
+	if err == nil {
+		t.Fatalf("revoke on a walk failure must error:\n%s", out)
+	}
+	if strings.Contains(err.Error(), "seq-1 tombstone") {
+		t.Errorf("walk failure misreported as a clean miss: %v", err)
+	}
+	if len(stub.published) != 0 {
+		t.Errorf("nothing may be published on a walk failure (published %d)", len(stub.published))
+	}
+}
+
 // TestRenewExtendsLease: renew fetches the current envelope (seq 4, expiring
 // soon), re-signs at seq 5 with a fresh 24 h window, and publishes.
 func TestRenewExtendsLease(t *testing.T) {
@@ -796,6 +856,58 @@ func TestBackupNothingToBackUp(t *testing.T) {
 	}
 }
 
+// TestBackupRestoreRejectsTruncatedMember: a member of EXACTLY the 1 MiB
+// read cap used to be silently truncated and restored as if fine (a corrupt
+// key that only fails later, at the worst possible moment). Restore must
+// refuse; a member just UNDER the cap still restores.
+func TestBackupRestoreRejectsTruncatedMember(t *testing.T) {
+	tempHome(t)
+	if err := home.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	mkArchive := func(t *testing.T, path string, size int) {
+		t.Helper()
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gz := gzip.NewWriter(f)
+		tw := tar.NewWriter(gz)
+		if err := tw.WriteHeader(&tar.Header{Name: "alice.key", Mode: 0o600, Size: int64(size)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(bytes.Repeat([]byte{0xAB}, size)); err != nil {
+			t.Fatal(err)
+		}
+		tw.Close()
+		gz.Close()
+		f.Close()
+	}
+
+	// Exactly the cap: refuse, name the member.
+	atCap := filepath.Join(t.TempDir(), "cap.tar.gz")
+	mkArchive(t, atCap, 1<<20)
+	_, err := captureStdout(t, func() error { return cmdBackup([]string{"-restore", atCap}) })
+	if err == nil || !strings.Contains(err.Error(), "1 MiB limit") || !strings.Contains(err.Error(), "alice.key") {
+		t.Fatalf("at-cap member = %v, want the truncation refusal naming the member", err)
+	}
+	if _, serr := os.Stat(filepath.Join(home.KeysDir(), "alice.key")); !os.IsNotExist(serr) {
+		t.Errorf("truncated member was written anyway: %v", serr)
+	}
+
+	// One byte under the cap: restores cleanly.
+	under := filepath.Join(t.TempDir(), "under.tar.gz")
+	mkArchive(t, under, 1<<20-1)
+	out, err := captureStdout(t, func() error { return cmdBackup([]string{"-restore", under}) })
+	if err != nil {
+		t.Fatalf("under-cap member = %v, want a clean restore:\n%s", err, out)
+	}
+	got, rerr := os.ReadFile(filepath.Join(home.KeysDir(), "alice.key"))
+	if rerr != nil || len(got) != 1<<20-1 {
+		t.Errorf("under-cap restore = %d bytes (%v), want %d", len(got), rerr, 1<<20-1)
+	}
+}
+
 // tarNames lists the entry names of a tar.gz (test helper).
 func tarNames(t *testing.T, path string) []string {
 	t.Helper()
@@ -836,5 +948,127 @@ func TestRenewRejectsFlagsAfterNames(t *testing.T) {
 	err = cmdRenew([]string{"alice", "-peers", "127.0.0.1:15353#abcd", "-force"})
 	if err == nil {
 		t.Fatal("renew alice -peers … -force: nil error, want the flag-order refusal")
+	}
+}
+
+// TestRenewDiscoveryFailurePropagates: a daemon GET transport failure must
+// NOT read as "no live record on the network" — that advice (register it!)
+// is actively wrong during exactly the incidents renew is the recommended
+// verb for. The failure names itself and says nothing was renewed. (renew
+// prints the per-name error and returns the 1-of-N summary, so the message
+// is asserted on stdout.)
+func TestRenewDiscoveryFailurePropagates(t *testing.T) {
+	h := tempHome(t)
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
+	stub.failGet = true // /get answers 500: transport failure, not a miss
+	kp := mustTestKeypair(t)
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdRenew([]string{"alice"}) })
+	if err == nil {
+		t.Fatalf("renew over a failed discovery must error:\n%s", out)
+	}
+	for _, want := range []string{"sequence discovery failed", "nothing renewed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "register it") {
+		t.Errorf("transport failure misread as a clean miss:\n%s", out)
+	}
+	if len(stub.published) != 0 {
+		t.Errorf("nothing may be published (published %d)", len(stub.published))
+	}
+}
+
+// TestRenewCleanMissStillAdvisesRegister: the OTHER half of the contract —
+// a clean (nil, nil) miss IS the genuine no-record case and keeps the
+// standing "register it" advice.
+func TestRenewCleanMissStillAdvisesRegister(t *testing.T) {
+	h := tempHome(t)
+	startStubAdmin(t, filepath.Join(h, "admin.sock"), nil) // /get answers 404: clean miss
+	kp := mustTestKeypair(t)
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdRenew([]string{"alice"}) })
+	if err == nil {
+		t.Fatalf("clean miss must fail:\n%s", out)
+	}
+	if !strings.Contains(out, "no live record on the network") || !strings.Contains(out, "register it") {
+		t.Fatalf("clean miss must keep the register-it advice:\n%s", out)
+	}
+	if strings.Contains(out, "sequence discovery failed") {
+		t.Errorf("clean miss misreported as a transport failure:\n%s", out)
+	}
+}
+
+// TestRenewSkipsSecondClaimPublishWhenDaemonDidBoth: the daemon's publish
+// already runs the K_claim leg for a claim-bearing record (accepted == 2,
+// including §8.3 re-attestation daemon-side) — a renewal must NOT repeat
+// PublishClaim after a 2-key acceptance (a second full K_claim walk on
+// every cycle). The stub answers accepted:2, so /publish-claim must see
+// nothing; with accepted:1 the repair leg still fires.
+func TestRenewSkipsSecondClaimPublishWhenDaemonDidBoth(t *testing.T) {
+	h := tempHome(t)
+	kp := mustTestKeypair(t)
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireName, err := naming.EncodeWireName(nil, "alice", tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := uint64(time.Now().Unix())
+	rec, err := wire.NewRecord(wireName, kp.Public(), 4, now-80000, now+2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The record must CARRY a claim — the skip/repair decision is "did the
+	// daemon's publish land both keys FOR A CLAIM-BEARING record".
+	claim, cerr := claims.MineAliasClaim("alice", kp, now, 8, 2_000_000, 16)
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	cb, cerr := claim.CanonicalBytes()
+	if cerr != nil {
+		t.Fatal(cerr)
+	}
+	rec.Claim = cb
+	prev, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := dht.KeyForWireName(wireName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), nil)
+	stub.getKey, stub.getEnv = key, prev
+	if err := writeKeyFile(filepath.Join(home.KeysDir(), "alice.key"), kp); err != nil {
+		t.Fatal(err)
+	}
+
+	// accepted:2 (the default stub answer): the claim leg already landed
+	// daemon-side — no second walk.
+	if out, err := captureStdout(t, func() error { return cmdRenew([]string{"alice", "-force"}) }); err != nil {
+		t.Fatalf("renew: %v\n%s", err, out)
+	}
+	if len(stub.publishedClaim) != 0 {
+		t.Fatalf("renewal repeated the K_claim publish after a 2-key acceptance (%d times)", len(stub.publishedClaim))
+	}
+
+	// accepted:1 (the claim leg failed daemon-side): the CLI repair fires.
+	stub.published, stub.publishedClaim = nil, nil
+	stub.accepted = 1
+	if out, err := captureStdout(t, func() error { return cmdRenew([]string{"alice", "-force"}) }); err != nil {
+		t.Fatalf("renew (accepted:1): %v\n%s", err, out)
+	}
+	if len(stub.publishedClaim) != 1 {
+		t.Fatalf("repair leg did not fire on accepted:1 (publishedClaim=%d)", len(stub.publishedClaim))
 	}
 }

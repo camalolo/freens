@@ -53,7 +53,7 @@ func fuzzSignedEnvelopeBytes(f *testing.F) []byte {
 	}
 	a, _ := A([]byte{203, 0, 113, 42}, 300)
 	aaaa, _ := AAAA(bytes.Repeat([]byte{1}, 16), 600)
-	txt, _ := TXT("hello", 100)
+	txt, _ := NewRR(RRTypeTXT, 100, []byte("hello"))
 	rec.RRset = []*RR{a, aaaa, txt}
 	rec.Delegation = bytes.Repeat([]byte{0xDE}, 32)
 	rec.PrevHash = bytes.Repeat([]byte{0xAD}, 32)

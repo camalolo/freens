@@ -12,9 +12,7 @@ package dht
 
 import (
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/camalolo/freens/internal/constants"
 )
@@ -24,9 +22,6 @@ import (
 // package is self-documenting.
 const IDLen = constants.NodeIDLen
 
-// bitsPerID is the bit-width of a node ID (IDLen * 8 = 256).
-const bitsPerID = IDLen * 8
-
 // checkID validates that x is exactly IDLen bytes and returns it. It is the
 // Go analogue of ids._check_id in the Python reference.
 func checkID(x []byte, name string) error {
@@ -34,29 +29,6 @@ func checkID(x []byte, name string) error {
 		return fmt.Errorf("dht: %s must be %d bytes, got %d", name, IDLen, len(x))
 	}
 	return nil
-}
-
-// XORBytes returns the bitwise XOR of two 32-byte IDs as a freshly allocated
-// 32-byte slice. It returns an error if either argument is not exactly IDLen
-// bytes.
-//
-// Golden vectors (by construction):
-//
-//	XORBytes(bytes(32), bytes(32))          == bytes(32)
-//	XORBytes(bytes(32), 0xff*32)            == 0xff*32
-//	XORBytes(0x01+bytes(31), bytes(32))     == 0x01+bytes(31)
-func XORBytes(a, b []byte) ([]byte, error) {
-	if err := checkID(a, "a"); err != nil {
-		return nil, err
-	}
-	if err := checkID(b, "b"); err != nil {
-		return nil, err
-	}
-	out := make([]byte, IDLen)
-	for i := 0; i < IDLen; i++ {
-		out[i] = a[i] ^ b[i]
-	}
-	return out, nil
 }
 
 // CompareDistance reports which of a or b is closer to target under the XOR
@@ -144,68 +116,6 @@ func CommonPrefixLength(a, b []byte) (int, error) {
 		break
 	}
 	return shared, nil
-}
-
-// BucketIndex returns the k-bucket index (0..255) for otherID relative to
-// selfID. Per the Kademlia rule, bucket i holds contacts that share exactly i
-// leading bits with selfID, so the index equals the common-prefix length of
-// selfID and otherID.
-//
-// It returns an error if the IDs are equal (an ID never routes to itself; its
-// common prefix length would be 256, which is not a valid bucket) or if
-// either input is the wrong length.
-//
-// Examples:
-//
-//	BucketIndex(bytes(32), 0x80+bytes(31)) == 0   // differ at MSB
-//	BucketIndex(bytes(32), bytes(31)+0x01) == 255 // differ only at LSB
-func BucketIndex(selfID, otherID []byte) (int, error) {
-	cpl, err := CommonPrefixLength(selfID, otherID)
-	if err != nil {
-		return 0, err
-	}
-	if cpl == bitsPerID {
-		return 0, errors.New("dht: an ID never routes to itself; no valid bucket")
-	}
-	return cpl, nil
-}
-
-// SortByDistance stably sorts ids in place ascending by XOR distance to
-// target. All ids and target are validated up front so a malformed id does
-// not slip through after partial sorting.
-func SortByDistance(target []byte, ids [][]byte) error {
-	if err := checkID(target, "target"); err != nil {
-		return err
-	}
-	for i, id := range ids {
-		if err := checkID(id, fmt.Sprintf("ids[%d]", i)); err != nil {
-			return err
-		}
-	}
-	sort.SliceStable(ids, func(i, j int) bool {
-		return CompareDistance(target, ids[i], ids[j]) < 0
-	})
-	return nil
-}
-
-// KClosest returns the k IDs nearest to target, ascending by XOR distance. If
-// fewer than k IDs are available, all are returned (still sorted). The input
-// slice is not mutated; a fresh slice is returned.
-//
-// k must be non-negative.
-func KClosest(target []byte, ids [][]byte, k int) ([][]byte, error) {
-	if k < 0 {
-		return nil, fmt.Errorf("dht: k must be non-negative, got %d", k)
-	}
-	cp := make([][]byte, len(ids))
-	copy(cp, ids)
-	if err := SortByDistance(target, cp); err != nil {
-		return nil, err
-	}
-	if k > len(cp) {
-		k = len(cp)
-	}
-	return cp[:k], nil
 }
 
 // HexID returns the lowercase hex encoding of a 32-byte ID (64 chars), for

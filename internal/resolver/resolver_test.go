@@ -909,7 +909,7 @@ func TestFreensRRToDNS(t *testing.T) {
 	}
 
 	// TXT
-	txtRR, _ := wire.TXT("hello freens", 600)
+	txtRR, _ := wire.NewRR(wire.RRTypeTXT, 600, []byte("hello freens"))
 	got = freensRRToDNS(name, txtRR, expires, fixedNow)
 	txt, ok := got.(*dns.TXT)
 	if !ok {
@@ -2225,11 +2225,11 @@ func TestResolveQuestionContestedWinnerTTLCapped(t *testing.T) {
 	cache := NewResponseCache(16, func() int64 { return clock })
 	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
-	if _, _, _, ok := cache.get(cacheKeyFor(q)); !ok {
+	if _, _, _, status := cache.get2(cacheKeyFor(q)); status != cacheFresh {
 		t.Fatal("contested entry missing from cache immediately after put")
 	}
 	clock += contestedClaimTTLCap + 1
-	if _, _, _, ok := cache.get(cacheKeyFor(q)); ok {
+	if _, _, _, status := cache.get2(cacheKeyFor(q)); status == cacheFresh {
 		t.Error("contested alias answer still cached past the §10.4 60 s cap")
 	}
 }
@@ -2259,7 +2259,7 @@ func TestResolveQuestionUncontestedWinnerNotCapped(t *testing.T) {
 	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
 	clock += contestedClaimTTLCap + 1
-	if _, _, _, ok := cache.get(cacheKeyFor(q)); !ok {
+	if _, _, _, status := cache.get2(cacheKeyFor(q)); status != cacheFresh {
 		t.Error("uncontested alias answer wrongly evicted within the §10.4 6 h allowance")
 	}
 }
@@ -2399,5 +2399,49 @@ func TestFlightReapOnStaleLeader(t *testing.T) {
 	rrs, rcode, _, err := r.resolveShared(context.Background(), q, ck)
 	if err != nil || rcode != dns.RcodeSuccess || len(rrs) != 1 {
 		t.Fatalf("re-lead after reap: rcode=%d len=%d err=%v", rcode, len(rrs), err)
+	}
+}
+
+// TestResolveQuestionRefusesNonINClass: only ClassINET is served. A non-IN
+// question is REFUSED at the ResolveQuestion entry — no claim walk, no
+// upstream forward (a CH forward would proxy the classic version.bind probe
+// to the recursive resolver), no cache entry.
+func TestResolveQuestionRefusesNonINClass(t *testing.T) {
+	w := newFreensWorld(t)
+	lookup := &countingLookup{fakeLookup: newFakeLookup()}
+	lookup.put(w.tldEnv)
+	lookup.put(w.wwwEnv)
+	up := &fakeUpstream{rcode: dns.RcodeSuccess}
+	r := newResolver(configFor(t, w, RouteFREENS), lookup, up)
+	r.Cache = NewResponseCache(0, func() int64 { return fixedNow })
+
+	for _, qc := range []uint16{dns.ClassCHAOS, dns.ClassHESIOD, dns.ClassNONE, dns.ClassANY} {
+		rrs, rcode, aa, err := r.ResolveQuestion(context.Background(),
+			dns.Question{Name: "www.footld.", Qtype: dns.TypeTXT, Qclass: qc})
+		if err != nil {
+			t.Fatalf("class %d: err = %v", qc, err)
+		}
+		if rcode != dns.RcodeRefused || aa || len(rrs) != 0 {
+			t.Errorf("class %d: rcode %d aa %v rrs %d, want REFUSED / non-authoritative / empty", qc, rcode, aa, len(rrs))
+		}
+	}
+	if got := atomic.LoadInt32(&lookup.calls); got != 0 {
+		t.Errorf("namespace lookups = %d, want 0 (non-IN must not walk)", got)
+	}
+	if got := len(up.seen); got != 0 {
+		t.Errorf("upstream saw %d queries, want 0 (non-IN must not be forwarded)", got)
+	}
+	if got := r.Cache.Len(); got != 0 {
+		t.Errorf("cache holds %d entries, want 0 (REFUSED is never cached)", got)
+	}
+
+	// End-to-end on the server path: the CH TXT version.bind probe gets a
+	// REFUSED rcode, not an upstream-relayed banner.
+	wr := &captureWriter{}
+	m := new(dns.Msg).SetQuestion("version.bind.", dns.TypeTXT)
+	m.Question[0].Qclass = dns.ClassCHAOS
+	r.ServeDNS(wr, m)
+	if wr.msg == nil || wr.msg.Rcode != dns.RcodeRefused {
+		t.Fatalf("CH version.bind via ServeDNS = %v, want REFUSED", wr.msg)
 	}
 }

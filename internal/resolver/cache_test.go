@@ -7,6 +7,7 @@ package resolver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -256,10 +257,10 @@ func TestResponseCacheBoundEvictsOldest(t *testing.T) {
 		t.Fatalf("Len = %d, want 4 (bound enforced)", got)
 	}
 	// key 0 was the oldest → evicted; key 4 (newest) is present.
-	if _, _, _, ok := c.get(testKey(0)); ok {
+	if _, _, _, status := c.get2(testKey(0)); status != cacheMiss {
 		t.Error("oldest entry should have been evicted")
 	}
-	if _, _, _, ok := c.get(testKey(4)); !ok {
+	if _, _, _, status := c.get2(testKey(4)); status != cacheFresh {
 		t.Error("newest entry should be present")
 	}
 }
@@ -270,27 +271,27 @@ func TestResponseCachePolicy(t *testing.T) {
 
 	// Zero-TTL positives are not cached (do-not-cache convention).
 	c.putFreens(testKey(0), []dns.RR{testA(t, 0)}, dns.RcodeSuccess, true)
-	if _, _, _, ok := c.get(testKey(0)); ok {
+	if _, _, _, status := c.get2(testKey(0)); status != cacheMiss {
 		t.Error("TTL-0 answer must not be cached")
 	}
 
 	// aa=false (DNS-forwarded / policy) is ignored entirely.
 	c.putFreens(testKey(1), []dns.RR{testA(t, 60)}, dns.RcodeSuccess, false)
-	if _, _, _, ok := c.get(testKey(1)); ok {
+	if _, _, _, status := c.get2(testKey(1)); status != cacheMiss {
 		t.Error("non-freens outcome must not be cached")
 	}
 
 	// SERVFAIL is transient → never cached.
 	c.putFreens(testKey(2), nil, dns.RcodeServerFailure, true)
-	if _, _, _, ok := c.get(testKey(2)); ok {
+	if _, _, _, status := c.get2(testKey(2)); status != cacheMiss {
 		t.Error("SERVFAIL must not be cached")
 	}
 
 	// A positive entry expires after its min TTL — but stays RETAINED for
-	// the §10.4 serve-stale window (get returns cacheStale, not a drop):
+	// the §10.4 serve-stale window (get2 reports cacheStale, not a drop):
 	// the entry only vanishes once the window itself passes.
 	c.putFreens(testKey(3), []dns.RR{testA(t, 60)}, dns.RcodeSuccess, true)
-	if _, _, _, ok := c.get(testKey(3)); !ok {
+	if _, _, _, status := c.get2(testKey(3)); status != cacheFresh {
 		t.Fatal("fresh positive entry should hit")
 	}
 	clock += 61
@@ -301,7 +302,7 @@ func TestResponseCachePolicy(t *testing.T) {
 		t.Errorf("Len inside the stale window = %d, want 1 (retained for revalidation)", got)
 	}
 	clock += int64(constants.StaleServeSecs)
-	if _, _, _, ok := c.get(testKey(3)); ok {
+	if _, _, _, status := c.get2(testKey(3)); status != cacheMiss {
 		t.Error("positive entry must drop once the stale window passes")
 	}
 	if got := c.Len(); got != 0 {
@@ -592,9 +593,9 @@ func TestResponseCachePersistRoundTrip(t *testing.T) {
 	if err := c2.LoadFrom(path); err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if rrs, rcode, _, ok := c2.get(ck); !ok || rcode != dns.RcodeSuccess ||
+	if rrs, rcode, _, status := c2.get2(ck); status != cacheFresh || rcode != dns.RcodeSuccess ||
 		len(rrs) != 1 || !rrs[0].(*dns.A).A.Equal(net.IPv4(203, 0, 113, 9)) || rrs[0].Header().Ttl != 600 {
-		t.Fatalf("restored positive = ok %v rcode %d rrs %v", ok, rcode, rrs)
+		t.Fatalf("restored positive = status %v rcode %d rrs %v", status, rcode, rrs)
 	}
 	if _, rcode, _, status := c2.get2(nk); status != cacheFresh || rcode != dns.RcodeNameError {
 		t.Fatalf("restored negative = status %v rcode %d", status, rcode)
@@ -615,6 +616,59 @@ func TestResponseCachePersistRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLoadFromHonorsMaxEntries: a cache whose maxEntries shrank between save
+// and load restores at most maxEntries entries, in file order.
+func TestLoadFromHonorsMaxEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dns-cache.json")
+	wireRR := func(t *testing.T, name string) []byte {
+		t.Helper()
+		rr := &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300}, A: net.IPv4(203, 0, 113, 1)}
+		buf := make([]byte, 65535)
+		n, err := dns.PackRR(rr, buf, 0, nil, false)
+		if err != nil || n <= 0 {
+			t.Fatalf("pack RR: n=%d err=%v", n, err)
+		}
+		return buf[:n]
+	}
+	mk := func(name string) persistedEntry {
+		return persistedEntry{
+			Name: name, Qtype: dns.TypeA, Qclass: dns.ClassINET,
+			Rcode: dns.RcodeSuccess, AA: true, ExpiresAt: 2_000,
+			RRs: [][]byte{wireRR(t, name)},
+		}
+	}
+	pc := persistedCache{
+		SavedAt: 1_000,
+		Entries: []persistedEntry{mk("first.footld."), mk("second.footld."), mk("third.footld.")},
+	}
+	b, err := json.Marshal(pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewResponseCache(2, func() int64 { return 1_500 })
+	if err := c.LoadFrom(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Len(); got != 2 {
+		t.Fatalf("Len after load = %d, want 2 (maxEntries honored)", got)
+	}
+	// The FIRST maxEntries entries in FILE order survive.
+	for _, name := range []string{"first.footld.", "second.footld."} {
+		ck := cacheKey{name: name, qtype: dns.TypeA, qclass: dns.ClassINET}
+		if _, _, _, status := c.get2(ck); status != cacheFresh {
+			t.Errorf("%s missing after load (file order must be preserved)", name)
+		}
+	}
+	third := cacheKey{name: "third.footld.", qtype: dns.TypeA, qclass: dns.ClassINET}
+	if _, _, _, status := c.get2(third); status != cacheMiss {
+		t.Error("entry past maxEntries restored")
+	}
+}
+
 func TestResponseCacheLoadCorruptIgnored(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dns-cache.json")
 	if err := os.WriteFile(path, []byte("{\"entries\": [broken"), 0o600); err != nil {
@@ -628,7 +682,7 @@ func TestResponseCacheLoadCorruptIgnored(t *testing.T) {
 	ck := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
 	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
-	if _, _, _, ok := c.get(ck); !ok {
+	if _, _, _, status := c.get2(ck); status != cacheFresh {
 		t.Fatal("cache unusable after a corrupt load")
 	}
 	if err := os.WriteFile(path, []byte("not a cache at all"), 0o600); err != nil {
@@ -803,6 +857,79 @@ func TestSweepRefreshesLeavesColdEntriesAlone(t *testing.T) {
 	clock.Store(clock.Load() + 601 + int64(refreshSweepHorizon) + 10)
 	if kicked := r.SweepRefreshes(clock.Load()); kicked != 0 {
 		t.Fatalf("sweep kicked %d for a cold entry, want 0 (abandoned names must age out)", kicked)
+	}
+}
+
+// TestPutFreensRefreshDoesNotReArmWarmSet is the putFreens twin of
+// TestSweepRefreshesLeavesColdEntriesAlone: a put that REPLACES an existing
+// entry is a refresh (sweeper, prefetch, stale revalidation), NOT a client
+// hit — the replacement carries the old entry's lastHit over, so a refresh
+// loop cannot re-qualify an abandoned name forever (one name permanently
+// consuming the refreshSweepBatch walk budget). A genuine CLIENT hit (get2)
+// does touch lastHit and keeps the name in the warm set.
+func TestPutFreensRefreshDoesNotReArmWarmSet(t *testing.T) {
+	now := int64(1_000_000)
+	c := NewResponseCache(0, func() int64 { return now })
+	ck := testKey(7)
+	ans := func() []dns.RR {
+		return []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: ck.name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.IPv4(203, 0, 113, 9),
+		}}
+	}
+
+	// Client era: one resolved query, then abandonment.
+	c.putFreens(ck, ans(), dns.RcodeSuccess, true)
+
+	// The sweeper keeps revalidating past the horizon only while the name
+	// is warm — here it is NOT, so every tick's re-put must leave the entry
+	// cold: replace-with-carried-lastHit, never lastHit=now.
+	now += int64(refreshSweepHorizon) + 1
+	for i := 0; i < 4; i++ {
+		now += 400 // past the 300 s TTL: every refresh replaces an expired entry
+		c.putFreens(ck, ans(), dns.RcodeSuccess, true)
+	}
+	now += 301 // the last refresh's data expires too
+	if got := c.SweepCandidates(now, refreshSweepHorizon, 100); len(got) != 0 {
+		t.Fatalf("refreshed-but-abandoned entry still in the warm set: %v — a refresh must not count as a client hit", got)
+	}
+
+	// A genuine client hit re-warms it: the name is swept again.
+	c.putFreens(ck, ans(), dns.RcodeSuccess, true) // e.g. a fresh walk re-cached it
+	if _, _, _, status := c.get2(ck); status != cacheFresh {
+		t.Fatalf("client get = %v, want cacheFresh", status)
+	}
+	now += 301
+	got := c.SweepCandidates(now, refreshSweepHorizon, 100)
+	if len(got) != 1 || got[0] != ck {
+		t.Fatalf("client-hit entry missing from the sweep: %v, want [%v]", got, ck)
+	}
+}
+
+// TestSweepRefreshesPrunesStaleBookkeeping: the sweeper tick prunes the
+// refresh-kick bookkeeping (same TTL rule as the insert path), so a
+// low-traffic box's maps do not linger at the cap forever between bursts.
+func TestSweepRefreshesPrunesStaleBookkeeping(t *testing.T) {
+	w := newFreensWorld(t)
+	r := newResolver(configFor(t, w, RouteFREENS), newFakeLookup(), nil)
+	r.Cache = NewResponseCache(0, func() int64 { return fixedNow }) // empty: no kicks fired
+
+	now := int64(1_000_000)
+	r.flightMu.Lock()
+	r.refreshes = map[cacheKey]int64{testKey(1): now - 10_000, testKey(2): now}
+	r.flightMu.Unlock()
+
+	r.SweepRefreshes(now)
+
+	r.flightMu.Lock()
+	_, staleKept := r.refreshes[testKey(1)]
+	_, freshKept := r.refreshes[testKey(2)]
+	r.flightMu.Unlock()
+	if staleKept {
+		t.Error("stale refresh bookkeeping survived the sweep prune")
+	}
+	if !freshKept {
+		t.Error("fresh refresh bookkeeping must survive the sweep prune")
 	}
 }
 

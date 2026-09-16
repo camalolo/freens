@@ -20,7 +20,8 @@
         </select>
         <input type="text" name="upstream_url" placeholder="https://dns.example/dns-query" value="{{.UpstreamURL}}" autocomplete="off">
       </div>
-      <div class="muted mt">Applied live on a running daemon — no restart needed.</div>
+      {{if .DaemonReload}}<div class="muted mt">Applied live on a running daemon — no restart needed.</div>
+      {{else}}<div class="muted mt">The daemon is not running — changes apply when it next starts.</div>{{end}}
     </div>
 
     <div class="mt">

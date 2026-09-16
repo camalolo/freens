@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -96,7 +97,7 @@ func (n *NginxEnv) Locate() error {
 	if n.ConfPath != "" {
 		return nil
 	}
-	res, err := n.run(context.Background(), n.Binary, "-V")
+	res, err := n.runBounded(n.Binary, "-V")
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrNginxNotFound, err)
 	}
@@ -491,7 +492,17 @@ func (n *NginxEnv) Install(home, keysDir, displayName, passphrase string, opts I
 			lines: strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n"),
 			mode:  mode,
 		}
-		for _, blk := range perFile[file] {
+		// One file commonly holds BOTH halves of a twin vhost (the :80 and
+		// the :443 block with the same server_name). Apply each file's block
+		// edits BOTTOM-UP (descending Start): every splice then lands at the
+		// offsets the scan recorded. Top-down, the first edit's inserted
+		// lines shift every later block's recorded range and the next edit
+		// splices into the wrong place (found live: our ssl_certificate ended
+		// up paired with the foreign key and a stray `listen 443 ssl` landed
+		// in the :80 block).
+		blks := append([]Block(nil), perFile[file]...)
+		sort.Slice(blks, func(i, j int) bool { return blks[i].Start > blks[j].Start })
+		for _, blk := range blks {
 			servesOurs := containsName(blk.CertPaths, r.CertPath)
 			if servesOurs && len(blk.CertPaths) == 1 {
 				res.Already = true
@@ -542,18 +553,34 @@ func (n *NginxEnv) Install(home, keysDir, displayName, passphrase string, opts I
 	res.UsedSudo = usedSudo
 
 	// Validate BEFORE reload; restore on failure so nginx never inherits a
-	// broken config from us.
+	// broken config from us. The restore goes through writeConfigFile — so
+	// an escalated edit is restored escalated — and its errors are CHECKED:
+	// claiming a restore that failed would leave /etc/nginx broken while the
+	// operator reads "backup restored" and hunts elsewhere.
 	if verr := n.Validate(usedSudo); verr != nil {
+		var restoreErrs []error
+		var broken []string
 		for i := range pendings {
 			pd := &pendings[i]
 			if !pd.changed {
 				continue
 			}
-			if b, rerr := os.ReadFile(pd.file + ".freens-pre"); rerr == nil {
-				_, _ = writeConfigFile(pd.file, b, pd.mode)
+			broken = append(broken, pd.file)
+			backup := pd.file + ".freens-pre"
+			b, rerr := os.ReadFile(backup)
+			if rerr != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("read %s: %v", backup, rerr))
+				continue
+			}
+			if _, werr := writeConfigFile(pd.file, b, pd.mode); werr != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("restore %s: %v", pd.file, werr))
 			}
 		}
-		return nil, fmt.Errorf("nginx -t rejected the edit (backup restored): %v", verr)
+		if len(restoreErrs) > 0 {
+			return nil, fmt.Errorf("nginx -t rejected the edit (%v) AND THE RESTORE FAILED — config left broken; fix or remove %s manually, the .freens-pre backups hold the originals (restore errors: %v)",
+				verr, strings.Join(broken, ", "), errors.Join(restoreErrs...))
+		}
+		return nil, fmt.Errorf("nginx -t rejected the edit (config restored): %v", verr)
 	}
 	res.Validated = true
 
@@ -755,9 +782,43 @@ func ReloadNginx(binary, conf string) error {
 	return n.Reload(true)
 }
 
+// sudoProbeTTL is how long a sudoAvailable verdict is reused (both
+// outcomes): the web UI hits the probe per click, and each probe is a
+// process spawn with a 5 s budget.
+const sudoProbeTTL = 30 * time.Second
+
+var (
+	sudoMu        sync.Mutex
+	sudoOK        bool
+	sudoCheckedAt time.Time
+)
+
+// resetSudoCache clears the cached sudoAvailable verdict (tests).
+func resetSudoCache() {
+	sudoMu.Lock()
+	sudoCheckedAt = time.Time{}
+	sudoMu.Unlock()
+}
+
 // sudoAvailable reports whether non-interactive sudo works here (one cheap
-// probe; the web UI hits this per click so failures are cached briefly).
+// probe, cached for sudoProbeTTL — both outcomes; the web UI hits this per
+// click and the probe costs a process spawn + a 5 s budget).
 var sudoAvailable = func() bool {
+	sudoMu.Lock()
+	if !sudoCheckedAt.IsZero() && time.Since(sudoCheckedAt) < sudoProbeTTL {
+		ok := sudoOK
+		sudoMu.Unlock()
+		return ok
+	}
+	sudoMu.Unlock()
+	ok := probeSudo()
+	sudoMu.Lock()
+	sudoOK, sudoCheckedAt = ok, time.Now()
+	sudoMu.Unlock()
+	return ok
+}
+
+func probeSudo() bool {
 	if runtime.GOOS == "windows" {
 		return false
 	}

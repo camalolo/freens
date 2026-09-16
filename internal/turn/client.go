@@ -201,8 +201,13 @@ func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 // WriteTo tunnels p to addr: lazily creates the permission (bounded wait),
 // then sends a Send indication. Returns len(p) on fire (indications are
 // unacknowledged per the RFC); a permission timeout still sends best-effort
-// — the permission may land moments later.
+// — the permission may land moments later. Payloads past maxDataPayload
+// are REFUSED with an error: they would encode past the receiver's
+// maxMessageLen and be silently dropped instead of relayed.
 func (c *Conn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if len(p) > maxDataPayload {
+		return 0, fmt.Errorf("turn: payload %d bytes exceeds the %d-byte tunnel budget", len(p), maxDataPayload)
+	}
 	ua, ok := addr.(*net.UDPAddr)
 	if !ok {
 		u, err := net.ResolveUDPAddr("udp", addr.String())

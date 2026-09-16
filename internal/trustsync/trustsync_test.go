@@ -668,6 +668,62 @@ func TestSweepSpoolRemovesExpired(t *testing.T) {
 	}
 }
 
+// TestPurgeUninstallsAfterRestart: the installed map is in-memory ONLY —
+// after a daemon restart it is empty while the persisted state (and the
+// real system-store copies it once described) survive. Both purge paths
+// (OnAliasDead, `trust remove`) must therefore uninstall UNCONDITIONALLY:
+// with 10 y cross-certs (v0.17) a stale same-subject anchor left behind is
+// a decade-long poisoning hazard (OpenSSL anchors the expired copy — the
+// minipc expired-anchor lesson), not a day-old nuisance.
+func TestPurgeUninstallsAfterRestart(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	opts.SystemStore = true
+	opts.SysCAPath = t.TempDir()
+	e1 := mustEngine(t, opts)
+	bobID := []byte{1, 2, 3}
+	caBob, _ := ownerCA(t, ownerSeed(t, 7), "bob", clock)
+	caCat, _ := ownerCA(t, ownerSeed(t, 8), "cat", clock)
+	e1.OnOwnerCA("bob", bobID, caBob, clock.Add(24*time.Hour).Unix(), false)
+	e1.OnOwnerCA("cat", []byte{4, 5, 6}, caCat, clock.Add(24*time.Hour).Unix(), false)
+	for _, alias := range []string{"bob", "cat"} {
+		if _, err := os.Stat(e1.SystemCertPath(alias)); err != nil {
+			t.Fatalf("fixture: system copy for %s missing: %v", alias, err)
+		}
+	}
+
+	// The restart: a fresh engine restores the persisted state while the
+	// installed map starts empty — the old gate would skip both uninstalls.
+	e2 := mustEngine(t, opts)
+	e2.mu.Lock()
+	restored := len(e2.state) == 2 && len(e2.installed) == 0
+	e2.mu.Unlock()
+	if !restored {
+		t.Fatal("fixture: restart should restore state with an empty installed map")
+	}
+
+	// Alias death uninstalls despite the empty map.
+	e2.OnAliasDead("bob", bobID)
+	if _, err := os.Stat(e2.SystemCertPath("bob")); !os.IsNotExist(err) {
+		t.Errorf("system copy survived alias death across a restart (err=%v)", err)
+	}
+	if n := len(e2.Snapshot()); n != 1 {
+		t.Errorf("state entries after OnAliasDead = %d, want 1", n)
+	}
+
+	// The operator path (`freens trust remove`) likewise.
+	if !e2.RemoveAlias("cat") {
+		t.Fatal("RemoveAlias reported nothing to remove")
+	}
+	if _, err := os.Stat(e2.SystemCertPath("cat")); !os.IsNotExist(err) {
+		t.Errorf("system copy survived RemoveAlias across a restart (err=%v)", err)
+	}
+	if n := len(e2.Snapshot()); n != 0 {
+		t.Errorf("state entries after RemoveAlias = %d, want 0", n)
+	}
+}
+
 // mkVintageExpired mints a PRE-v0.17-shaped cross-cert whose validity has
 // already passed — the short-lived vintage real boxes still carry on disk
 // after upgrading. CrossCert itself no longer mints lease-capped certs, so
@@ -802,6 +858,37 @@ func TestMintThrottle(t *testing.T) {
 	e.mu.Unlock()
 	if mintedAt != clock.Unix() {
 		t.Fatalf("missing-spool re-mint did not stamp MintedAt: %d != %d", mintedAt, clock.Unix())
+	}
+}
+
+// TestMintThrottleSpoolMissingBeatsThrottle: the missing-spool case must be
+// checked BEFORE the mint throttle — the spool is the privileged bridge's
+// source of truth, so its loss forces an immediate re-mint instead of
+// waiting out the hour throttle (the documented "state fresh but spool
+// vanished re-mints" invariant).
+func TestMintThrottleSpoolMissingBeatsThrottle(t *testing.T) {
+	clock := time.Now()
+	opts := testOpts(t)
+	opts.Now = func() time.Time { return clock }
+	e := mustEngine(t, opts)
+	caDER, _ := ownerCA(t, ownerSeed(t, 7), "bob", clock)
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(48*time.Hour).Unix(), false)
+
+	// Minutes later — well INSIDE the throttle — the spool file vanishes:
+	// the next notification must re-mint at once.
+	clock = clock.Add(5 * time.Minute)
+	if err := os.Remove(e.spoolPath("bob")); err != nil {
+		t.Fatal(err)
+	}
+	e.OnOwnerCA("bob", []byte{1}, caDER, clock.Add(48*time.Hour).Unix(), false)
+	e.mu.Lock()
+	mintedAt := e.state["bob"].MintedAt
+	e.mu.Unlock()
+	if mintedAt != clock.Unix() {
+		t.Fatalf("missing-spool re-mint waited out the throttle: MintedAt=%d, want %d", mintedAt, clock.Unix())
+	}
+	if _, err := os.Stat(e.spoolPath("bob")); err != nil {
+		t.Fatalf("re-mint did not restore the spool file: %v", err)
 	}
 }
 

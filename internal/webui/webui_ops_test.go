@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,7 +82,7 @@ func TestOpsRegisterFullFlow(t *testing.T) {
 	if r, err := f.daem.Resolve(context.Background(), "opsflow"); err != nil || r == nil || !r.Found {
 		t.Fatalf("resolve after register: %v %+v", err, r)
 	} else {
-		if got := firstAdminIPText(r.RRset); got != "203.0.113.90" {
+		if got := firstIP(r.RRset); got != "203.0.113.90" {
 			t.Errorf("resolved IP = %q, want 203.0.113.90", got)
 		}
 	}
@@ -131,7 +132,7 @@ func TestOpsSetNameRenewRevoke(t *testing.T) {
 	}
 	if r, err := f.daem.Resolve(ctx, "www.lifecycle"); err != nil || r == nil || !r.Found {
 		t.Fatalf("resolve www: %v %+v", err, r)
-	} else if got := firstAdminIPText(r.RRset); got != "203.0.113.81" {
+	} else if got := firstIP(r.RRset); got != "203.0.113.81" {
 		t.Errorf("www IP = %q", got)
 	}
 
@@ -157,9 +158,59 @@ func TestOpsSetNameRenewRevoke(t *testing.T) {
 	if r, err := f.daem.Resolve(ctx, "lifecycle"); err != nil || r == nil || !r.Revoked {
 		t.Fatalf("resolve revoked: %v %+v", err, r)
 	}
-	// And the tombstone bumps the next publish's sequence base.
-	if seq, err := f.ops.SetName(ctx, "lifecycle", "203.0.113.83", 300, pass); err != nil || seq != 3 {
-		t.Fatalf("post-revoke SetName: seq=%d err=%v", seq, err)
+	// And the tombstone bumps the next publish's sequence base. The apex
+	// re-publish is REGISTER's job — SetName refuses the apex (the guard:
+	// a bare-RRset apex publish would strip the §7.4 claim, the TLSCA
+	// binding and the recovery policy) — so re-register and expect the
+	// tombstone's 2 + 1.
+	res, err := f.ops.Register(ctx, RegisterInput{Alias: "lifecycle", IP: "203.0.113.83", Passphrase: pass}, nil)
+	if err != nil {
+		t.Fatalf("post-revoke re-register: %v", err)
+	}
+	if res.Sequence != 3 {
+		t.Errorf("post-revoke re-register sequence = %d, want 3 (tombstone 2 + 1)", res.Sequence)
+	}
+}
+
+// TestOpsSetNameRefusesApex mirrors TestOpsSetNameRenewRevoke for the apex
+// guard: "(apex)" was offered by the name-detail form, and publishing a
+// fresh apex record with RRset only silently stripped the §7.4 claim, the
+// §9.5 TLSCA binding and the recovery policy (later renewals copy the
+// stripped fields forward — the verify=19 outage class). The CLI twin
+// refuses the same input (cli/name.go); the webui must too.
+func TestOpsSetNameRefusesApex(t *testing.T) {
+	f := newOpsFixture(t)
+	ctx, cancelMain := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancelMain()
+
+	const pass = "apex guard secret"
+	if _, err := f.ops.Register(ctx, RegisterInput{Alias: "guarded", IP: "203.0.113.60", Passphrase: pass}, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Apex target: refused with the CLI's wording, nothing published.
+	_, err := f.ops.SetName(ctx, "guarded", "203.0.113.61", 300, pass)
+	if err == nil {
+		t.Fatal("SetName on the apex must refuse")
+	}
+	if !strings.Contains(err.Error(), "apex itself") || !strings.Contains(err.Error(), "register owns the apex") {
+		t.Errorf("error %q does not carry the apex-refusal wording", err)
+	}
+	// The existing apex record is untouched: still found, still seq 1.
+	r, rerr := f.daem.Resolve(ctx, "guarded")
+	if rerr != nil || r == nil || !r.Found {
+		t.Fatalf("resolve after refused apex publish: %v %+v", rerr, r)
+	}
+	if r.Sequence != 1 {
+		t.Errorf("apex sequence = %d after the refused publish, want 1 (nothing published)", r.Sequence)
+	}
+	if got := firstIP(r.RRset); got != "203.0.113.60" {
+		t.Errorf("apex IP = %q, want the registered address (record untouched)", got)
+	}
+
+	// A sub-name still works exactly as before.
+	if seq, err := f.ops.SetName(ctx, "www.guarded", "203.0.113.62", 300, pass); err != nil || seq != 1 {
+		t.Fatalf("SetName www after the refusal: seq=%d err=%v", seq, err)
 	}
 }
 

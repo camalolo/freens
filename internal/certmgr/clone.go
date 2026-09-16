@@ -13,6 +13,7 @@ package certmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -104,11 +105,35 @@ func (n *NginxEnv) installCloned(home, keysDir string, r *Renewal, cloneFrom str
 	}
 
 	// Validate BEFORE reload; a failed clone leaves only OUR file behind —
-	// remove it and the tree is exactly as before.
+	// remove it and the tree is exactly as before. Escalated writes are
+	// root-owned in root-owned directories, so the removal must go through
+	// the SAME privilege path: a sudo-installed clone the daemon user
+	// cannot unlink stays in the config tree and bricks every nginx
+	// reload/restart while the message claims "(removed)" — removal errors
+	// are checked, and the post-cleanup tree is re-validated.
 	if verr := n.Validate(res.UsedSudo); verr != nil {
-		os.Remove(real)
+		var rmErrs []error
+		if err := removeConfigPath(real, res.UsedSudo); err != nil {
+			rmErrs = append(rmErrs, err)
+		}
 		if link != "" {
-			_ = os.Remove(link)
+			if err := removeConfigPath(link, res.UsedSudo); err != nil {
+				rmErrs = append(rmErrs, err)
+			}
+		}
+		if cerr := n.Validate(res.UsedSudo); cerr != nil {
+			// Still broken without our file: either a removal failed or the
+			// tree was already broken before the clone. Never claim "removed".
+			if len(rmErrs) > 0 {
+				return nil, fmt.Errorf("nginx -t rejected the cloned vhost (%v); cleanup FAILED (%v) and the config tree is STILL broken (nginx -t: %v) — fix or remove %s manually",
+					verr, errors.Join(rmErrs...), cerr, real)
+			}
+			return nil, fmt.Errorf("nginx -t rejected the cloned vhost (%v); the clone was removed but the config tree is STILL broken (nginx -t: %v) — the tree was already broken before the clone; run nginx -t to investigate",
+				verr, cerr)
+		}
+		if len(rmErrs) > 0 {
+			return nil, fmt.Errorf("nginx -t rejected the cloned vhost; cleanup was incomplete (%v) — verify %s (and its enabled-side link) are gone",
+				errors.Join(rmErrs...), real)
 		}
 		return nil, fmt.Errorf("nginx -t rejected the cloned vhost (removed): %v", verr)
 	}
@@ -238,6 +263,29 @@ func ensureSymlink(dst, target string, allowSudo bool) error {
 	res, err := execRunner(ctx, "sudo", "-n", "ln", "-sfn", rel, dst)
 	if err != nil {
 		return fmt.Errorf("sudo ln: %v: %s", err, strings.TrimSpace(res.Stderr))
+	}
+	return nil
+}
+
+// removeConfigPath removes a config file (or enabled-side symlink) that
+// certmgr created, undoing an install. A file written through the sudo path
+// (`sudo -n install`) is root-owned in a root-owned directory: the daemon
+// user's direct unlink is refused, so the removal goes through the same
+// privilege path (`sudo -n rm -f` via the execRunner seam). Callers treat a
+// failure as an error — a leftover rejected clone bricks every nginx reload.
+func removeConfigPath(path string, escalated bool) error {
+	if !escalated {
+		return os.Remove(path)
+	}
+	if !sudoAvailable() {
+		// No privilege path available: try direct anyway and report honestly.
+		return os.Remove(path)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, err := execRunner(ctx, "sudo", "-n", "rm", "-f", "--", path)
+	if err != nil {
+		return fmt.Errorf("sudo rm %s: %v: %s", path, err, strings.TrimSpace(res.Stderr))
 	}
 	return nil
 }

@@ -215,7 +215,7 @@ func buildXferWorld(t *testing.T, a *xferNode, alias string, now int64) *xferWor
 		t.Fatal(err)
 	}
 	v1Rec.Claim = cb
-	txt, err := wire.TXT("freens-tld-v1", 10)
+	txt, err := wire.NewRR(wire.RRTypeTXT, 10, []byte("freens-tld-v1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func mintTransfer(t *testing.T, a *xferNode, w *xferWorld, now int64) {
 	v2Rec.Delegation = w.k2.Public() // "subtree authority follows"
 	v2Rec.PrevHash = h1              // the auditable hand-off link
 	v2Rec.Claim = w.claimBytes       // the alias follows the TLD (§8.3)
-	txt, err := wire.TXT("freens-tld-v2", 10)
+	txt, err := wire.NewRR(wire.RRTypeTXT, 10, []byte("freens-tld-v2"))
 	if err != nil {
 		t.Fatal(err)
 	}

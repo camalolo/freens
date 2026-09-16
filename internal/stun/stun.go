@@ -98,6 +98,17 @@ const (
 	// discoverTimeout caps one whole Discover (send + wait) at 3 s, per the
 	// project's §6.2 contract. A ctx deadline earlier than this wins.
 	discoverTimeout = 3 * time.Second
+
+	// Serve-loop read-error discipline (serve): a transient read error —
+	// a spurious ICMP wakeup on a connected UDP socket, an ephemeral
+	// fd hiccup — is tolerated, but a PERSISTENTLY erroring socket must
+	// not busy-spin a core. Pause briefly once a few consecutive errors
+	// pile up, and give the socket up entirely after a long streak (Close
+	// remains the normal exit: it sets closed, and serve returns on the
+	// closed check regardless of the streak).
+	readErrBackoff     = 10 * time.Millisecond
+	readErrBackoffAt   = 3   // consecutive errors before the pause starts
+	readErrGiveUpAfter = 100 // consecutive errors before serve exits
 )
 
 // ---------------------------------------------------------------------------
@@ -437,14 +448,22 @@ func (s *Server) Close() error {
 func (s *Server) serve() {
 	defer s.wg.Done()
 	buf := make([]byte, readBufSize)
+	errs := 0 // consecutive read errors (reset on any successful read)
 	for {
 		n, raddr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			if s.closed.Load() {
 				return
 			}
-			continue // transient read error (e.g. a spurious ICMP wakeup)
+			errs++
+			if d, giveUp := readErrPause(errs); giveUp {
+				return // persistently erroring socket: stop pinning the core
+			} else if d > 0 {
+				time.Sleep(d)
+			}
+			continue
 		}
+		errs = 0
 		if !isBindingRequest(buf[:n]) {
 			continue // not a Binding Request: silently ignore (§7.1)
 		}
@@ -453,6 +472,19 @@ func (s *Server) serve() {
 			return
 		}
 	}
+}
+
+// readErrPause maps a streak of consecutive read errors to the serve loop's
+// next move: how long to pause before the next read (0 = none), and whether
+// the streak is so long the socket should be given up entirely.
+func readErrPause(errs int) (d time.Duration, giveUp bool) {
+	if errs >= readErrGiveUpAfter {
+		return 0, true
+	}
+	if errs >= readErrBackoffAt {
+		return readErrBackoff, false
+	}
+	return 0, false
 }
 
 // isBindingRequest reports whether m is a structurally well-formed Binding

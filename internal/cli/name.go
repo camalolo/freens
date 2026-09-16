@@ -33,18 +33,36 @@ func cmdName(args []string) error {
 	ip := fs.String("ip", "", "IPv4 address for the A record (default: the apex's current A record)")
 	ttl := fs.Uint64("ttl", 300, "A record TTL in seconds")
 	peersCSV := fs.String("peers", "", "comma-separated bootstrap peers as ip:port#<64-hex-pubkey> (standalone mode; default: the running daemon)")
-	if err := fs.Parse(args); err != nil {
+	// Leading positional (the natural `name www.alice -ttl 600` form), like
+	// renew/revoke/forget: stdlib flag stops at the first non-flag argument.
+	var lead []string
+	rest := args
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		lead, rest = rest[:1], rest[1:]
+	}
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	if len(fs.Args()) != 1 {
+	// Anything after the name lands in fs.Args() verbatim — including
+	// misordered flags (`name www.alice -ttl 600` would otherwise try to
+	// publish a name literally called "-ttl"). Fail with the truthful
+	// renew-style error instead.
+	for _, a := range fs.Args() {
+		if strings.HasPrefix(a, "-") {
+			return usageErr("flags must come BEFORE the name (got %q after a name)", a)
+		}
+	}
+	names := append(lead, fs.Args()...)
+	if len(names) != 1 {
 		return usageErr("name takes exactly one name: <label>.<alias> (e.g. www.alice)")
 	}
-	labels, alias, err := naming.DecomposeName(fs.Args()[0])
+	displayName := names[0]
+	labels, alias, err := naming.DecomposeName(displayName)
 	if err != nil {
-		return usageErr("invalid name %q: %v", fs.Args()[0], err)
+		return usageErr("invalid name %q: %v", displayName, err)
 	}
 	if len(labels) == 0 {
-		return usageErr("%q is the apex itself — register owns the apex; name adds <label>.<alias> sub-names", fs.Args()[0])
+		return usageErr("%q is the apex itself — register owns the apex; name adds <label>.<alias> sub-names", displayName)
 	}
 
 	// --- owner key from the keychain ----------------------------------------
@@ -71,7 +89,6 @@ func cmdName(args []string) error {
 	if err != nil {
 		return err
 	}
-	displayName := fs.Args()[0]
 
 	// --- current state: this name's sequence + the apex's A record ----------
 	// Sequence discovery fetches the envelope by key (tombstones included —
@@ -179,7 +196,13 @@ func cmdName(args []string) error {
 			return fmt.Errorf("publish (daemon): %w", err)
 		}
 	} else {
-		if err := node.Publish(nodeCtx, env); err != nil {
+		// A fresh budget for the publish leg: discovery already consumed an
+		// unbounded share of the shared node ctx (two walks + gets), so a
+		// publish riding the leftovers could die mid-walk on a busy keyspace
+		// — same shape as renewOne's standalone publish.
+		pctx, pcancel := context.WithTimeout(context.Background(), cliTimeout)
+		defer pcancel()
+		if err := node.Publish(pctx, env); err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}
 	}

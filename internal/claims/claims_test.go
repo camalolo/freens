@@ -327,6 +327,89 @@ func TestNilWitnessesEncodesAsEmptyArray(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// FreshAttestations evaluation cap (§8.3 mergeReAttests input bound)
+// ---------------------------------------------------------------------------
+
+// TestFreshAttestationsEvaluationCap: the merged hGet answer-set is
+// untrusted input of attacker-influenceable size, so FreshAttestations must
+// Ed25519-evaluate at most maxWitnessEvaluations attestations — the same
+// deduped-evaluation bound ValidWitnesses applies. With ALL entries valid
+// and fresh, the number of accepted attestations EQUALS the number of
+// evaluations, so an output longer than the cap would prove the cap absent;
+// asserting exactly the cap pins the bound. (Deduplication still works
+// inside the window: repeated NodeIDs are collapsed to the first.)
+func TestFreshAttestationsEvaluationCap(t *testing.T) {
+	const now = int64(1_700_000_000)
+	const window = int64(600)
+	ph := bytes.Repeat([]byte{0x42}, constants.SHA256Len)
+
+	build := func(n int) []*WitnessAttestation {
+		t.Helper()
+		atts := make([]*WitnessAttestation, 0, n)
+		for i := 0; i < n; i++ {
+			kp, err := crypto.Generate()
+			if err != nil {
+				t.Fatalf("witness Generate: %v", err)
+			}
+			w, err := NewWitnessAttestation(kp, uint64(now), ph) // fresh, in-window
+			if err != nil {
+				t.Fatalf("NewWitnessAttestation: %v", err)
+			}
+			atts = append(atts, w)
+		}
+		return atts
+	}
+
+	// Well under the cap: everything valid passes through.
+	small := build(4)
+	if got := FreshAttestations(small, ph, now, window); len(got) != 4 {
+		t.Fatalf("FreshAttestations(4 valid) = %d, want 4", len(got))
+	}
+
+	// Over the cap: evaluation (and therefore output) stops at the cap.
+	big := build(maxWitnessEvaluations + 25)
+	if got := FreshAttestations(big, ph, now, window); len(got) != maxWitnessEvaluations {
+		t.Fatalf("FreshAttestations(%d valid) = %d, want the cap %d", len(big), len(got), maxWitnessEvaluations)
+	}
+
+	// Duplicates do not buy extra evaluations: 3× the cap of the SAME
+	// attestation collapses to one entry (first-occurrence dedup).
+	dup := make([]*WitnessAttestation, 0, 3*maxWitnessEvaluations)
+	for i := 0; i < 3*maxWitnessEvaluations; i++ {
+		dup = append(dup, small[0])
+	}
+	if got := FreshAttestations(dup, ph, now, window); len(got) != 1 {
+		t.Fatalf("FreshAttestations(all duplicates) = %d, want 1 (deduped)", len(got))
+	}
+}
+
+// TestInferDifficultyOf pins the single-source §6.2/A.4 inference rule:
+// Nonce[0] when it is at least the baseline, else the baseline.
+func TestInferDifficultyOf(t *testing.T) {
+	withDifficulty(t, 24, func() {
+		if got := InferDifficultyOf(&AliasClaim{Nonce: []byte{30}}); got != 30 {
+			t.Errorf("Nonce[0]=30 vs baseline 24: got %d, want 30", got)
+		}
+		if got := InferDifficultyOf(&AliasClaim{Nonce: []byte{8}}); got != 24 {
+			t.Errorf("Nonce[0]=8 vs baseline 24: got %d, want 24", got)
+		}
+		if got := InferDifficultyOf(&AliasClaim{Nonce: nil}); got != 24 {
+			t.Errorf("empty nonce: got %d, want the baseline 24", got)
+		}
+		if got := InferDifficultyOf(&AliasClaim{Nonce: []byte{24}}); got != 24 {
+			t.Errorf("Nonce[0]=24 == baseline: got %d, want 24", got)
+		}
+	})
+	// The baseline is read from the RETUNABLE atomic (the whole point of the
+	// single source): lowering it lets a sub-24 Nonce[0] stand.
+	withDifficulty(t, 8, func() {
+		if got := InferDifficultyOf(&AliasClaim{Nonce: []byte{8}}); got != 8 {
+			t.Errorf("Nonce[0]=8 vs retuned baseline 8: got %d, want 8", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // VerifyPoW inference (lowered PoWDifficultyInit)
 // ---------------------------------------------------------------------------
 
@@ -413,9 +496,9 @@ func orderPtrs(cs []*AliasClaim) []uint64 {
 	return out
 }
 
-// OrderKey tie-break on pow_hash then tld_id (with equal timestamps, impossible
-// for distinct claimants but exercised by fabricating two claims sharing a
-// timestamp).
+// LessOrderKey tie-break on pow_hash then tld_id (with equal timestamps,
+// impossible for distinct claimants but exercised by fabricating two claims
+// sharing a timestamp).
 func TestOrderKeyTieBreak(t *testing.T) {
 	withDifficulty(t, 8, func() {
 		const ts = uint64(1234)

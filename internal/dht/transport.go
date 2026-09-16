@@ -471,10 +471,8 @@ func (n *Node) penalized(id []byte, now int64) bool {
 // LookupStats reports what one iterative lookup did (issue #1
 // observability + the degraded-miss classification).
 type LookupStats struct {
-	ProbesSent      int      // candidate probes issued
-	ProbesFailed    int      // probes that errored (timeout / unreachable / malformed)
-	ProbesThrottled int      // probes answered with §12 error 301 "throttled" (peer alive, rate-limited)
-	ProbedNodeIDs   [][]byte // IDs probed, in order (penalized contacts excluded)
+	ProbesFailed    int // probes that errored (timeout / unreachable / malformed)
+	ProbesThrottled int // probes answered with §12 error 301 "throttled" (peer alive, rate-limited)
 }
 
 // ErrDegradedMiss reports a lookup that found nothing while some probes
@@ -1972,11 +1970,10 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	}
 	// §8.3: a re-attestation is evidence — this node keeps what it signed
 	// (per claim identity) so hGet can serve it to verifiers merging fresh
-	// quorums across the converged set.
+	// quorums across the converged set. prefixHash was length-checked and
+	// prefix-bound above, so the hex identity is always the real one.
 	if reattest {
-		if phHex := hex.EncodeToString(prefixHash); phHex != "" {
-			n.claims.StoreReAttests(kClaimFor(aliasN), phHex, []*claims.WitnessAttestation{att})
-		}
+		n.claims.StoreReAttests(kClaimFor(aliasN), hex.EncodeToString(prefixHash), []*claims.WitnessAttestation{att})
 	}
 	// Appendix A.4: count the accepted claim only on this node's FIRST
 	// co-sign of the alias (`seen` from the witnessLast probe above);
@@ -2108,6 +2105,12 @@ func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []b
 		delete(n.pending, key)
 		n.mu.Unlock()
 	}()
+	// A stopped Timer (not time.After): every RPC that finishes early — the
+	// overwhelmingly common case — would otherwise leave its timeout tick
+	// parked on the runtime timer heap until it fires, one leak-per-RPC on
+	// chatty walks.
+	timer := time.NewTimer(rpcTimeout())
+	defer timer.Stop()
 	if n.conn == nil {
 		return nil, errors.New("dht: transport not started")
 	}
@@ -2117,7 +2120,7 @@ func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []b
 	select {
 	case resp := <-ch:
 		return resp, nil
-	case <-time.After(rpcTimeout()):
+	case <-timer.C:
 		return nil, ErrTimeout
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -2292,8 +2295,6 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 		var wg sync.WaitGroup
 		for i, c := range batch {
 			queried[string(c.NodeID)] = true
-			stats.ProbesSent++
-			stats.ProbedNodeIDs = append(stats.ProbedNodeIDs, c.NodeID)
 			wg.Add(1)
 			go func(i int, c *NodeContact) {
 				defer wg.Done()
@@ -2737,24 +2738,17 @@ func (n *Node) PublishClaimStats(ctx context.Context, env *wire.SignedEnvelope) 
 	return []PublishStats{stats}, perr
 }
 
-// PublishKeyedAt publishes env at the EXPLICIT keys (the dht.StorageKeys
-// set: K_tld/K_name plus K_claim for claim-carrying records). Exported for
-// the daemon's auto-renew loop, which re-publishes a re-signed envelope at
-// every key its predecessor legitimately lived at. Best-effort like Publish:
-// nil when at least one target accepted. On total failure the LAST underlying
-// error is returned (v0.9.1: it used to collapse every failure — including
-// "accepted by 0 of N peers", i.e. peers refusing the put — into ErrNoPeers,
-// which masked the 2026-08-22 §8.4 deadlock as a phantom connectivity
-// problem); ErrNoPeers is returned only when no key could even be attempted
-// against a known peer.
-func (n *Node) PublishKeyedAt(ctx context.Context, keys [][]byte, env *wire.SignedEnvelope) error {
-	_, err := n.PublishKeyedAtStats(ctx, keys, env)
-	return err
-}
-
-// PublishKeyedAtStats is PublishKeyedAt with per-key PublishStats: the
-// caller can see, per key, how many of the R targets accepted. Error
-// semantics are identical (last failure when NO key published).
+// PublishKeyedAtStats publishes env at the EXPLICIT keys (the dht.StorageKeys
+// set: K_tld/K_name plus K_claim for claim-carrying records) — the daemon's
+// auto-renew loop and reconciler re-publish a re-signed envelope at every key
+// its predecessor legitimately lived at, with per-key PublishStats so the
+// caller can see, per key, how many of the R targets accepted. Best-effort
+// like Publish: nil when at least one target accepted. On total failure the
+// LAST underlying error is returned (v0.9.1: it used to collapse every
+// failure — including "accepted by 0 of N peers", i.e. peers refusing the
+// put — into ErrNoPeers, which masked the 2026-08-22 §8.4 deadlock as a
+// phantom connectivity problem); ErrNoPeers is returned only when no key
+// could even be attempted against a known peer.
 func (n *Node) PublishKeyedAtStats(ctx context.Context, keys [][]byte, env *wire.SignedEnvelope) ([]PublishStats, error) {
 	published := false
 	var lastErr error
@@ -3457,9 +3451,25 @@ func cacheFreshness(env *wire.SignedEnvelope) int64 {
 	return min
 }
 
-// freshLocked reports whether the cached env under key is still fresh at now.
-// Keys never fetched by this lookup (authoritative-local) are always fresh.
+// freshLocked reports whether the cached env under key may be served WITHOUT
+// a network walk at now. Two gates, either of which forces a re-walk:
+//
+//   - CACHE freshness: keys never fetched by this lookup (authoritative-local,
+//     including PUSHED cache copies a peer put directly into the store) are
+//     always inside the freshness window; a fetched copy stays fresh for one
+//     cacheFreshness window past its fetch stamp.
+//   - RECORD validity (v0.18.1, the www.camalolo incident): a cached copy
+//     whose record is past its own expires is NEVER served, however fresh the
+//     cache stamp — the §7.4 checklist would NXDOMAIN it while the network may
+//     hold a newer generation, and without this gate a pushed/no-stamp copy
+//     (fresh forever by the first gate) masked the expiry entirely: the box
+//     NXDOMAINed without ever re-walking. Authoritative-local copies expired
+//     the same way — correct, the owner's reconciler renews (the §6.4
+//     ExpiryGrace only bounds the STORE's lazy eviction, not serving).
 func (l *DHTLookup) freshLocked(key []byte, env *wire.SignedEnvelope, now int64) bool {
+	if env == nil || env.Record == nil || now >= int64(env.Record.Expires) {
+		return false
+	}
 	var k [constants.SHA256Len]byte
 	copy(k[:], key)
 	fa, ok := l.fetchedAt[k]
@@ -3507,6 +3517,13 @@ func (l *DHTLookup) stampFetchedAt(key []byte, now int64) {
 	}
 	l.mu.Lock()
 	for _, kk := range dead {
+		// Re-check under the second lock: between the snapshot and here a
+		// concurrent Lookup may have re-fetched the envelope (store alive
+		// again) — deleting its stamp would launder a network cache into an
+		// authoritative-local key (always-fresh, never re-walked).
+		if l.store.Has(kk[:], now) {
+			continue
+		}
 		delete(l.fetchedAt, kk)
 	}
 	l.mu.Unlock()
@@ -3537,10 +3554,13 @@ func (l *DHTLookup) expiredWinner(ctx context.Context, key []byte, env *wire.Sig
 }
 
 // Lookup returns the winning SignedEnvelope for wireName: a fresh local hit
-// first; a stale network-cached hit triggers re-validation via an iterative
-// GET (on fetch failure the stale copy is served — offline resilience, the
-// §6.4 grace analogue); a total miss fetches and caches. Returns (nil, nil)
-// when no record is available locally or across the reachable network.
+// first (fresh = inside the cache-freshness window AND not past its record
+// expires — see freshLocked; an expired local hit falls through and re-walks,
+// where the expiredWinner warm-and-retry applies); a stale network-cached hit
+// triggers re-validation via an iterative GET (on fetch failure the stale copy
+// is served — offline resilience, the §6.4 grace analogue); a total miss
+// fetches and caches. Returns (nil, nil) when no record is available locally
+// or across the reachable network.
 func (l *DHTLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*wire.SignedEnvelope, error) {
 	key, err := KeyForWireName(wireName)
 	if err != nil {
@@ -3652,7 +3672,8 @@ func (l *DHTLookup) LoadFetchMetaJSON(data []byte) error {
 // Semantics per path, mirroring Lookup with one claim-specific refinement:
 //
 //	fresh local hit (authoritative seeds have no fetchedAt and are always
-//	fresh; fetched caches are fresh for cacheFreshness):
+//	fresh; fetched caches are fresh for cacheFreshness; either way the
+//	record must still be unexpired or the lookup re-walks):
 //	  serve it — the fast path, unchanged.
 //	stale/absent local + network walk finds an envelope:
 //	  adopt and cache it (§6.4 EnvelopeWins already picked the max-sequence
@@ -3833,7 +3854,7 @@ func (l *rateLimiter) allow(key []byte) bool {
 			// uncapped map is an unbounded-memory bug — found auditing
 			// the flood paths).
 			if len(l.buckets) >= limiterMaxEntries {
-				l.evictLRULocked(limiterMaxEntries - limiterMaxEntries/4)
+				l.evictLRULocked(limiterMaxEntries-limiterMaxEntries/4, now)
 			}
 		}
 		b = &tokenBucket{tokens: l.burst, last: now}
@@ -3863,7 +3884,7 @@ func (l *rateLimiter) sweepIdleLocked(now time.Time) {
 // evictLRULocked drops least-recently-touched entries until len(buckets) is
 // at most target (never dropping a bucket touched within the last second, so
 // an in-progress honest burst survives). Caller must hold l.mu.
-func (l *rateLimiter) evictLRULocked(target int) {
+func (l *rateLimiter) evictLRULocked(target int, now time.Time) {
 	type lastT struct {
 		k    string
 		last time.Time
@@ -3873,7 +3894,7 @@ func (l *rateLimiter) evictLRULocked(target int) {
 		all = append(all, lastT{k, b.last})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].last.Before(all[j].last) })
-	cutoff := time.Now().Add(-time.Second)
+	cutoff := now.Add(-time.Second)
 	dropped := 0
 	for _, e := range all {
 		if len(l.buckets)-dropped <= target || e.last.After(cutoff) {
@@ -3972,9 +3993,13 @@ func encodeNodes(contacts []*NodeContact) []any {
 }
 
 // advertiseableAddr reports whether addr is a literal "ip:port" whose host
-// parses as a SPECIFIED IP address — the only shape §6.2 allows on the wire.
-// See the encodeNodes doc for the "<nil>:port" failure this prevents.
+// parses as a SPECIFIED IP address and whose port is in 1..65535 — the only
+// shape §6.2 allows on the wire. See the encodeNodes doc for the "<nil>:port"
+// failure this prevents.
 func advertiseableAddr(addr string) bool {
+	if p := portOf(addr); p <= 0 || p > 65535 {
+		return false
+	}
 	ip := net.ParseIP(hostOf(addr))
 	return ip != nil && !ip.IsUnspecified()
 }
@@ -4014,7 +4039,10 @@ func parseNodes(raw any) []*NodeContact {
 			continue
 		}
 		port, ok := asUint64(ea[1])
-		if !ok {
+		// Port sanity: a negative CBOR int decodes through asUint64 as a
+		// huge uint64, and port 0 advertises nothing dialable — both are
+		// garbage, skipped like the malformed entries around them.
+		if !ok || port == 0 || port > 65535 {
 			continue
 		}
 		nodeID, ok := ea[2].([]byte)

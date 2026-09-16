@@ -110,7 +110,7 @@ func TestRRConstructors(t *testing.T) {
 	if aaaa.TTL != 600 {
 		t.Errorf("AAAA TTL = %d, want 600", aaaa.TTL)
 	}
-	txt, err := TXT("hello", 100)
+	txt, err := NewRR(RRTypeTXT, 100, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,20 +164,21 @@ func TestRRWireArray(t *testing.T) {
 }
 
 // TestRREmptyRdataEncodesAsEmptyBstr pins the B1 fix: a nil Rdata (reachable
-// via TXT("") or NewRR(typ,ttl,nil), since []byte("") and append(nil,nil...)
-// are nil) must encode as CBOR empty bstr (0x40), NOT CBOR null (0xf6). The
-// Python reference emits b"" never null, and strict CBOR decoders reject null
-// for a bstr-typed field. Both the global canonicalEM NilContainerAsEmpty
-// setting and the defensive normalization in RR.MarshalCBOR guard this.
+// via NewRR(RRTypeTXT, ttl, []byte("")) or NewRR(typ,ttl,nil), since
+// []byte("") and append(nil,nil...) are nil) must encode as CBOR empty bstr
+// (0x40), NOT CBOR null (0xf6). The Python reference emits b"" never null,
+// and strict CBOR decoders reject null for a bstr-typed field. Both the
+// global canonicalEM NilContainerAsEmpty setting and the defensive
+// normalization in RR.MarshalCBOR guard this.
 func TestRREmptyRdataEncodesAsEmptyBstr(t *testing.T) {
-	// TXT("") yields a nil Rdata: []byte("") is nil, and NewRR's
-	// append([]byte(nil), nil...) returns nil.
-	rr, err := TXT("", 300)
+	// NewRR(RRTypeTXT, ttl, []byte("")) yields a nil Rdata: []byte("") is
+	// nil, and NewRR's append([]byte(nil), nil...) returns nil.
+	rr, err := NewRR(RRTypeTXT, 300, []byte(""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rr.Rdata != nil {
-		t.Fatalf("precondition: TXT(\"\").Rdata = %v, want nil", rr.Rdata)
+		t.Fatalf("precondition: NewRR(RRTypeTXT,300,[]byte(\"\")).Rdata = %v, want nil", rr.Rdata)
 	}
 
 	// Direct marshal via the exported MarshalCBOR (uses canonicalEM + nil

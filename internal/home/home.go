@@ -10,12 +10,14 @@
 package home
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/dht"
 )
 
@@ -43,8 +45,6 @@ func Dir() string {
 
 // ConfPath is the daemon config (INI: resolver sections + [dht]).
 func ConfPath() string { return filepath.Join(Dir(), "freens.conf") }
-
-// NodeKeyPath is the daemon's node identity keyfile (@keyfile form).
 
 func SeedsPath() string { return filepath.Join(Dir(), "seeds.conf") }
 
@@ -112,11 +112,10 @@ func SavePeerbook(peers []dht.Peer, now int64) error {
 	if err := Ensure(); err != nil {
 		return err
 	}
-	tmp := PeerbookPath() + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, PeerbookPath())
+	// atomicfile.Write (perm 0600 — the mode the hand-rolled tmp+rename
+	// used): temp file in the target dir, fsync, rename, dir-fsync — no
+	// half-written or orphaned book.json.tmp after a crash.
+	return atomicfile.Write(PeerbookPath(), b, 0o600)
 }
 
 // LoadPeerbook reads the learned book (nil when absent/unreadable —
@@ -132,39 +131,11 @@ func LoadPeerbook() []dht.Peer {
 	}
 	var out []dht.Peer
 	for _, p := range pj.Peers {
-		pk, err := hexDecode(p.PK)
+		pk, err := hex.DecodeString(p.PK)
 		if err != nil || len(pk) != 32 || p.Addr == "" {
 			continue
 		}
 		out = append(out, dht.Peer{Addr: p.Addr, PublicKey: pk, Confirmed: p.Confirmed})
 	}
 	return out
-}
-
-func hexDecode(s string) ([]byte, error) {
-	if len(s)%2 != 0 {
-		return nil, fmt.Errorf("odd length")
-	}
-	out := make([]byte, len(s)/2)
-	for i := range out {
-		hi := hexVal(s[2*i])
-		lo := hexVal(s[2*i+1])
-		if hi < 0 || lo < 0 {
-			return nil, fmt.Errorf("bad hex")
-		}
-		out[i] = byte(hi<<4 | lo)
-	}
-	return out, nil
-}
-
-func hexVal(c byte) int {
-	switch {
-	case c >= '0' && c <= '9':
-		return int(c - '0')
-	case c >= 'a' && c <= 'f':
-		return int(c-'a') + 10
-	case c >= 'A' && c <= 'F':
-		return int(c-'A') + 10
-	}
-	return -1
 }

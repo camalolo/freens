@@ -164,7 +164,10 @@ func networkLeaseState(nv *admin.NetworkView) string {
 	case !nv.ClaimFound:
 		return "missing"
 	case nv.ClaimExpires <= uint64(time.Now().Unix()):
-		return fmt.Sprintf("expired at %s", time.Unix(int64(nv.ClaimExpires), 0).Format("15:04"))
+		// Date included: a lapsed lease can easily be days old (the
+		// renewal-starved shapes), and "expired at 15:04" reads like
+		// "15 minutes ago" without one.
+		return fmt.Sprintf("expired at %s", time.Unix(int64(nv.ClaimExpires), 0).Format("2006-01-02 15:04"))
 	default:
 		return "stale"
 	}
@@ -363,7 +366,7 @@ func cmdDoctor(args []string) error {
 		case terr != nil:
 			warn("TLS trust sync state unavailable (older daemon or disabled: %v)", terr)
 		default:
-			check(true, "TLS trust root %s…", fp[:16])
+			check(true, "TLS trust root %s…", shortHash(fp))
 			if len(cross) == 0 {
 				warn("TLS: no namespaces cross-certified yet — resolve a freens name with a TLSCA record (§9.5.5: first https visit may need one retry)")
 			} else {

@@ -41,6 +41,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/wire"
@@ -444,22 +445,8 @@ func (p *ClaimPool) PersistClaimPoolMeta(dir string) error {
 		return fmt.Errorf("dht: persist-claim-pool meta marshal: %w", err)
 	}
 	final := filepath.Join(dir, "claims-meta.json")
-	tmp, err := os.CreateTemp(dir, ".claims-meta.tmp-*")
-	if err != nil {
-		return fmt.Errorf("dht: persist-claim-pool meta temp in %q: %w", dir, err)
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return fmt.Errorf("dht: persist-claim-pool meta write %q: %w", tmp.Name(), err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return fmt.Errorf("dht: persist-claim-pool meta close: %w", err)
-	}
-	if err := os.Rename(tmp.Name(), final); err != nil {
-		os.Remove(tmp.Name())
-		return fmt.Errorf("dht: persist-claim-pool meta rename %q: %w", final, err)
+	if err := atomicfile.Write(final, b, 0o600); err != nil {
+		return fmt.Errorf("dht: persist-claim-pool meta write %q: %w", final, err)
 	}
 	return nil
 }
@@ -643,9 +630,8 @@ func poolEntryLess(a, b PoolEntry) bool {
 
 // PersistClaimPoolTo writes every pooled claim envelope as
 // <H_record hex>.cbor into dir (created if missing), after a Sweep so only
-// live claims and in-window §8.4 tombstones are written. Same
-// temp-file-then-rename write as EnvelopeStore.PersistTo. Returns the number
-// written.
+// live claims and in-window §8.4 tombstones are written. Same atomicfile
+// write as EnvelopeStore.PersistTo. Returns the number written.
 func (p *ClaimPool) PersistClaimPoolTo(dir string, now int64) (int, error) {
 	if p == nil {
 		return 0, nil
@@ -666,22 +652,8 @@ func (p *ClaimPool) PersistClaimPoolTo(dir string, now int64) (int, error) {
 		}
 		name := hex.EncodeToString(h)
 		final := filepath.Join(dir, name+".cbor")
-		tmp, err := os.CreateTemp(dir, "."+name+".tmp-*")
-		if err != nil {
-			return written, fmt.Errorf("dht: persist-claim-pool temp file in %q: %w", dir, err)
-		}
-		if _, err := tmp.Write(b); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-claim-pool write %q: %w", tmp.Name(), err)
-		}
-		if err := tmp.Close(); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-claim-pool close %q: %w", tmp.Name(), err)
-		}
-		if err := os.Rename(tmp.Name(), final); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-claim-pool rename %q: %w", final, err)
+		if err := atomicfile.Write(final, b, 0o600); err != nil {
+			return written, fmt.Errorf("dht: persist-claim-pool write %q: %w", final, err)
 		}
 		written++
 	}

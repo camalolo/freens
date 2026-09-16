@@ -585,6 +585,12 @@ func (l *DHTLookup) CollectClaimsWithWitnesses(ctx context.Context, alias string
 // optional resolver.ReAttestSource interface (same structural-satisfaction
 // trick as CollectClaims — the import would cycle).
 func (l *DHTLookup) ReAttestSets(ctx context.Context, alias string, now int64) (map[string][]*claims.WitnessAttestation, error) {
+	if l.node == nil {
+		// Island (a nil-node lookup over a local store): no pool, no stored
+		// re-attestations — the empty set (same contract as the nil-node
+		// paths of Lookup / CollectClaims / LookupClaim).
+		return map[string][]*claims.WitnessAttestation{}, nil
+	}
 	key, err := KeyForClaim(alias)
 	if err != nil {
 		return nil, err

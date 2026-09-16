@@ -140,6 +140,60 @@ func TestCertSubcommandDispatch(t *testing.T) {
 	}
 }
 
+// TestCertUnknownSubcommandNeverBecomesAName: a typo'd subcommand (`cert
+// rene`) must not reach the issuer as certificate NAME "rene" — it gets
+// the usage listing instead. A REAL keychain name keeps issuing.
+func TestCertUnknownSubcommandNeverBecomesAName(t *testing.T) {
+	home := tempHome(t)
+	keys := filepath.Join(home, "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := keychain.Save(keychain.OwnerKeyPath(keys, "alice"), lifecycleKeypair(t, 9), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Typo'd subcommand, empty-ish keychain for "rene": refused with the
+	// subcommand list, nothing issued.
+	_, err := captureStdout(t, func() error { return cmdCert([]string{"rene"}) })
+	if err == nil || !strings.Contains(err.Error(), "neither a subcommand nor a name") || !strings.Contains(err.Error(), "cert renew") {
+		t.Fatalf("typo'd subcommand = %v, want the usage listing", err)
+	}
+	if _, serr := os.Stat(filepath.Join(home, "rene.crt")); serr == nil {
+		t.Fatal("rene.crt was issued for a typo'd subcommand")
+	}
+
+	// A real keychain name still flows through to the issuer.
+	out := filepath.Join(home, "out")
+	got, err := captureStdout(t, func() error {
+		return cmdCert([]string{"-out-dir", out, "-no-track", "alice"})
+	})
+	if err != nil {
+		t.Fatalf("cert <owned name>: %v\n%s", err, got)
+	}
+	if _, serr := os.Stat(filepath.Join(out, "alice.crt")); serr != nil {
+		t.Fatalf("owned-name issue produced no cert: %v", serr)
+	}
+}
+
+// TestShortHash: the display clamp never panics on daemon-provided values
+// shorter than the usual 64-hex fingerprint.
+func TestShortHash(t *testing.T) {
+	long := strings.Repeat("ab", 32) // 64 hex chars, the normal sha256 shape
+	if got := shortHash(long); got != long[:16] {
+		t.Errorf("shortHash(64 hex) = %q, want %q", got, long[:16])
+	}
+	if got := shortHash("abc"); got != "abc" {
+		t.Errorf("shortHash(short) = %q, want it verbatim", got)
+	}
+	if got := shortHash(""); got != "" {
+		t.Errorf("shortHash(empty) = %q, want empty", got)
+	}
+	if got := shortHash("0123456789abcdef0123"); got != "0123456789abcdef" {
+		t.Errorf("shortHash(21 chars) = %q, want the 16-char clamp", got)
+	}
+}
+
 func TestFlagsFirstLetsNamesLead(t *testing.T) {
 	// The natural CLI order (name before flags) must parse — Go's flag
 	// package stops at the first positional otherwise.

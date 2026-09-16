@@ -97,33 +97,33 @@ func TestReuseWindowEndMatrix(t *testing.T) {
 
 	// In window: died 1 h ago, 30-day window open.
 	env, _, _ := tombstoneFixture(t, alias, uint64(now-90000), now-90000, now-3600, true, false)
-	if end := reuseWindowEnd(env, alias, now); end != now-3600+int64(constants.AliasReuseDelay) {
+	if end, _ := reuseWindowEnd(env, alias, now); end != now-3600+int64(constants.AliasReuseDelay) {
 		t.Errorf("in-window tombstone: end = %d, want %d", end, now-3600+int64(constants.AliasReuseDelay))
 	}
 	// Still alive: not a tombstone.
 	alive, _, _ := tombstoneFixture(t, alias, uint64(now-100), now-100, now+3600, true, false)
-	if end := reuseWindowEnd(alive, alias, now); end != 0 {
+	if end, _ := reuseWindowEnd(alive, alias, now); end != 0 {
 		t.Errorf("alive carrier: end = %d, want 0", end)
 	}
 	// Window closed (> 30 d past expiry): inert.
 	closedAt := now - int64(constants.AliasReuseDelay) - 10
 	closed, _, _ := tombstoneFixture(t, alias, uint64(closedAt-86400), closedAt-86400, closedAt, true, false)
-	if end := reuseWindowEnd(closed, alias, now); end != 0 {
+	if end, _ := reuseWindowEnd(closed, alias, now); end != 0 {
 		t.Errorf("closed window: end = %d, want 0", end)
 	}
 	// Revoked (§8.5 deliberate death): NOT a tombstone.
 	revoked, _, _ := tombstoneFixture(t, alias, uint64(now-90000), now-90000, now-3600, true, true)
-	if end := reuseWindowEnd(revoked, alias, now); end != 0 {
+	if end, _ := reuseWindowEnd(revoked, alias, now); end != 0 {
 		t.Errorf("revoked carrier: end = %d, want 0", end)
 	}
 	// Quorum-less fabrication: NOT a tombstone (locking must cost a real
 	// registration — the rigged-node bar).
 	fabricated, _, _ := tombstoneFixture(t, alias, uint64(now-90000), now-90000, now-3600, false, false)
-	if end := reuseWindowEnd(fabricated, alias, now); end != 0 {
+	if end, _ := reuseWindowEnd(fabricated, alias, now); end != 0 {
 		t.Errorf("quorum-less fabrication: end = %d, want 0", end)
 	}
 	// Wrong alias: evidence for a different K_claim.
-	if end := reuseWindowEnd(env, "otheralias", now); end != 0 {
+	if end, _ := reuseWindowEnd(env, "otheralias", now); end != 0 {
 		t.Errorf("alias mismatch: end = %d, want 0", end)
 	}
 	// Foreign signer (carrier not signed by the claimant): NOT a tombstone.
@@ -136,7 +136,7 @@ func TestReuseWindowEndMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if end := reuseWindowEnd(foreign, alias, now); end != 0 {
+	if end, _ := reuseWindowEnd(foreign, alias, now); end != 0 {
 		t.Errorf("foreign signer: end = %d, want 0", end)
 	}
 }

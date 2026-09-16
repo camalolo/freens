@@ -114,6 +114,16 @@ const (
 	// maxMessageLen caps the header length field (bytes after the header).
 	maxMessageLen = 2048
 
+	// maxDataPayload is the largest DATA value the tunnel can carry: a
+	// Send/Data indication's body is XOR-PEER-ADDRESS (4+8 bytes, v4) +
+	// DATA (4 bytes header + value + 0..3 padding), and the body must stay
+	// ≤ maxMessageLen or the receiving parseMessage silently DROPS the
+	// datagram. With padding included, every payload ≤ maxDataPayload
+	// encodes to a body ≤ maxMessageLen. The client's WriteTo rejects
+	// anything larger; the relay loop drops oversized peer datagrams
+	// rather than relay a truncated prefix.
+	maxDataPayload = maxMessageLen - 2*attrHdrLen - 8
+
 	// authTag domain-separates the node-key signature (mirrors
 	// wire.RecoverySigningTag).
 	authTag = "freens-turn-v1"

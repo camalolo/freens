@@ -125,6 +125,23 @@ func sameSite(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// securityHeaders pins the baseline hardening headers on every mux
+// response — pages, mutations, fragments, the auth faces, the DoH faces,
+// static assets. It wraps the mux itself (Handler()), the one chokepoint
+// page() and mutation() and the unauthenticated faces all pass through.
+// Deliberately NO strict CSP: the layout/register pages carry inline
+// scripts and would break. /healthz is reachable probes' business and gets
+// the headers for free — harmless.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // logRequests is a compact one-line access log (Info level: this server has
 // no CLI polling noise).
 func (s *Server) logRequests(next http.Handler) http.Handler {

@@ -208,3 +208,30 @@ func TestSetURLWithColonsSurvives(t *testing.T) {
 		t.Errorf("round trip = %q %v %v, want %q", v, ok, err, url)
 	}
 }
+
+// TestSetRejectsNewlineInjection: Set writes "key = value" VERBATIM, so a
+// \n or \r inside either operand would inject whole config lines (e.g.
+// value "9.9.9.9\n[dht]\nport = 1"). Set must refuse before touching the
+// file — the original content stays untouched.
+func TestSetRejectsNewlineInjection(t *testing.T) {
+	original := "[upstream]\nservers = 9.9.9.9\n"
+	path := writeConf(t, original)
+
+	injections := []struct{ name, key, val string }{
+		{"newline in value", "servers", "9.9.9.9\n[dht]\nport = 1"},
+		{"CR in value", "servers", "9.9.9.9\revil"},
+		{"newline in key", "doh\nserve", "true"},
+		{"CRLF in key", "do\rh", "true"},
+		{"bare CR in section-write value", "upstream", "\r"},
+	}
+	for _, tc := range injections {
+		if err := Set(path, "upstream", tc.key, tc.val); err == nil {
+			t.Errorf("%s: Set accepted newline-bearing input", tc.name)
+		} else if !strings.Contains(err.Error(), "newline") {
+			t.Errorf("%s: unhelpful error: %v", tc.name, err)
+		}
+		if got := readConf(t, path); got != original {
+			t.Fatalf("%s: file was modified by the refused Set:\n%s", tc.name, got)
+		}
+	}
+}

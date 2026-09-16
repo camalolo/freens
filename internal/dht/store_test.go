@@ -66,7 +66,7 @@ func envBytes(t *testing.T, env *wire.SignedEnvelope) int {
 }
 
 // ---------------------------------------------------------------------------
-// Basic Put / Get / Has / Count / SizeBytes
+// Basic Put / Get / Has / Count + the running byte counter
 // ---------------------------------------------------------------------------
 
 func TestEnvelopeStoreBasicPutGet(t *testing.T) {
@@ -101,8 +101,8 @@ func TestEnvelopeStoreBasicPutGet(t *testing.T) {
 	if !bytes.Equal(rhNew, rhGot) {
 		t.Error("Get returned an envelope with a different RecordHash")
 	}
-	if want := envBytes(t, env); s.SizeBytes() != want {
-		t.Errorf("SizeBytes = %d, want %d", s.SizeBytes(), want)
+	if want := envBytes(t, env); s.bytes != want {
+		t.Errorf("byte counter = %d, want %d", s.bytes, want)
 	}
 }
 
@@ -111,8 +111,8 @@ func TestEnvelopeStoreEmptyStore(t *testing.T) {
 	if s.Count() != 0 {
 		t.Errorf("Count = %d, want 0", s.Count())
 	}
-	if s.SizeBytes() != 0 {
-		t.Errorf("SizeBytes = %d, want 0", s.SizeBytes())
+	if s.bytes != 0 {
+		t.Errorf("byte counter = %d, want 0", s.bytes)
 	}
 	if got, _ := s.Get(keyN(0), 1000); got != nil {
 		t.Error("Get on empty store should return nil")
@@ -518,18 +518,24 @@ func TestEnvelopeStoreEvictExpiredSweep(t *testing.T) {
 		t.Fatalf("Count = %d, want 1", c)
 	}
 
-	// Advance well past grace and sweep.
+	// Advance well past grace and sweep (the same sweep Put runs after every
+	// acceptance; the direct call pins its contract).
 	farFuture := int64(2000 + constants.ExpiryGrace + 1000)
-	n := s.EvictExpired(farFuture)
+	s.mu.Lock()
+	n := s.evictExpiredLocked(farFuture)
+	s.mu.Unlock()
 	if n != 1 {
-		t.Errorf("EvictExpired = %d, want 1", n)
+		t.Errorf("expired sweep = %d, want 1", n)
 	}
 	if c := s.Count(); c != 0 {
 		t.Errorf("Count after sweep = %d, want 0", c)
 	}
 	// A second sweep on an empty store is a no-op returning 0.
-	if n := s.EvictExpired(farFuture); n != 0 {
-		t.Errorf("EvictExpired on empty = %d, want 0", n)
+	s.mu.Lock()
+	n = s.evictExpiredLocked(farFuture)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Errorf("expired sweep on empty = %d, want 0", n)
 	}
 }
 
@@ -556,8 +562,8 @@ func TestEnvelopeStoreByteCapLRU(t *testing.T) {
 	if ok, _ := s.Put(k2, env, 1001, true); !ok {
 		t.Fatal("Put(k2) should accept")
 	}
-	if s.SizeBytes() > cap {
-		t.Fatalf("after k1,k2 SizeBytes=%d > cap=%d", s.SizeBytes(), cap)
+	if s.bytes > cap {
+		t.Fatalf("after k1,k2 bytes=%d > cap=%d", s.bytes, cap)
 	}
 
 	// Third put overflows; LRU (k1) is evicted; the just-put k3 survives.
@@ -576,8 +582,8 @@ func TestEnvelopeStoreByteCapLRU(t *testing.T) {
 	if c := s.Count(); c != 2 {
 		t.Errorf("Count = %d, want 2", c)
 	}
-	if s.SizeBytes() > cap {
-		t.Errorf("SizeBytes = %d > cap %d after LRU eviction", s.SizeBytes(), cap)
+	if s.bytes > cap {
+		t.Errorf("bytes = %d > cap %d after LRU eviction", s.bytes, cap)
 	}
 }
 
@@ -668,7 +674,7 @@ func TestEnvelopeStoreInvalidKey(t *testing.T) {
 		t.Errorf("Count after invalid puts = %d, want 0", c)
 	}
 
-	// Get / Has with wrong-length keys.
+	// Get / Has / Remove with wrong-length keys.
 	if _, err := s.Get(tooShort, 1500); err == nil {
 		t.Error("Get with 31-byte key should return an error")
 	}
@@ -747,8 +753,8 @@ func makeChainedEnvAt(t *testing.T, sequence uint64, prevHash []byte, ownerKP *c
 	return env
 }
 
-// TestEnvelopeStoreByteCounterTracksEntries: the running byte counter behind
-// SizeBytes (O(1) per put on readLoop) must never drift from the ground
+// TestEnvelopeStoreByteCounterTracksEntries: the running byte counter
+// s.bytes (O(1) per put on readLoop) must never drift from the ground
 // truth — the sum of per-entry cached sizes. Exercises every mutation site:
 // fresh insert, same-key replacement, Remove, lazy Get eviction, the
 // expired sweep, and LRU cap shedding.
@@ -760,7 +766,8 @@ func TestEnvelopeStoreByteCounterTracksEntries(t *testing.T) {
 	check := func(stage string) {
 		t.Helper()
 		// Ground truth: Get every present key (lazily sweeping dead ones —
-		// exactly what SizeBytes has always counted) then sum the survivors.
+		// exactly what the counter has always tracked) then sum the
+		// survivors.
 		for _, k := range s.Keys() {
 			s.Get(k, clock)
 		}
@@ -768,8 +775,8 @@ func TestEnvelopeStoreByteCounterTracksEntries(t *testing.T) {
 		for _, e := range s.Entries(clock) {
 			want += envBytes(t, e.Env)
 		}
-		if got := s.SizeBytes(); got != want {
-			t.Fatalf("%s: SizeBytes() = %d, ground truth = %d — counter drifted", stage, got, want)
+		if got := s.bytes; got != want {
+			t.Fatalf("%s: byte counter = %d, ground truth = %d — counter drifted", stage, got, want)
 		}
 	}
 

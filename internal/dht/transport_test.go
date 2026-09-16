@@ -549,14 +549,20 @@ func TestIterativeGetDeadOnlyMissesFast(t *testing.T) {
 	if el := time.Since(start); el > 4*time.Second {
 		t.Errorf("dead-only miss took %v; want < 4s via probe budget", el)
 	}
-	// The penalty is active: a second walk must skip the corpse entirely
-	// (no probes at all — every unqueried candidate is penalized).
+	// The penalty is active: a second walk must skip the corpse entirely.
+	// (The corpse was already EVICTED from the table by the first walk's
+	// failure, so the second walk is an island: it returns a clean miss
+	// immediately, with no probe that could fail.)
+	start2 := time.Now()
 	_, stats2, err2 := b.IterativeGetDetailed(ctx, key)
 	if err2 != nil {
 		t.Fatalf("second walk: %v", err2)
 	}
-	if stats2.ProbesSent != 0 {
-		t.Errorf("second walk probed %d contact(s); the penalized corpse must be skipped", stats2.ProbesSent)
+	if stats2.ProbesFailed != 0 || stats2.ProbesThrottled != 0 {
+		t.Errorf("second walk stats = %+v; an island walk probes nothing", stats2)
+	}
+	if el := time.Since(start2); el > time.Second {
+		t.Errorf("second walk took %v; the penalized corpse must be skipped", el)
 	}
 }
 
@@ -580,8 +586,11 @@ func TestIterativeGetCleanMissIsNotDegraded(t *testing.T) {
 	if env != nil || err != nil {
 		t.Fatalf("clean miss = (%v, %v); want (nil, nil)", env, err)
 	}
-	if stats.ProbesFailed != 0 || stats.ProbesSent == 0 {
-		t.Errorf("stats = %+v; want probes sent, none failed", stats)
+	// The setup pinned a live candidate into B's table (AddPeer fails the
+	// test above), so this clean miss was ANSWERED, not an island — and no
+	// probe failed: an authoritative "not held".
+	if stats.ProbesFailed != 0 {
+		t.Errorf("stats = %+v; want no failed probes", stats)
 	}
 }
 
@@ -622,15 +631,19 @@ func TestIterativeGetPenaltySurvivesReadvertisement(t *testing.T) {
 	if err := b.AddPeer(d.PublicKey(), dAddr.String()); err != nil {
 		t.Fatal(err)
 	}
-	// A SECOND walk while the penalty is live must not probe the corpse.
-	_, stats, err := b.IterativeGetDetailed(ctx, key)
-	if err != nil {
+	// A SECOND walk while the penalty is live must not probe the corpse:
+	// the walk still interrogates the live holder (a), but a probe of the
+	// closed d would fail and EVICT it — its continued presence in the table
+	// is the proof the penalty skipped it.
+	start2 := time.Now()
+	if _, _, err := b.IterativeGetDetailed(ctx, key); err != nil {
 		t.Fatalf("second walk: %v", err)
 	}
-	for _, id := range stats.ProbedNodeIDs {
-		if string(id) == string(d.ID()) {
-			t.Error("the penalized corpse was re-probed inside the penalty window")
-		}
+	if got := b.RoutingTable().Get(d.ID()); got == nil {
+		t.Error("the penalized corpse was re-probed inside the penalty window (probe failure evicted it)")
+	}
+	if el := time.Since(start2); el > 2*time.Second {
+		t.Errorf("second walk took %v; probing the corpse would burn the 2s probe budget", el)
 	}
 }
 
@@ -683,32 +696,26 @@ func TestIterativeGetChurnFindsRecord(t *testing.T) {
 	_ = nodes[1].Publish(pubCtx, env) // best-effort fan-out; node 0 is the guaranteed holder
 
 	// Kill the 3 nodes (among 2..5) closest to the key.
-	type di struct {
-		i    int
-		dist []byte
-	}
-	var order []di
+	var order []*Node
 	for i, n := range nodes {
 		if i <= 1 {
 			continue // keep the publisher + node 0 (both hold the record)
 		}
-		dist, err := XORBytes(key, n.ID())
-		if err != nil {
-			t.Fatal(err)
-		}
-		order = append(order, di{i, dist})
+		order = append(order, n)
 	}
-	sort.Slice(order, func(a, b int) bool {
-		return bytes.Compare(order[a].dist, order[b].dist) < 0
+	// Closest first (the walker itself is not among them, so CompareDistance
+	// never ties here).
+	sort.SliceStable(order, func(a, b int) bool {
+		return CompareDistance(key, order[a].ID(), order[b].ID()) < 0
 	})
-	for _, k := range order[:3] {
-		if err := nodes[k.i].Close(); err != nil {
+	for _, n := range order[:3] {
+		if err := n.Close(); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// The searcher: a surviving node far from the key (the last in order).
-	searcher := nodes[order[len(order)-1].i]
+	searcher := order[len(order)-1]
 	start := time.Now()
 	got, stats, err := searcher.IterativeGetDetailed(ctx, key)
 	elapsed := time.Since(start)

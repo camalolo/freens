@@ -26,6 +26,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/wire"
 )
@@ -114,7 +115,7 @@ func (s *EnvelopeStore) EvidenceCount() int {
 
 // PersistEvidenceTo writes every retained §8.4 evidence blob as
 // <H_record hex>.cbor into dir (created if missing), using the same
-// temp-file-then-rename atomic write as [EnvelopeStore.PersistTo] /
+// atomicfile write as [EnvelopeStore.PersistTo] /
 // PersistHistoryTo. The filename IS the H_record key, so the daemon's -load
 // seeding can PutEvidenceRaw it back under the same key (the §8.4 evidence
 // analogue of the §8.3 history round trip). Returns the number written.
@@ -140,22 +141,8 @@ func (s *EnvelopeStore) PersistEvidenceTo(dir string) (int, error) {
 	written := 0
 	for _, e := range snapshot {
 		final := filepath.Join(dir, hex.EncodeToString(e.k[:])+".cbor")
-		tmp, err := os.CreateTemp(dir, "."+hex.EncodeToString(e.k[:])+".tmp-*")
-		if err != nil {
-			return written, fmt.Errorf("dht: persist-evidence temp file in %q: %w", dir, err)
-		}
-		if _, err := tmp.Write(e.raw); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-evidence write %q: %w", tmp.Name(), err)
-		}
-		if err := tmp.Close(); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-evidence close %q: %w", tmp.Name(), err)
-		}
-		if err := os.Rename(tmp.Name(), final); err != nil {
-			os.Remove(tmp.Name())
-			return written, fmt.Errorf("dht: persist-evidence rename %q: %w", final, err)
+		if err := atomicfile.Write(final, e.raw, 0o600); err != nil {
+			return written, fmt.Errorf("dht: persist-evidence write %q: %w", final, err)
 		}
 		written++
 	}
@@ -361,6 +348,7 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 	queried := make(map[string]bool, len(shortlist))
 	batchSize := constants.Alpha
 	probesFailed := 0
+	throttled := 0
 	for round := 0; round < maxLookupRounds; round++ {
 		// Nearest-first so the ALPHA un-queried we pick are the closest.
 		sort.SliceStable(shortlist, func(i, j int) bool {
@@ -408,6 +396,17 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 
 		roundAnswered := 0
 		for i, r := range results {
+			// §12 throttle: the peer is alive but withheld its answer. NOT a
+			// §6.2 failure (no eviction/penalty — and no adaptive-batch
+			// widening, hammering the throttling holder harder is wrong), but
+			// the "held or not" question went unanswered, so a finding-
+			// nothing walk below degrades (same classification as
+			// IterativeGetDetailed).
+			if errors.Is(r.err, ErrThrottled) {
+				roundAnswered++
+				throttled++
+				continue
+			}
 			// Kademlia failure handling (§6.2), as in IterativeGet: a
 			// parent-context cancellation is not a peer failure, and a
 			// failed-over node skips the corpse penalty.
@@ -435,7 +434,7 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 			}
 		}
 	}
-	if probesFailed > 0 {
+	if probesFailed > 0 || throttled > 0 {
 		return nil, ErrDegradedMiss
 	}
 	return nil, nil
@@ -443,7 +442,12 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 
 // evidenceFromPeer issues a single get(recordHash) RPC to c and parses the
 // §8.4 "evidence" piggyback and the closer-contacts list out of the response.
-// A y="e" response is a successful exchange (no evidence offered).
+// A y="e" response is a successful exchange (no evidence offered) — with ONE
+// exception, mirroring getFromPeer: a §12 301 "throttled" answer returns
+// [ErrThrottled] ("peer alive, answer withheld"), which the walk classifies
+// as DEGRADED — never as "the round answered with no evidence", which would
+// let a rate-limited holder turn an unprovable §8.4 hop into an
+// authoritative-looking clean miss.
 func (n *Node) evidenceFromPeer(ctx context.Context, recordHash []byte, c *NodeContact) ([]byte, []*NodeContact, error) {
 	addr, err := net.ResolveUDPAddr("udp", c.Addr)
 	if err != nil {
@@ -453,7 +457,13 @@ func (n *Node) evidenceFromPeer(ctx context.Context, recordHash []byte, c *NodeC
 	if err != nil {
 		return nil, nil, err
 	}
-	if resp == nil || resp.Y == wire.MsgTypeError {
+	if resp == nil {
+		return nil, nil, nil
+	}
+	if resp.Y == wire.MsgTypeError {
+		if code, ok := errorCode(resp); ok && code == 301 {
+			return nil, nil, ErrThrottled
+		}
 		return nil, nil, nil
 	}
 	raw, _ := resp.A["evidence"].([]byte)

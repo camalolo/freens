@@ -292,12 +292,11 @@ func TestRoutingTableClosest(t *testing.T) {
 				i, got[i].NodeID[0], want, got[0].NodeID, got[1].NodeID, got[2].NodeID)
 		}
 	}
-	// Verify distances to target are ascending.
+	// Verify distances to target are ascending (CompareDistance < 0 for the
+	// previous pair; 0 cannot occur — the node IDs are distinct).
 	for i := 1; i < len(got); i++ {
-		dPrev, _ := XORBytes(target, got[i-1].NodeID)
-		dCur, _ := XORBytes(target, got[i].NodeID)
-		if bytes.Compare(dPrev, dCur) > 0 {
-			t.Fatalf("Closest not ascending at %d: prev=%x cur=%x", i, dPrev, dCur)
+		if CompareDistance(target, got[i-1].NodeID, got[i].NodeID) > 0 {
+			t.Fatalf("Closest not ascending at %d: prev=%x cur=%x", i, got[i-1].NodeID, got[i].NodeID)
 		}
 	}
 	// Closest entry must be the 0x81 contact (smallest distance to zero).

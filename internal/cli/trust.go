@@ -90,17 +90,14 @@ func cmdTrustList(args []string) error {
 	}
 	fmt.Printf("%-20s %-12s %-18s %-21s %s\n", "ALIAS", "STATUS", "CA (sha256/16)", "NOT_AFTER", "SYSTEM")
 	for _, s := range snap {
-		ca := s.CASha256
-		if len(ca) > 16 {
-			ca = ca[:16]
-		}
+		ca := shortHash(s.CASha256)
 		notAfter := "—"
 		if s.NotAfter > 0 {
 			notAfter = time.Unix(s.NotAfter, 0).UTC().Format(time.RFC3339)
 		}
 		status := s.Status
 		if s.PendingCASha256 != "" {
-			status += fmt.Sprintf(" (→%s since %s)", s.PendingCASha256[:16],
+			status += fmt.Sprintf(" (→%s since %s)", shortHash(s.PendingCASha256),
 				time.Unix(s.PendingSince, 0).UTC().Format("15:04:05"))
 		}
 		sys := "spool"
@@ -211,17 +208,40 @@ func cmdCert(args []string) error {
 			return cmdCertNginx(args[1:])
 		case "forget":
 			return cmdCertForget(args[1:])
+		default:
+			// Not a known subcommand: fall through to the issuer ONLY when
+			// the word could actually be a cert name of this keychain —
+			// otherwise a typo'd subcommand (`cert rene`) used to reach
+			// the issuer as a NAME and die deep inside certmgr with a
+			// misleading "no owner key" error. (A real keychain name keeps
+			// issuing; flag-led args belong to the issuer's own parser.)
+			if !strings.HasPrefix(args[0], "-") && !certNameOwned(args[0]) {
+				return usageErr("cert: %q is neither a subcommand nor a name in this keychain\n"+
+					"  subcommands: cert renew [name…] · cert list · cert nginx <name> · cert forget <name> · cert <name>", args[0])
+			}
 		}
 	}
 	return cmdCertIssue(args)
 }
 
+// certNameOwned reports whether name decomposes under an alias whose owner
+// key sits in the keychain — the cheap pre-flight for `cert <name>`.
+func certNameOwned(name string) bool {
+	_, alias, err := naming.DecomposeName(name)
+	if err != nil {
+		return false
+	}
+	if _, err := os.Stat(ownerKeyPath(alias)); err != nil {
+		return false
+	}
+	return true
+}
+
 func cmdCertIssue(args []string) error {
 	fs := flag.NewFlagSet("cert", flag.ContinueOnError)
 	outDir := fs.String("out-dir", ".", "directory for <name>.crt / <name>.key")
-	days := fs.Int("days", 7, "leaf validity in days (capped by the §9.5.3 7-day ceiling for daemon-issued certs)")
 	noTrack := fs.Bool("no-track", false, "skip renewal tracking (one-shot export; `cert renew` will not know this cert)")
-	if err := fs.Parse(flagsFirst(args, "out-dir", "days")); err != nil {
+	if err := fs.Parse(flagsFirst(args, "out-dir")); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 1 {
@@ -232,7 +252,7 @@ func cmdCertIssue(args []string) error {
 	if _, _, err := naming.DecomposeName(displayName); err != nil {
 		return usageErr("invalid name %q: %v", displayName, err)
 	}
-	_ = days // validity is fixed at the §9.5.3 ceiling inside tlsca.Leaf
+	// Leaf validity is fixed at the §9.5.3 7-day ceiling inside tlsca.Leaf.
 
 	out := *outDir
 	if out != "" {

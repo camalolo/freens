@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -227,12 +228,23 @@ func chainPEM(ders ...[]byte) []byte {
 	return out
 }
 
+// leafSANCap bounds the leaf certificate's SAN list. The SAN list is fed
+// from the daemon's envelope store, so a namespace with many published
+// subnames would otherwise mint an arbitrarily large leaf (DER size and
+// handshake cost grow with every record — an accidental self-DoS, and a
+// path for a peer to inflate our certs). The bound applies to the SORTED
+// subname list so the choice is deterministic: the same store always
+// yields the same certificate (byte-stable re-issues instead of a rotating
+// subset on every restart).
+const leafSANCap = 100
+
 // leafSANs builds the leaf's SAN list for alias: the apex, the wildcard,
 // and — the part Windows clients need — every PUBLISHED subname of the
-// namespace, because schannel and Chromium refuse `*.alias` coverage for
-// `<sub>.alias` when `alias` is an unknown TLD. Subnames come from the
-// daemon's store (the same records a resolver would serve); a store miss
-// degrades to apex+wildcard. Best-effort like everything here.
+// namespace (capped at leafSANCap, sorted), because schannel and Chromium
+// refuse `*.alias` coverage for `<sub>.alias` when `alias` is an unknown
+// TLD. Subnames come from the daemon's store (the same records a resolver
+// would serve); a store miss degrades to apex+wildcard. Best-effort like
+// everything here.
 func leafSANs(daemon webui.Daemon, kp *crypto.Keypair, alias string, log *slog.Logger) []string {
 	sans := []string{alias, "*." + alias}
 	if daemon == nil {
@@ -249,10 +261,19 @@ func leafSANs(daemon webui.Daemon, kp *crypto.Keypair, alias string, log *slog.L
 	if err != nil {
 		return sans
 	}
+	var subs []string
 	for _, e := range sr.Entries {
 		if len(e.Labels) > 0 && e.TldIDB32 == want {
-			sans = append(sans, strings.Join(e.Labels, ".")+"."+alias)
+			subs = append(subs, strings.Join(e.Labels, ".")+"."+alias)
 		}
+	}
+	if len(subs) > 0 {
+		sort.Strings(subs) // deterministic pick under the cap (see leafSANCap)
+		if len(subs) > leafSANCap {
+			log.Warn("webui: leaf SAN list capped", "subnames", len(subs), "cap", leafSANCap)
+			subs = subs[:leafSANCap]
+		}
+		sans = append(sans, subs...)
 	}
 	log.Info("webui: leaf SANs", "count", len(sans), "sans", strings.Join(sans, ", "))
 	return sans

@@ -444,7 +444,10 @@ func run(args []string) error {
 			"listen", dhtEffective,
 			"node_id", hex.EncodeToString(node.ID()),
 			"node_pk", hex.EncodeToString(node.PublicKey()),
-			"passive", *passive,
+			// Effective values (flag > [dht] config > default): logging the
+			// raw flag hid a config-file passive/relay setting from the very
+			// log operators grep when debugging why a box "does nothing".
+			"passive", passiveEffective,
 			// §6.2 advertised address: explicit -advertise, the UPnP mapping,
 			// or empty (peers learn the observed source; Node.Start logs a
 			// warning if a passed address could not be honored).
@@ -456,11 +459,11 @@ func run(args []string) error {
 		// the relay outcome is known right after Start (the allocation dials
 		// inside it — dht logged the relayed address on success); the TURN
 		// server's concrete bound address (e.g. for :0) only exists now.
-		if *turnRelayAddr != "" {
+		if turnRelayEffective != "" {
 			if node.RelayedMode() {
-				logger.Info("TURN relay mode active; advertising the relayed address", "relay", *turnRelayAddr)
+				logger.Info("TURN relay mode active; advertising the relayed address", "relay", turnRelayEffective)
 			} else {
-				logger.Warn("TURN relay mode inactive; using direct UDP + observed source", "relay", *turnRelayAddr)
+				logger.Warn("TURN relay mode inactive; using direct UDP + observed source", "relay", turnRelayEffective)
 			}
 		}
 		if ts := node.TURNServer(); ts != nil {
@@ -674,7 +677,7 @@ func run(args []string) error {
 	// counters/gauges are near-free when -metrics is off; only the HTTP
 	// endpoint below is optional. Gauges are refreshed by a 15s goroutine;
 	// freens_dns_queries_total is incremented in the DNS server path and the
-	// cache hit/miss counters in ResponseCache.get.
+	// cache hit/miss counters in ResponseCache.get2.
 	reg := metrics.New()
 	processStart := time.Now()
 	uptimeGauge := reg.NewGauge("freens_uptime_seconds", "Seconds since the daemon process started.")
@@ -703,8 +706,10 @@ func run(args []string) error {
 	cache := resolver.NewResponseCache(0, nil)
 	cache.SetMetrics(reg)
 	res.Cache = cache
+	var dnsCachePath string
+	var dnsCacheStop chan struct{}
 	if persistEffective != "" {
-		dnsCachePath := filepath.Join(persistEffective, "dns-cache.json")
+		dnsCachePath = filepath.Join(persistEffective, "dns-cache.json")
 		if err := cache.LoadFrom(dnsCachePath); err != nil {
 			if !os.IsNotExist(err) {
 				logger.Warn("dns cache restore skipped", "error", err)
@@ -712,7 +717,8 @@ func run(args []string) error {
 		} else if cache.Len() > 0 {
 			logger.Info("dns cache restored", "entries", cache.Len())
 		}
-		go persistDNSCacheLoop(cache, dnsCachePath, logger)
+		dnsCacheStop = make(chan struct{})
+		go persistDNSCacheLoop(cache, dnsCachePath, logger, dnsCacheStop)
 	}
 
 	udpSrv := resolver.NewServer(cfg.ListenUDP, "udp", res)
@@ -955,6 +961,20 @@ func run(args []string) error {
 			logger.Info("persisted recovery evidence at shutdown", "count", ec)
 		}
 		persistAuxState(dhtNode, persistEffective, logger)
+	}
+	// Final DNS-cache save next to the final envelope persist: the loop's
+	// 60 s cadence otherwise drops up to a minute of validation results on
+	// EVERY shutdown — and restarts (upgrades, crash recovery) are the
+	// exact event the persisted cache exists to paper over. Run after the
+	// loop is stopped so the save races nothing meaningful (SaveIfDirty is
+	// internally locked; a redundant double save is a no-op).
+	if dnsCacheStop != nil {
+		close(dnsCacheStop)
+		if saved, err := cache.SaveIfDirty(dnsCachePath); err != nil {
+			logger.Error("final dns cache persist failed", "path", dnsCachePath, "error", err)
+		} else if saved {
+			logger.Info("persisted dns cache at shutdown", "path", dnsCachePath)
+		}
 	}
 	return firstErr
 }
@@ -1209,7 +1229,9 @@ func reconcileLoop(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger
 }
 
 // reconcileTick is one reconciler pass: on the boot tick, the keyspace
-// warm-up walks; then the renewal scan (a); then reconciliation (b).
+// warm-up walks; then the renewal scan (a); then reconciliation (b). The
+// keychain is read ONCE per tick and handed to both passes (renewOnce used
+// to re-read it — identical work, and two chances to disagree).
 func reconcileTick(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger, boot bool) {
 	ownerMap := loadOwnerKeypairs(logger)
 	if len(ownerMap) == 0 {
@@ -1218,7 +1240,7 @@ func reconcileTick(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger
 	if boot {
 		warmKeyspaces(node, ownerMap, logger)
 	}
-	renewOnce(node, store, logger)
+	renewOnce(node, store, ownerMap, logger)
 	reconcileLeases(node, store, ownerMap, logger, boot)
 }
 
@@ -1455,9 +1477,10 @@ func reconcileLeaseAt(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvel
 // lifetime is inside renewal.ShouldRenew, re-signs them (sequence+1,
 // fresh 24 h window) and republishes them at every legitimate key
 // (dht.StorageKeys: K_tld/K_name plus K_claim for claim-carrying
-// records). Owner-private keys live in <home>/keys (0600, same user as
-// the daemon) — the scan reads them to sign, exactly like the CLI would,
-// and never exposes them further.
+// records). The owner map is passed in by the tick (loaded once per tick,
+// shared with pass (b)). Owner-private keys live in <home>/keys (0600,
+// same user as the daemon) — the scan reads them to sign, exactly like the
+// CLI would, and never exposes them further.
 //
 // Conservatisms: a record that is REVOKED is never renewed (deliberate
 // death), and a renewal that fails to publish anywhere is retried by the
@@ -1466,10 +1489,13 @@ func reconcileLeaseAt(node *dht.Node, logger *slog.Logger, env *wire.SignedEnvel
 // gone since v0.18 is the confirm/retry queue: pass (b)'s network GETs
 // are the confirmation (network missing/older → the existing envelope is
 // re-put, idempotently), and a publish that lands nowhere just means the
-// next tick re-signs afresh.
-func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
+// next tick re-signs afresh. Claim-bearing names occupy TWO store entries
+// (K_tld AND K_claim — one envelope); the scan dedups by envelope
+// identity so one name is renewed exactly once per tick (the duplicate
+// re-signed to the same byte-identical envelope — benign but noisy, and
+// it burned an acceptance slot; observed live on the fleet).
+func renewOnce(node *dht.Node, store *dht.EnvelopeStore, ownerMap map[string]keychainOwner, logger *slog.Logger) {
 	// The keychain map: owner public key -> keypair.
-	ownerMap := loadOwnerKeypairs(logger)
 	if len(ownerMap) == 0 {
 		return
 	}
@@ -1480,6 +1506,7 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 
 	now := store.Now()
 	renewed := 0
+	seen := make(map[string]bool) // envelope identity (signer+name) -> already renewed this tick
 	for _, ent := range store.Entries(now) {
 		env := ent.Env
 		if env == nil || env.Record == nil || env.IsRevoked() {
@@ -1490,6 +1517,11 @@ func renewOnce(node *dht.Node, store *dht.EnvelopeStore, logger *slog.Logger) {
 		if !mine {
 			continue // not ours: cached/relayed records are their owners' business
 		}
+		identity := signerHex + "/" + hex.EncodeToString(env.Record.Name)
+		if seen[identity] {
+			continue // the K_claim entry of a name renewed via its K_tld entry this tick
+		}
+		seen[identity] = true
 		if !renewal.ShouldRenew(now, int64(env.Record.Created), int64(env.Record.Expires)) {
 			continue // fresh: pass (b) verifies the network's copy, this pass never re-signs
 		}
@@ -1948,21 +1980,28 @@ func isPort53(addr string) bool {
 }
 
 // persistDNSCacheLoop saves the response cache every 60 s (dirty caches
-// only) until the process exits — the same cadence and never-fatal shape as
-// the envelope/peerbook persist loops. Restored at boot by LoadFrom, this
-// is what makes daemon restarts (upgrades, the 05:00 pppd dance, crash
-// recovery) invisible to DNS clients: the first query after a restart is
-// answered from the restored validation results while the background
-// refresh revalidates.
-func persistDNSCacheLoop(cache *resolver.ResponseCache, path string, logger *slog.Logger) {
+// only) until stop closes — the same cadence and never-fatal shape as the
+// envelope/peerbook persist loops (a final save happens in the shutdown
+// sequence, next to the final envelope persist, so the tail of the cache
+// survives every restart). Restored at boot by LoadFrom, this is what
+// makes daemon restarts (upgrades, the 05:00 pppd dance, crash recovery)
+// invisible to DNS clients: the first query after a restart is answered
+// from the restored validation results while the background refresh
+// revalidates.
+func persistDNSCacheLoop(cache *resolver.ResponseCache, path string, logger *slog.Logger, stop <-chan struct{}) {
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
-	for range t.C {
-		saved, err := cache.SaveIfDirty(path)
-		if err != nil {
-			logger.Error("dns cache persist failed", "error", err)
-		} else if saved {
-			logger.Info("persisted dns cache", "path", path)
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			saved, err := cache.SaveIfDirty(path)
+			if err != nil {
+				logger.Error("dns cache persist failed", "error", err)
+			} else if saved {
+				logger.Info("persisted dns cache", "path", path)
+			}
 		}
 	}
 }

@@ -400,3 +400,46 @@ func TestThrottledCollectClaimsIsDegradedMiss(t *testing.T) {
 		t.Fatalf("throttled CollectClaims err = %v, want ErrDegradedMiss", err2)
 	}
 }
+
+// TestThrottledEvidenceGetIsDegradedMiss: the §8.4 evidence fetch classifies
+// the same way — evidenceFromPeer maps a 301 answer to ErrThrottled, so an
+// all-throttled evidence walk is a DEGRADED miss, not a clean "no evidence
+// anywhere" (the resolver must not treat a rate-limited holder's silence as
+// proof that the §8.4 hop is unprovable). The throttling peer must also
+// survive un-penalized and un-evicted.
+func TestThrottledEvidenceGetIsDegradedMiss(t *testing.T) {
+	a, b, _ := startThrottlePair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	aAddr, err := a.LocalAddr()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := make([]byte, constants.SHA256Len) // A holds no evidence under this key
+
+	// First walk consumes the single burst token and comes back CLEAN
+	// (answered "no evidence" everywhere) — the baseline shape.
+	raw, err := b.iterativeGetEvidence(ctx, hash)
+	if err != nil || raw != nil {
+		t.Fatalf("first evidence walk: raw=%v err=%v", raw, err)
+	}
+
+	// Burn any token refilled since (0.5/s refills one in 2 s), then walk
+	// again: A throttles → degraded, NOT a clean miss.
+	_, _ = b.sendQuery(ctx, aAddr, a.ID(), "get", map[string]any{"key": hash})
+	raw2, err2 := b.iterativeGetEvidence(ctx, hash)
+	if raw2 != nil {
+		t.Fatal("throttled evidence walk returned evidence; want nil")
+	}
+	if !errors.Is(err2, ErrDegradedMiss) {
+		t.Fatalf("throttled evidence walk err = %v, want ErrDegradedMiss", err2)
+	}
+
+	// The throttling holder is alive: neither evicted nor corpse-penalized.
+	if got := b.RoutingTable().Size(); got < 1 {
+		t.Fatalf("throttled peer evicted from routing table (size %d)", got)
+	}
+	if b.penalized(a.ID(), time.Now().Unix()) {
+		t.Error("throttled peer was dead-penalized; §12 throttling is not a §6.2 failure")
+	}
+}

@@ -81,18 +81,6 @@ func (ts *TokenStore) secretForEpoch(epoch int) []byte {
 	return mac.Sum(nil)
 }
 
-// CurrentSecret returns the active epoch's secret (diagnostic; do not
-// transmit).
-func (ts *TokenStore) CurrentSecret(now int64) []byte {
-	return ts.secretForEpoch(ts.Epoch(now))
-}
-
-// PreviousSecret returns the previous epoch's secret (diagnostic; do not
-// transmit).
-func (ts *TokenStore) PreviousSecret(now int64) []byte {
-	return ts.secretForEpoch(ts.Epoch(now) - 1)
-}
-
 // Issue returns token = HMAC-SHA256(secretForCurrentEpoch, peerIP) — exactly
 // constants.SHA256Len (32) bytes. The current epoch is read from the injected
 // clock. Issue is strict about the epoch derivation but lenient about an

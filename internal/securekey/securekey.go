@@ -94,11 +94,18 @@ func DecryptSeed(b []byte, passphrase string) ([]byte, error) {
 	nonce := b[off : off+12]
 	off += 12
 	ct := b[off:]
-	// Parameter sanity: refuse absurd work factors (a hostile file must not
-	// turn `freens name` into a CPU bomb).
-	if n < 1<<10 || n > 1<<22 || r < 1 || r > 32 || p < 1 || p > 8 {
-		return nil, fmt.Errorf("securekey: implausible scrypt parameters N=%s r=%s p=%s",
-			strconv.FormatUint(uint64(n), 10), strconv.FormatUint(uint64(r), 10), strconv.FormatUint(uint64(p), 10))
+	// Parameter allowlist: the header is UNTRUSTED input, and the old
+	// "bounds" check (N≤2^22, r≤32, p≤8) still admitted ~16 GiB of scrypt
+	// state from a tampered keyfile — an OOM bomb on the arm64 box. This
+	// build has exactly one writer profile, so only the writer's own
+	// parameters are accepted; anything else is refused BEFORE scrypt runs.
+	// (The version/magic check above is unchanged: the envelope format is
+	// version-stable and every keyfile this code ever wrote carries exactly
+	// these parameters, so nothing legitimate is locked out.)
+	if n != scryptN || r != scryptR || p != scryptP {
+		return nil, fmt.Errorf("securekey: unsupported scrypt parameters N=%s r=%s p=%s (this build supports only N=%d r=%d p=%d; the keyfile header may be corrupted or from an incompatible writer)",
+			strconv.FormatUint(uint64(n), 10), strconv.FormatUint(uint64(r), 10), strconv.FormatUint(uint64(p), 10),
+			scryptN, scryptR, scryptP)
 	}
 	key, err := scrypt.Key([]byte(passphrase), salt, int(n), int(r), int(p), keyLen)
 	if err != nil {

@@ -25,3 +25,7 @@ freens-web.exe
 # stray build artifacts (the throwaway re-attest probe, debug binaries)
 reattprobe
 *.debug
+
+# stray working litter (test tarball, throwaway probe output)
+/f8.tar.gz
+/fetched.json

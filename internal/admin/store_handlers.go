@@ -6,11 +6,9 @@
 package admin
 
 import (
-	"encoding/base32"
 	"encoding/hex"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/camalolo/freens/internal/claims"
@@ -73,7 +71,7 @@ func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
 		}
 		if labels, tldID, err := naming.DecodeWireName(rec.Name); err == nil {
 			entry.Labels = labels
-			entry.TldIDB32 = tldB32(tldID)
+			entry.TldIDB32 = EncodeTldIDB32(tldID)
 		}
 		// Claim-carrying envelopes: decode the embedded claim for the alias,
 		// and mark the row that IS K_claim (the contest-set copy §7.4/C.1
@@ -125,12 +123,6 @@ func (s *Server) handleDifficulty(w http.ResponseWriter, r *http.Request) {
 		RetargetBlock:  constants.PoWRetargetBlock,
 		TargetInterval: int(constants.PoWTargetInterval),
 	})
-}
-
-// tldB32 renders a tld_id in the display convention (lowercase RFC 4648
-// base32, padding stripped).
-func tldB32(tldID []byte) string {
-	return strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
 }
 
 // rrJSON renders one wire RR with the human rdata filled for the types the

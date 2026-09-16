@@ -207,7 +207,10 @@ func (a *authStore) lockedOut(addr string) bool {
 
 // recordFail counts one failed login against the source's prefix bucket;
 // the maxLoginFails-th failure inside loginWindow locks that bucket for
-// loginWindow.
+// loginWindow. Each pass also prunes quiesced buckets — window over and no
+// lock live — so a source that failed a few logins once does not sit in the
+// map forever (pre-fix the buckets were never deleted; small, but unbounded
+// in an always-on process).
 func (a *authStore) recordFail(addr string) {
 	key := failKey(addr)
 	a.mu.Lock()
@@ -221,6 +224,11 @@ func (a *authStore) recordFail(addr string) {
 	f.count++
 	if f.count >= maxLoginFails {
 		f.lockUntil = now.Add(loginWindow)
+	}
+	for k, b := range a.fails {
+		if now.Sub(b.firstAt) > loginWindow && now.After(b.lockUntil) {
+			delete(a.fails, k)
+		}
 	}
 }
 

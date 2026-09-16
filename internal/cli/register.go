@@ -404,35 +404,43 @@ func cmdRegister(args []string) error {
 	}
 
 	if tr.daemon() {
-		if _, err := tr.client.Publish(ctx, env); err != nil {
+		n, err := tr.client.Publish(ctx, env)
+		if err != nil {
 			return fmt.Errorf("publish (K_tld, daemon): %w", err)
 		}
-		if perr := tr.client.PublishClaim(ctx, env); perr != nil {
-			// The async publish job can complete AFTER the caller's poll
-			// deadline — the walk grinds through replicas that may be
-			// unreachable from this vantage while enough others accept
-			// (found live 2026-09-01: a fresh VPS's CLI printed a timeout
-			// for a claim that was already live and resolving). Never fail
-			// on a poll deadline without asking the daemon whether the
-			// name actually resolves.
-			verify := func() bool {
-				for attempt := 0; attempt < 4; attempt++ {
-					if attempt > 0 {
-						time.Sleep(2 * time.Second)
+		// The daemon's publish already runs the K_claim leg for a
+		// claim-bearing record (accepted == 2, including §8.3 re-attestation
+		// daemon-side); repeating PublishClaim here was a second full
+		// K_claim walk on every registration. Only repair a claim leg that
+		// did NOT land (accepted < 2).
+		if n < 2 {
+			if perr := tr.client.PublishClaim(ctx, env); perr != nil {
+				// The async publish job can complete AFTER the caller's poll
+				// deadline — the walk grinds through replicas that may be
+				// unreachable from this vantage while enough others accept
+				// (found live 2026-09-01: a fresh VPS's CLI printed a timeout
+				// for a claim that was already live and resolving). Never fail
+				// on a poll deadline without asking the daemon whether the
+				// name actually resolves.
+				verify := func() bool {
+					for attempt := 0; attempt < 4; attempt++ {
+						if attempt > 0 {
+							time.Sleep(2 * time.Second)
+						}
+						vctx, vcancel := context.WithTimeout(ctx, 5*time.Second)
+						res, rerr := tr.client.Resolve(vctx, *alias)
+						vcancel()
+						if rerr == nil && res != nil && res.Found && !res.Revoked {
+							return true
+						}
 					}
-					vctx, vcancel := context.WithTimeout(ctx, 5*time.Second)
-					res, rerr := tr.client.Resolve(vctx, *alias)
-					vcancel()
-					if rerr == nil && res != nil && res.Found && !res.Revoked {
-						return true
-					}
+					return false
 				}
-				return false
+				if !verify() {
+					return fmt.Errorf("publish (K_claim, daemon): %w", perr)
+				}
+				fmt.Printf("publish: the replication job was still running at the poll deadline, but %s resolves via the daemon — publish complete\n", *alias)
 			}
-			if !verify() {
-				return fmt.Errorf("publish (K_claim, daemon): %w", perr)
-			}
-			fmt.Printf("publish: the replication job was still running at the poll deadline, but %s resolves via the daemon — publish complete\n", *alias)
 		}
 	} else {
 		// Walk toward K_tld first so the R closest storers are in the routing

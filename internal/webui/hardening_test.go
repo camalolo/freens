@@ -214,3 +214,65 @@ func TestPlaintextFaceBehindGate(t *testing.T) {
 		t.Errorf("on-allowlist plaintext request = %d, want the 308 redirect", w.Code)
 	}
 }
+
+// TestLogoutCrossSiteGuard: logout is a bare GET, and SameSite=Lax still
+// sends the session cookie on top-level cross-site navigations — so any web
+// page's <a href="…/logout"> would log the visitor out. Fetch Metadata
+// detection (the sameSite guard's shape) must refuse cross-site (and
+// same-site sibling-origin) navigations as a no-op redirect home, while
+// same-origin and headerless callers log out normally.
+func TestLogoutCrossSiteGuard(t *testing.T) {
+	_, ts := newTestServer(t, newFakeDaemon())
+	c := newUClient(t)
+	c.bootstrap(ts.URL) // logged in
+
+	logoutWith := func(secFetchSite string) (int, string) {
+		req, err := http.NewRequest("GET", ts.URL+"/logout", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if secFetchSite != "" {
+			req.Header.Set("Sec-Fetch-Site", secFetchSite)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			t.Fatalf("GET /logout: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode, resp.Header.Get("Location")
+	}
+
+	// Cross-site navigation: refused as a no-op — session SURVIVES.
+	if code, loc := logoutWith("cross-site"); code != http.StatusSeeOther || loc != "/" {
+		t.Errorf("cross-site logout = %d %q, want 303 \"/\"", code, loc)
+	}
+	if code := c.get(ts.URL + "/"); code != http.StatusOK {
+		t.Errorf("dashboard after refused cross-site logout = %d, want 200 (session must survive)", code)
+	}
+	// A same-site sibling-origin navigation is refused the same way.
+	if code, loc := logoutWith("same-site"); code != http.StatusSeeOther || loc != "/" {
+		t.Errorf("same-site logout = %d %q, want 303 \"/\"", code, loc)
+	}
+	if code := c.get(ts.URL + "/"); code != http.StatusOK {
+		t.Errorf("dashboard after refused same-site logout = %d, want 200", code)
+	}
+
+	// Same-origin (the UI's own menu): logs out.
+	if code, loc := logoutWith("same-origin"); code != http.StatusSeeOther || loc != "/login" {
+		t.Errorf("same-origin logout = %d %q, want 303 /login", code, loc)
+	}
+	if code := c.get(ts.URL + "/"); code != http.StatusSeeOther {
+		t.Errorf("dashboard after same-origin logout = %d, want 303 (logged out)", code)
+	}
+
+	// Headerless (curl/scripts): still logs out — log back in first.
+	if code := c.post(ts.URL+"/login", url.Values{"password": {"hunter2x"}}, false); code != http.StatusSeeOther {
+		t.Fatalf("re-login = %d", code)
+	}
+	if code, loc := logoutWith(""); code != http.StatusSeeOther || loc != "/login" {
+		t.Errorf("headerless logout = %d %q, want 303 /login", code, loc)
+	}
+	if code := c.get(ts.URL + "/"); code != http.StatusSeeOther {
+		t.Errorf("dashboard after headerless logout = %d, want 303 (logged out)", code)
+	}
+}

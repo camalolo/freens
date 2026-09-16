@@ -43,6 +43,17 @@ func (g *gatedLookup) Lookup(ctx context.Context, wireName []byte, now int64) (*
 	return g.env, nil
 }
 
+// panickyLookup panics inside Lookup (a poisoned record source) and counts
+// invocations — the resolveShared panic-safety fixture.
+type panickyLookup struct {
+	calls atomic.Int32
+}
+
+func (p *panickyLookup) Lookup(context.Context, []byte, int64) (*wire.SignedEnvelope, error) {
+	p.calls.Add(1)
+	panic("test: poisoned record source")
+}
+
 // TestServeDNSSingleFlightCollapsesStampede: 8 concurrent identical queries
 // during a slow resolution produce exactly ONE namespace Lookup; every
 // caller still receives the answer.
@@ -100,6 +111,41 @@ func TestServeDNSSingleFlightCollapsesStampede(t *testing.T) {
 	}
 }
 
+// TestResolveSharedPanicReleasesFlight: a panic inside the resolution (a
+// poisoned record source here) must still uninstall the flight and wake the
+// followers — the completion is deferred, under the lock conditional on the
+// flight still being the installed one. Without it, a dead flight left
+// installed captures every future resolution of the key (the v0.16.3 corpse
+// class), and the delete/close window would let a concurrent caller re-lead
+// onto the same flight.
+func TestResolveSharedPanicReleasesFlight(t *testing.T) {
+	w := newFreensWorld(t)
+	p := &panickyLookup{}
+	r := newResolver(configFor(t, w, RouteFREENS), p, nil)
+	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	ck := cacheKeyFor(q)
+
+	for i := 0; i < 2; i++ {
+		func() {
+			defer func() {
+				if rec := recover(); rec == nil {
+					t.Errorf("call %d: the panic must keep propagating", i+1)
+				}
+			}()
+			_, _, _, _ = r.resolveShared(context.Background(), q, ck)
+		}()
+		r.flightMu.Lock()
+		installed := len(r.flights)
+		r.flightMu.Unlock()
+		if installed != 0 {
+			t.Fatalf("call %d: %d flight(s) left installed after the panic — a dead flight must not capture future resolutions", i+1, installed)
+		}
+	}
+	if got := p.calls.Load(); got != 2 {
+		t.Fatalf("lookups = %d, want 2 (the second call must lead a fresh flight, not join a corpse)", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TXT chunking + UDP truncation
 // ---------------------------------------------------------------------------
@@ -109,7 +155,7 @@ func TestServeDNSSingleFlightCollapsesStampede(t *testing.T) {
 // the full answer message Packs.
 func TestTXTMappingChunksLongRdata(t *testing.T) {
 	long := strings.Repeat("freens", 111) // 666 bytes
-	rr, err := wire.TXT(long, 300)
+	rr, err := wire.NewRR(wire.RRTypeTXT, 300, []byte(long))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +191,7 @@ func TestTXTMappingChunksLongRdata(t *testing.T) {
 // consumed record and served Txt: [""].
 func TestTXTMappingDoesNotMutateSharedRR(t *testing.T) {
 	long := strings.Repeat("freens", 111) // 666 bytes
-	rr, err := wire.TXT(long, 300)
+	rr, err := wire.NewRR(wire.RRTypeTXT, 300, []byte(long))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +224,7 @@ func TestUDPResponseTruncated(t *testing.T) {
 	}
 	big := strings.Repeat("x", 300)
 	for i := 0; i < 3; i++ {
-		rr, err := wire.TXT(big, 300)
+		rr, err := wire.NewRR(wire.RRTypeTXT, 300, []byte(big))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,6 +304,62 @@ func TestDoHUpstreamForwards(t *testing.T) {
 	}
 	if len(resp.Answer) != 1 {
 		t.Fatalf("response answers = %d, want 1", len(resp.Answer))
+	}
+}
+
+// TestDoHUpstreamSharedClient: the default client is built ONCE and reused
+// across Forward calls (a per-query client paid a full TCP+TLS handshake on
+// every forwarded miss and left each discarded transport's idle conns parked
+// for IdleConnTimeout), and queries still round-trip through it.
+func TestDoHUpstreamSharedClient(t *testing.T) {
+	answer := new(dns.Msg)
+	answer.SetReply(new(dns.Msg).SetQuestion("example.com.", dns.TypeA))
+	var gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotMethod = req.Method
+		body, _ := io.ReadAll(req.Body)
+		q := new(dns.Msg)
+		if err := q.Unpack(body); err != nil {
+			http.Error(w, "bad query", http.StatusBadRequest)
+			return
+		}
+		m := new(dns.Msg)
+		m.SetReply(q)
+		w.Header().Set("Content-Type", "application/dns-message")
+		packed, _ := answer.Pack()
+		_, _ = w.Write(packed)
+	}))
+	defer srv.Close()
+
+	u := &DoHUpstream{URL: srv.URL}
+	c1 := u.httpClient()
+	c2 := u.httpClient()
+	if c1 == nil || c1 != c2 {
+		t.Fatalf("httpClient returned different clients (%p vs %p) — it must be built once and reused", c1, c2)
+	}
+	if c1.Timeout != 5*time.Second {
+		t.Errorf("shared client Timeout = %v, want the 5s default (per-query semantics preserved)", c1.Timeout)
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := u.Forward(context.Background(), new(dns.Msg).SetQuestion("example.com.", dns.TypeA))
+		if err != nil {
+			t.Fatalf("Forward %d: %v", i, err)
+		}
+		if resp == nil || resp.Rcode != dns.RcodeSuccess {
+			t.Fatalf("Forward %d = %v", i, resp)
+		}
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("request method = %q, want POST", gotMethod)
+	}
+	if got := u.httpClient(); got != c1 {
+		t.Error("client changed after Forwards")
+	}
+	// A caller-supplied Client still wins untouched.
+	sentinel := &http.Client{}
+	u2 := &DoHUpstream{URL: srv.URL, Client: sentinel}
+	if got := u2.httpClient(); got != sentinel {
+		t.Error("caller-supplied Client must be used as-is")
 	}
 }
 

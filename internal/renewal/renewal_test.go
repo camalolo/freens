@@ -3,6 +3,7 @@
 package renewal
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -90,6 +91,67 @@ func TestRenewEnvelopeRefusesRevoked(t *testing.T) {
 	if _, err := RenewEnvelope(env, kp, now); err == nil {
 		t.Fatal("revoked record renewed (revocation is deliberate death)")
 	}
+}
+
+// TestRenewEnvelopeCopiesRecoveryAndClaim: the renewed envelope is SIGNED
+// over prev's Recovery policy and embedded Claim, so it must carry DEEP
+// COPIES — a caller mutating the previous envelope afterwards (reusing or
+// re-signing it) must not corrupt the renewal's signature or contents.
+func TestRenewEnvelopeCopiesRecoveryAndClaim(t *testing.T) {
+	now := time.Now().Unix()
+	kp := kpFor(t)
+	env := buildClaimedApex(t, "bob", kp, 3, uint64(now-3600), uint64(now+1000))
+	r1, _ := crypto.Generate()
+	r2, _ := crypto.Generate()
+	pol, err := wire.NewRecoveryPolicyWire(2, [][]byte{r1.Public(), r2.Public()}, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.Record.Recovery = pol
+	claimBefore := append([]byte(nil), env.Record.Claim...)
+	recBefore, err := wire.NewRecoveryPolicyWire(2, [][]byte{r1.Public(), r2.Public()}, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := RenewEnvelope(env, kp, now)
+	if err != nil {
+		t.Fatalf("RenewEnvelope: %v", err)
+	}
+
+	// Mutate EVERYTHING reachable from prev's Recovery/Claim after the fact.
+	env.Record.Claim[0] ^= 0xff
+	env.Record.Recovery.Threshold = 9
+	env.Record.Recovery.Keys[0][0] ^= 0xff
+
+	if !bytes.Equal(out.Record.Claim, claimBefore) {
+		t.Fatal("renewed envelope aliases prev's Claim bytes")
+	}
+	if out.Record.Recovery == nil || out.Record.Recovery == env.Record.Recovery {
+		t.Fatal("renewed envelope did not deep-copy the Recovery policy")
+	}
+	if out.Record.Recovery.Threshold != recBefore.Threshold {
+		t.Fatalf("renewed Recovery.Threshold = %d, want %d", out.Record.Recovery.Threshold, recBefore.Threshold)
+	}
+	for i := range recBefore.Keys {
+		if !bytes.Equal(out.Record.Recovery.Keys[i], recBefore.Keys[i]) {
+			t.Fatalf("renewed Recovery key %d aliased/mutated", i)
+		}
+	}
+	// The decisive check: the signature was computed over the copies, so it
+	// still verifies after prev was corrupted.
+	if !out.VerifySignature() {
+		t.Fatal("renewed envelope signature broken (Recovery/Claim aliased prev)")
+	}
+}
+
+func kpFor(t *testing.T) *crypto.Keypair {
+	t.Helper()
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kp
 }
 
 func TestShouldRenew(t *testing.T) {

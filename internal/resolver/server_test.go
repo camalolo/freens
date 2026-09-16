@@ -136,7 +136,7 @@ func TestServerWithoutQueryCounter(t *testing.T) {
 	}
 }
 
-// TestResponseCacheMetrics: hits/misses counters move exactly at the get()
+// TestResponseCacheMetrics: hits/misses counters move exactly at the get2()
 // decision points, including the expired-entry-is-a-miss rule.
 func TestResponseCacheMetrics(t *testing.T) {
 	reg := metrics.New()
@@ -147,13 +147,13 @@ func TestResponseCacheMetrics(t *testing.T) {
 	key := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
 
 	// Miss: empty cache.
-	if _, _, _, ok := c.get(key); ok {
+	if _, _, _, status := c.get2(key); status != cacheMiss {
 		t.Fatal("first get should miss")
 	}
 	// Hit: stored freens outcome retrieved.
 	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
 	c.putFreens(key, []dns.RR{rr}, dns.RcodeSuccess, true)
-	if _, _, _, ok := c.get(key); !ok {
+	if _, _, _, status := c.get2(key); status != cacheFresh {
 		t.Fatal("second get should hit")
 	}
 	// An expired POSITIVE entry inside the §10.4 serve-stale window is
@@ -164,7 +164,7 @@ func TestResponseCacheMetrics(t *testing.T) {
 	}
 	// Past the stale window it is finally a miss (and the entry drops).
 	now += int64(constants.StaleServeSecs)
-	if _, _, _, ok := c.get(key); ok {
+	if _, _, _, status := c.get2(key); status != cacheMiss {
 		t.Fatal("get past the stale window should miss")
 	}
 
@@ -188,12 +188,12 @@ func TestResponseCacheNilMetricsUninstrumented(t *testing.T) {
 	c.SetMetrics(metrics.NilRegistry())
 
 	key := cacheKeyFor(dns.Question{Name: "a.b.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
-	if _, _, _, ok := c.get(key); ok {
+	if _, _, _, status := c.get2(key); status != cacheMiss {
 		t.Fatal("empty cache must miss")
 	}
 	rr := &dns.A{Hdr: dns.RR_Header{Name: "a.b.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
 	c.putFreens(key, []dns.RR{rr}, dns.RcodeSuccess, true)
-	if _, _, _, ok := c.get(key); !ok {
+	if _, _, _, status := c.get2(key); status != cacheFresh {
 		t.Fatal("stored entry must hit")
 	}
 }

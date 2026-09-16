@@ -457,6 +457,25 @@ func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKe
 	r.flights[ck] = f
 	r.flightMu.Unlock()
 
+	// Panic-safe completion (registered BEFORE the semaphore release, so it
+	// runs LAST and the slot frees before followers wake). Under the lock:
+	// remove the flight only if it is still the installed one (a follower
+	// whose ctx expired may already have reaped it, or a re-lead taken the
+	// slot); then close(f.done) OUTSIDE the lock. Deferring both steps in
+	// this order means a panic inside ResolveQuestion can neither leave a
+	// dead flight installed to capture every future resolution of the key
+	// (the v0.16.3 corpse class) nor open a window between the map delete
+	// and the channel close where a concurrent caller would re-lead and
+	// two leaders could race one flight.
+	defer func() {
+		r.flightMu.Lock()
+		if cur, ok := r.flights[ck]; ok && cur == f {
+			delete(r.flights, ck)
+		}
+		r.flightMu.Unlock()
+		close(f.done)
+	}()
+
 	defer func() {
 		if r.resSem != nil {
 			<-r.resSem
@@ -468,10 +487,6 @@ func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKe
 		r.Cache.putFreens(ck, f.rrs, f.rcode, f.aa)
 	}
 
-	r.flightMu.Lock()
-	delete(r.flights, ck)
-	r.flightMu.Unlock()
-	close(f.done)
 	return f.rrs, f.rcode, f.aa, f.err
 }
 
@@ -510,6 +525,16 @@ func (r *Resolver) now() int64 {
 //     aa=true; otherwise aa=false.
 //     DENY:    REFUSED; aa=false.
 func (r *Resolver) ResolveQuestion(ctx context.Context, q dns.Question) (rrs []dns.RR, rcode int, aa bool, err error) {
+	// Only the INternet class is served. freens names are ClassINET by
+	// construction, and a non-IN question forwarded verbatim would do
+	// nothing useful upstream (forwardDNS packs ClassINET regardless) except
+	// leak the CH class's classic version.bind probe to the recursive
+	// resolver. REFUSED, and nothing else runs: no claim walk, no cache
+	// entry (putFreens never caches REFUSED), no upstream traffic.
+	if q.Qclass != dns.ClassINET {
+		return nil, dns.RcodeRefused, false, nil
+	}
+
 	now := r.now()
 
 	// Undo miekg/dns's RFC 4343 presentation escaping so a raw-UTF-8 U-label
@@ -1001,7 +1026,6 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	if err != nil || len(envs) == 0 {
 		return nil, false, false // transient error / no claim anywhere: a miss
 	}
-	survivors := make([]*claims.AliasClaim, 0, len(envs))
 	oracle, _ := r.Freens.(DifficultyOracle)
 	// §8.4 reuse window (v0.8.0; exemption refined v0.9.1): dead-but-offered
 	// claim envelopes act as tombstones. While one is inside
@@ -1066,15 +1090,23 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 	// and give any claim carrying a verified fresh re-attestation quorum
 	// precedence among past-horizon identities (claims_ratchet.go for the
 	// order of the two steps and why evidence outranks observation).
-	r.pastHorMu.Lock()
-	if r.pastHorizon == nil {
-		r.pastHorizon = newPastHorizonLedger()
-	}
+	//
+	// The ReAttestSets fetch (network RPC whose results run Ed25519
+	// verification inside claims.HasFreshQuorum) happens BEFORE pastHorMu is
+	// taken: holding the mutex across it serialized ALL claim-set
+	// resolutions on the box against one ledger. The ledger calls themselves
+	// (established/observe/hasAny) are internally locked; pastHorMu only
+	// protects the lazily-initialized ledger pointer + the observe/establish
+	// sequence within one resolution.
 	var reAttestSets map[string][]*claims.WitnessAttestation
 	if rs, ok := r.Freens.(ReAttestSource); ok {
 		if sets, rerr := rs.ReAttestSets(ctx, alias, now); rerr == nil {
 			reAttestSets = sets
 		}
+	}
+	r.pastHorMu.Lock()
+	if r.pastHorizon == nil {
+		r.pastHorizon = newPastHorizonLedger()
 	}
 	liveClaims = r.filterPastHorizonNewcomers(alias, liveClaims, witnessSet, reAttestSets, now)
 	r.pastHorMu.Unlock()
@@ -1101,6 +1133,10 @@ func (r *Resolver) resolveClaimSet(ctx context.Context, csr ClaimSetResolver, al
 			return nil, false, false
 		}
 	}
+	// The §6.4 ordering input: allocate at FILL time — every pre-filter
+	// allocation sized off len(envs) overcounted once the §7.4/§8.4 filters
+	// have dropped tombstones and invalid claims.
+	survivors := make([]*claims.AliasClaim, 0, len(liveClaims))
 	for _, lc := range liveClaims {
 		survivors = append(survivors, lc.claim)
 	}
@@ -1290,14 +1326,13 @@ func effectivePoWDifficulty(c *claims.AliasClaim, oracle DifficultyOracle) int {
 	if oracle == nil {
 		return claims.InferDifficulty
 	}
-	// Replicate claims.VerifyPoW's InferDifficulty inference (the sentinel's
-	// documented rule); the hash itself is recomputed inside VerifyPoW at
-	// whatever difficulty is returned here.
+	// The A.4 inference comes from claims.InferDifficultyOf — the single
+	// source of the rule (VerifyPoW/VerifyFull and the keychain share it);
+	// the hash itself is recomputed inside VerifyPoW at whatever difficulty
+	// is returned here. The baseline for the floor translation below is the
+	// same retunable shadow InferDifficultyOf reads.
 	baseline := int(claims.PoWDifficultyInit.Load())
-	inferred := baseline
-	if c != nil && len(c.Nonce) >= 1 && int(c.Nonce[0]) >= baseline {
-		inferred = int(c.Nonce[0])
-	}
+	inferred := claims.InferDifficultyOf(c)
 	floor := oracle.NetworkDifficulty() - (constants.PoWDifficultyInit - baseline)
 	// A.4: the check never drops below the verifier's POW_DIFFICULTY_INIT
 	// baseline (a misbehaving oracle cannot lower it either).
@@ -1536,6 +1571,13 @@ func (r *Resolver) SweepRefreshes(now int64) int {
 	if r.Cache == nil {
 		return 0
 	}
+	// Prune stale refresh bookkeeping alongside the sweep: the insert path
+	// only prunes once refreshBookkeepingCap keys have piled up, so a
+	// low-traffic box's maps would linger at the cap forever between
+	// bursts. Same TTL rule, amortized O(1) at tick cadence.
+	r.flightMu.Lock()
+	r.pruneRefreshBookkeepingLocked(now)
+	r.flightMu.Unlock()
 	keys := r.Cache.SweepCandidates(now, refreshSweepHorizon, refreshSweepBatch)
 	kicked := 0
 	for _, k := range keys {

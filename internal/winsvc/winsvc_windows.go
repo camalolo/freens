@@ -199,25 +199,24 @@ func runningService(name string) bool {
 // errNotInstalled reports the service does not exist.
 var errNotInstalled = errors.New("service not installed")
 
-// openRunning connects to the manager and opens the default daemon
-// service in one go.
-func openRunning() (*mgr.Service, error) {
-	return openRunningNamed(Name)
-}
-
 // openRunningNamed connects to the manager and opens the named service.
+// BOTH SCM handles must be released: mgr.Service.Close closes ONLY the
+// service handle (it does NOT own the manager connection — an earlier
+// comment here claimed otherwise and leaked one HSCManager per call), and
+// the manager handle is closed right here on both paths: on the
+// OpenService failure explicitly, on success via defer (an
+// OpenService-derived service handle stays valid independently of the
+// manager handle; callers Close the service as before).
 func openRunningNamed(name string) (*mgr.Service, error) {
 	m, err := mgr.Connect()
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the service manager: %w", err)
 	}
+	defer m.Disconnect()
 	s, err := m.OpenService(name)
 	if err != nil {
-		m.Disconnect()
 		return nil, errNotInstalled
 	}
-	// s owns the manager connection's lifetime too; Close on the service
-	// is enough for our process-lifetime usage.
 	return s, nil
 }
 

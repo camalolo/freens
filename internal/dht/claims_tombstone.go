@@ -157,20 +157,24 @@ func ClaimEvidence(env *wire.SignedEnvelope, alias string, now int64) (*claims.A
 
 // reuseWindowEnd returns the §8.4 reuse-window end time (expires +
 // AliasReuseDelay) when env is a DEAD-but-content-valid claim envelope for
-// alias whose window is still open at now, and 0 otherwise. "Content-valid"
-// is exactly ClaimEvidence (see above).
-func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) int64 {
-	if _, ph := ClaimEvidence(env, alias, now); ph == nil {
-		return 0
+// alias whose window is still open at now, plus that candidate's claim
+// identity (the §7.3 PoW prefix hash ClaimEvidence already computed) — the
+// full screen runs ONCE (PoW + W Ed25519 verifies), and the caller reuses
+// the identity instead of re-deriving it. (0, nil) when env is not
+// in-window tombstone evidence.
+func reuseWindowEnd(env *wire.SignedEnvelope, alias string, now int64) (int64, []byte) {
+	_, ph := ClaimEvidence(env, alias, now)
+	if ph == nil {
+		return 0, nil
 	}
 	exp := int64(env.Record.Expires)
 	if now < exp {
-		return 0 // still alive: an ordinary competing claim, not a tombstone
+		return 0, nil // still alive: an ordinary competing claim, not a tombstone
 	}
 	if now >= exp+int64(constants.AliasReuseDelay) {
-		return 0 // window closed: the alias is claimable again
+		return 0, nil // window closed: the alias is claimable again
 	}
-	return exp + int64(constants.AliasReuseDelay)
+	return exp + int64(constants.AliasReuseDelay), ph
 }
 
 // claimReuseRefusal answers whether a claim presentation for alias must be
@@ -209,11 +213,11 @@ func (n *Node) claimReuseRefusal(alias string, incomingPrefixHash []byte, now in
 		return 0
 	}
 	for _, cand := range n.claims.Top2(kClaim) {
-		end := reuseWindowEnd(cand, aliasN, now)
+		end, candPH := reuseWindowEnd(cand, aliasN, now)
 		if end == 0 {
 			continue // not (valid, dead, in-window) evidence
 		}
-		if _, candPH := ClaimEvidence(cand, aliasN, now); bytes.Equal(candPH, incomingPrefixHash) {
+		if bytes.Equal(candPH, incomingPrefixHash) {
 			// Same claim identity: the tombstone's own claim, re-carried
 			// by its claimant (v0.9.1) — renewal or resurrection, both
 			// are ownership continuity. Never refused.

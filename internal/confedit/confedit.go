@@ -74,10 +74,28 @@ func Get(path, section, key string) (value string, found bool, err error) {
 // missing key inside an existing section is appended at the END of that
 // section's body (after its comments, before the next header).
 //
+// INJECTION GUARD: the written line is "key = value" — verbatim text with
+// no escaping — so a key or value carrying \r or \n would smuggle whole
+// config lines past the edit (e.g. a value "9.9.9.9\n[dht]\nport = 1").
+// Set refuses such input with an error; callers quoting user input should
+// sanitize before calling.
+//
+// LINE NORMALIZATION: reading goes through bufio.Scanner, whose ScanLines
+// tokenizes on \n and strips a trailing \r — CRLF files are normalized to
+// LF line endings on write (a trailing-\r remnant on the LAST line would
+// otherwise glue itself to the new value). Get tolerates both forms on
+// read; Set's output is always LF-terminated.
+//
 // The file is replaced atomically and <path>.pre-doh holds the previous
 // content when the file actually changed. No-op when the file already
 // expresses exactly the requested state (no backup churn).
 func Set(path, section, key, value string) error {
+	if strings.ContainsAny(key, "\r\n") {
+		return fmt.Errorf("confedit: key must not contain a newline (got %q)", key)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("confedit: value must not contain a newline (got %q)", value)
+	}
 	lines, err := readLines(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

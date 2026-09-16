@@ -1,7 +1,6 @@
 package home
 
-// seeds.go — the zero-config bootstrap seed list (seeds.conf) and the
-// routing-table → peerbook adapter.
+// seeds.go — the zero-config bootstrap seed list (seeds.conf).
 //
 // seeds.conf is the "first boot" peer source: when a daemon is started with
 // no -peers and no -peers-file, cmd/freens falls back to this file plus the
@@ -100,26 +99,4 @@ func EnsureSeeds() error {
 		return err
 	}
 	return os.WriteFile(p, []byte(DefaultSeeds()), 0o600)
-}
-
-// ContactsToPeers converts routing-table contacts (Node.RoutingTable().
-// AllContacts()) into bootstrap Peer values so the daemon can persist them
-// via SavePeerbook. The PK is the contact's node PUBLIC KEY (not the Node
-// ID): AddPeer derives the recipient_id from the public key, so only the
-// key round-trips into a dialable peerbook entry. The key bytes are copied
-// so the peer does not alias routing-table memory. Contacts with an empty
-// address or a malformed key are skipped (they cannot be bootstrapped
-// from anyway).
-func ContactsToPeers(contacts []*dht.NodeContact) []dht.Peer {
-	out := make([]dht.Peer, 0, len(contacts))
-	for _, c := range contacts {
-		if c == nil || c.Addr == "" || len(c.PublicKey) != constants.Ed25519PublicKeyLen {
-			continue
-		}
-		out = append(out, dht.Peer{
-			Addr:      c.Addr,
-			PublicKey: append([]byte(nil), c.PublicKey...),
-		})
-	}
-	return out
 }

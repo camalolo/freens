@@ -179,6 +179,63 @@ func TestReusableClaimRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDifficultyOfFollowsTunableBaseline: difficultyOf must read the same
+// RETUNABLE claims.PoWDifficultyInit baseline the claims package verifies
+// with — not the frozen constants.PoWDifficultyInit it used to read (the
+// demo retunes the atomic; the two copies silently diverged).
+func TestDifficultyOfFollowsTunableBaseline(t *testing.T) {
+	c := &claims.AliasClaim{Nonce: []byte{8}} // sub-baseline nonce byte
+	prev := claims.PoWDifficultyInit.Load()
+	t.Cleanup(func() { claims.PoWDifficultyInit.Store(prev) })
+
+	claims.PoWDifficultyInit.Store(int32(constants.PoWDifficultyInit)) // 24
+	if got := difficultyOf(c); got != constants.PoWDifficultyInit {
+		t.Fatalf("Nonce[0]=8 at baseline 24: difficultyOf = %d, want 24", got)
+	}
+	// Bump the atomic DOWN: the frozen constant would still say 24; the
+	// keychain must now follow the 8-bit nonce byte.
+	claims.PoWDifficultyInit.Store(6)
+	if got := difficultyOf(c); got != 8 {
+		t.Fatalf("Nonce[0]=8 at retuned baseline 6: difficultyOf = %d, want 8", got)
+	}
+	// And a nonce byte above the baseline always wins outright.
+	claims.PoWDifficultyInit.Store(24)
+	if got := difficultyOf(&claims.AliasClaim{Nonce: []byte{30}}); got != 30 {
+		t.Fatalf("Nonce[0]=30: difficultyOf = %d, want 30", got)
+	}
+	// Empty nonce → the baseline itself.
+	if got := difficultyOf(&claims.AliasClaim{}); got != constants.PoWDifficultyInit {
+		t.Fatalf("empty nonce: difficultyOf = %d, want baseline", got)
+	}
+}
+
+// TestAliasesRejectNonValidAliasShapes: the keychain regexes only
+// shape-check filenames, so an all-numeric "alias" like 123.key matches —
+// but §3.2 forbids all-numeric aliases and nothing this tool mints would
+// ever carry such a file. Aliases/Inventory/BuildBackup must skip it.
+func TestAliasesRejectNonValidAliasShapes(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"123.key", "123.rec1.key", "123.claim.json", "alice.key"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := Aliases(dir); len(got) != 1 || got[0] != "alice" {
+		t.Fatalf("Aliases = %v, want [alice] (123 is not a valid alias)", got)
+	}
+	inv := Inventory(dir)
+	if len(inv) != 1 || inv[0].Alias != "alice" {
+		t.Fatalf("Inventory = %+v, want only the alice row", inv)
+	}
+	var buf bytes.Buffer
+	if _, err := BuildBackup(&buf, dir); err != nil {
+		t.Fatalf("BuildBackup refused a valid keychain: %v", err)
+	}
+	if strings.Contains(buf.String(), "123.key") {
+		t.Error("all-numeric alias file leaked into the backup")
+	}
+}
+
 func TestBuildBackup(t *testing.T) {
 	dir := t.TempDir()
 	kp := mustKP(t)

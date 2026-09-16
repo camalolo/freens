@@ -20,40 +20,18 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// the shared A-record builder (make-record + name + register)
+// the shared record builder (make-record + name + register)
 // ---------------------------------------------------------------------------
 
-// buildARecord builds the UNSIGNED §4.1 record for displayName (labels.alias,
-// e.g. "www.alice.foo") carrying exactly one A RR. It is the shared core of
-// make-record, name, and register: decompose + encode the wire name (§3.3)
-// under the given tldID pin, NewRecord with a fresh created stamp and the
-// given expiry window. Callers attach their extras (recovery policy, claim)
-// and sign (wire.SignRecord). Returns the record plus the wire_name (callers
-// print it and derive K_tld/K_name from it).
-func buildARecord(displayName string, tldID, ownerPK []byte, ip4 net.IP, seq, ttl, expires uint64) (*wire.Record, []byte, error) {
-	labels, alias, err := naming.DecomposeName(displayName)
-	if err != nil {
-		return nil, nil, usageErr("invalid name %q: %v", displayName, err)
-	}
-	wireName, err := naming.EncodeWireName(labels, alias, tldID)
-	if err != nil {
-		return nil, nil, err
-	}
-	now := uint64(time.Now().Unix())
-	rec, err := wire.NewRecord(wireName, ownerPK, seq, now, expires)
-	if err != nil {
-		return nil, nil, err
-	}
-	aRR, err := wire.A(ip4, ttl)
-	if err != nil {
-		return nil, nil, err
-	}
-	rec.RRset = []*wire.RR{aRR}
-	return rec, wireName, nil
-}
-
-// buildRRRecord is buildARecord for ANY pre-built address RR (A or AAAA —
-// the IPv6 path of `name`; see addrRR).
+// buildRRRecord builds the UNSIGNED §4.1 record for displayName
+// (labels.alias, e.g. "www.alice.foo") carrying exactly one pre-built RR
+// (wire.A for the IPv4 callers — make-record — or an AAAA from addrRR for
+// `name`). It is the shared core of make-record, name, and register:
+// decompose + encode the wire name (§3.3) under the given tldID pin,
+// NewRecord with a fresh created stamp and the given expiry window. Callers
+// attach their extras (recovery policy, claim) and sign (wire.SignRecord).
+// Returns the record plus the wire_name (callers print it and derive
+// K_tld/K_name from it).
 func buildRRRecord(displayName string, tldID, ownerPK []byte, rr *wire.RR, seq, expires uint64) (*wire.Record, []byte, error) {
 	labels, alias, err := naming.DecomposeName(displayName)
 	if err != nil {
@@ -129,7 +107,11 @@ func cmdMakeRecord(args []string) error {
 		}
 		expires = e
 	}
-	rec, wireName, err := buildARecord(*name, tldID, ownerKP.Public(), ip4, *seq, *ttl, expires)
+	aRR, err := wire.A(ip4, *ttl)
+	if err != nil {
+		return err
+	}
+	rec, wireName, err := buildRRRecord(*name, tldID, ownerKP.Public(), aRR, *seq, expires)
 	if err != nil {
 		return err
 	}

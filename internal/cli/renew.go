@@ -115,7 +115,14 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 	if tr.daemon() {
 		ctx, cancel := adminCtx()
 		defer cancel()
-		prev, _ = tr.client.Get(ctx, key)
+		var gerr error
+		if prev, gerr = tr.client.Get(ctx, key); gerr != nil {
+			// A transport failure is not "nothing published": renewing on
+			// that belief prints the register-it advice DURING incidents —
+			// and renew is the incident verb the doctor recommends.
+			// Propagate (a clean nil,nil miss is the genuine no-record case).
+			return fmt.Errorf("sequence discovery failed: %w (nothing renewed — retry)", gerr)
+		}
 	} else {
 		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 2*cliTimeout)
 		defer nodeCancel()
@@ -139,7 +146,13 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 		if kClaim, kerr := dht.KeyForClaim(alias); kerr == nil {
 			node.IterativeFindNode(nodeCtx, kClaim, constants.WitnessSet)
 		}
-		prev, _ = node.IterativeGet(nodeCtx, key)
+		var gerr error
+		if prev, gerr = node.IterativeGet(nodeCtx, key); gerr != nil {
+			// A walk FAILURE is not a miss (same discipline as revoke/name):
+			// pretending the network is empty here is actively wrong during
+			// exactly the incidents renew is for. Propagate.
+			return fmt.Errorf("sequence discovery failed: %w (nothing renewed — retry)", gerr)
+		}
 	}
 	if prev == nil {
 		return fmt.Errorf("no live record on the network — nothing to renew (register it)")
@@ -163,10 +176,18 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 	if tr.daemon() {
 		ctx, cancel := publishCtx()
 		defer cancel()
-		if _, err := tr.client.Publish(ctx, env); err != nil {
+		n, err := tr.client.Publish(ctx, env)
+		if err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}
-		if len(env.Record.Claim) > 0 {
+		// The daemon's publish ALREADY runs the K_claim leg for a
+		// claim-bearing record (accepted == 2), including driving §8.3
+		// re-attestation daemon-side — repeating PublishClaim here was a
+		// second full K_claim walk on every renewal of every claim-bearing
+		// apex. Only repair the gap when the daemon's own claim leg did
+		// NOT land (accepted < 2; claim-less records never exceed 1 and
+		// are filtered by the Claim check anyway).
+		if n < 2 && len(env.Record.Claim) > 0 {
 			if err := tr.client.PublishClaim(ctx, env); err != nil {
 				return fmt.Errorf("publish (K_claim): %w", err)
 			}
@@ -188,7 +209,8 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 	}
 
 	pin := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
-	fmt.Printf("%s: RENEWED (sequence %d, fresh 24 h window) tld_id_b32=%s\n", display, env.Record.Sequence, pin)
+	fmt.Printf("%s: RENEWED (sequence %d, fresh %d h window) tld_id_b32=%s\n",
+		display, env.Record.Sequence, constants.RecordDefaultTTL/3600, pin)
 
 	// §8.3 re-attestation (v2 amendment): best-effort re-notarization of
 	// the unchanged claim at the converged witness set — renewals keep the

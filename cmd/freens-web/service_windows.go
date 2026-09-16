@@ -12,6 +12,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -31,10 +32,24 @@ const webuiLogRotateSize = 8 << 20
 
 // windowsRunService rotates the log sink into place and blocks in the SCM
 // control loop until the service stops. Returns a process exit code.
+//
+// svc.Run's error is NOT ignorable: a nil return means the handler ran to
+// completion (its own exit code was already reported through the control
+// protocol), but an error return means the SCM handshake itself failed —
+// the service never came up. That must not masquerade as a clean exit 0
+// (the SCM's recovery actions and the event log both key off the exit
+// code), so it is logged and turned into exit 1.
 func windowsRunService() int {
 	logSink = openWebuiLog()
-	svc.Run(winsvc.WebName, &webuiService{})
-	return 0 // svc.Run only returns after Execute finished; the code was already reported
+	if err := svc.Run(winsvc.WebName, &webuiService{}); err != nil {
+		out := os.Stderr
+		if logSink != nil {
+			out = logSink
+		}
+		fmt.Fprintf(out, "freens-web: service control loop failed: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // openWebuiLog opens <home>\webui.log for appending, rotating an oversized

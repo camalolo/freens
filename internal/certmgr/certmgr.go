@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/keychain"
 	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/tlsca"
@@ -190,10 +191,19 @@ func Issue(keysDir, displayName, outDir, passphrase string, now time.Time) (*Iss
 	certPath := filepath.Join(outDir, displayName+".crt")
 	keyPath := filepath.Join(outDir, displayName+".key")
 	chain := append(tlsca.CertPEM(leafDER), tlsca.CertPEM(caDER)...)
-	if err := writeFileAtomic(certPath, chain, 0o644); err != nil {
+	// KEY first, then the chain. Each file's rename is atomic, but the PAIR
+	// only becomes consistent after both land: a server reload inside the
+	// window sees a mismatched pair either way and fails closed (nginx keeps
+	// serving its previous in-memory pair — the loud, harmless outcome).
+	// Key-first keeps the transient on-disk CERTIFICATE the old, already
+	// trusted one — the file external consumers read in isolation
+	// (monitoring, `openssl x509`, stapling checks) — and, if we die
+	// mid-renewal, leaves the previously trusted cert in place for the next
+	// renewal to retry, instead of a fresh cert nothing can sign for.
+	if err := writeFileAtomic(keyPath, tlsca.KeyPEM(leafKeyDER), 0o600); err != nil {
 		return nil, err
 	}
-	if err := writeFileAtomic(keyPath, tlsca.KeyPEM(leafKeyDER), 0o600); err != nil {
+	if err := writeFileAtomic(certPath, chain, 0o644); err != nil {
 		return nil, err
 	}
 	leaf, err := tlsca.ParseCertDER(leafDER)
@@ -355,37 +365,14 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// writeFileAtomic replaces path with data: temp file in the SAME directory,
-// fsync, rename (the keychain's scheme, minus the Windows dir-sync special
-// case which securekey/keychain already documented as best-effort there —
-// for cert files the rename itself is the atomicity that matters, and a
-// cert re-issued by tomorrow's timer heals any lost rename anyway).
-func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			os.Remove(tmp.Name())
-		}
-	}()
-	if _, err = tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err = os.Chmod(tmp.Name(), mode); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+// writeFileAtomic replaces path with data: the shared internal/atomicfile
+// scheme (temp file in the SAME directory, fsync, chmod, rename, dir-fsync
+// with the Windows skip). Its MkdirAll(0700) only creates MISSING
+// directories, so it is a safe superset of the previous local version (which
+// created none). NOT used for the sudo config-write path — that is a
+// privilege escalation, not an atomic write (writeConfigFile in nginx.go).
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return atomicfile.Write(path, data, mode)
 }
 
 // containsName: exact membership (server_name lists, deployed-file lists).

@@ -47,11 +47,13 @@ func TestValidateAlias(t *testing.T) {
 			t.Errorf("ValidateAlias(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
-	if !IsValidAlias("foo") {
-		t.Error("IsValidAlias(foo) = false, want true")
+	// The boolean wrapper is gone (dead code — nothing but this test read
+	// it); the error path above covers the same cases via ValidateAlias.
+	if _, err := ValidateAlias("foo"); err != nil {
+		t.Errorf("ValidateAlias(foo) errored: %v", err)
 	}
-	if IsValidAlias("123") {
-		t.Error("IsValidAlias(123) = true, want false")
+	if _, err := ValidateAlias("123"); err == nil {
+		t.Error("ValidateAlias(123) = nil error, want the all-numeric rejection")
 	}
 }
 

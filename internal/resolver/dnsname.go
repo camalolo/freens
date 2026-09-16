@@ -26,9 +26,12 @@ package resolver
 //	\DDD   — exactly three decimal digits, value 0..255
 //	\X     — any other single character, literally (covers \. \\ etc.)
 //
-// A malformed \DDD (non-digits) degrades to the literal backslash + character.
-// The function never fails: best-effort round-tripping is strictly better than
-// rejecting a name the client's own resolver considers well-formed.
+// A malformed \DDD — non-digits, too short, or a value ABOVE 255 (e.g. \999)
+// — degrades to the literal-character escape: the backslash is dropped and
+// the next character is emitted as-is (so "\999" round-trips as the three
+// digits "999"). The function never fails: best-effort round-tripping is
+// strictly better than rejecting a name the client's own resolver considers
+// well-formed.
 func unescapeName(s string) string {
 	if !containsBackslash(s) {
 		return s // fast path: conventional ASCII name
@@ -40,7 +43,7 @@ func unescapeName(s string) string {
 			out = append(out, c)
 			continue
 		}
-		if i+3 < len(s)+1 && i+4 <= len(s) && isDigit(s[i+1]) && isDigit(s[i+2]) && isDigit(s[i+3]) {
+		if i+4 <= len(s) && isDigit(s[i+1]) && isDigit(s[i+2]) && isDigit(s[i+3]) {
 			v := int(s[i+1]-'0')*100 + int(s[i+2]-'0')*10 + int(s[i+3]-'0')
 			if v <= 255 {
 				out = append(out, byte(v))

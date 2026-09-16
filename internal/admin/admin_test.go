@@ -494,8 +494,8 @@ func TestResolveClaimAndName(t *testing.T) {
 	if res.Owner != hex.EncodeToString(owner.Public()) {
 		t.Errorf("owner = %s, want the TLD owner", res.Owner)
 	}
-	if res.TldIDB32 != encodeTldIDB32(claim.TldID) || res.TldIDB32 != encodeTldIDB32(tid) {
-		t.Errorf("tld_id_b32 = %s, want %s", res.TldIDB32, encodeTldIDB32(tid))
+	if res.TldIDB32 != EncodeTldIDB32(claim.TldID) || res.TldIDB32 != EncodeTldIDB32(tid) {
+		t.Errorf("tld_id_b32 = %s, want %s", res.TldIDB32, EncodeTldIDB32(tid))
 	}
 	if res.Sequence != 1 {
 		t.Errorf("sequence = %d, want 1", res.Sequence)
@@ -523,7 +523,7 @@ func TestResolveClaimAndName(t *testing.T) {
 	}
 
 	// (c) The pin path: tld_id_b32 supplied, claim hop skipped.
-	pin := encodeTldIDB32(tid)
+	pin := EncodeTldIDB32(tid)
 	resp, err := unixHTTP(c.Sock).Post("http://admin/resolve", "application/json",
 		strings.NewReader(fmt.Sprintf(`{"name":"apex","tld_id_b32":%q}`, pin)))
 	if err != nil {

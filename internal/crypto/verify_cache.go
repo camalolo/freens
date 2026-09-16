@@ -54,10 +54,6 @@ type verifyCacheEntry struct {
 // in-flight store is simply not yet visible.
 var verifyCache [verifyCacheSlots]atomic.Pointer[verifyCacheEntry]
 
-// verifyCacheStats counts memo hits/misses for diagnostics (atomic; read via
-// VerifyCacheStats).
-var verifyCacheHits, verifyCacheMisses atomic.Uint64
-
 // verifyCacheKey derives the memo key over ALL Verify inputs. publicKey and
 // signature have protocol-fixed lengths (32, 64), so the concatenation is
 // unambiguous; the final SHA-256 makes collisions negligible.
@@ -79,21 +75,13 @@ func verifyCacheSlot(key [sha256.Size]byte) int {
 	return int((v * 0x9E3779B97F4A7C15) >> (64 - verifyCacheBits))
 }
 
-// VerifyCacheStats reports (hits, misses) since process start — the memo's
-// observed effectiveness (exposed for tests and /metrics wiring later).
-func VerifyCacheStats() (hits, misses uint64) {
-	return verifyCacheHits.Load(), verifyCacheMisses.Load()
-}
-
 // verifyMemoized wraps a real ed25519 verification with the memo table.
 func verifyMemoized(publicKey, signature, message []byte) bool {
 	key := verifyCacheKey(publicKey, signature, message)
 	slot := &verifyCache[verifyCacheSlot(key)]
 	if e := slot.Load(); e != nil && e.key == key {
-		verifyCacheHits.Add(1)
 		return e.ok
 	}
-	verifyCacheMisses.Add(1)
 	ok := ed25519.Verify(publicKey, message, signature)
 	slot.Store(&verifyCacheEntry{key: key, ok: ok})
 	return ok

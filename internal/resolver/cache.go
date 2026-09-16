@@ -166,16 +166,6 @@ func (c *ResponseCache) countStale() {
 	}
 }
 
-// get returns the cached outcome for key, with every answer RR deep-copied
-// and its TTL decayed to the remaining cache lifetime. ok is false on a miss
-// or an expired entry (which is dropped). The hit/miss counters are bumped
-// OUTSIDE the cache mutex (each does a strings.Join + its own lock; counting
-// under c.mu serialized every query against every insert).
-func (c *ResponseCache) get(key cacheKey) (rrs []dns.RR, rcode int, aa bool, ok bool) {
-	rrs, rcode, aa, status := c.get2(key)
-	return rrs, rcode, aa, status == cacheFresh
-}
-
 // cacheStatus classifies a get2 outcome: cacheFresh (live entry), cacheStale
 // (expired POSITIVE entry still inside the §10.4 serve-stale window — the
 // answer was fully validated when fetched, and ServeDNS will revalidate it
@@ -194,7 +184,8 @@ const (
 // record TTL.
 const staleTTL = 30
 
-// get2 is get() with the serve-stale dimension: an expired positive entry
+// get2 returns the cached outcome for key with the serve-stale dimension: an
+// expired positive entry
 // whose age past expiry is still within StaleServeSecs is returned with
 // cacheStale instead of being dropped (negatives are ALWAYS dropped — a
 // revoked name must go dark within its TTL + NegTTL, never later). The
@@ -296,6 +287,17 @@ func (c *ResponseCache) putFreens(key cacheKey, rrs []dns.RR, rcode int, aa bool
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A put that REPLACES an existing entry is a refresh (sweeper, prefetch,
+	// stale revalidation), not a client hit: carry the old entry's lastHit
+	// over instead of stamping now, so one periodic refresh cannot keep an
+	// abandoned name in the sweeper's warm set forever (lastHit is the
+	// CLIENT-hit clock — see the cacheEntry doc; get2 touches it on every
+	// fresh/stale serve, which is what keeps actively-queried names warm).
+	// A brand-new entry (no old one) stamps lastHit=now: its first client
+	// query is the put that followed the walk.
+	if old, ok := c.entries[key]; ok {
+		e.lastHit = old.lastHit
+	}
 	c.nextStamp++
 	e.stamp = c.nextStamp
 	// Periodic full sweep (per-entry expiry is enforced on Get regardless);
@@ -418,7 +420,9 @@ func (c *ResponseCache) snapshotLocked() *persistedCache {
 // window is exactly the validated answer the stale path serves while a
 // background refresh revalidates — so a restart is invisible. Entries past
 // the window (and negatives past NegTTL) simply miss on first use, as in
-// memory. A corrupt/truncated file is ignored (start empty).
+// memory. At most maxEntries entries (in file order) are restored — a cache
+// shrunken between save and load must not exceed its own bound on startup.
+// A corrupt/truncated file is ignored (start empty).
 func (c *ResponseCache) LoadFrom(path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -432,6 +436,9 @@ func (c *ResponseCache) LoadFrom(path string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, pe := range pc.Entries {
+		if restored >= c.maxEntries {
+			break
+		}
 		e := &cacheEntry{rcode: pe.Rcode, aa: pe.AA, expiresAt: pe.ExpiresAt, lastHit: pc.SavedAt}
 		for _, wire := range pe.RRs {
 			rr, _, err := dns.UnpackRR(wire, 0)

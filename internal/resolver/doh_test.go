@@ -297,6 +297,24 @@ func TestDoHHandlerBadRequests(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversize status = %d, want 413", rec.Code)
 	}
+
+	// Oversized GET payload: the base64url-decoded dns parameter gets the
+	// same cap as the POST body (it is otherwise unbounded).
+	oversize := make([]byte, maxDoHQueryBytes+1)
+	for i := range oversize {
+		oversize[i] = 'A'
+	}
+	if rec := doHGET(t, h, base64RawURL(oversize)); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversize GET status = %d, want 413", rec.Code)
+	}
+	// The cap is exact: maxDoHQueryBytes decoded bytes still pass.
+	exact := make([]byte, maxDoHQueryBytes)
+	for i := range exact {
+		exact[i] = 'A'
+	}
+	if rec := doHGET(t, h, base64RawURL(exact)); rec.Code == http.StatusRequestEntityTooLarge {
+		t.Errorf("exactly-max GET payload rejected — the cap must be >, not >=")
+	}
 }
 
 // TestDoHHandlerFORMERR: a decodable DNS message with no question answers

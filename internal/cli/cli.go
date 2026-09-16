@@ -234,9 +234,16 @@ func editDistance(a, b string) int {
 	return d[len(a)][len(b)]
 }
 
-// usageTo writes the subcommand help to any writer (usage(os.Stderr) is the
-// process-level form).
-func usageTo(w io.Writer) { usage(w) }
+// shortHash clamps a hex fingerprint to its first 16 chars for display.
+// Daemon-provided JSON may carry a shorter (or empty) value than the usual
+// 64-hex sha256 — slicing [:16] unguarded panics on exactly the corrupt
+// input worth displaying, so clamp instead.
+func shortHash(s string) string {
+	if len(s) > 16 {
+		return s[:16]
+	}
+	return s
+}
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage:", ProgName, "<subcommand> [flags]")

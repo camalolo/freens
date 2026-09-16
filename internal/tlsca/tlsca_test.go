@@ -233,6 +233,23 @@ func TestValidateOwnerCARejects(t *testing.T) {
 	}
 }
 
+// TestLeafRequiresNames: an empty SAN list must surface as an error, not a
+// panic on names[0] — Leaf runs on renewal paths and async callers where a
+// caller bug must never crash the process.
+func TestLeafRequiresNames(t *testing.T) {
+	now := time.Now()
+	caDER, caKey, err := OwnerCA(testSeed(t), "bob", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Leaf(caDER, caKey, nil, now); !errors.Is(err, ErrTLSCA) {
+		t.Fatalf("Leaf(nil names) = %v, want ErrTLSCA", err)
+	}
+	if _, _, err := Leaf(caDER, caKey, []string{}, now); !errors.Is(err, ErrTLSCA) {
+		t.Fatalf("Leaf(empty names) = %v, want ErrTLSCA", err)
+	}
+}
+
 func mustParse(t *testing.T, der []byte) *x509.Certificate {
 	t.Helper()
 	c, err := ParseCertDER(der)

@@ -51,6 +51,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/camalolo/freens/internal/atomicfile"
 	"github.com/camalolo/freens/internal/tlsca"
 )
 
@@ -416,12 +417,19 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		case claimYoung:
 			// installed in an earlier, mature era — claims never re-young
 			act = actNone
+		case st.NotAfter > 0 && now.Add(refreshWithin).Before(time.Unix(st.NotAfter, 0)) && !present[alias]:
+			// State fresh but the spool file vanished: re-mint NOW. The
+			// spool is the privileged bridge's source of truth, so this
+			// must NOT wait out the mint throttle (the documented
+			// "state fresh but spool vanished re-mints" invariant — the
+			// throttle case below used to shadow it for up to an hour).
+			act = actInstall
 		case st.MintedAt != 0 && now.Unix()-st.MintedAt < int64(mintThrottle/time.Second):
 			act = actNone // throttled: a healthy re-mint at most once an hour
 		case st.NotAfter > 0 && now.Add(refreshWithin).Before(time.Unix(st.NotAfter, 0)) && present[alias]:
 			act = actNone // healthy, fresh, unchanged, and the spool agrees
 		default:
-			act = actInstall // near expiry, or the spool file went missing
+			act = actInstall // near expiry
 		}
 	default:
 		// DIFFERENT CA IDENTITY under the SAME live identity (alias): the
@@ -487,7 +495,14 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 			e.log.Warn("tls: cross-cert mint failed", "alias", alias, "err", err)
 			return
 		}
-		cross, _ := tlsca.ParseCertDER(crossDER)
+		cross, perr := tlsca.ParseCertDER(crossDER)
+		if perr != nil {
+			// CrossCert just produced these bytes, so this is unreachable in
+			// practice — but OnOwnerCA runs on async resolver paths and must
+			// never nil-deref: skip the install; the next notification retries.
+			e.log.Warn("tls: freshly minted cross-cert failed to parse", "alias", alias, "err", perr)
+			return
+		}
 		crossPEM := tlsca.CertPEM(crossDER)
 
 		// 1) Spool (the privileged bridge's source of truth).
@@ -641,7 +656,6 @@ func (e *Engine) RemoveAlias(alias string) bool {
 	e.mu.Lock()
 	_, ok := e.state[alias]
 	spool := e.spoolPath(alias)
-	sysOK := e.installed[alias]
 	delete(e.state, alias)
 	delete(e.installed, alias)
 	e.mu.Unlock()
@@ -649,9 +663,11 @@ func (e *Engine) RemoveAlias(alias string) bool {
 		return false
 	}
 	_ = os.Remove(spool)
-	if sysOK {
-		e.uninstallSystem(alias)
-	}
+	// Unconditional best-effort uninstall (see OnAliasDead): the in-memory
+	// installed map says nothing about what earlier ENGINE INSTANCES (before
+	// the last restart) put in the real stores — `trust remove` must purge
+	// those too, or a dead namespace keeps its decade-long anchor.
+	e.uninstallSystem(alias)
 	if e.opts.NSSInstall {
 		e.uninstallNSS(alias)
 	}
@@ -679,15 +695,19 @@ func (e *Engine) OnAliasDead(alias string, tldID []byte) {
 		}
 	}
 	spool := e.spoolPath(alias)
-	sysOK := e.installed[alias]
 	delete(e.state, alias)
 	delete(e.installed, alias)
 	e.mu.Unlock()
 
 	_ = os.Remove(spool)
-	if sysOK {
-		e.uninstallSystem(alias)
-	}
+	// Uninstall unconditionally (best-effort, idempotent — purgeIfExpired
+	// set the precedent): the installed map is in-memory ONLY, so after a
+	// daemon restart it is empty while the system/NSS copies it describes
+	// persist. With 10 y cross-certs (v0.17) a stale same-subject anchor
+	// left behind is a decade-long poisoning hazard, not a day-old
+	// nuisance — gate the uninstall on the map and root-mode installs
+	// survive alias death until the next expiry sweep.
+	e.uninstallSystem(alias)
 	if e.opts.NSSInstall {
 		e.uninstallNSS(alias)
 	}
@@ -786,39 +806,11 @@ func (e *Engine) saveState() error {
 	return writeAtomic(e.statePath(), b, 0o600)
 }
 
-// writeAtomic mirrors the keychain's temp+fsync+rename write.
-func writeAtomic(path string, data []byte, mode os.FileMode) (err error) {
-	dir := filepath.Dir(path)
-	if err = os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp")
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			os.Remove(tmp.Name())
-		}
-	}()
-	if _, err = tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	if err = os.Chmod(tmp.Name(), mode); err != nil {
-		return err
-	}
-	if err = os.Rename(tmp.Name(), path); err != nil {
-		return err
-	}
-	return nil
+// writeAtomic replaces path with data via the shared internal/atomicfile
+// scheme (temp+fsync+chmod+rename+dir-fsync; MkdirAll(0700) — the same
+// directory policy this wrapper had).
+func writeAtomic(path string, data []byte, mode os.FileMode) error {
+	return atomicfile.Write(path, data, mode)
 }
 
 // decodeECKey parses a SEC1 EC PRIVATE KEY PEM.

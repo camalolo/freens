@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeIGD serves a realistic IGD: /rootDesc.xml with the connection service
@@ -34,6 +35,7 @@ type fakeIGD struct {
 	mappedExt int          // port AddAnyPortMapping reserves
 	mapped    map[int]bool // live entries (external ports)
 	refuseAdd bool         // fail all Add* (simulates a locked-down router)
+	probes    []string     // raw GetSpecificPortMappingEntry request bodies
 }
 
 func newFakeIGD(t *testing.T) *fakeIGD {
@@ -115,11 +117,31 @@ func newFakeIGD(t *testing.T) *fakeIGD {
 			f.mu.Unlock()
 			fmt.Fprint(w, `<s:Envelope><s:Body><u:AddPortMappingResponse></u:AddPortMappingResponse></s:Body></s:Envelope>`)
 		case "GetSpecificPortMappingEntry":
-			p, _ := strconv.Atoi(arg("NewRemotePort"))
+			// The spec takes EXACTLY NewRemoteHost (may be empty),
+			// NewExternalPort and NewProtocol. A spec-compliant router
+			// answers 402 Invalid Args to anything else — bake that in,
+			// so a client regression here (the probeMapping 402-forever
+			// bug) fails every EnsureFresh test instead of passing.
+			bodyStr := string(body)
 			f.mu.Lock()
-			_, alive := f.mapped[p]
+			f.probes = append(f.probes, bodyStr)
+			mapped := make(map[int]bool, len(f.mapped))
+			for k, v := range f.mapped {
+				mapped[k] = v
+			}
 			f.mu.Unlock()
-			if !alive {
+			if strings.Contains(bodyStr, "NewRemotePort") ||
+				!regexp.MustCompile(`<NewRemoteHost></NewRemoteHost>`).MatchString(bodyStr) ||
+				!strings.Contains(bodyStr, "<NewProtocol>UDP</NewProtocol>") {
+				soapFault(w, 402, "Invalid Args")
+				return
+			}
+			p, err := strconv.Atoi(arg("NewExternalPort"))
+			if err != nil {
+				soapFault(w, 402, "Invalid Args")
+				return
+			}
+			if !mapped[p] {
 				soapFault(w, 714, "NoSuchEntryInArray")
 				return
 			}
@@ -147,7 +169,7 @@ func soapFault(w http.ResponseWriter, code int, desc string) {
 // gwFor returns a Gateway pointed at the fake's root description.
 func gwFor(t *testing.T, f *fakeIGD) *Gateway {
 	t.Helper()
-	gw, err := probeGateway(f.srv.URL+"/rootDesc.xml", nil)
+	gw, err := probeGateway(f.srv.URL + "/rootDesc.xml")
 	if err != nil {
 		t.Fatalf("probeGateway: %v", err)
 	}
@@ -336,6 +358,12 @@ func TestEnsureFreshFollowsIPChange(t *testing.T) {
 	}
 }
 
+// TestEnsureFreshRemapsAfterReboot — the reboot-heal path end to end:
+// the probe asks about the mapped port and gets 714 (the router forgot
+// it), EnsureFresh re-maps on the same gateway and reports the
+// replacement. The fake's strict 402 screen (see the
+// GetSpecificPortMappingEntry case) makes this test fail if probeMapping
+// ever sends non-spec SOAP arguments again.
 func TestEnsureFreshRemapsAfterReboot(t *testing.T) {
 	f := newFakeIGD(t)
 	f.mappedExt = 53535
@@ -366,6 +394,61 @@ func TestEnsureFreshLostAndUnrecoverable(t *testing.T) {
 	nm, changed, err := m.EnsureFresh(context.Background())
 	if err != nil || changed || nm != nil {
 		t.Fatalf("EnsureFresh on lost+refused mapping: nm=%v changed=%v err=%v (want nil,false,nil)", nm, changed, err)
+	}
+}
+
+// TestProbeMappingUsesSpecArgs — regression pin for the probeMapping SOAP
+// arguments: the code once sent a bogus "NewRemotePort" argument and omitted
+// NewRemoteHost, so spec-compliant routers answered 402 Invalid Args
+// forever and EnsureFresh's 714→re-map reboot healing never fired. The fake
+// now 402s non-spec probes (every EnsureFresh test above would catch a
+// relapse); this test additionally pins the exact arguments on the wire.
+func TestProbeMappingUsesSpecArgs(t *testing.T) {
+	f := newFakeIGD(t)
+	f.mappedExt = 53535
+	m, err := gwFor(t, f).MapUDP(context.Background(), 15353, "freens")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, changed, err := m.EnsureFresh(context.Background()); err != nil || changed {
+		t.Fatalf("healthy probe misread: changed=%v err=%v", changed, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.probes) != 1 {
+		t.Fatalf("probe count = %d, want 1", len(f.probes))
+	}
+	body := f.probes[0]
+	if strings.Contains(body, "NewRemotePort") {
+		t.Fatal("probe sends the bogus NewRemotePort argument")
+	}
+	if !strings.Contains(body, "<NewRemoteHost></NewRemoteHost>") {
+		t.Fatal("probe omits the (possibly empty) NewRemoteHost argument")
+	}
+	if !strings.Contains(body, "<NewExternalPort>53535</NewExternalPort>") {
+		t.Fatal("probe does not carry NewExternalPort with the mapped port")
+	}
+	if !strings.Contains(body, "<NewProtocol>UDP</NewProtocol>") {
+		t.Fatal("probe does not carry NewProtocol")
+	}
+}
+
+// TestSSDPWaveCtxCancel — ssdpWave0 must honor its ctx: a parent canceled
+// up front shortens the (internally 1.5 s-bounded) wave instead of burning
+// the whole window.
+func TestSSDPWaveCtxCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	locs, err := ssdpWave0(ctx)
+	if err != nil {
+		t.Fatalf("ssdpWave0: %v", err)
+	}
+	if len(locs) != 0 {
+		t.Fatalf("locations = %v on a canceled ctx", locs)
+	}
+	if el := time.Since(start); el >= ssdpWave {
+		t.Fatalf("canceled wave burned the full window (%v)", el)
 	}
 }
 

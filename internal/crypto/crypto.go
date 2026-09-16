@@ -1,12 +1,9 @@
 // Package crypto implements the freens cryptography layer (specifications.md §5):
 //
 //   - Ed25519 (RFC 8032) signatures and SHA-256 key identities (§5.1, §5.2).
-//   - Simple per-purpose hierarchical key derivation
-//     SK_purpose = SHA-256(SK_root || "freens:" || purpose) (§5.3).
 //   - Hashcash-style proof of work pow_hash = SHA-256(prefix || nonce)
 //     with >= D leading zero bits (§7.3), difficulty recorded in nonce[0]
 //     per Appendix A.4.
-//   - Threshold recovery policy data structure (§5.4).
 //   - Canonical witness-attestation signing input (§7.3).
 //
 // Only the Go standard library is used (crypto/ed25519, crypto/sha256,
@@ -50,11 +47,22 @@ func FromSeed(seed []byte) (*Keypair, error) {
 	return &Keypair{priv: ed25519.NewKeyFromSeed(seed)}, nil
 }
 
-// Public returns the 32-byte Ed25519 verifying key.
-func (k *Keypair) Public() []byte { return k.priv[32:] }
+// Public returns the 32-byte Ed25519 verifying key. The result is a COPY:
+// callers may not corrupt the keypair through the returned slice (returning
+// the internal subslice let any caller write clobber the private key
+// buffer — the seed and the public half share one allocation).
+func (k *Keypair) Public() []byte {
+	pub := make([]byte, ed25519.PublicKeySize)
+	copy(pub, k.priv[32:])
+	return pub
+}
 
-// Seed returns the 32-byte private seed.
-func (k *Keypair) Seed() []byte { return k.priv[:32] }
+// Seed returns the 32-byte private seed. The result is a COPY (see Public).
+func (k *Keypair) Seed() []byte {
+	seed := make([]byte, ed25519.SeedSize)
+	copy(seed, k.priv[:32])
+	return seed
+}
 
 // Sign returns a 64-byte Ed25519 signature over message.
 func (k *Keypair) Sign(message []byte) []byte { return ed25519.Sign(k.priv, message) }
@@ -87,29 +95,6 @@ func TldID(publicKey []byte) ([]byte, error) {
 // algorithm as TldID; distinct name documents intent.
 func NodeID(publicKey []byte) ([]byte, error) {
 	return TldID(publicKey)
-}
-
-// DerivePurpose returns SK_purpose = SHA-256(rootSeed || "freens:" || purpose)
-// per §5.3's simple per-purpose derivation. The 32-byte digest is a valid
-// Ed25519 seed.
-func DerivePurpose(rootSeed []byte, purpose string) ([]byte, error) {
-	if len(rootSeed) != constants.Ed25519PrivateKeyLen {
-		return nil, fmt.Errorf("crypto: root seed must be %d bytes", constants.Ed25519PrivateKeyLen)
-	}
-	h := sha256.New()
-	h.Write(rootSeed)
-	h.Write([]byte("freens:"))
-	h.Write([]byte(purpose))
-	return h.Sum(nil), nil
-}
-
-// DerivePurposeKeypair derives a purpose seed and wraps it into a Keypair.
-func DerivePurposeKeypair(rootSeed []byte, purpose string) (*Keypair, error) {
-	seed, err := DerivePurpose(rootSeed, purpose)
-	if err != nil {
-		return nil, err
-	}
-	return FromSeed(seed)
 }
 
 // LeadingZeroBits counts the leading zero bits in a big-endian digest.
@@ -173,6 +158,13 @@ func clampDifficultyByte(difficultyBits int) byte {
 // the difficulty used); only the remaining nonceSize-1 bytes are randomized.
 //
 // Returns ErrCrypto if maxIters is exhausted.
+//
+// The loop is the registration hot path (~16.7 M iterations at the production
+// difficulty): it reuses ONE digest object (Reset per attempt), ONE nonce
+// buffer, and ONE hash-output buffer instead of allocating per iteration.
+// The acceptance predicate and the mined bytes are unchanged — each attempt
+// still hashes exactly SHA-256(prefix || dByte||tail) with a fresh
+// crypto/rand tail.
 func MinePoW(prefix []byte, difficultyBits, maxIters, nonceSize int) (nonce, powHash []byte, err error) {
 	if difficultyBits < 0 {
 		return nil, nil, fmt.Errorf("crypto: difficulty must be >= 0")
@@ -184,63 +176,29 @@ func MinePoW(prefix []byte, difficultyBits, maxIters, nonceSize int) (nonce, pow
 	if tailLen < 0 {
 		tailLen = 0
 	}
-	dByte := byte(0)
+	tail := make([]byte, tailLen) // the randomized nonce bytes
+	nonceBuf := make([]byte, nonceSize)
 	if nonceSize >= 1 {
-		dByte = clampDifficultyByte(difficultyBits)
+		nonceBuf[0] = clampDifficultyByte(difficultyBits)
 	}
+	h := sha256.New()
+	var digest [sha256.Size]byte
 	for i := 0; i < maxIters; i++ {
-		tail := make([]byte, tailLen)
 		if _, err := crand.Read(tail); err != nil {
 			return nil, nil, err
 		}
-		nonce := append([]byte{dByte}, tail...)
-		if nonceSize == 0 {
-			nonce = tail
+		if nonceSize >= 1 {
+			copy(nonceBuf[1:], tail) // nonceBuf[0] stays the difficulty byte
 		}
-		h := PoWHash(prefix, nonce)
-		if MeetsDifficulty(h, difficultyBits) {
-			return nonce, h, nil
+		h.Reset()
+		h.Write(prefix)
+		h.Write(nonceBuf)
+		dig := h.Sum(digest[:0])
+		if MeetsDifficulty(dig, difficultyBits) {
+			return nonceBuf, dig, nil
 		}
 	}
 	return nil, nil, fmt.Errorf("%w: PoW mining exceeded %d iterations at difficulty %d", ErrCrypto, maxIters, difficultyBits)
-}
-
-// VerifyPoW reports whether SHA-256(prefix || nonce) meets difficultyBits. It
-// verifies the hash only; it does not require nonce[0] == difficulty (that
-// byte is informational per Appendix A.4).
-func VerifyPoW(prefix, nonce []byte, difficultyBits int) bool {
-	return MeetsDifficulty(PoWHash(prefix, nonce), difficultyBits)
-}
-
-// RecoveryPolicy is the §5.4 threshold-of-N recovery policy with a timelock.
-// Mirrors the CBOR structure {1: threshold, 2: keys, 3: timelock}.
-type RecoveryPolicy struct {
-	Threshold int
-	Keys      [][]byte // 32-byte recovery public keys
-	Timelock  int
-}
-
-// NewRecoveryPolicy validates and constructs a recovery policy.
-func NewRecoveryPolicy(threshold int, keys [][]byte, timelock int) (*RecoveryPolicy, error) {
-	if threshold < 1 {
-		return nil, errors.New("crypto: threshold must be >= 1")
-	}
-	for _, k := range keys {
-		if len(k) != constants.Ed25519PublicKeyLen {
-			return nil, fmt.Errorf("crypto: recovery keys must be %d bytes", constants.Ed25519PublicKeyLen)
-		}
-	}
-	if threshold > len(keys) {
-		return nil, errors.New("crypto: threshold > keys count")
-	}
-	if timelock < 0 {
-		return nil, errors.New("crypto: timelock must be >= 0")
-	}
-	cp := make([][]byte, len(keys))
-	for i, k := range keys {
-		cp[i] = append([]byte{}, k...)
-	}
-	return &RecoveryPolicy{Threshold: threshold, Keys: cp, Timelock: timelock}, nil
 }
 
 // WitnessSigningTag is the canonical domain-separation tag for witness

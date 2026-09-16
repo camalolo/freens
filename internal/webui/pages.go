@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,6 +54,11 @@ func mustParseTemplates() {
 		"bootstrap":  "tmpl/bootstrap.tmpl",
 		"storeentry": "tmpl/storeentry.tmpl",
 		"lookupout":  "tmpl/lookupout.tmpl",
+		// lookupempty: the lookup page's hint fragment when the probe is
+		// asked with no usable name (empty/whitespace/"." — the form marks
+		// the field required, but the endpoint is reachable directly and
+		// pre-fix rendered a 500: no such fragment).
+		"lookupempty": "tmpl/lookupempty.tmpl",
 		// networkpeers is also parsed into the base clone (inline use by
 		// the network page) and registered standalone for the /api polling
 		// endpoint (the peers table refreshes itself every 30s).
@@ -103,12 +110,6 @@ func (s *Server) render(w http.ResponseWriter, status int, page string, data any
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = buf.WriteTo(w)
-}
-
-// DebugTemplates parses the full set (test hook).
-func DebugTemplates() error {
-	mustParseTemplates()
-	return nil
 }
 
 // basePage is the common template data.
@@ -210,7 +211,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 					n.Revoked = true
 				} else if res.Found {
 					n.Healthy = true
-					n.IP = firstAdminIPText(res.RRset)
+					n.IP = firstIP(res.RRset)
 					n.ExpiryText = "live"
 				}
 			}
@@ -235,23 +236,7 @@ func (s *Server) aliasTldB32(alias string) string {
 	if err != nil {
 		return ""
 	}
-	return tldB32Display(tldID)
-}
-
-func firstAdminIPText(rrs []admin.RR) string {
-	v6 := ""
-	for _, rr := range rrs {
-		if rr.Text == "" {
-			continue
-		}
-		if rr.Type == rrTypeA {
-			return rr.Text
-		}
-		if rr.Type == rrTypeAAAA && v6 == "" {
-			v6 = rr.Text
-		}
-	}
-	return v6
+	return admin.EncodeTldIDB32(tldID)
 }
 
 // rrTypeA/rrTypeAAAA mirror wire.RRType* without importing wire here.
@@ -288,7 +273,7 @@ func (s *Server) handleNames(w http.ResponseWriter, r *http.Request) {
 				c.ExpiryText = "revoked"
 			} else if res.Found {
 				c.Healthy = true
-				c.IP = firstAdminIPText(res.RRset)
+				c.IP = firstIP(res.RRset)
 				c.ExpiryText = "live"
 			}
 		}
@@ -337,7 +322,7 @@ func (s *Server) handleNameDetail(w http.ResponseWriter, r *http.Request) {
 			d.Sequence = res.Sequence
 			d.Owner = res.Owner
 			d.RRs = res.RRset
-			d.IP = firstAdminIPText(res.RRset)
+			d.IP = firstIP(res.RRset)
 			d.ExpiryText = "live"
 			d.TTLText = "≤ 1 h cap"
 		}
@@ -362,10 +347,10 @@ func (s *Server) subNames(ctx context.Context, alias, tldB32 string) []string {
 		}
 		// display order: labels are stored TLD-adjacent (reversed)
 		labels := append([]string(nil), e.Labels...)
-		reverse(labels)
+		slices.Reverse(labels)
 		out = append(out, strings.Join(labels, ".")+"."+alias)
 	}
-	sortStrings(out)
+	sort.Strings(out)
 	return out
 }
 
@@ -425,7 +410,7 @@ func (s *Server) handleStorePage(w http.ResponseWriter, r *http.Request) {
 		for _, e := range st.Entries {
 			row := storeRow{StoreEntry: e}
 			labels := append([]string(nil), e.Labels...)
-			reverse(labels)
+			slices.Reverse(labels)
 			row.DisplayName = strings.Join(labels, ".")
 			switch {
 			case e.Revoked:
@@ -636,7 +621,20 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// handleLogout clears the session. Logout is a bare GET, and SameSite=Lax
+// still delivers the session cookie on top-level cross-site navigations —
+// so any web page's <a href="http://box:8090/logout"> would otherwise log
+// the visitor out (logout CSRF). The sameSite guard's Fetch-Metadata
+// detection applies here too: a cross-site (or same-site sibling-origin)
+// navigation is refused as a no-op redirect home — the session is NOT
+// cleared. same-origin (the UI's own menu), "none" (typed address) and
+// headerless non-browser callers log out normally.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	switch strings.TrimSpace(strings.ToLower(r.Header.Get("Sec-Fetch-Site"))) {
+	case "cross-site", "same-site":
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	s.auth.dropSession(sessionFromRequest(r))
 	s.clearSessionCookie(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -698,20 +696,6 @@ func (s *Server) handleBootstrapPost(w http.ResponseWriter, r *http.Request) {
 // --------------------------------------------------------------------------
 
 func urlQuery(s string) string { return template.URLQueryEscaper(s) }
-
-func reverse(ss []string) {
-	for i, j := 0, len(ss)-1; i < j; i, j = i+1, j-1 {
-		ss[i], ss[j] = ss[j], ss[i]
-	}
-}
-
-func sortStrings(ss []string) {
-	for i := 1; i < len(ss); i++ {
-		for j := i; j > 0 && ss[j] < ss[j-1]; j-- {
-			ss[j], ss[j-1] = ss[j-1], ss[j]
-		}
-	}
-}
 
 func readSeeds(path string) []string {
 	b, err := os.ReadFile(path)

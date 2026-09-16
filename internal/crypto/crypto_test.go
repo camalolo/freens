@@ -88,31 +88,36 @@ func TestTldID(t *testing.T) {
 	}
 }
 
-func TestDerivePurpose(t *testing.T) {
-	root := bytes.Repeat([]byte{0xaa}, 32)
-	k1, _ := DerivePurpose(root, "tld")
-	k2, _ := DerivePurpose(root, "node")
-	k3, _ := DerivePurpose(root, "tld")
-	if !bytes.Equal(k1, k3) {
-		t.Error("DerivePurpose not deterministic")
+// TestKeypairAccessorsReturnCopies: Public() and Seed() must hand out COPIES
+// of the key material — the private key buffer holds seed||public in one
+// allocation, so an aliased return value let any caller write corrupt the
+// keypair (either half).
+func TestKeypairAccessorsReturnCopies(t *testing.T) {
+	kp, err := Generate()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if bytes.Equal(k1, k2) {
-		t.Error("DerivePurpose should differ per purpose")
+	pub := kp.Public()
+	seed := kp.Seed()
+	pub[0] ^= 0xff
+	seed[31] ^= 0xff
+	if bytes.Equal(kp.Public(), pub) {
+		t.Error("mutating the returned public slice affected the keypair")
 	}
-	// matches SHA-256(root || "freens:tld")
-	h := sha256.New()
-	h.Write(root)
-	h.Write([]byte("freens:tld"))
-	if want := h.Sum(nil); !bytes.Equal(k1, want) {
-		t.Error("DerivePurpose formula mismatch")
+	if bytes.Equal(kp.Seed(), seed) {
+		t.Error("mutating the returned seed slice affected the keypair")
 	}
-	if _, err := DerivePurpose(bytes.Repeat([]byte{0}, 31), "x"); err == nil {
-		t.Error("DerivePurpose should reject 31-byte root")
+	// And repeated calls are stable (fresh copies each time, same values).
+	if !bytes.Equal(kp.Public(), kp.Public()) {
+		t.Error("Public() not stable across calls")
 	}
-	// keypair from derivation can sign/verify.
-	sub, _ := DerivePurposeKeypair(root, "tld")
-	if !Verify(sub.Public(), sub.Sign([]byte("z")), []byte("z")) {
-		t.Error("derived keypair sign/verify failed")
+	if !bytes.Equal(kp.Seed(), kp.Seed()) {
+		t.Error("Seed() not stable across calls")
+	}
+	// The keypair still signs validly after the attempted corruption.
+	msg := []byte("still intact")
+	if !Verify(kp.Public(), kp.Sign(msg), msg) {
+		t.Error("keypair corrupted through an accessor-returned slice")
 	}
 }
 
@@ -221,8 +226,8 @@ func TestMinePoW(t *testing.T) {
 	if !MeetsDifficulty(h, 8) {
 		t.Error("mined hash does not meet difficulty 8")
 	}
-	if !VerifyPoW(prefix, nonce, 8) {
-		t.Error("VerifyPoW failed on freshly-mined nonce")
+	if !MeetsDifficulty(PoWHash(prefix, nonce), 8) {
+		t.Error("recomputed hash does not meet difficulty 8")
 	}
 	// difficulty 0 always succeeds immediately
 	n0, _, err := MinePoW([]byte("x"), 0, 10, 8)
@@ -233,7 +238,7 @@ func TestMinePoW(t *testing.T) {
 		t.Errorf("difficulty-0 nonce[0] = %d, want 0", n0[0])
 	}
 	// impossible difficulty -> never verifies
-	if VerifyPoW(prefix, nonce, 256) {
+	if MeetsDifficulty(PoWHash(prefix, nonce), 256) {
 		t.Error("difficulty 256 should be impossible")
 	}
 	// PoWHash determinism
@@ -243,25 +248,36 @@ func TestMinePoW(t *testing.T) {
 	}
 }
 
-func TestRecoveryPolicy(t *testing.T) {
-	k1, _ := Generate()
-	k2, _ := Generate()
-	k3, _ := Generate()
-	rp, err := NewRecoveryPolicy(2, [][]byte{k1.Public(), k2.Public(), k3.Public()}, 100)
+// BenchmarkMinePoW measures the mining hot loop at a small difficulty so
+// the iteration count dominates (the production shape is ~16.7 M iterations
+// per registration): the per-iteration cost is one crypto/rand fill plus
+// one SHA-256 over prefix||nonce.
+func BenchmarkMinePoW(b *testing.B) {
+	prefix := bytes.Repeat([]byte{0x5a}, 64)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := MinePoW(prefix, 0, 10000, 16); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// TestMinePoWZeroNonceSize: the degenerate "hash the prefix only" nonce
+// space must not panic the reuse-buffer loop — difficulty 0 succeeds on the
+// first attempt with an empty nonce, any real difficulty exhausts.
+func TestMinePoWZeroNonceSize(t *testing.T) {
+	n, h, err := MinePoW([]byte("prefix"), 0, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rp.Threshold != 2 || len(rp.Keys) != 3 || rp.Timelock != 100 {
-		t.Errorf("rp = %+v", rp)
+	if len(n) != 0 {
+		t.Fatalf("nonce len = %d, want 0", len(n))
 	}
-	if _, err := NewRecoveryPolicy(0, [][]byte{k1.Public()}, 1); err == nil {
-		t.Error("threshold 0 should fail")
+	if !bytes.Equal(PoWHash([]byte("prefix"), nil), h) {
+		t.Error("hash mismatch for empty nonce")
 	}
-	if _, err := NewRecoveryPolicy(5, [][]byte{k1.Public(), k2.Public()}, 1); err == nil {
-		t.Error("threshold > keys should fail")
-	}
-	if _, err := NewRecoveryPolicy(1, [][]byte{bytes.Repeat([]byte{0}, 31)}, 1); err == nil {
-		t.Error("31-byte key should fail")
+	if _, _, err := MinePoW([]byte("p"), 8, 10, 0); err == nil {
+		t.Error("difficulty 8 with an empty nonce space must exhaust")
 	}
 }
 

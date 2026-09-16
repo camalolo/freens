@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
 	"github.com/camalolo/freens/internal/home"
@@ -149,6 +150,63 @@ func TestNameApexRejected(t *testing.T) {
 	}
 }
 
+// TestNameAcceptsFlagsAfterName: like renew/revoke/forget, the natural
+// `name www.alice -ttl 600` form must parse (the lead positional is
+// lifted), while a SECOND name and a misordered mid-args flag fail with
+// the truthful errors.
+func TestNameAcceptsFlagsAfterName(t *testing.T) {
+	h := tempHome(t)
+	kp := mustTestKeypair(t)
+	if err := home.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeKeyFile(ownerKeyPath("alice"), kp); err != nil {
+		t.Fatal(err)
+	}
+	tldID, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := startStubAdmin(t, filepath.Join(h, "admin.sock"), map[string]string{
+		"alice": resolvedJSON("alice", 2, "203.0.113.9"),
+	})
+	wwwWire, err := naming.EncodeWireName([]string{"www"}, "alice", tldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wwwKey, err := dht.KeyForWireName(wwwWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub.getKey, stub.getEnv = wwwKey, mustTestEnvelope(t, kp, wwwWire, 3) // seq 3 → publishes 4
+
+	// Flags AFTER the name: the natural form now parses, -ttl applied.
+	out, err := captureStdout(t, func() error { return cmdName([]string{"www.alice", "-ttl", "600"}) })
+	if err != nil {
+		t.Fatalf("name www.alice -ttl 600: %v\n%s", err, out)
+	}
+	if len(stub.published) != 1 || stub.published[0].Record.RRset[0].TTL != 600 {
+		t.Fatalf("ttl after the name not applied: %+v", stub.published)
+	}
+
+	// Two names: the one-name rule, verbatim shape.
+	stub.published = nil
+	_, err = captureStdout(t, func() error { return cmdName([]string{"www.alice", "other.alice"}) })
+	if err == nil || !strings.Contains(err.Error(), "exactly one name") {
+		t.Errorf("two names = %v, want the one-name usage error", err)
+	}
+
+	// A misordered flag after the name: the truthful renew-style refusal,
+	// never a name literally called "-ttl".
+	_, err = captureStdout(t, func() error { return cmdName([]string{"-ip", "203.0.113.1", "www.alice", "-peers", "x"}) })
+	if err == nil || !strings.Contains(err.Error(), "BEFORE") || !strings.Contains(err.Error(), "-peers") {
+		t.Errorf("misordered flag = %v, want the flags-BEFORE-name refusal", err)
+	}
+	if len(stub.published) != 0 {
+		t.Errorf("the refusals must publish nothing (published %d)", len(stub.published))
+	}
+}
+
 // TestFirstAdminAIP: the apex-IP inheritance helper picks the first A
 // record out of an admin RRset — via the daemon's dotted-quad Text
 // rendering, or the base64 rdata when Text is absent.
@@ -156,7 +214,7 @@ func TestFirstAdminAIP(t *testing.T) {
 	aB64 := func(ip string) string {
 		return base64.StdEncoding.EncodeToString(net.ParseIP(ip).To4())
 	}
-	rrs := []adminRR{
+	rrs := []admin.RR{
 		{Type: 16, TTL: 300, Rdata: base64.StdEncoding.EncodeToString([]byte("hello")), Text: `"hello"`}, // TXT: skipped
 		{Type: 1, TTL: 300, Rdata: aB64("203.0.113.9")},                                                  // no Text: rdata path
 		{Type: 1, TTL: 300, Rdata: aB64("192.0.2.1"), Text: "192.0.2.1"},
@@ -165,7 +223,7 @@ func TestFirstAdminAIP(t *testing.T) {
 		t.Errorf("firstAdminAIP = %q, want 203.0.113.9", got)
 	}
 	// Text rendering wins when present.
-	if got := firstAdminAIP([]adminRR{{Type: 1, Rdata: aB64("198.51.100.5"), Text: "198.51.100.5"}}); got != "198.51.100.5" {
+	if got := firstAdminAIP([]admin.RR{{Type: 1, Rdata: aB64("198.51.100.5"), Text: "198.51.100.5"}}); got != "198.51.100.5" {
 		t.Errorf("firstAdminAIP(Text) = %q, want 198.51.100.5", got)
 	}
 	if got := firstAdminAIP(nil); got != "" {

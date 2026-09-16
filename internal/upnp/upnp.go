@@ -78,10 +78,12 @@ type Gateway struct {
 	base    *url.URL // device description URL (control URLs resolve against it)
 	control *url.URL // WANIPConnection / WANPPPConnection control URL
 	service string   // the service URN, e.g. urn:schemas-upnp-org:service:WANIPConnection:1
-	log     Logger
 }
 
-// Logger is the minimal logging surface (satisfied by *slog.Logger).
+// Logger is the minimal logging surface accepted by Map/Discover (satisfied
+// by *slog.Logger). Gateways never log through it — every failure is
+// returned as an error and the caller logs — but the parameter stays part
+// of the exported API (cmd/freens passes its logger).
 type Logger interface {
 	Info(msg string, args ...any)
 	Warn(msg string, args ...any)
@@ -140,7 +142,13 @@ func ssdpWave0(ctx context.Context) ([]string, error) {
 	}
 
 	buf := make([]byte, 4096)
+read:
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			break read // parent canceled: return what the wave gathered so far
+		default:
+		}
 		if err := conn.SetReadDeadline(time.Now().Add(time.Until(deadline))); err != nil {
 			break
 		}
@@ -268,10 +276,10 @@ func parseLocation(resp []byte) (string, bool) {
 // Discover SSDP-searches the LAN and returns every gateway whose device
 // description yields a usable WAN connection control URL (best first —
 // order follows discovery). Callers iterate and keep the first that maps.
+// The log parameter is accepted for API stability and currently unused
+// (see Logger).
 func Discover(ctx context.Context, log Logger) ([]*Gateway, error) {
-	if log == nil {
-		log = nopLogger{}
-	}
+	_ = log
 	locs, err := ssdpSearch(ctx)
 	if err != nil {
 		return nil, err
@@ -281,7 +289,7 @@ func Discover(ctx context.Context, log Logger) ([]*Gateway, error) {
 		if i >= maxDevices {
 			break
 		}
-		gw, err := probeGateway(loc, log)
+		gw, err := probeGateway(loc)
 		if err != nil {
 			continue // not an IGD (a smart TV answered SSDP too): skip
 		}
@@ -292,7 +300,7 @@ func Discover(ctx context.Context, log Logger) ([]*Gateway, error) {
 
 // probeGateway fetches the device description at loc and resolves the WAN
 // connection control URL.
-func probeGateway(loc string, log Logger) (*Gateway, error) {
+func probeGateway(loc string) (*Gateway, error) {
 	base, err := url.Parse(loc)
 	if err != nil {
 		return nil, fmt.Errorf("upnp: bad LOCATION %q: %w", loc, err)
@@ -320,7 +328,7 @@ func probeGateway(loc string, log Logger) (*Gateway, error) {
 	if err != nil || cu.Scheme != "http" {
 		return nil, fmt.Errorf("upnp: bad control URL %q", control)
 	}
-	return &Gateway{base: base, control: cu, service: service, log: log}, nil
+	return &Gateway{base: base, control: cu, service: service}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -514,11 +522,15 @@ type Mapping struct {
 
 // probeMapping asks GetSpecificPortMappingEntry whether externalPort is
 // still mapped (714 NoSuchEntryInArray ⇒ the router forgot it — reboot,
-// firmware reset, lease purge).
+// firmware reset, lease purge). The argument names are the spec's
+// (NewRemoteHost may be empty — wildcard source — but must be PRESENT):
+// a bogus or missing argument makes spec-compliant routers answer 402
+// Invalid Args forever, which would silently disable the reboot healing.
 func (g *Gateway) probeMapping(ctx context.Context, externalPort int) error {
 	_, err := g.soapCall(ctx, "GetSpecificPortMappingEntry", map[string]string{
-		"NewRemotePort": strconv.Itoa(externalPort),
-		"NewProtocol":   "UDP",
+		"NewRemoteHost":   "",
+		"NewExternalPort": strconv.Itoa(externalPort),
+		"NewProtocol":     "UDP",
 	})
 	return err
 }
@@ -702,9 +714,3 @@ func (m *Mapping) Release() error {
 	})
 	return err
 }
-
-type nopLogger struct{}
-
-func (nopLogger) Info(string, ...any)  {}
-func (nopLogger) Warn(string, ...any)  {}
-func (nopLogger) Debug(string, ...any) {}

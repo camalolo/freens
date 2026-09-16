@@ -228,9 +228,10 @@ func (s *Server) mutation(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Handler returns the fully-wrapped root handler (gate outermost).
+// Handler returns the fully-wrapped root handler (gate outermost, the
+// security headers just inside — every mux face gets them).
 func (s *Server) Handler() http.Handler {
-	return s.gate(s.mux)
+	return s.gate(securityHeaders(s.mux))
 }
 
 // ListenAndServe binds cfg.Listen and serves until the process exits. The

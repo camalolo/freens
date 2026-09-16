@@ -123,6 +123,12 @@ func backupRestore(path string, force bool) error {
 		if err != nil {
 			return fmt.Errorf("reading %q from backup: %w", name, err)
 		}
+		if len(b) == 1<<20 {
+			// The read hit the cap: the member is AT LEAST 1 MiB and what we
+			// hold is a silent truncation — writing it would restore a
+			// corrupt key as if it were fine.
+			return fmt.Errorf("member %q exceeds the 1 MiB limit; backup corrupt or unsupported", name)
+		}
 		if err := os.WriteFile(dst, b, 0o600); err != nil {
 			return fmt.Errorf("writing %q: %w", dst, err)
 		}

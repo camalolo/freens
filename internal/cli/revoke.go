@@ -73,9 +73,7 @@ func cmdRevoke(args []string) error {
 	}
 	pin := strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
 
-	// Current state: the name's live sequence (1 for a name the network
-	// has never seen — revoking an unregistered name is a no-op, refuse).
-	// Sequence discovery fetches the envelope by key (tombstones included —
+	// Network state: the name's terminal envelope (tombstones included —
 	// revoking an already-revoked name via /resolve would reset to 1 and
 	// lose the winner race; same fix as the web UI's engine).
 	tr, err := pickTransport(*peersCSV)
@@ -90,17 +88,21 @@ func cmdRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Network state: the name's terminal envelope (tombstones included —
-	// revoking an already-revoked name via /resolve would reset to 1 and
-	// lose the winner race; same fix as the web UI's engine).
 	cur, err := discoverEnvelope(tr, nameKey)
 	if err != nil {
 		return err
 	}
-	var seq uint64 = 1
-	if cur != nil && cur.Record != nil {
-		seq = cur.Record.Sequence + 1
+	if cur == nil || cur.Record == nil {
+		// A CLEAN discovery miss is not a free pass for a seq-1 tombstone:
+		// it would silently lose the §6.4 winner race against the live
+		// record while the CLI printed REVOKED — and the much more common
+		// real-world shape is a pocketed/stale vantage hiding a LIVE name
+		// (the miss proves nothing about the rest of the network). Refuse;
+		// only a name that is genuinely unregistered anywhere matters, and
+		// revoking that is a no-op anyway.
+		return usageErr("nothing is published for %q at this vantage — refusing to mint a seq-1 tombstone (check the name and this box's network view; a name live elsewhere can hide from a pocketed vantage)", displayName)
 	}
+	seq := cur.Record.Sequence + 1
 
 	if !*yes && sysIsTerminal() {
 		fmt.Printf("revoke %s — the name will STOP resolving everywhere (un-revoke = publish a newer record). Proceed? [y/N] ", displayName)

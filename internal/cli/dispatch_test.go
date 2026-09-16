@@ -87,7 +87,7 @@ func TestSuggestSubcommands(t *testing.T) {
 // dispatch table (no orphan verbs, no undocumented ones).
 func TestUsageListsEverySubcommand(t *testing.T) {
 	var sb strings.Builder
-	usageTo(&sb)
+	usage(&sb)
 	got := sb.String()
 	for sub := range dispatch {
 		if sub == "version" {

@@ -225,3 +225,80 @@ func TestForgetNonInteractiveRequiresYes(t *testing.T) {
 		t.Errorf("owner key touched despite refusal: %v", err)
 	}
 }
+
+// forgetSeedTombstone publishes a REVOKED envelope for alias at the given
+// sequence (the already-revoked shape forget's middle branch handles).
+func forgetSeedTombstone(t *testing.T, boot *dht.Node, kp *crypto.Keypair, alias string, seq uint64) {
+	t.Helper()
+	tid, err := crypto.TldID(kp.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wn, err := naming.EncodeWireName(nil, alias, tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	rec, err := wire.NewRecord(wn, kp.Public(), seq, uint64(now), uint64(now+int64(constants.RecordDefaultTTL)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := true
+	rec.Revoke = &rev
+	rec.RRset = nil // §9.5: "revoke = true and empty rrset"
+	env, err := wire.SignRecord(rec, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := boot.Publish(ctx, env); err != nil {
+		t.Fatalf("seeding the %s tombstone: %v", alias, err)
+	}
+}
+
+// TestForgetAlreadyRevokedRequiresConfirmation: the "already revoked"
+// branch prunes the ONLY copies of the keys just as destructively as the
+// live branch — it must prompt (and abort on refusal), and honor -yes.
+func TestForgetAlreadyRevokedRequiresConfirmation(t *testing.T) {
+	kp := forgetKeychain(t, "laurent")
+	boot, peers := startWitnessNet(t, 2)
+	forgetSeedTombstone(t, boot, kp, "laurent", 2)
+
+	// Interactive, prompt refused (tests have no TTY: the scan reads EOF →
+	// abort), so the key material must survive untouched.
+	oldTerm := sysIsTerminal
+	sysIsTerminal = func() bool { return true }
+	t.Cleanup(func() { sysIsTerminal = oldTerm })
+	devnull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = devnull
+	t.Cleanup(func() { os.Stdin = oldStdin; devnull.Close() })
+
+	out, fnErr := captureStdout(t, func() error {
+		return cmdForget([]string{"-peers", peers[0], "laurent"})
+	})
+	if fnErr == nil || !strings.Contains(fnErr.Error(), "forget aborted") {
+		t.Fatalf("prompt refusal = %v, want the abort:\n%s", fnErr, out)
+	}
+	if _, err := os.Stat(keychain.OwnerKeyPath(home.KeysDir(), "laurent")); err != nil {
+		t.Errorf("owner key deleted despite the refused prompt: %v", err)
+	}
+
+	// -yes skips the prompt and prunes.
+	out, fnErr = captureStdout(t, func() error {
+		return cmdForget([]string{"-yes", "-peers", peers[0], "laurent"})
+	})
+	if fnErr != nil {
+		t.Fatalf("forget -yes (already revoked): %v\n%s", fnErr, out)
+	}
+	if !strings.Contains(out, "already revoked") || !strings.Contains(out, "key files removed: 3") {
+		t.Errorf("forget output incomplete:\n%s", out)
+	}
+	if _, err := os.Stat(keychain.OwnerKeyPath(home.KeysDir(), "laurent")); !os.IsNotExist(err) {
+		t.Errorf("owner key survived -yes forget: %v", err)
+	}
+}

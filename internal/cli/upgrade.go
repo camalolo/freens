@@ -266,7 +266,7 @@ func stageTarball(tarPath, stageDir string) (map[string]string, error) {
 		// Windows tarballs ship the binaries with an .exe suffix; match and
 		// stage them under the plain release name so every consumer below
 		// (staged["freens"], installTargetPath) stays GOOS-agnostic.
-		if !sliceContains(releaseBinaries, strings.TrimSuffix(base, ".exe")) || staged[strings.TrimSuffix(base, ".exe")] != "" {
+		if !slices.Contains(releaseBinaries, strings.TrimSuffix(base, ".exe")) || staged[strings.TrimSuffix(base, ".exe")] != "" {
 			continue
 		}
 		base = strings.TrimSuffix(base, ".exe")
@@ -298,15 +298,6 @@ func stageTarball(tarPath, stageDir string) (map[string]string, error) {
 		return nil, fmt.Errorf("release tarball has no %s (corrupt download?)", releaseAssetName())
 	}
 	return staged, nil
-}
-
-func sliceContains(hay []string, needle string) bool {
-	for _, s := range hay {
-		if s == needle {
-			return true
-		}
-	}
-	return false
 }
 
 // verifyStaged runs the staged freens binary and requires it to report the
@@ -375,31 +366,15 @@ func parseVersion(s string) (versionNumbers, bool) {
 // compareVersions orders release tags: numeric triple first, then the
 // suffix (plain < suffixed for the same number, repo convention; two
 // suffixes order lexically). ok=false when either side is not a release
-// tag (dev, garbage).
+// tag (dev, garbage). The ordering itself is compareVersionsNumbers — one
+// implementation, two entry points (string-level vs struct-level).
 func compareVersions(a, b string) (int, bool) {
 	av, aok := parseVersion(a)
 	bv, bok := parseVersion(b)
 	if !aok || !bok {
 		return 0, false
 	}
-	for i := range av.nums {
-		if av.nums[i] != bv.nums[i] {
-			if av.nums[i] < bv.nums[i] {
-				return -1, true
-			}
-			return 1, true
-		}
-	}
-	switch {
-	case av.suffix == bv.suffix:
-		return 0, true
-	case av.suffix == "":
-		return -1, true
-	case bv.suffix == "":
-		return 1, true
-	default:
-		return strings.Compare(av.suffix, bv.suffix), true
-	}
+	return compareVersionsNumbers(av, bv), true
 }
 
 // ---------------------------------------------------------------------------

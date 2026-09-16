@@ -101,8 +101,8 @@ func TestEnvelopeStoreHistoryWrongLengthHash(t *testing.T) {
 	}
 }
 
-// TestEnvelopeStoreHistoryOnExpirySweep: an envelope dropped by
-// EvictExpired is retained in history — the §8.3 case: an EXPIRED
+// TestEnvelopeStoreHistoryOnExpirySweep: an envelope dropped by the expired
+// sweep is retained in history — the §8.3 case: an EXPIRED
 // predecessor must stay fetchable for transfer-chain verification
 // (predecessors are audit history, not live records).
 func TestEnvelopeStoreHistoryOnExpirySweep(t *testing.T) {
@@ -113,8 +113,11 @@ func TestEnvelopeStoreHistoryOnExpirySweep(t *testing.T) {
 	putOK(t, s, key, env, 1500)
 
 	dead := int64(2000) + int64(constants.ExpiryGrace) + 1
-	if n := s.EvictExpired(dead); n != 1 {
-		t.Fatalf("EvictExpired = %d, want 1", n)
+	s.mu.Lock()
+	n := s.evictExpiredLocked(dead)
+	s.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("expired sweep = %d, want 1", n)
 	}
 	if s.Count() != 0 {
 		t.Fatalf("Count after sweep = %d, want 0", s.Count())

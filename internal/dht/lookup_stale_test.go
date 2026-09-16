@@ -137,6 +137,100 @@ func TestLookupClaimStaleCacheRevalidates(t *testing.T) {
 	}
 }
 
+// TestLookupClaimExpiredPushedCopyRewalks (the v0.18.1 www.camalolo
+// incident, claim-keyspace mirror): a PUSHED claim cache copy (a peer put it
+// straight into B's store) carries no fetchedAt stamp and used to read as
+// fresh forever — once the record expired, LookupClaim served it, the §7.4
+// checklist NXDOMAINed it, and the box never re-walked while the network
+// held the newer generation. The expired local hit must fall through to the
+// walk.
+func TestLookupClaimExpiredPushedCopyRewalks(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	lapsedEnv, kClaim := claimEnvelopeAt(t, kp, "pushedclaim", 1, now-100, now+10)
+	liveEnv, _ := claimEnvelopeAt(t, kp, "pushedclaim", 2, now-5, now+3600)
+
+	// The network (A) holds the live generation; B's copy was PUSHED (no
+	// fetch, no stamp).
+	if accepted, err := a.store.Put(kClaim, liveEnv, now, true); err != nil || !accepted {
+		t.Fatalf("seed A (live): accepted=%v err=%v", accepted, err)
+	}
+	if accepted, err := b.store.Put(kClaim, lapsedEnv, now, true); err != nil || !accepted {
+		t.Fatalf("push (lapsed) into B: accepted=%v err=%v", accepted, err)
+	}
+	lookup := NewDHTLookup(b.store, b)
+	var kArr [constants.SHA256Len]byte
+	copy(kArr[:], kClaim)
+	lookup.mu.Lock()
+	_, stamped := lookup.fetchedAt[kArr]
+	lookup.mu.Unlock()
+	if stamped {
+		t.Fatal("precondition: a pushed copy must carry no fetch stamp")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	got, err := lookup.LookupClaim(ctx, "pushedclaim", now+11)
+	if err != nil {
+		t.Fatalf("LookupClaim: %v", err)
+	}
+	gh, _ := got.RecordHash()
+	lh, _ := liveEnv.RecordHash()
+	if !bytes.Equal(gh, lh) {
+		t.Fatal("LookupClaim served the expired pushed copy instead of revalidating against the network")
+	}
+}
+
+// TestLookupClaimExpiredFreshStampRewalks: the stamped variant — a fetched
+// claim cache whose freshness stamp is still inside its window (empty RRset
+// ⇒ a full RecordDefaultTTL window) but whose record lease has lapsed must
+// not be served; the lookup re-walks and adopts the newer generation.
+func TestLookupClaimExpiredFreshStampRewalks(t *testing.T) {
+	a, b := peerPair(t)
+	defer a.Close()
+	defer b.Close()
+
+	kp, err := crypto.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	lapsedEnv, kClaim := claimEnvelopeAt(t, kp, "stampclaim", 1, now-100, now+10)
+	liveEnv, _ := claimEnvelopeAt(t, kp, "stampclaim", 2, now-5, now+3600)
+
+	if accepted, err := a.store.Put(kClaim, liveEnv, now, true); err != nil || !accepted {
+		t.Fatalf("seed A (live): accepted=%v err=%v", accepted, err)
+	}
+	if accepted, err := b.store.Put(kClaim, lapsedEnv, now, true); err != nil || !accepted {
+		t.Fatalf("seed B (lapsed): accepted=%v err=%v", accepted, err)
+	}
+	lookup := NewDHTLookup(b.store, b)
+	var kArr [constants.SHA256Len]byte
+	copy(kArr[:], kClaim)
+	lookup.mu.Lock()
+	lookup.fetchedAt[kArr] = now - 1 // fresh for a full RecordDefaultTTL window
+	lookup.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	got, err := lookup.LookupClaim(ctx, "stampclaim", now+11)
+	if err != nil {
+		t.Fatalf("LookupClaim: %v", err)
+	}
+	gh, _ := got.RecordHash()
+	lh, _ := liveEnv.RecordHash()
+	if !bytes.Equal(gh, lh) {
+		t.Fatal("LookupClaim served the lapsed-but-fresh-stamped copy instead of revalidating")
+	}
+}
+
 func TestLookupClaimDegradedWithLapsedCacheIsNotNXDOMAIN(t *testing.T) {
 	a, b := peerPair(t)
 	kp, err := crypto.Generate()

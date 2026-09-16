@@ -1,5 +1,116 @@
 # Changelog
 
+## Unreleased — the audit-hardening pass (fleet-review fixes: bugs, races, dead code, dedup)
+
+A full-tree review (all 24 packages) found and this pass fixes, grouped by
+severity. Every fix ships with a regression test; every deletion was
+grep-verified zero-caller (including tests) before removal.
+
+**HIGH (real-bug class):**
+- webui `SetName` refused at the apex (parity with the CLI): the "Change
+  address" flow used to publish a claim-less/TLSCA-less/recovery-less apex
+  record at seq+1 that won the §6.4 race and stripped the binding
+  permanently (verify=19 class, two clicks).
+- `revoke` refuses to mint a seq-1 tombstone when discovery cleanly missed
+  (a pocketed vantage on a live name used to silently publish a loser and
+  print REVOKED).
+- DHTLookup.Lookup/LookupClaim revalidate on an expired local hit (pushed
+  no-stamp copies included): an expired envelope is no longer served to the
+  §7.4 checklist → no more NXDOMAIN-without-rewalking (the www/minipc
+  class; the v0.18.1 candidate).
+- certmgr: a failed nginx clone now cleans up through the same privilege
+  path it wrote with, checks the removal errors, and re-validates the tree
+  (a rejected sudo-path clone used to stay in the tree and brick every
+  reload/restart); Install applies multiple block edits BOTTOM-UP (the
+  80/443 twin-vhost file used to get the foreign key paired with our cert
+  and a `listen 443` injected into the :80 block).
+- resolver DoH upstream builds ONE shared http.Client (was: a fresh
+  transport + TCP+TLS handshake per query, idle conns leaked ~90 s).
+
+**MEDIUM (correctness/efficiency):**
+- resolver cache: refreshes no longer re-arm the warm set (`lastHit`
+  carried over on replace) — abandoned names age out as documented, and
+  live names keep the walk budget; bootstrap resolution no longer holds
+  bootMu across network I/O; resolveShared flight completion is
+  panic-safe (deferred delete+close, no corpse flights, no re-lead
+  window); pastHorMu no longer spans ReAttestSets + quorum verification;
+  non-IN qclass → REFUSED; DoH GET payload capped like POST; LoadFrom
+  honors maxEntries.
+- UPnP probeMapping sends the spec SOAP args (NewExternalPort +
+  NewRemoteHost) — post-router-reboot re-mapping healing actually fires
+  now; test fake made spec-strict.
+- trustsync: OnAliasDead/RemoveAlias uninstall system/NSS unconditionally
+  (best-effort) — a post-restart empty `installed` map used to leave a
+  10-year cross-cert in the system store (anchor-poisoning class);
+  missing-spool re-mint precedes the mint throttle.
+- cli/webui renewals: sequence-discovery failures propagate ("sequence
+  discovery failed — retry") instead of publishing phantom seq-1 or
+  reporting "nothing to renew"; the daemon-path renewal skips the
+  duplicate K_claim walk when the publish count says the claim leg
+  already landed; renewOnce dedups claim-bearing names (one renewal per
+  name per tick — the noisy duplicate-renewal class) and the keychain is
+  read once per reconciler tick.
+- webui: job-state race fixed (runner-owned fields read through a j.mu
+  snapshot); missing `lookupempty` fragment added (no more 500 on an
+  empty lookup); toast headers decode `+` as space; GET /settings no
+  longer POSTs /reload as a render side effect; login fail-buckets prune;
+  nosniff/X-Frame-Options/Referrer-Policy headers on; cross-site logout
+  link refused.
+- certmgr: `nginx -V` runs bounded (the one unbounded exec left);
+  exec.WaitDelay set; validate-failure restore is truthful and escalates;
+  sudoAvailable verdict cached (30 s); cert-then-key write order flipped
+  (key first) to keep reload windows consistent.
+- TURN: one expiry timer per allocation (refresh used to stack dormant
+  timers unboundedly); payload budget enforced at the ingress/egress
+  points (oversize datagrams error/drop instead of silently truncating).
+- STUN serve loop backs off on consecutive read errors instead of
+  busy-spinning.
+- claims: FreshAttestations applies the same evaluation cap as
+  ValidWitnesses (untrusted RPC input); the A.4 difficulty inference is
+  single-sourced in claims.InferDifficultyOf (the keychain copy read the
+  frozen constant and diverged under retuning; the resolver replica
+  deleted).
+- crypto/securekey: scrypt parameter allowlist (a tampered keyfile can no
+  longer request ~16 GiB of state); Keypair.Public()/Seed() return
+  copies; MinePoW allocates 2 vs 4 per iteration.
+- dht: evidence walks classify a throttled holder as degraded (was: a
+  clean "no evidence"); the §7.4 claim screen runs once per candidate
+  instead of 2-5×; contact ports validated (0/>65535 rejected);
+  per-RPC timer leak fixed.
+- cli: revoke/renew discovery-error contracts (above); `name` accepts
+  flags after the name like its siblings; unchecked `fp[:16]` slices
+  clamped; `backup -restore` errors on a member at exactly the 1 MiB cap
+  (used to silently truncate); `cert <typo>` no longer tries to issue a
+  certificate for the typo; `forget` confirms the already-revoked branch;
+  daemon logs print effective [dht] values; the DNS cache persists on
+  shutdown (no more 60 s of validation results dropped per restart).
+- renewal: Recovery/Claim deep-copied (no slice aliasing between
+  generations); EnsureTLSCA drops ALL foreign TLSCA slots, not one.
+- tlsca.Leaf rejects an empty SAN list instead of panicking.
+
+**Dead code deleted:** dht (PublishKeyedAt, the ids/tokens/store
+test-only exports, unread LookupStats fields), crypto
+(RecoveryPolicy — a drifting second §5.4 validator —, DerivePurpose*,
+package-level VerifyPoW, VerifyCacheStats), naming.IsValidAlias,
+claims.OrderKey, home.ContactsToPeers, winsvc.openRunning, webui
+(DebugTemplates, keyEnc), resolver (ResponseCache.get), wire.TXT,
+upnp.Gateway.log, the parsed-but-ignored `cert -days` flag. Tracked
+litter f8.tar.gz + fetched.json untracked and gitignored.
+
+**Dedup/consolidation:** one atomic-file writer (internal/atomicfile:
+temp+fsync+chmod+rename+dir-fsync with the Windows skip) replaces six
+drifting copies (dht ×4, keychain, confedit, home, certmgr, trustsync);
+admin's tldB32 twins merged; webui firstIP/min/itoa/sorts → shared or
+stdlib; cli compareVersions/buildARecord/sliceContains collapsed;
+upnp/turn/stun/certmgr/webui hand-rolled insertion sorts gone where
+found.
+
+**Deliberately deferred** (documented, not built): the shared iterative
+walk across dht's three walk variants (the ErrThrottled drift it caused
+is fixed; full consolidation is v0.19-scale), store-heap LRU eviction,
+DoH serve-face config caching, TLSSync per-event goroutine coalescing,
+strict CSP for the webui.
+
 ## v0.18.0 — one reconciler: the envelope-state healing mechanisms consolidated
 
 **The invariant, stated once:** local envelope state reconciles toward

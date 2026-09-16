@@ -303,11 +303,9 @@ func (s *Server) advertisedAddr() string {
 	return s.node.Advertised()
 }
 
-// storeCounts returns (live, history) envelope counts of the daemon's store.
-//
-// NOTE: pending the parallel dht.DHTLookup.Store() accessor these are 0; the
-// daemon's store exists (it backs the node) but the admin side cannot reach
-// it through the pinned New() surface yet. See the package report.
+// storeCounts returns (live, history) envelope counts of the daemon's
+// store — the DHTLookup's own store (it backs the node and the lookup
+// cache). 0/0 only when no lookup/store is wired (New with a nil lookup).
 func (s *Server) storeCounts() (live, history int) {
 	if s.lookup == nil || s.lookup.Store() == nil {
 		return 0, 0
@@ -508,9 +506,8 @@ type getRequest struct {
 	Key string `json:"key"`
 }
 
-// handleGet fetches the winning envelope at a raw storage key: the daemon's
-// local store first (authoritative seeds + §6.4 lookup-path cache), then an
-// iterative §6.4 GET across the network. 404 means "no envelope at this key
+// handleGet fetches the winning envelope at a raw storage key: a §6.4
+// iterative GET across the network. 404 means "no envelope at this key
 // anywhere reachable" — the CLI maps it to (nil, nil), not an error.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	if s.node == nil {
@@ -549,13 +546,15 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"envelope": base64.StdEncoding.EncodeToString(b)})
 }
 
-// fetchEnvelope is the /get lookup: a §6.4 iterative GET across the network.
-// (The daemon's local store would be the natural first hop, but no
-// key-addressed store read is reachable through the pinned New() surface —
-// DHTLookup.Lookup takes a wire_name, not a raw key — so /get is purely the
-// network view. The iterative path caches into the daemon's store anyway,
-// and a get immediately following a publish is served by the accepting
-// peers.)
+// fetchEnvelope is the /get lookup: a §6.4 iterative GET across the
+// network. The daemon's local store IS reachable from here (DHTLookup
+// exposes it — storeCounts and the publish path use it), but /get is
+// deliberately the NETWORK view: sequence discovery and doctor-style checks
+// want the network's winning envelope, not the walker's cached copy, and a
+// live-but-stale local replica would under-sequence a publish. The
+// iterative path still caches what its hGet hops learn back into the local
+// store, so a get immediately following a publish is answered by the
+// accepting peers.
 func (s *Server) fetchEnvelope(ctx context.Context, key []byte) (*wire.SignedEnvelope, error) {
 	return s.node.IterativeGet(ctx, key)
 }
@@ -809,7 +808,7 @@ func resolvedFrom(labels []string, alias string, tldID []byte, env *wire.SignedE
 		Name:     name,
 		Owner:    hex.EncodeToString(env.Record.Owner),
 		Sequence: env.Record.Sequence,
-		TldIDB32: encodeTldIDB32(tldID),
+		TldIDB32: EncodeTldIDB32(tldID),
 	}
 	for _, rr := range env.Record.RRset {
 		if rr == nil {
@@ -830,9 +829,11 @@ func resolvedFrom(labels []string, alias string, tldID []byte, env *wire.SignedE
 	return res
 }
 
-// encodeTldIDB32 renders a tld_id in the freens display convention: lowercase
-// RFC 4648 base32, padding stripped (what gen-key prints and pins accept).
-func encodeTldIDB32(tldID []byte) string {
+// EncodeTldIDB32 renders a tld_id in the freens display convention:
+// lowercase RFC 4648 base32, padding stripped (what gen-key prints and pins
+// accept). The ONE renderer for the convention — the store surface used to
+// carry a private duplicate that drifted in name only.
+func EncodeTldIDB32(tldID []byte) string {
 	return strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
 }
 

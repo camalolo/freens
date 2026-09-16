@@ -7,7 +7,6 @@ package webui
 
 import (
 	"context"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
@@ -135,7 +134,6 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	// Owner key: reuse the parked one for cooldown-safe retries.
 	keyPath := keychain.OwnerKeyPath(e.keysDir, alias)
 	kp, err := keychain.Load(keyPath, in.Passphrase)
-	var keyEnc bool
 	switch {
 	case err == nil:
 		tell("reusing the existing owner key for %s", alias)
@@ -149,14 +147,12 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 		if err := keychain.Save(keyPath, kp, in.Passphrase); err != nil {
 			return RegisterResult{}, userErr("writing the owner key: %v", err)
 		}
-		keyEnc = in.Passphrase != ""
 	}
-	_ = keyEnc
 	tldID, err := crypto.TldID(kp.Public())
 	if err != nil {
 		return RegisterResult{}, err
 	}
-	pin := tldB32Display(tldID)
+	pin := admin.EncodeTldIDB32(tldID)
 
 	// Recovery plan (default on), reusing nothing (a re-register of the
 	// same alias keeps its existing recovery files — regenerating would
@@ -212,17 +208,20 @@ func (e *opsEnv) Register(ctx context.Context, in RegisterInput, progress func(s
 	tell("witnesses: %d distinct nodes co-signed", len(claim.Witnesses))
 
 	// Sequence: the network's current + 1 (tombstones included — see
-	// currentSequence; retries/revocations must out-sequence, §6.4).
-	seq := uint64(1)
-	if wn, werr := naming.EncodeWireName(nil, alias, tldID); werr == nil {
-		seq = e.currentSequence(wn)
-	}
-
-	// Build + sign the TLD record.
+	// currentSequence; retries/revocations must out-sequence, §6.4). A
+	// failed discovery walk aborts here — nothing has been written yet —
+	// never publishing at seq 1 (the phantom-sequence class, cli/name.go's
+	// same fix).
 	wireName, err := naming.EncodeWireName(nil, alias, tldID)
 	if err != nil {
 		return RegisterResult{}, err
 	}
+	seq, err := e.currentSequence(ctx, wireName)
+	if err != nil {
+		return RegisterResult{}, err
+	}
+
+	// Build + sign the TLD record.
 	ipRR, err := addrRR(ip, ttl)
 	if err != nil {
 		return RegisterResult{}, userErr("invalid IP %q", ip)
@@ -311,24 +310,43 @@ func (e *opsEnv) collectWitnesses(ctx context.Context, alias string, tldID, clai
 // Resolve after a revocation would reset to 1 and silently LOSE the §6.4
 // winner race against the tombstone; found live by the webui ops tests,
 // the same flaw the CLI's un-revoke path had).
-func (e *opsEnv) currentSequence(wireName []byte) uint64 {
+//
+// A failed Get is an ERROR, never a silent seq 1: a walk failure means the
+// network's sequence is unknown, and publishing at 1 would make the new
+// record a global §6.4 loser while the UI reported success (the
+// phantom-sequence class; fixed in the CLI first — cli/name.go "A failed
+// discovery walk must not publish at seq 1").
+func (e *opsEnv) currentSequence(ctx context.Context, wireName []byte) (uint64, error) {
 	key, err := dht.KeyForWireName(wireName)
 	if err != nil {
-		return 1
+		return 0, err
 	}
-	if env, gerr := e.d.Get(context.Background(), key); gerr == nil && env != nil && env.Record != nil {
-		return env.Record.Sequence + 1
+	env, gerr := e.d.Get(ctx, key)
+	if gerr != nil {
+		return 0, userErr("sequence discovery failed: %v (nothing published — retry)", gerr)
 	}
-	return 1
+	if env != nil && env.Record != nil {
+		return env.Record.Sequence + 1, nil
+	}
+	return 1, nil
 }
 
-// SetName publishes <label>.<alias> (or the apex when label is empty) at
-// sequence+1 with the given IP — `freens name`. Passphrase unlocks an
+// SetName publishes <label>.<alias> at sequence+1 with the given IP —
+// `freens name`. The apex itself is refused (the CLI's twin refuses the
+// same case): a fresh apex record built here would carry an RRset only,
+// silently stripping the §7.4 claim, the §9.5 TLSCA binding and the
+// recovery policy from the winning apex envelope — and every later renewal
+// copies those fields forward, so one apex "change address" would zero the
+// trust chain (the verify=19 outage class). Passphrase unlocks an
 // encrypted owner key when needed.
 func (e *opsEnv) SetName(ctx context.Context, displayName, ip string, ttl uint64, passphrase string) (seq uint64, err error) {
 	labels, alias, err := naming.DecomposeName(displayName)
 	if err != nil {
 		return 0, userErr("invalid name: %v", err)
+	}
+	if len(labels) == 0 {
+		// cli/name.go's apex refusal, ported: register owns the apex.
+		return 0, userErr("%q is the apex itself — register owns the apex; name adds <label>.<alias> sub-names", displayName)
 	}
 	kp, err := e.loadOwner(alias, passphrase)
 	if err != nil {
@@ -356,7 +374,10 @@ func (e *opsEnv) SetName(ctx context.Context, displayName, ip string, ttl uint64
 	if err != nil {
 		return 0, err
 	}
-	seq = e.currentSequence(wireName)
+	seq, err = e.currentSequence(ctx, wireName)
+	if err != nil {
+		return 0, err
+	}
 	ipRR, err := addrRR(strings.TrimSpace(ip), ttl)
 	if err != nil {
 		return 0, userErr("invalid IP %q", ip)
@@ -395,7 +416,10 @@ func (e *opsEnv) Revoke(ctx context.Context, displayName, passphrase string) (se
 	if err != nil {
 		return 0, err
 	}
-	seq = e.currentSequence(wireName)
+	seq, err = e.currentSequence(ctx, wireName)
+	if err != nil {
+		return 0, err
+	}
 	now := uint64(time.Now().Unix())
 	rec, err := wire.NewRecord(wireName, kp.Public(), seq, now, now+uint64(constants.RecordDefaultTTL))
 	if err != nil {
@@ -436,7 +460,14 @@ func (e *opsEnv) Renew(ctx context.Context, displayName, passphrase string, forc
 	if err != nil {
 		return 0, err
 	}
-	prev, _ := e.d.Get(ctx, key)
+	prev, gerr := e.d.Get(ctx, key)
+	if gerr != nil {
+		// A failed discovery walk is not "nothing to renew": the network's
+		// current sequence is unknown, and minting prev=nil as seq 1 would
+		// publish a global §6.4 loser reporting success (the
+		// phantom-sequence class — same fix as currentSequence).
+		return 0, userErr("sequence discovery failed: %v (nothing renewed — retry)", gerr)
+	}
 	if prev == nil || prev.Record == nil {
 		return 0, userErr("no live record on the network — nothing to renew")
 	}
@@ -499,10 +530,6 @@ func (errEncryptedKey) Error() string { return "key is passphrase-encrypted" }
 // small shared helpers
 // ---------------------------------------------------------------------------
 
-func tldB32Display(tldID []byte) string {
-	return strings.ToLower(strings.TrimRight(base32.StdEncoding.EncodeToString(tldID), "="))
-}
-
 // addrRR is the CLI's addrrr.addrRR (IPv4 → A, IPv6 literal → AAAA).
 func addrRR(ipStr string, ttl uint64) (*wire.RR, error) {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
@@ -518,14 +545,20 @@ func addrRR(ipStr string, ttl uint64) (*wire.RR, error) {
 	}
 }
 
-// firstIP renders the first A (or AAAA) rdata of an admin RRset.
+// firstIP renders the first A (or AAAA fallback) rdata text of an admin
+// RRset — the ONE helper behind the dashboard/names/detail cards and
+// SetName's apex-address inheritance (it used to exist twice, once per
+// file, drifting apart).
 func firstIP(rrs []admin.RR) string {
 	v6 := ""
 	for _, rr := range rrs {
-		if rr.Type == wire.RRTypeA && rr.Text != "" {
+		if rr.Text == "" {
+			continue
+		}
+		if rr.Type == wire.RRTypeA {
 			return rr.Text
 		}
-		if rr.Type == wire.RRTypeAAAA && rr.Text != "" && v6 == "" {
+		if rr.Type == wire.RRTypeAAAA && v6 == "" {
 			v6 = rr.Text
 		}
 	}

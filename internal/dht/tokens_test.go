@@ -205,24 +205,3 @@ func TestVerifyRejectsBadInput(t *testing.T) {
 		t.Fatal("Verify(tolerance=-1) want false, got true")
 	}
 }
-
-func TestCurrentAndPreviousSecret(t *testing.T) {
-	t.Parallel()
-
-	root := bytes.Repeat([]byte{'k'}, 32)
-	ts, _ := newTestTokenStore(t, root, 0)
-
-	cur := ts.CurrentSecret(1300)     // epoch 4
-	prev := ts.PreviousSecret(1300)   // epoch 3
-	earlier := ts.CurrentSecret(1000) // epoch 3
-	if bytes.Equal(cur, prev) {
-		t.Fatal("CurrentSecret(1300) == PreviousSecret(1300); want distinct")
-	}
-	if !bytes.Equal(prev, earlier) {
-		t.Fatal("PreviousSecret(1300) != CurrentSecret(1000); want equal (both epoch 3)")
-	}
-	// Secrets are 32 bytes.
-	if len(cur) != constants.SHA256Len || len(prev) != constants.SHA256Len {
-		t.Fatalf("secret length = %d/%d, want %d", len(cur), len(prev), constants.SHA256Len)
-	}
-}

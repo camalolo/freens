@@ -82,6 +82,23 @@ var PoWDifficultyInit atomic.Int32
 
 func init() { PoWDifficultyInit.Store(int32(constants.PoWDifficultyInit)) }
 
+// InferDifficultyOf returns the Appendix A.4 difficulty inference for claim c
+// (§6.2): the difficulty recorded in Nonce[0] when it is at least the current
+// PoWDifficultyInit baseline, else the baseline itself. A nil claim (or one
+// without a nonce) infers the baseline. This is the SINGLE SOURCE of the
+// inference rule: VerifyPoW, VerifyFull, the keychain's difficulty
+// bookkeeping, and the resolver's effectivePoWDifficulty all call this
+// instead of carrying their own copies (the copies drifted — keychain read
+// the frozen constants.PoWDifficultyInit while this package reads the
+// retunable atomic shadow, diverging under cmd/freens-cli's demo retuning).
+func InferDifficultyOf(c *AliasClaim) int {
+	base := int(PoWDifficultyInit.Load())
+	if c != nil && len(c.Nonce) >= 1 && int(c.Nonce[0]) >= base {
+		return int(c.Nonce[0])
+	}
+	return base
+}
+
 // InferDifficulty, passed as the difficultyBits argument to VerifyPoW or
 // VerifyFull, requests inferring the difficulty: if Nonce is non-empty and
 // Nonce[0] >= PoWDifficultyInit the inferred difficulty is Nonce[0] (the
@@ -262,24 +279,6 @@ type AliasClaim struct {
 	Witnesses  []*WitnessAttestation `cbor:"7,keyasint"` // MAY be empty
 }
 
-// OrderKey is the §7.4 step-3 ordering tuple (timestamp, pow_hash, tld_id),
-// ascending. It holds the raw slice fields for inspection; ordering itself is
-// performed by LessOrderKey / OrderClaims / SelectWinner using bytes.Compare.
-type OrderKey struct {
-	TS      uint64
-	PowHash []byte
-	TldID   []byte
-}
-
-// OrderKey returns the §7.4 lexicographic ascending ordering tuple
-// (timestamp, pow_hash, tld_id). Earliest asserted time wins; ties are broken
-// by the lower PoW hash (a public lottery), then by the lower TLD ID. Ties on
-// (timestamp, pow_hash) are impossible between distinct claimants because
-// tld_id = SHA-256(claimant_pk) differs.
-func (c *AliasClaim) OrderKey() OrderKey {
-	return OrderKey{TS: c.Timestamp, PowHash: c.PowHash, TldID: c.TldID}
-}
-
 // buildPrefix is the shared identity-fields encoder used by both Prefix and
 // MineAliasClaim, guaranteeing the mined PoW prefix and the verified prefix are
 // byte-identical. Field 4 (nonce) is intentionally OMITTED (Appendix C.1).
@@ -326,11 +325,7 @@ func (c *AliasClaim) Prefix() ([]byte, error) {
 func (c *AliasClaim) VerifyPoW(difficultyBits int) bool {
 	d := difficultyBits
 	if d < 0 {
-		if len(c.Nonce) >= 1 && int(c.Nonce[0]) >= int(PoWDifficultyInit.Load()) {
-			d = int(c.Nonce[0])
-		} else {
-			d = int(PoWDifficultyInit.Load())
-		}
+		d = InferDifficultyOf(c)
 	}
 	prefix, err := c.Prefix()
 	if err != nil {
@@ -475,6 +470,12 @@ func (c *AliasClaim) hasQuorumFromPrefixHash(prefixHash []byte, witnessSetIDs ma
 // attestations arrive from storing nodes' pools (each re-attesting witness
 // keeps what it signed); the verifier re-checks every signature — pool state
 // is untrusted input, exactly like pooled envelopes.
+//
+// At most maxWitnessEvaluations deduplicated attestations are
+// cryptographically evaluated (the same bound ValidWitnesses applies): the
+// merged hGet input is attacker-influenceable in size, and each evaluation
+// is an Ed25519 verify — the cap bounds the cost to a constant regardless of
+// the answer-set's size (DoS hardening).
 func FreshAttestations(atts []*WitnessAttestation, prefixHash []byte, now int64, freshWindow int64) []*WitnessAttestation {
 	if len(atts) == 0 {
 		return nil
@@ -483,11 +484,16 @@ func FreshAttestations(atts []*WitnessAttestation, prefixHash []byte, now int64,
 	hi := now + int64(constants.SkewTolerance)
 	seen := make(map[string]struct{}, len(atts))
 	out := make([]*WitnessAttestation, 0, len(atts))
+	evaluated := 0
 	for _, w := range atts {
 		k := hex.EncodeToString(w.NodeID)
 		if _, dup := seen[k]; dup {
 			continue
 		}
+		if evaluated >= maxWitnessEvaluations {
+			break // evaluation cap reached (see maxWitnessEvaluations)
+		}
+		evaluated++
 		if !w.Verify(prefixHash) {
 			continue
 		}
@@ -621,11 +627,11 @@ func MineAliasClaim(alias string, claimantKP *crypto.Keypair, timestamp uint64, 
 // §7.4 — deterministic ordering / full-validity helpers
 // ---------------------------------------------------------------------------
 
-// LessOrderKey implements the §7.4 step-3 ascending total order
-// (timestamp, pow_hash, tld_id): earlier timestamp wins; ties broken by lower
-// PoW hash, then lower TLD ID. Used by SelectWinner (linear min) and
-// OrderClaims (sort.SliceStable) for deterministic, observation-independent
-// convergence.
+// LessOrderKey implements the §7.4 step-3 ascending total order over claims
+// — the ordering tuple (timestamp, pow_hash, tld_id): earlier timestamp
+// wins; ties broken by lower PoW hash, then lower TLD ID. Used by
+// SelectWinner (linear min) and OrderClaims (sort.SliceStable) for
+// deterministic, observation-independent convergence.
 func LessOrderKey(a, b *AliasClaim) bool {
 	if a.Timestamp != b.Timestamp {
 		return a.Timestamp < b.Timestamp
@@ -649,10 +655,10 @@ func structurallyAndPoWValid(c *AliasClaim) bool {
 // SelectWinner returns the deterministic winner of a set of competing claims
 // (§7.4 step 3): it filters to claims whose claimant key is consistent
 // (TldID binds to ClaimantPK) and whose PoW recomputes (difficulty inferred
-// from Nonce[0] when sane, else PoWDifficultyInit), then returns the one with
-// the SMALLEST OrderKey. It returns nil if no claim survives. Witness quorum is
-// intentionally NOT required here; use VerifyFull for the full §7.4 step-2
-// filter.
+// via InferDifficultyOf), then returns the one with the SMALLEST ordering
+// tuple (timestamp, pow_hash, tld_id). It returns nil if no claim survives.
+// Witness quorum is intentionally NOT required here; use VerifyFull for the
+// full §7.4 step-2 filter.
 func SelectWinner(claims []*AliasClaim) *AliasClaim {
 	var best *AliasClaim
 	for _, c := range claims {
@@ -666,10 +672,11 @@ func SelectWinner(claims []*AliasClaim) *AliasClaim {
 	return best
 }
 
-// OrderClaims returns the surviving claims sorted ascending by OrderKey
-// (§7.4 step 3). Only structurally-and-PoW-valid claims are included; the rest
-// are dropped. The sort is stable so equal-key claims (impossible for distinct
-// claimants) retain input order.
+// OrderClaims returns the surviving claims sorted ascending by the §7.4
+// ordering tuple (timestamp, pow_hash, tld_id — see LessOrderKey). Only
+// structurally-and-PoW-valid claims are included; the rest are dropped. The
+// sort is stable so equal-key claims (impossible for distinct claimants)
+// retain input order.
 func OrderClaims(claims []*AliasClaim) []*AliasClaim {
 	survivors := make([]*AliasClaim, 0, len(claims))
 	for _, c := range claims {
@@ -687,9 +694,8 @@ func OrderClaims(claims []*AliasClaim) []*AliasClaim {
 // hold:
 //
 //   - the claimant key is consistent (TldID == SHA-256(ClaimantPK));
-//   - the PoW is valid at difficultyBits (<0 / InferDifficulty → inferred from
-//     Nonce[0] when sane, else PoWDifficultyInit) — recomputed, never trusting
-//     the stored hash;
+//   - the PoW is valid at difficultyBits (<0 / InferDifficulty → inferred via
+//     InferDifficultyOf) — recomputed, never trusting the stored hash;
 //   - the witness quorum is met among DISTINCT CORROBORATING witnesses: v2
 //     attestations bound to this claim's prefix hash, dated inside the
 //     corroboration band around the claim's asserted timestamp (see
@@ -706,11 +712,7 @@ func VerifyFull(c *AliasClaim, difficultyBits int, witnessSetIDs map[string]bool
 	}
 	d := difficultyBits
 	if d < 0 {
-		if len(c.Nonce) >= 1 && int(c.Nonce[0]) >= int(PoWDifficultyInit.Load()) {
-			d = int(c.Nonce[0])
-		} else {
-			d = int(PoWDifficultyInit.Load())
-		}
+		d = InferDifficultyOf(c)
 	}
 	prefix, err := c.Prefix()
 	if err != nil {

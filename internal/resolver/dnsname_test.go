@@ -21,6 +21,8 @@ func TestUnescapeName(t *testing.T) {
 		{`weird\9.`, "weird9."},                      // \C literal escape of '9' (RFC 4343)
 		{`trailing\`, `trailing\`},                   // lone backslash
 		{`\255\000x.`, "\xff\x00x."},                 // byte values
+		{`\999x.`, "999x."},                          // \DDD value > 255: backslash dropped, digits pass through
+		{`\12x.`, "12x."},                            // short \DDD: backslash dropped, rest passes through
 	}
 	for _, c := range cases {
 		if got := unescapeName(c.in); got != c.want {
