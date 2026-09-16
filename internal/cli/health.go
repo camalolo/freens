@@ -285,7 +285,9 @@ func cmdDoctor(args []string) error {
 		// of the shared admin timeout — a slow-but-honest walk is a PASS,
 		// not a warning.
 		nvCtx, nvCancel := context.WithTimeout(context.Background(), 29*time.Second)
-		r, nerr := c.ResolveNetwork(nvCtx, a)
+		nvClient := *c
+		nvClient.Timeout = 29 * time.Second // the shared adminTimeout (15s) kills slow-but-honest walks
+		r, nerr := nvClient.ResolveNetwork(nvCtx, a)
 		nvCancel()
 		nv := func() *admin.NetworkView {
 			if r != nil {
