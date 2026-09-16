@@ -469,6 +469,23 @@ tokens are `HMAC-SHA256(rotating_secret, peer_ip)` and rotate every
 
 1. Owner (or any refresh helper) locates the `R = 8` closest nodes to
    `K_name` via iterative `find_node` with parallelism `ALPHA = 3`.
+   **Replica-target amendment (v0.18.1, the 2026-09-17 pocket
+   lessons):** proximity elects the replica set only where the routing
+   table is a fair census of the network. Real small-network tables are
+   dominated by one-shot "ghost" contacts — ephemeral ports of CLI
+   verbs, burst boxes, stale NAT self-addresses — which answer
+   honestly for seconds and die holding whatever replica they were
+   handed. A publish therefore targets its **citizens**: contacts that
+   have been known for at least 10 minutes AND whose direct
+   confirmation is still fresh. Longevity cannot be faked by a
+   short-lived process, and continuously-confirming daemons pass
+   without noticing; restored/persisted peers count as long-known.
+   The discovery walk demotes to the sparse-table path (no citizens
+   yet — a fresh bootstrap), and a walk-rescue tops the replica set
+   back up to `R` whenever acceptance lands below `R`, so coverage
+   converges to §6.4 replication regardless of the citizens count.
+   Contacts without citizenship remain fully routable and discoverable
+   — the rule gates lease-holding, never reachability.
 2. Obtains write tokens, then issues `put` to each.
 3. Storing nodes verify (in order): token, envelope signature, record
    validity rules (Section 4.4 as checkable locally), sequence number
