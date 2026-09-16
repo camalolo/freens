@@ -54,6 +54,15 @@ type NodeContact struct {
 	LastSeen    int64  // unix seconds
 	ConfirmedAt int64  // unix seconds; 0 = never directly confirmed
 
+	// FirstSeen is when THIS node first learned the contact from a live
+	// exchange (unix seconds; 0 = pre-v0.19 entry or a peerbook/bootstrap
+	// restore, both treated as long-known). It is the longevity signal the
+	// replica-targeting rule needs: a one-shot ghost contact (CLI verb,
+	// burst box, stale self-address) confirms exactly once at birth and is
+	// dead minutes later, while a citizen daemon re-confirms continuously —
+	// only the latter survives the min-age gate (see RoutingTable.Citizens).
+	FirstSeen int64 `json:"first_seen,omitempty"`
+
 	Alts []AddrState `json:"alts,omitempty"` // other known addresses, preferred excluded
 }
 
@@ -110,6 +119,7 @@ func (c *NodeContact) clone() *NodeContact {
 		Addr:        c.Addr,
 		LastSeen:    c.LastSeen,
 		ConfirmedAt: c.ConfirmedAt,
+		FirstSeen:   c.FirstSeen,
 	}
 	if len(c.Alts) > 0 {
 		cc.Alts = make([]AddrState, len(c.Alts))
@@ -513,6 +523,44 @@ func (rt *RoutingTable) AllContacts() []*NodeContact {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	return rt.allContactsLocked()
+}
+
+// Citizens returns the contacts eligible to hold replica puts: directly
+// confirmed at least once (ConfirmedAt > 0), whose confirmation AND last
+// exchange are both fresher than maxFresh seconds, and that this node has
+// known for at least minAge seconds — or legacy entries with no birth stamp
+// (FirstSeen == 0: pre-v0.19 tables and peerbook/bootstrap restores), which
+// count as long-known when confirmed and fresh.
+//
+// This is the v0.19 replica-targeting rule. A one-shot ghost contact — a CLI
+// verb's ephemeral port, a burst box, a stale self-address from a rotated
+// NAT mapping — confirms exactly once at birth and is dead within minutes;
+// it can never satisfy minAge, so it is routable but can never be handed a
+// lease. A citizen daemon re-confirms continuously and passes without
+// noticing. In the 2026-09-17 census a 91-contact table held ~8 citizens
+// against ~83 corpses, and the hash-proximity closest-11 election they fed
+// landed a fleet renewal at accepted=1/11 while the unreached LAN fleet
+// expired into NXDOMAIN pockets. Returns cloned contacts, unordered. Safe
+// for concurrent use.
+func (rt *RoutingTable) Citizens(now, minAge, maxFresh int64) []*NodeContact {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	var out []*NodeContact
+	for _, b := range rt.Buckets {
+		for _, c := range b.Nodes {
+			if c.ConfirmedAt == 0 {
+				continue
+			}
+			if now-c.ConfirmedAt > maxFresh || now-c.LastSeen > maxFresh {
+				continue
+			}
+			if c.FirstSeen != 0 && now-c.FirstSeen < minAge {
+				continue
+			}
+			out = append(out, c.clone())
+		}
+	}
+	return out
 }
 
 // allContactsLocked returns cloned contacts in storage order. Caller must hold

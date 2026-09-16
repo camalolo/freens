@@ -94,6 +94,19 @@ const lookupProbeTimeout = 2 * time.Second
 // that has already given up.
 const rescueWalkBudget = 60 * time.Second
 
+// v0.19 replica-target citizenship gates (see RoutingTable.Citizens). A
+// contact must have been known for putCitizenMinAge before it can be handed
+// a lease, and its direct confirmation plus last exchange must both be
+// fresher than putConfirmMaxAge — the fleet's own reconciler GETs and gossip
+// re-confirm citizens every few minutes, while a one-shot ghost is dead
+// minutes after birth and never re-confirms. maxCitizenPutTargets only
+// bounds a pathological table; the real fleet fits in single digits.
+const (
+	putCitizenMinAge     int64 = 10 * 60
+	putConfirmMaxAge     int64 = 30 * 60
+	maxCitizenPutTargets       = 32
+)
+
 // defaultRepublishInterval is the default scan period of the §6.4 step 4
 // republish timer (overridable via NodeConfig.RepublishInterval). It is a
 // daemon-level knob, not a spec constant: the spec only fixes WHEN a record is
@@ -1085,6 +1098,11 @@ func (n *Node) learnPeer(pk []byte, raddr *net.UDPAddr, advertised string) {
 		return
 	}
 	c.ConfirmedAt = n.now() // a verified inbound message: direct confirmation
+	if n.rt.Get(c.NodeID) == nil {
+		// v0.19 birth stamp on the first live exchange with a stranger
+		// (see RoutingTable.Citizens).
+		c.FirstSeen = c.LastSeen
+	}
 	n.learn(c)
 }
 
@@ -2580,6 +2598,12 @@ func (n *Node) learnContact(c *NodeContact) {
 	}
 	c.LastSeen = n.now()
 	isNew := n.rt.Get(c.NodeID) == nil
+	if isNew {
+		// v0.19 birth stamp: the longevity signal behind replica-target
+		// citizenship (see RoutingTable.Citizens). Peerbook/bootstrap adds
+		// deliberately bypass this — restored contacts count as long-known.
+		c.FirstSeen = c.LastSeen
+	}
 	// Table ownership starts HERE: learn hands the contact to the routing
 	// table BY REFERENCE and later refreshes mutate it in place under
 	// rt.mu (AddOrRefresh / learnPeer) — so give the table a private copy
@@ -2793,22 +2817,54 @@ type PublishStats struct {
 	Accepted int    // stores that accepted the put
 }
 
+// publishTargets assembles the replica set for a keyed publish.
+//
+// v0.17.0: the replica set is defined by REACHABILITY, not by table
+// membership. Puts go to the contacts that ANSWERED a real node-walk
+// (IterativeFindNode is answer-filtered since v0.16.1 — corpses cannot
+// occupy put slots), retiring at the root the old failure shape where
+// half the closest-set was dead and every publish needed a rescue
+// afterwards. The walk also warms the exact keyspace it targets.
+// Islands (walk reached nothing) fall back to the table round.
+//
+// v0.19.0: answer-filtering is not enough. A one-shot ghost contact is
+// genuinely alive for the seconds of its exchange — a walk overlapping
+// a burst (the friend's VPS fires every ~10 min; every CLI heal/
+// diagnostic is itself a one-shot) collects it as "answered" and hands
+// it a replica it takes to the grave. In the 2026-09-17 census a
+// 91-contact table held ~8 citizen daemons against ~83 such corpses,
+// and the closest-11 election landed a fleet renewal at accepted=1/11
+// while the untouched LAN fleet expired into NXDOMAIN pockets. The
+// replica set is therefore the node's CITIZENS — contacts whose
+// confirmation has stayed fresh and whose acquaintance predates
+// putCitizenMinAge (see RoutingTable.Citizens); a one-shot cannot fake
+// that span. The discovery walk now runs only for SPARSE tables (no
+// citizens yet — a fresh bootstrap), and the walk-rescue below remains
+// the backstop that reaches whoever else is alive.
+func (n *Node) publishTargets(ctx context.Context, key []byte, now int64) []*NodeContact {
+	closest := n.rt.Citizens(now, putCitizenMinAge, putConfirmMaxAge)
+	if len(closest) > 0 {
+		sort.Slice(closest, func(i, j int) bool {
+			return CompareDistance(key, closest[i].NodeID, closest[j].NodeID) < 0
+		})
+		if len(closest) > maxCitizenPutTargets {
+			closest = closest[:maxCitizenPutTargets]
+		}
+		return closest
+	}
+	closest = n.IterativeFindNode(ctx, key, constants.RReplication)
+	if len(closest) == 0 {
+		closest = n.rt.Closest(key, constants.RReplication)
+	}
+	return closest
+}
+
 func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.SignedEnvelope, evidence []byte) (PublishStats, error) {
 	envBytes, err := env.Bytes()
 	if err != nil {
 		return PublishStats{KeyHex: hex.EncodeToString(key)}, err
 	}
-	// v0.17.0: the replica set is defined by REACHABILITY, not by table
-	// membership. Puts go to the contacts that ANSWERED a real node-walk
-	// (IterativeFindNode is answer-filtered since v0.16.1 — corpses cannot
-	// occupy put slots), retiring at the root the old failure shape where
-	// half the closest-set was dead and every publish needed a rescue
-	// afterwards. The walk also warms the exact keyspace it targets.
-	// Islands (walk reached nothing) fall back to the table round.
-	closest := n.IterativeFindNode(ctx, key, constants.RReplication)
-	if len(closest) == 0 {
-		closest = n.rt.Closest(key, constants.RReplication)
-	}
+	closest := n.publishTargets(ctx, key, n.now())
 	stats := PublishStats{KeyHex: hex.EncodeToString(key), Targets: len(closest)}
 	if len(closest) == 0 {
 		return stats, ErrNoPeers
@@ -2832,7 +2888,14 @@ func (n *Node) publishKeyedStats(ctx context.Context, key []byte, env *wire.Sign
 	// rare degraded-walk path; the bounded 60 s budget keeps it honest, and
 	// republishing to already-accepting stores is idempotent
 	// (sameStoredRecord → accepted).
-	if stats.Accepted < stats.Targets {
+	//
+	// v0.19.0: with citizen targeting the target set can legitimately be
+	// smaller than R (a sparse citizens table), so full acceptance of a
+	// short target list is still UNDER-replication — the holder of the
+	// predecessor may live outside the citizens set (a live peer only some
+	// other node knows). Rescue therefore fires whenever acceptance is
+	// below the §6.4 replica count R, citizen-set or not.
+	if stats.Accepted < constants.RReplication {
 		rctx, rcancel := context.WithTimeout(context.Background(), rescueWalkBudget)
 		tried := make(map[string]bool, len(closest))
 		for _, c := range closest {
