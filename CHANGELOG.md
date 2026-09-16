@@ -105,6 +105,23 @@ stdlib; cli compareVersions/buildARecord/sliceContains collapsed;
 upnp/turn/stun/certmgr/webui hand-rolled insertion sorts gone where
 found.
 
+**The pocket root cause (2026-09-17, fleet night):** replica targeting was
+a hash-proximity election over the raw routing table, and the table is a
+log of everyone who ever spoke — 91 contacts holding ~8 citizen daemons
+against ~83 one-shot corpses (CLI verb ephemeral ports, the burst box,
+stale NAT self-addresses). The election landed fleet renewals at
+accepted=1/11 while the unreached LAN fleet expired into NXDOMAIN
+pockets. Reachability was never the problem; targeting was.
+NodeContact.FirstSeen + RoutingTable.Citizens make lease-holding a
+longevity privilege: a replica put goes to contacts whose acquaintance
+predates 10 minutes with a still-fresh confirmation — something a
+one-shot physically cannot fake — while the discovery walk demotes to
+the sparse-table bootstrap path and the walk-rescue (now also firing
+below R acceptances) stays the backstop. Peerbook restores count as
+citizens at boot. Follow-ups proposed: self-identifying transient verbs
+(wire flag: one-shots ask not to be learned), citizen-gated {nodes}
+advertisement and witness eligibility.
+
 **Deliberately deferred** (documented, not built): the shared iterative
 walk across dht's three walk variants (the ErrThrottled drift it caused
 is fixed; full consolidation is v0.19-scale), store-heap LRU eviction,
