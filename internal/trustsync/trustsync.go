@@ -133,6 +133,11 @@ type crossState struct {
 	// grace.
 	Status  string     `json:"status,omitempty"`
 	Pending *pendingCA `json:"pending_ca,omitempty"`
+	// System records whether the CURRENT cross-cert made it into the OS
+	// trust store(s) (v0.19.2: previously in-memory only, so every daemon
+	// restart reset the ledger to "spool" and the doctor false-positived
+	// forever — found live on the windows box, 2026-09-17).
+	System bool `json:"system,omitempty"`
 	// CAIdentity is the §9.5.1 CA identity (subject-public-key hash, v0.16.2)
 	// the dedup and rotation decisions key on — invariant across the daily
 	// derivation-day cert-byte changes. Empty in pre-v0.16.2 state files
@@ -525,6 +530,7 @@ func (e *Engine) OnOwnerCA(alias string, tldID, caDER []byte, recordExpires int6
 		e.state[alias] = crossState{
 			TldIDB32: tldB32, CASha256: caHash, NotAfter: cross.NotAfter.Unix(),
 			Status: statusInstalled, CAIdentity: caHash, MintedAt: now.Unix(),
+			System: sysOK,
 		}
 		e.installed[alias] = sysOK
 		e.mu.Unlock()
@@ -745,7 +751,7 @@ func (e *Engine) Snapshot() []Snapshot {
 			TldIDB32:   st.TldIDB32,
 			CASha256:   st.CASha256,
 			NotAfter:   st.NotAfter,
-			System:     e.installed[alias],
+			System:     e.installed[alias] || st.System,
 			Status:     statusOf(st.Status),
 			CAIdentity: st.CAIdentity,
 		}
@@ -756,6 +762,51 @@ func (e *Engine) Snapshot() []Snapshot {
 		out = append(out, snap)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
+	return out
+}
+
+// InstallCrossCertsNow re-installs every trusted namespace's current spool
+// cross-cert into the OS trust store(s) and refreshes the ledger — the
+// repair for a store purge the OnOwnerCA dedup cannot see (state + spool
+// present ⇒ skip; found live 2026-09-17: a purged windows machine store
+// stayed invisible forever). Aliases whose spool copy is expired or
+// missing are skipped (the next OnOwnerCA re-mints them). Returns the
+// per-alias results.
+func (e *Engine) InstallCrossCertsNow() map[string]bool {
+	e.mu.Lock()
+	aliases := make([]string, 0, len(e.state))
+	for alias, st := range e.state {
+		if st.Status != "" && st.Status != statusInstalled {
+			continue // quarantine/rotation have their own §9.5.4 semantics
+		}
+		aliases = append(aliases, alias)
+	}
+	e.mu.Unlock()
+	out := make(map[string]bool, len(aliases))
+	for _, alias := range aliases {
+		pemBytes, err := os.ReadFile(e.spoolPath(alias))
+		if err != nil {
+			out[alias] = false
+			continue
+		}
+		cross, perr := tlsca.ParseCertPEM(pemBytes)
+		if perr != nil || time.Now().After(cross.NotAfter) {
+			out[alias] = false // expired spool copy: never re-poison the store
+			continue
+		}
+		ok := e.installSystem(alias, pemBytes)
+		out[alias] = ok
+		e.mu.Lock()
+		e.installed[alias] = ok
+		if st, have := e.state[alias]; have {
+			st.System = ok
+			e.state[alias] = st
+		}
+		e.mu.Unlock()
+	}
+	if err := e.saveState(); err != nil {
+		e.log.Debug("tls: state save failed after cross-cert reinstall", "err", err)
+	}
 	return out
 }
 

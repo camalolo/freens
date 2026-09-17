@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/winsvc"
@@ -35,6 +36,12 @@ func init() { systemStoreWritable = func() bool { return true } }
 // start rotates the previous log aside (daemon.log.1) instead of growing
 // one file forever.
 const daemonLogRotateSize = 8 << 20
+
+// shutdownFailsafe bounds the graceful shutdown: the SCM reports "could
+// not be stopped" and orphans the process when the stop handler outlives
+// its patience, which is strictly worse than a forced exit of an
+// atomic-writing daemon.
+const shutdownFailsafe = 12 * time.Second
 
 // windowsRunService rotates the log sink into place and blocks in the SCM
 // control loop until the service stops. Returns a process exit code.
@@ -102,6 +109,19 @@ func (s *freensService) Execute(args []string, r <-chan svc.ChangeRequest, chang
 			case svc.Stop, svc.Shutdown:
 				changes <- svc.Status{State: svc.StopPending}
 				signalStop()
+				// The SCM abandons a stop that outlives its patience and
+				// leaves the process half-alive ("could not be stopped" —
+				// found live 2026-09-17, needing taskkill /F). Every durable
+				// artifact this daemon writes is atomic at write time, so a
+				// forced exit loses at most the current log line: when the
+				// graceful shutdown overruns, exit anyway.
+				go func() {
+					time.Sleep(shutdownFailsafe)
+					if daemonLogSink != nil {
+						fmt.Fprintln(daemonLogSink, "graceful shutdown overran — forcing exit")
+					}
+					os.Exit(0)
+				}()
 			}
 		}
 	}

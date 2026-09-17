@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -158,9 +159,12 @@ func cmdTrustInstall(args []string) error {
 		return err
 	}
 	engine, err := trustsync.New(trustsync.Options{
-		HomeDir:     home.Dir(),
-		NSSInstall:  true,
-		SystemStore: os.Geteuid() == 0,
+		HomeDir:    home.Dir(),
+		NSSInstall: true,
+		// os.Geteuid() is -1 on windows (never 0): without this the
+		// cross-cert system installs were silently skipped there (found
+		// live 2026-09-17 — trust-install on windows only did the root).
+		SystemStore: os.Geteuid() == 0 || goosWindows,
 	})
 	if err != nil {
 		return err
@@ -169,6 +173,22 @@ func cmdTrustInstall(args []string) error {
 	fp := engine.RootFingerprint()
 	fmt.Printf("local trust root: %s\n", rootPathOf(home.Dir()))
 	fmt.Printf("  sha256: %s\n", fp)
+	// v0.19.2: trust-install covers the CROSS-CERTS too, not just the root
+	// — a purged/rotated system store is invisible to the daemon's OnOwnerCA
+	// dedup (state + spool present ⇒ skip), so the operator's repair verb
+	// must reinstall what the store lost (found live 2026-09-17).
+	if results := engine.InstallCrossCertsNow(); len(results) > 0 {
+		names := make([]string, 0, len(results))
+		for alias, ok := range results {
+			if ok {
+				names = append(names, alias)
+			}
+		}
+		sort.Strings(names)
+		if len(names) > 0 {
+			fmt.Printf("cross-certs installed system-side: %s\n", strings.Join(names, ", "))
+		}
+	}
 	if blk, _ := pem.Decode(rootPEM); blk == nil {
 		return fmt.Errorf("internal: root PEM unreadable")
 	}
