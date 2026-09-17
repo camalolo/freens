@@ -52,12 +52,22 @@ type Client struct {
 // Close-semantics probe in tests. A socket file that exists but refuses the
 // dial (stale from a crashed daemon) is dead, not alive.
 func Alive(sock string) bool {
-	conn, err := net.DialTimeout("unix", sock, time.Second)
-	if err != nil {
-		return false
+	// Two dials: a busy daemon can overrun a single 1s budget under load
+	// (a resolver upstream-timeout storm, for example), and the doctor
+	// must not report a live daemon dead on one missed dial (found live
+	// 2026-09-17: an upstream outage produced a false "no daemon" while
+	// the process was logging normally).
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, err := net.DialTimeout("unix", sock, time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		if attempt == 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
 	}
-	_ = conn.Close()
-	return true
+	return false
 }
 
 // timeout resolves the effective per-request budget.

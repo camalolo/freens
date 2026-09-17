@@ -210,10 +210,23 @@ func cmdDoctor(args []string) error {
 		doctorWarn(format, args...)
 	}
 
-	// 1. admin socket.
+	// 1. admin socket. A failed dial is TWO different realities with
+	// different fixes: the socket file MISSING means the daemon is not
+	// running; the file PRESENT but not answering means a live daemon
+	// under load (found live 2026-09-17: an upstream-outage timeout
+	// storm produced a false "no daemon" while the process was logging
+	// normally). Never report the second as the first.
 	sock := home.AdminSock()
 	c := maybeAdmin()
-	check(c != nil, "admin socket alive (%s)", sock)
+	if c == nil {
+		if _, statErr := os.Stat(sock); statErr == nil {
+			check(false, "admin socket present but not answering (%s) — the daemon is under load; retry in a moment", sock)
+		} else {
+			check(false, "admin socket alive (%s)", sock)
+		}
+	} else {
+		check(true, "admin socket alive (%s)", sock)
+	}
 
 	// 2. daemon version (needs the socket).
 	var peers int
