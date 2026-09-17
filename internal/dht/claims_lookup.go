@@ -17,7 +17,6 @@
 package dht
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -163,7 +162,11 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 		}
 	}
 
-	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
+	// v0.19: the shared fast walk — citizens always in the pool, ordered
+	// first, 8-wide rounds (was: closest-ALPHA over a ghost-seeded
+	// shortlist; the doctor's claim survey was the slowest walk in the
+	// fleet because of exactly that drift).
+	shortlist := n.walkShortlist(key)
 	if len(shortlist) == 0 {
 		return sortedByRecordHash(collected), nil, nil, nil // island: local copy only.
 	}
@@ -178,30 +181,11 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 	answered := make(map[string]*NodeContact, len(shortlist)) // reachable nodes
 	probesFailed := 0
 	probesThrottled := 0
-	batchSize := constants.Alpha
+	batchSize := lookupRoundWidth
 
 	for round := 0; round < maxLookupRounds; round++ {
-		// Nearest-first so the ALPHA un-queried we pick are the closest.
-		sort.SliceStable(shortlist, func(i, j int) bool {
-			return CompareDistance(key, shortlist[i].NodeID, shortlist[j].NodeID) < 0
-		})
 		now := n.now()
-		var batch []*NodeContact
-		for _, c := range shortlist {
-			if queried[string(c.NodeID)] {
-				continue
-			}
-			if bytes.Equal(c.NodeID, n.id) {
-				continue // the walker itself: peers re-advertise it back, but its answer is the local view, not the network's
-			}
-			if n.penalized(c.NodeID, now) {
-				continue // recently-failed corpse: skip (issue #1 churn)
-			}
-			batch = append(batch, c)
-			if len(batch) >= batchSize {
-				break
-			}
-		}
+		batch := n.walkBatch(shortlist, queried, key, now, batchSize)
 		if len(batch) == 0 {
 			break // every known contact queried or penalized: converged.
 		}
@@ -222,7 +206,11 @@ func (n *Node) collectClaims(ctx context.Context, alias string, includeLocal boo
 				// Same probe budget as IterativeGet: a peer that cannot
 				// answer a tiny UDP get within lookupProbeTimeout is
 				// effectively unavailable.
-				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
+				budget := lookupProbeTimeout
+				if !citizenNow(c, n.now()) {
+					budget = unprovenProbeTimeout
+				}
+				pctx, cancel := context.WithTimeout(ctx, budget)
 				defer cancel()
 				es, ns, rts, err := n.getFromPeer(pctx, key, c)
 				results[i] = res{es, ns, rts, err}

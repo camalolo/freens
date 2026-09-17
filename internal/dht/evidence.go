@@ -335,7 +335,9 @@ func (l *DHTLookup) LookupEvidence(ctx context.Context, recordHash []byte) (*wir
 // churn/partition turning that into an NXDOMAIN-class miss is exactly the
 // issue-#1 failure mode the degraded classification exists to prevent.
 func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]byte, error) {
-	shortlist := append([]*NodeContact(nil), n.rt.Closest(recordHash, constants.K)...)
+	// v0.19: the shared fast walk — citizens always in the pool, ordered
+	// first, 8-wide rounds.
+	shortlist := n.walkShortlist(recordHash)
 	if len(shortlist) == 0 {
 		return nil, nil // no peers known: an island.
 	}
@@ -346,30 +348,11 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 	}
 	defer n.releaseWalk()
 	queried := make(map[string]bool, len(shortlist))
-	batchSize := constants.Alpha
+	batchSize := lookupRoundWidth
 	probesFailed := 0
 	throttled := 0
 	for round := 0; round < maxLookupRounds; round++ {
-		// Nearest-first so the ALPHA un-queried we pick are the closest.
-		sort.SliceStable(shortlist, func(i, j int) bool {
-			return CompareDistance(recordHash, shortlist[i].NodeID, shortlist[j].NodeID) < 0
-		})
-		var batch []*NodeContact
-		for _, c := range shortlist {
-			if queried[string(c.NodeID)] {
-				continue
-			}
-			if bytes.Equal(c.NodeID, n.id) {
-				continue // the walker itself: its answer is the local view, not the network's
-			}
-			if n.penalized(c.NodeID, n.now()) {
-				continue // recently-failed corpse: skip as a candidate
-			}
-			batch = append(batch, c)
-			if len(batch) >= batchSize {
-				break
-			}
-		}
+		batch := n.walkBatch(shortlist, queried, recordHash, n.now(), batchSize)
 		if len(batch) == 0 {
 			break // every known contact queried or penalized: converged.
 		}
@@ -386,7 +369,11 @@ func (n *Node) iterativeGetEvidence(ctx context.Context, recordHash []byte) ([]b
 			wg.Add(1)
 			go func(i int, c *NodeContact) {
 				defer wg.Done()
-				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
+				budget := lookupProbeTimeout
+				if !citizenNow(c, n.now()) {
+					budget = unprovenProbeTimeout
+				}
+				pctx, cancel := context.WithTimeout(ctx, budget)
 				defer cancel()
 				raw, nodes, err := n.evidenceFromPeer(pctx, recordHash, c)
 				results[i] = res{raw, nodes, err}
