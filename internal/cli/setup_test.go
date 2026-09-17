@@ -189,8 +189,8 @@ func TestSetupIdempotent(t *testing.T) {
 	// (the :53 -> daemon-port redirect carries the port; resolv.conf itself
 	// has no port syntax). The nft redirect commands ran via sudo.
 	gotResolv := strings.TrimSpace(string(readFileOrDie(pathResolvConf)))
-	if gotResolv != "nameserver 127.0.0.1" {
-		t.Errorf("resolv.conf = %q, want exactly \"nameserver 127.0.0.1\"", gotResolv)
+	if gotResolv != "nameserver 127.0.0.1\nnameserver 9.9.9.9" {
+		t.Errorf("resolv.conf = %q, want loopback + fallback", gotResolv)
 	}
 	if !rec.ran("sudo", "-n", "nft", "add", "table", "ip", nftTableName) {
 		t.Errorf("nft redirect table not installed: %v", rec.cmds)

@@ -350,7 +350,20 @@ func wireOSResolver() string {
 	//    backup with an intermediate version — os.Stat suffices, /etc is
 	//    searchable and stat needs no read permission on the file).
 	cur, _ := sysReadFile(pathResolvConf)
+	fallbacks := resolvFallbacks(string(cur))
 	if strings.HasPrefix(string(cur), "nameserver 127.0.0.1\n") {
+		// Already wired — make sure a FALLBACK resolver line exists (the
+		// 2026-09-17 desktop lesson: resolv.conf pointing at the daemon
+		// ALONE means a stopped daemon takes the machine's DNS down with
+		// it; with a fallback line the OS resolver fails over and
+		// internet names survive — freens names may fail, internet names
+		// must not).
+		if len(fallbacks) == 0 {
+			if err := sysWriteEtc(pathResolvConf, []byte("nameserver 127.0.0.1\nnameserver 9.9.9.9\n"), 0o644); err != nil {
+				printManualCommands("resolv.conf fallback line", manual[len(manual)-1:])
+				return withNote("OS resolver: MANUAL step printed above (sudo failed) — append `nameserver 9.9.9.9` after the 127.0.0.1 line")
+			}
+		}
 		return withNote("OS resolver: already wired (resolv.conf -> 127.0.0.1, :53 -> " + addr + " redirect)")
 	}
 	if !sysStatExists(pathResolvBackup) {
@@ -364,7 +377,17 @@ func wireOSResolver() string {
 	// anymore, and the mv still bypasses a resolved stub symlink (it
 	// replaces the symlink itself; writing through it would land in /run
 	// and be regenerated on the next restart).
-	if err := sysWriteEtc(pathResolvConf, []byte("nameserver 127.0.0.1\n"), 0o644); err != nil {
+	// The daemon loopback stays FIRST; the pre-freens upstreams (or the
+	// public pair when none are known) follow as the OS-level failover —
+	// the DNS-outage invariant.
+	wired := "nameserver 127.0.0.1\n"
+	for _, fb := range fallbacks {
+		wired += "nameserver " + fb + "\n"
+	}
+	if len(fallbacks) == 0 {
+		wired += "nameserver 9.9.9.9\n"
+	}
+	if err := sysWriteEtc(pathResolvConf, []byte(wired), 0o644); err != nil {
 		printManualCommands("resolv.conf rewrite", manual[len(manual)-1:])
 		return withNote("OS resolver: MANUAL step printed above (sudo failed) — resolv.conf nameserver 127.0.0.1")
 	}
@@ -896,3 +919,27 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 `
+
+// resolvFallbacks harvests the non-loopback nameservers from a resolv.conf
+// body (the pre-freens upstreams), for the failover lines that keep
+// internet DNS alive while the freens daemon is stopped or being upgraded.
+func resolvFallbacks(conf string) []string {
+	var out []string
+	seen := map[string]bool{"127.0.0.1": true, "::1": true}
+	for _, line := range strings.Split(conf, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "nameserver ") {
+			continue
+		}
+		ns := strings.TrimSpace(strings.TrimPrefix(line, "nameserver "))
+		if ns == "" || seen[ns] {
+			continue
+		}
+		seen[ns] = true
+		out = append(out, ns)
+	}
+	if len(out) > 2 {
+		out = out[:2]
+	}
+	return out
+}

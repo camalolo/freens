@@ -165,8 +165,8 @@ func TestWireOSResolverAtomicReplaceNoRmGap(t *testing.T) {
 	if sysStatExists(pathResolvConf + etcStagingSuffix) {
 		t.Errorf("staging file left behind: %s", pathResolvConf+etcStagingSuffix)
 	}
-	if got := string(mustRead(t, pathResolvConf)); got != "nameserver 127.0.0.1\n" {
-		t.Errorf("resolv.conf = %q, want %q", got, "nameserver 127.0.0.1\n")
+	if got := string(mustRead(t, pathResolvConf)); got != "nameserver 127.0.0.1\nnameserver 9.9.9.9\n" {
+		t.Errorf("resolv.conf = %q, want loopback + fallback", got)
 	}
 }
 
@@ -197,7 +197,9 @@ func TestWireOSResolverBackupTakenOnce(t *testing.T) {
 	if got := string(mustRead(t, pathResolvBackup)); got != "nameserver 9.9.9.9\n" {
 		t.Errorf("pristine backup clobbered: %q, want %q", got, "nameserver 9.9.9.9\n")
 	}
-	if got := string(mustRead(t, pathResolvConf)); got != "nameserver 127.0.0.1\n" {
+	// The re-run harvests the clobbered 8.8.8.8 as the failover resolver
+	// (the DNS-outage invariant: loopback first, real upstream after).
+	if got := string(mustRead(t, pathResolvConf)); got != "nameserver 127.0.0.1\nnameserver 8.8.8.8\n" {
 		t.Errorf("resolv.conf not rewired on re-run: %q", got)
 	}
 }

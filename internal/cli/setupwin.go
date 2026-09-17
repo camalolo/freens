@@ -309,12 +309,12 @@ func wireOSResolverWindows() string {
 		if err := windowsSetAdapterDNS(dnsLoopbackServer); err != nil {
 			return fmt.Sprintf("OS resolver: wired, but the re-apply failed (%v) — existing wiring kept", err)
 		}
-		if err := saveDNSBackup(cur); err != nil {
+		if err := saveDNSBackup(stripLoopbackOnlyAdapters(cur)); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: warning: dns backup not saved: %v\n", ProgName, err)
 		}
 		return fmt.Sprintf("OS resolver: already wired (adapter DNS -> %s, suffix %q; conventional names forward upstream through the daemon)", dnsLoopbackServer, windowsDNSSuffix)
 	}
-	if err := saveDNSBackup(cur); err != nil {
+	if err := saveDNSBackup(stripLoopbackOnlyAdapters(cur)); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: dns backup not saved: %v\n", ProgName, err)
 	}
 	if err := windowsSetAdapterDNS(dnsLoopbackServer); err != nil {

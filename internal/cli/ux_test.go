@@ -52,7 +52,7 @@ func TestDoctorFixWiresResolverAndTriesDaemon(t *testing.T) {
 	// The fix actually wired the stubbed resolv.conf (bare loopback; the
 	// redirect rides in the firewall, stubbed as sysRun commands).
 	b, rerr := os.ReadFile(pathResolvConf)
-	if rerr != nil || strings.TrimSpace(string(b)) != "nameserver 127.0.0.1" {
+	if rerr != nil || strings.TrimSpace(string(b)) != "nameserver 127.0.0.1\nnameserver 9.9.9.9" {
 		t.Errorf("resolv.conf not wired by doctor --fix: %v\n%s", rerr, b)
 	}
 }
@@ -79,7 +79,7 @@ func TestDoctorFixWiresResolverWhenDaemonUp(t *testing.T) {
 		t.Errorf("--fix re-ran setup although the daemon was up:\n%s", out)
 	}
 	b, err := os.ReadFile(pathResolvConf)
-	if err != nil || strings.TrimSpace(string(b)) != "nameserver 127.0.0.1" {
+	if err != nil || strings.TrimSpace(string(b)) != "nameserver 127.0.0.1\nnameserver 9.9.9.9" {
 		t.Errorf("resolv.conf not wired:\n%s", b)
 	}
 }

@@ -451,8 +451,7 @@ func installBinary(stagePath, target string) (result string, err error) {
 	staging := target + ".freens-new"
 
 	if !writable && runtime.GOOS == "windows" {
-		// No sudo equivalent: an elevated shell is the only way in. The
-		// caller stopped the service first, so nothing is half-swapped.
+		// No sudo equivalent: an elevated shell is the only way in.
 		return "", fmt.Errorf("%s is not writable by this user — re-run `upgrade` from an elevated (Run as administrator) shell", filepath.Dir(target))
 	}
 	if writable {
@@ -904,42 +903,62 @@ func cmdUpgrade(args []string) error {
 	if goosWindows {
 		winServiceWasRunning = winSvcRunning()
 		winWebWasRunning = winSvcWebRunning()
-		if winServiceWasRunning {
-			if !winSvcElevated() {
-				return usageErr("the freens service is running and `upgrade` needs admin rights to restart it — re-run from an elevated (Run as administrator) shell (or `net stop freens` first)")
-			}
-			fmt.Println("stopping service freens (Windows locks a running image)…")
-			if err := winSvcStop(); err != nil {
-				return fmt.Errorf("stopping the freens service: %w", err)
-			}
+		if (winServiceWasRunning || winWebWasRunning) && !winSvcElevated() {
+			return usageErr("the freens services are running and `upgrade` needs admin rights to restart them — re-run from an elevated (Run as administrator) shell")
 		}
-		if winWebWasRunning {
-			fmt.Println("stopping service freens-web (Windows locks a running image)…")
-			if err := winSvcWebStop(); err != nil {
-				if winServiceWasRunning {
-					_ = winSvcStart() // leave the daemon as we found it
-				}
-				return fmt.Errorf("stopping the freens-web service: %w", err)
-			}
-		}
+		// v0.19: SWAP FIRST while the services keep running. installBinary
+		// replaces a running image legally on Windows (rename-aside: the
+		// old image's lock dies with the process), so the stop is no longer
+		// the precondition for the swap — and the order means a killed verb
+		// can never leave the services STOPPED. The old stop→swap→start
+		// flow had a dead-DNS window between stop and start, and a verb
+		// killed inside it (found live 2026-09-17: an aborted desktop
+		// upgrade stopped the SCM service and died, taking the machine's
+		// whole DNS down with it) had no way back but a manual start. The
+		// worst case now is a completed swap with a restart still owed —
+		// any restart (re-run, reboot, SCM recovery) finishes it. The
+		// stop-first flow remains the fallback below for a swap that
+		// refuses while running.
 	}
 
 	// Install each binary in place of the running one.
 	fmt.Println("installing:")
-	var installErr error
-	for _, bin := range releaseBinaries {
-		target := installTargetPath(bin)
-		res, err := installBinary(staged[bin], target)
-		if err != nil {
-			installErr = fmt.Errorf("installing %s: %w", target, err)
-			break
+	runInstall := func() error {
+		for _, bin := range releaseBinaries {
+			target := installTargetPath(bin)
+			res, err := installBinary(staged[bin], target)
+			if err != nil {
+				return fmt.Errorf("installing %s: %w", target, err)
+			}
+			fmt.Printf("  %s: %s\n", target, res)
 		}
-		fmt.Printf("  %s: %s\n", target, res)
+		return nil
 	}
-	if installErr != nil {
+	installErr := runInstall()
+	if installErr != nil && goosWindows && (winServiceWasRunning || winWebWasRunning) {
+		// The in-place swap refused while running (locked/permission
+		// edge): fall back to the classic stop-first dance — the restore
+		// semantics inside installBinary keep the old binaries in place
+		// for a plain start, and the services come back right after.
+		fmt.Println("in-place swap refused while running — falling back to stop-first…")
+		if winServiceWasRunning {
+			_ = winSvcStop()
+		}
+		if winWebWasRunning {
+			_ = winSvcWebStop()
+		}
+		installErr = runInstall()
+		if installErr != nil {
+			if winServiceWasRunning {
+				_ = winSvcStart()
+			}
+			if winWebWasRunning {
+				_ = winSvcWebStart()
+			}
+			return installErr
+		}
+	} else if installErr != nil {
 		if goosWindows && winServiceWasRunning {
-			// Leave the machine as we found it: the old binaries are all
-			// still in place (or restored), so a plain start succeeds.
 			_ = winSvcStart()
 		}
 		if goosWindows && winWebWasRunning {

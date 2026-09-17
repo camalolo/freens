@@ -22,6 +22,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,19 +115,94 @@ func windowsCaptureAdapterDNS() ([]dnsAdapter, error) {
 // bare name); see setupwin.go's config template for the full story.
 const windowsDNSSuffix = "freens"
 
+// windowsDNSFallbacks is the universal fallback chain appended AFTER the
+// daemon loopback when no real upstream is known for an adapter (the
+// 2026-09-17 desktop lesson: setup pointed every adapter at 127.0.0.1
+// ALONE, so a stopped or wedged daemon took the machine's entire DNS down
+// with it — internet names included — and an aborted upgrade left it that
+// way). Windows fails over to the adapter's next server when the primary
+// times out, so a dead freens daemon degrades to a slower lookup, never to
+// a DNS outage: freens names may fail, internet names must not.
+var windowsDNSFallbacks = []string{"1.1.1.1", "9.9.9.9"}
+
+// isLoopbackIP reports whether s is a loopback literal (the daemon's own
+// resolver is never an upstream fallback — that way lies a forward loop).
+func isLoopbackIP(s string) bool {
+	ip := net.ParseIP(strings.TrimSpace(s))
+	return ip != nil && ip.IsLoopback()
+}
+
+// adapterServerList builds the server list for a wired adapter: the daemon
+// loopback FIRST (freens names answer here), then the adapter's real
+// pre-wire upstreams as failover, then the public fallback pair when
+// nothing real is known (a re-run sees a loopback-only list — the pre-wire
+// truth is long gone). Capped at four entries (loopback + three).
+func adapterServerList(current []string, server string) []string {
+	out := []string{server}
+	seen := map[string]bool{server: true}
+	add := func(s string) {
+		if len(out) >= 4 {
+			return
+		}
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] || isLoopbackIP(s) {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range current {
+		add(s)
+	}
+	for _, s := range windowsDNSFallbacks {
+		add(s)
+	}
+	return out
+}
+
+// stripLoopbackOnlyAdapters drops captured adapters whose ENTIRE server
+// list is loopback — they were already wired by a previous setup, and
+// saving them as the "original" DNS poisons the backup (the 2026-09-17
+// desktop dns-backup.json held nothing but 127.0.0.1, so uninstall had
+// nothing real to restore and re-runs had no upstreams to fall back to).
+func stripLoopbackOnlyAdapters(adapters []dnsAdapter) []dnsAdapter {
+	kept := make([]dnsAdapter, 0, len(adapters))
+	for _, a := range adapters {
+		real := false
+		for _, s := range a.Servers {
+			if !isLoopbackIP(s) {
+				real = true
+				break
+			}
+		}
+		if real {
+			kept = append(kept, a)
+		}
+	}
+	return kept
+}
+
 // windowsSetAdapterDNS points every adapter that currently carries DNS
-// servers at server (the daemon loopback) and gives it the rescue suffix.
-// Setting the complete server list per adapter also clears any IPv6
+// servers at server (the daemon loopback) FIRST and the adapter's real
+// upstreams (or the public fallback pair) after it, and gives it the rescue
+// suffix. Setting the complete server list per adapter also clears any IPv6
 // resolver entries — the daemon serves both families from its v4 loopback
-// listener.
+// listener. The fallback chain is the DNS-outage invariant: with the daemon
+// dead, the OS resolver fails over to the next server and internet names
+// keep resolving.
 func windowsSetAdapterDNS(server string) error {
 	adapters, err := windowsCaptureAdapterDNS()
 	if err != nil {
 		return err
 	}
 	for _, a := range adapters {
-		script := fmt.Sprintf("Set-DnsClientServerAddress -InterfaceAlias '%s' -ServerAddresses @('%s'); Set-DnsClient -InterfaceAlias '%s' -ConnectionSpecificSuffix '%s'",
-			psQuote(a.Alias), psQuote(server), psQuote(a.Alias), psQuote(windowsDNSSuffix))
+		servers := adapterServerList(a.Servers, server)
+		items := make([]string, 0, len(servers))
+		for _, s := range servers {
+			items = append(items, "'"+psQuote(s)+"'")
+		}
+		script := fmt.Sprintf("Set-DnsClientServerAddress -InterfaceAlias '%s' -ServerAddresses @(%s); Set-DnsClient -InterfaceAlias '%s' -ConnectionSpecificSuffix '%s'",
+			psQuote(a.Alias), strings.Join(items, ","), psQuote(a.Alias), psQuote(windowsDNSSuffix))
 		if _, err := winPowerShell(script); err != nil {
 			return fmt.Errorf("wiring adapter %q DNS to %s: %w", a.Alias, server, err)
 		}
