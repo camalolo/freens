@@ -87,6 +87,13 @@ const dhtLookupTimeout = 6 * time.Second
 // effectively unavailable and gets evicted (§6.2 failure handling).
 const lookupProbeTimeout = 2 * time.Second
 
+// unprovenProbeTimeout is the walk budget for candidates WITHOUT
+// citizenship (never confirmed, or too recently known to trust): a live
+// node answers a tiny UDP query in well under a second even over WAN, so
+// the shorter budget only bites on corpses — the filler tier of the batch
+// never sets the round's pace at full price.
+const unprovenProbeTimeout = time.Second
+
 // rescueWalkBudget is the publish walk-rescue's OWN budget (v0.16.2): the
 // rescue runs under a fresh deadline instead of the caller's (possibly
 // ghost-timeout-exhausted) ctx, so the walk that finds the real closest set
@@ -442,7 +449,14 @@ type Node struct {
 // a walk-minute, long enough that a churn window does not burn a 2 s probe
 // budget on the same corpse per query (field-observed: minute-long dig
 // timeouts while 3/7 nodes were down).
-const deadPenaltyWindow = 30 * time.Second
+// deadPenaltyWindow is how long a probe failure demotes a contact out of
+// walk candidate slots — the "retry table" bottom (2026-09-17 fleet night):
+// a corpse that failed once must not cost a second walk a probe budget an
+// hour later, because live peers keep re-advertising it in {nodes} until
+// THEY probe it. The window matches the one-shot ghost lifetime (~1 h idle
+// sweep): by the time the penalty lapses, a real corpse is usually swept
+// from the table, and a real peer has re-confirmed itself clear.
+const deadPenaltyWindow = time.Hour
 
 // deadPenaltySweepAt bounds the deadUntil map: past this many entries every
 // insert sweeps expired ones. Without the sweep the map grows by one
@@ -2264,7 +2278,7 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 	if len(key) != constants.SHA256Len {
 		return nil, stats, fmt.Errorf("dht: key must be %d bytes, got %d", constants.SHA256Len, len(key))
 	}
-	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
+	shortlist := n.walkShortlist(key)
 	if len(shortlist) == 0 {
 		return nil, stats, nil // no peers known: an island.
 	}
@@ -2306,7 +2320,15 @@ func (n *Node) IterativeGetDetailed(ctx context.Context, key []byte) (*wire.Sign
 				// peer that cannot answer a tiny UDP get within 2s is
 				// effectively unavailable; burning the full 5s per dead
 				// candidate makes misses unboundedly slow (§6.4 GET latency).
-				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
+				// v0.19: unproven candidates get HALF that — a live node
+				// answers in well under a second, so a young one-shot
+				// contact costs 1s, not 2s, and the filler tier never sets
+				// the round's pace while citizens are in it.
+				budget := lookupProbeTimeout
+				if !citizenNow(c, n.now()) {
+					budget = unprovenProbeTimeout
+				}
+				pctx, cancel := context.WithTimeout(ctx, budget)
 				defer cancel()
 				es, ns, _, err := n.getFromPeer(pctx, key, c)
 				results[i] = res{es, ns, err}
@@ -2387,7 +2409,7 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 	if len(target) != constants.SHA256Len || want <= 0 {
 		return nil
 	}
-	shortlist := append([]*NodeContact(nil), n.rt.Closest(target, constants.K)...)
+	shortlist := n.walkShortlist(target)
 	if len(shortlist) == 0 {
 		return nil // island
 	}
@@ -2422,7 +2444,11 @@ func (n *Node) IterativeFindNode(ctx context.Context, target []byte, want int) [
 			wg.Add(1)
 			go func(i int, c *NodeContact) {
 				defer wg.Done()
-				pctx, cancel := context.WithTimeout(ctx, lookupProbeTimeout)
+				budget := lookupProbeTimeout
+				if !citizenNow(c, n.now()) {
+					budget = unprovenProbeTimeout
+				}
+				pctx, cancel := context.WithTimeout(ctx, budget)
 				defer cancel()
 				results[i].nodes, results[i].err = n.findNodeRound(pctx, target, c)
 			}(i, c)
@@ -2791,6 +2817,29 @@ type PublishStats struct {
 	KeyHex   string // hex of the key this publish targeted
 	Targets  int    // closest R contacts attempted
 	Accepted int    // stores that accepted the put
+}
+
+// walkShortlist builds a walk's candidate pool: the K closest contacts to
+// the key PLUS every citizen (2026-09-17 fleet night). The closest-K alone
+// can be a corpse cluster — in a ghost-seeded keyspace the hash-nearest
+// entries are exactly the one-shot contacts everyone walks past — and a
+// shortlist without citizens made round 1 pay its full probe budget on
+// dead addresses before the walk ever reached a live holder. Citizens are
+// few, so always including them keeps the pool small; walkBatch then orders
+// citizens first within it.
+func (n *Node) walkShortlist(key []byte) []*NodeContact {
+	shortlist := append([]*NodeContact(nil), n.rt.Closest(key, constants.K)...)
+	seen := make(map[string]bool, len(shortlist))
+	for _, c := range shortlist {
+		seen[string(c.NodeID)] = true
+	}
+	for _, c := range n.rt.Citizens(n.now()) {
+		if !seen[string(c.NodeID)] {
+			seen[string(c.NodeID)] = true
+			shortlist = append(shortlist, c)
+		}
+	}
+	return shortlist
 }
 
 // citizenNow is the replica-target citizenship predicate for a single
