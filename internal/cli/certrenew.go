@@ -76,6 +76,7 @@ func cmdCertRenew(args []string) error {
 	}
 	now := time.Now()
 	var fails []error
+	renewed, skipped := 0, 0
 	for _, name := range names {
 		var r *certmgr.Renewal
 		err := resolveCertPass(func(pass string) error {
@@ -86,6 +87,7 @@ func cmdCertRenew(args []string) error {
 		})
 		switch {
 		case err == nil:
+			renewed++
 			left := time.Until(time.Unix(r.NotAfter, 0)).Round(time.Hour)
 			if !*quiet {
 				fmt.Printf("✔ renewed %s (valid %s more)", name, left)
@@ -95,6 +97,7 @@ func cmdCertRenew(args []string) error {
 				fmt.Println()
 			}
 		case errors.Is(err, certmgr.ErrNotDue):
+			skipped++
 			if !*quiet {
 				st, _ := certmgr.LoadState(home.Dir(), name)
 				left := "unknown"
@@ -107,6 +110,13 @@ func cmdCertRenew(args []string) error {
 			fails = append(fails, fmt.Errorf("%s: %v", name, err))
 			fmt.Fprintf(os.Stderr, "✘ %s: %v\n", name, err)
 		}
+	}
+	if *quiet && len(fails) == 0 {
+		// Cron-visible one-liner even when everything is fine: a nightly
+		// run that prints NOTHING is indistinguishable from a run that
+		// never happened (found live 2026-09-17: a due cert sat unrenewed
+		// because the silent skip looked like silence either way).
+		fmt.Printf("cert renew: %d due, %d renewed, %d skipped (not due)\n", len(names), renewed, skipped)
 	}
 	if len(fails) > 0 {
 		return errors.Join(fails...)

@@ -121,13 +121,15 @@ func TestCertRenewQuietBulk(t *testing.T) {
 	if _, _, err := certmgr.TrackIssue(home, keys, "bob", "", "", "", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	// Fresh cert + quiet: no output at all, success.
+	// Fresh cert + quiet: exactly one cron-visible summary line (a run
+	// that prints NOTHING is indistinguishable from a run that never
+	// happened — found live 2026-09-17).
 	got, err := captureStdout(t, func() error { return cmdCertRenew([]string{"-quiet"}) })
 	if err != nil {
 		t.Fatalf("quiet bulk renew: %v", err)
 	}
-	if strings.TrimSpace(got) != "" {
-		t.Fatalf("quiet renew printed:\n%s", got)
+	if !strings.Contains(got, "cert renew: 1 due, 0 renewed, 1 skipped") {
+		t.Fatalf("quiet renew summary missing:\n%s", got)
 	}
 }
 
