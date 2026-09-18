@@ -69,6 +69,17 @@ func IsReservedTLD(alias string) bool {
 	return ok
 }
 
+// IsPublicTLD reports whether alias is on the public-DNS boundary: a
+// delegated ICANN TLD or an IANA special-use name. Unlike IsReservedTLD it
+// EXCLUDES the project's own "freens" namespace — "freens" is reserved for
+// registration (nobody may claim it, §7.7), but it is not public DNS; it is
+// exactly the connection-specific suffix the §9.4 suffix rescue exists to
+// strip, so rescue gating must not treat it as a real-TLD boundary.
+func IsPublicTLD(alias string) bool {
+	_, ok := reservedTLDs[alias]
+	return ok
+}
+
 // ErrReserved is wrapped by every §7.7 gate error (errors.Is-compatible).
 var ErrReserved = fmt.Errorf("reserved alias")
 

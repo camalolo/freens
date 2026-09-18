@@ -71,6 +71,12 @@ type Config struct {
 	// other than freens-first never rescue. Setup enables it on Windows,
 	// where the OS resolver otherwise never resolves single-label freens
 	// names at all, and pairs it with a "freens" connection suffix.
+	// Since v0.19.5 the rescue runs only when the name's LAST label is
+	// not a delegated ICANN TLD / IANA special-use name (naming.
+	// IsPublicTLD): stripping a public-TLD name sent a DHT claim walk
+	// for a junk alias on every fresh public NXDOMAIN — ~2 s per lookup
+	// on a node with stale DHT contacts (the desktop cold-lookup
+	// incident of 2026-09-18).
 	SuffixRescue bool
 
 	// AllowReserved overrides the §7.7 reserved-alias policy

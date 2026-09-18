@@ -318,7 +318,11 @@ func dohUpstreamAnswers(url, conf string) bool {
 		plainServers = strings.Fields(strings.ReplaceAll(servers, ",", " "))
 	}
 	plain := &resolver.DNSUpstream{Servers: plainServers}
-	u := &resolver.DoHUpstream{URL: url, Fallback: plain}
+	// HedgeAfter: -1 disables the hedged fallback (v0.19.5): this check must
+	// answer "does the DOH leg work", not "does the box resolve" — with the
+	// hedge on, a dead DoH endpoint would be masked by the plaintext
+	// fallback and the check would pass while the encrypted path rots.
+	u := &resolver.DoHUpstream{URL: url, Fallback: plain, HedgeAfter: -1}
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
 	q.RecursionDesired = true

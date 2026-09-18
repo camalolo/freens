@@ -133,6 +133,19 @@ func (f *fakeLookup) Lookup(_ context.Context, wireName []byte, _ int64) (*wire.
 	return f.records[hex.EncodeToString(wireName)], nil
 }
 
+// lookupCounter wraps a fakeLookup and counts record lookups — the
+// public-suffix rescue gate asserts a public NXDOMAIN never reaches the
+// namespace.
+type lookupCounter struct {
+	*fakeLookup
+	lookups int64
+}
+
+func (c *lookupCounter) Lookup(ctx context.Context, wireName []byte, now int64) (*wire.SignedEnvelope, error) {
+	atomic.AddInt64(&c.lookups, 1)
+	return c.fakeLookup.Lookup(ctx, wireName, now)
+}
+
 // fakeUpstream is an Upstream that returns a canned response, optionally
 // recording the queries it saw. rcode lets a test simulate NXDOMAIN etc.
 type fakeUpstream struct {
@@ -326,6 +339,34 @@ footld = freens-first
 		}
 		if len(up.seen) == 0 {
 			t.Error("upstream never consulted; rescue must run after the normal route")
+		}
+	})
+
+	t.Run("public-TLD suffix never rescues (the 2026-09-18 cold-lookup fix)", func(t *testing.T) {
+		// "fresh.example.org": a real-DNS-shaped name under a delegated
+		// TLD. The upstream NXDOMAINs it; the rescue would strip it to the
+		// alias "example" and send a DHT claim walk for junk on EVERY
+		// fresh public NXDOMAIN (the desktop cold-lookup incident:
+		// ~2 s per name on a table with stale contacts). The gate skips
+		// the rescue entirely — the name stays on the ordinary dns-first
+		// path, whose reserved-alias gate answers NXDOMAIN without a walk.
+		cl := &lookupCounter{fakeLookup: newFakeLookup()}
+		up := &fakeUpstream{rcode: dns.RcodeNameError}
+		r := newResolver(mkCfg(true), cl, up)
+
+		q := dns.Question{Name: "fresh.example.org.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+		_, rcode, _, err := r.ResolveQuestion(context.Background(), q)
+		if err != nil {
+			t.Fatalf("ResolveQuestion: %v", err)
+		}
+		if rcode != dns.RcodeNameError {
+			t.Fatalf("rcode = %d; want NXDOMAIN for a public-TLD name", rcode)
+		}
+		if n := atomic.LoadInt64(&cl.lookups); n != 0 {
+			t.Errorf("freens record lookups = %d, want 0 — public-TLD names must never reach the namespace", n)
+		}
+		if len(up.seen) == 0 {
+			t.Error("upstream never consulted; the public-suffix gate must not change routing")
 		}
 	})
 }

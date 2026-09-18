@@ -570,17 +570,33 @@ func (r *Resolver) ResolveQuestion(ctx context.Context, q dns.Question) (rrs []d
 		route := RouteFor(r.Cfg, alias)
 		_, explicit := r.Cfg.TLDRoutes[alias]
 		if !explicit || route == RouteFREENSFirst {
-			rrs, rcode, aa, err = r.resolveRouted(ctx, q, labels, alias, now)
-			if err == nil && rcode == dns.RcodeNameError {
-				strippedLabels, strippedAlias, serr := naming.DecomposeName(dns.Fqdn(strings.Join(labels, ".")))
-				if serr == nil {
-					sRRs, sRcode, sErr := r.freensResolve(ctx, strippedLabels, strippedAlias, q, now)
-					if sErr == nil && sRcode == dns.RcodeSuccess && len(sRRs) > 0 {
-						return sRRs, dns.RcodeSuccess, true, nil
+			// PUBLIC-SUFFIX GATE (v0.19.5): rescue only names whose LAST
+			// label is NOT a delegated ICANN TLD. The rescue exists for
+			// OS-suffix-dressed freens names — "desktop" arriving as
+			// "desktop.freens" (the connection suffix setup wires), or LAN
+			// suffixes like "lan". A name under a PUBLIC TLD is a real DNS
+			// name, and stripping one ("fresh.wikipedia.org" → alias
+			// "wikipedia") sent a full DHT claim walk for a junk alias on
+			// EVERY public NXDOMAIN: measured live on desktop 2026-09-18
+			// at ~2 s per fresh lookup on a table with stale contacts —
+			// the fleet's slow-cold-lookup incident. Public-TLD names keep
+			// the ordinary dns-first path (whose own NXDOMAIN fallthrough
+			// instant-NXDOMAINs reserved aliases via the §7.7 gate).
+			// IsPublicTLD (not IsReservedTLD): the project's own "freens"
+			// suffix must keep rescuing — it is the designed case.
+			if !naming.IsPublicTLD(alias) {
+				rrs, rcode, aa, err = r.resolveRouted(ctx, q, labels, alias, now)
+				if err == nil && rcode == dns.RcodeNameError {
+					strippedLabels, strippedAlias, serr := naming.DecomposeName(dns.Fqdn(strings.Join(labels, ".")))
+					if serr == nil {
+						sRRs, sRcode, sErr := r.freensResolve(ctx, strippedLabels, strippedAlias, q, now)
+						if sErr == nil && sRcode == dns.RcodeSuccess && len(sRRs) > 0 {
+							return sRRs, dns.RcodeSuccess, true, nil
+						}
 					}
 				}
+				return rrs, rcode, aa, err
 			}
-			return rrs, rcode, aa, err
 		}
 	}
 

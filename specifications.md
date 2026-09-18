@@ -1134,6 +1134,20 @@ on delegated ICANN TLDs and IANA special-use names unless the operator
 explicitly overrides — this routing fallback is the second line of
 defense, not the only one.
 
+**Suffix rescue gate (v0.19.5):** the optional `[options]
+suffix-rescue` interposer (Windows single-label support: a bare name
+the OS dressed with its connection suffix, `desktop.freens`) runs ONLY
+when the name's last label is NOT a delegated ICANN TLD or IANA
+special-use name. A name under a public TLD is a real DNS name;
+stripping one (`fresh.example.org` → alias `example`) used to send a
+DHT claim walk for a junk alias on every public NXDOMAIN — measured at
+~2 s per fresh lookup on a node whose DHT table held stale contacts.
+Public-TLD names keep the ordinary `dns-first` path, whose own
+NXDOMAIN fallthrough answers reserved aliases immediately via the §7.7
+gate. The project's own `freens` suffix (reserved for registration,
+§7.7) is deliberately NOT a public-TLD boundary — it is the designed
+rescue case.
+
 ### 9.4 Browser/OS integration path
 
 1. **Today:** local resolver (this section) — zero app changes.
@@ -1370,11 +1384,35 @@ default OFF so an upgrade changes nothing until the operator asks.
 
 When `doh` is set, every §9.2 step-4 forward goes out as one RFC 8484
 POST (`application/dns-message`); on ANY DoH failure (network, HTTP
-4xx/5xx, malformed reply) the query is retried over the `servers`
+4xx/5xx, malformed reply) the query is answered over the `servers`
 list — enabling DoH MUST NOT reduce availability. freens names never
 ride this path (§9.2 keeps them on the DHT); DoH here only protects
 the conventional-DNS traffic from passive observers on the local
 segment and at the recursive resolver.
+
+HEDGE RULE (normative, v0.19.5): the plaintext fallback is raced, not
+awaited serially. A forward still unanswered after a short hedge budget
+(200 ms default) starts the `servers` equivalent IN PARALLEL and the
+first good answer wins; the loser is cancelled. Rationale: serial
+fallback let one slow-but-alive DoH leg hold every forwarded lookup for
+its full timeout before the rescue even started, and a DoH failure that
+returned no answer was invisible (no log, no metric) — a resolution
+path that fails silently eventually fails permanently. A fast DoH
+failure starts the fallback immediately (no hedge delay). A healthy DoH
+leg answers within the budget, so conventional names never leak to
+plaintext in normal operation; during a degradation stretch the query
+IS seen by the `servers` list — that is the documented cost of the
+availability rule above, and it is announced: the upstream logs a
+transition WARN on entering the hedged state and an INFO on recovery,
+never per query.
+
+KEEPALIVE RULE (v0.19.5): the daemon rides one throwaway root-NS query
+through the shared DoH client every 30 s so the pooled TLS connection
+never idles past the transport's reuse window. A connection that dies
+of idling is re-paid as a fresh TCP+TLS handshake on the first query
+after every quiet stretch — and on stateful middleboxes (NAT, DPI) a
+cold flow can stall outright. The ping is best-effort; its outcome is
+ignored and it never touches the plaintext fallback.
 
 BOOTSTRAP RULE (normative): the DoH endpoint's own hostname, when the
 endpoint is not an IP literal, MUST be resolved via the plaintext

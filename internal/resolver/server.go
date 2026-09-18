@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/camalolo/freens/internal/metrics"
@@ -387,7 +389,22 @@ func ensureDNSPort(srv string) string {
 // retried over conventional DNS rather than erroring out, so wiring DoH
 // never reduces availability. A nil Fallback makes DoH the only path.
 //
-// Bootstrap loop (v0.14.0): the DoH endpoint's own HOSTNAME is resolved via
+// HEDGED FALLBACK (v0.19.5): the fallback is not awaited serially. A
+// healthy DoH round trip completes in tens of milliseconds, so a query
+// still unanswered after HedgeAfter starts the plaintext equivalent IN
+// PARALLEL and the first good answer wins (the loser is cancelled).
+// Serial fallback let one slow-but-alive DoH leg (rate limiting, DPI
+// tarpits, stateful-middlebox cold flows — all observed fleet-side, e.g.
+// the HiNet upstream outage of 2026-09-17) hold every forwarded lookup
+// hostage for its full timeout before the plaintext rescue even started.
+// Hedging bounds the cold path at HedgeAfter + plaintext RTT no matter how
+// the DoH leg misbehaves, while a healthy DoH leg still answers every query
+// and never leaks it to plaintext. A DoH leg that fails fast starts the
+// fallback immediately (no hedge delay). Under sustained degradation a
+// transition WARN is emitted once (and an INFO on recovery) so the
+// condition is never silent — the old code fell back without a trace.
+//
+// BOOTSTRAP LOOP (v0.14.0): the DoH endpoint's own HOSTNAME is resolved via
 // the plaintext Fallback servers — never the OS resolver. With the fleet's
 // standard wiring (resolv.conf → 127.0.0.1) the OS resolver IS this daemon,
 // so an OS-resolved dial of "dns.example.com" would route the bootstrap
@@ -405,7 +422,17 @@ type DoHUpstream struct {
 	URL      string        // the DoH endpoint (e.g. https://dns.example/dns-query)
 	Timeout  time.Duration // per-request timeout; default 5 s
 	Client   *http.Client  // default: a client whose dialer bootstraps via Fallback
-	Fallback *DNSUpstream  // optional plaintext fallback (tried after DoH fails)
+	Fallback *DNSUpstream  // optional plaintext fallback (raced after HedgeAfter; nil ⇒ DoH only)
+	// HedgeAfter is how long the DoH leg may stay unanswered before the
+	// plaintext fallback is started in parallel. Zero ⇒ defaultHedgeAfter;
+	// negative ⇒ hedge DISABLED (strict serial: DoH, then fallback only on
+	// failure — the historical behavior the `freens doh` health check
+	// relies on to test the DoH leg itself).
+	HedgeAfter time.Duration
+	// Logger, when set, reports DoH-degradation TRANSITIONS only (first
+	// hedged answer, then recovery) — never per-query, so a sustained DoH
+	// outage logs exactly once instead of once per lookup.
+	Logger *slog.Logger
 
 	// Bootstrap state: the endpoint host's pinned IPs and when they were
 	// resolved. Guarded by bootMu; refreshed lazily after bootstrapRefresh
@@ -425,19 +452,112 @@ type DoHUpstream struct {
 	// once-built client keeps the exact per-request timeout semantics.
 	httpOnce sync.Once
 	httpCL   *http.Client
+
+	// degraded is the transition state for the hedge logging (atomic: the
+	// hedged legs report from their own goroutines).
+	degraded atomic.Bool
 }
+
+// defaultHedgeAfter is how long a DoH leg may stay unanswered before the
+// plaintext fallback is raced. It must sit above the healthy DoH round
+// trip (tens of ms locally, ~130 ms observed internationally) so healthy
+// operation never double-queries, yet far below any human-noticeable
+// threshold. Overridable per-upstream via HedgeAfter.
+const defaultHedgeAfter = 200 * time.Millisecond
 
 // bootstrapRefresh is how long a pinned DoH-endpoint IP stays trusted before
 // the next connection attempt re-resolves it (DoH endpoints are anycast and
 // near-immortal; this bounds staleness without per-request DNS chatter).
 const bootstrapRefresh = 5 * time.Minute
 
-// Forward implements Upstream: one DoH POST of the packed query; on success
-// (HTTP 200 with a decodable DNS message) the response is returned as-is.
+// Forward implements Upstream. With a usable fallback it runs the DoH POST
+// and — after the hedge budget — the plaintext fallback IN PARALLEL, first
+// good answer winning; the loser is cancelled with the caller's context.
+// With no fallback (or the hedge disabled) it is the strict serial path:
+// one DoH POST, then the fallback only on failure.
 func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 	if u == nil || u.URL == "" {
 		return nil, errors.New("resolver: no DoH URL configured")
 	}
+	hedge := u.HedgeAfter
+	if hedge == 0 {
+		hedge = defaultHedgeAfter
+	}
+	if hedge <= 0 || u.Fallback == nil || len(u.Fallback.Servers) == 0 {
+		resp, err := u.doHPost(ctx, q)
+		if err != nil {
+			return u.fallbackOr(ctx, q, err)
+		}
+		u.markDoHLive()
+		return resp, nil
+	}
+
+	// Hedged path. Both legs share the caller's context plus a cancel of
+	// our own: the first winner cancels the loser (an idempotent DNS query
+	// already on the wire is harmless, but a pending one should not burn a
+	// connection). done is buffered 2× so neither goroutine can leak on a
+	// return path that stops reading.
+	hctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type legResult struct {
+		resp *dns.Msg
+		err  error
+		doh  bool
+	}
+	done := make(chan legResult, 2)
+	hedgeNow := make(chan struct{}) // closed early when the DoH leg fails fast
+	go func() {
+		resp, err := u.doHPost(hctx, q)
+		done <- legResult{resp: resp, err: err, doh: true}
+	}()
+	go func() {
+		timer := time.NewTimer(hedge)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-hedgeNow:
+		case <-hctx.Done():
+			return
+		}
+		resp, err := u.Fallback.Forward(hctx, q)
+		done <- legResult{resp: resp, err: err, doh: false}
+	}()
+
+	var dohErr, plainErr error
+	for remaining := 2; remaining > 0; remaining-- {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case r := <-done:
+			if r.err == nil && r.resp != nil {
+				if r.doh {
+					u.markDoHLive()
+				} else {
+					// The plaintext leg won while DoH was still in flight
+					// (slow) or had already failed — the degraded state is
+					// announced once, not per query.
+					u.markDoHDegraded(dohErr)
+				}
+				return r.resp, nil
+			}
+			if r.doh {
+				dohErr = r.err
+				close(hedgeNow) // a dead primary must not hold the hedge hostage
+			} else {
+				plainErr = r.err
+			}
+		}
+	}
+	if dohErr == nil {
+		dohErr = plainErr
+	}
+	return nil, fmt.Errorf("resolver: DoH and plaintext fallback both failed (doh: %v; plaintext: %v)", dohErr, plainErr)
+}
+
+// doHPost is one RFC 8484 POST round trip: pack, send, unpack. Errors are
+// returned to the caller (Forward decides fallback); a non-200 or an
+// undecodable body is an error, never a half-answer.
+func (u *DoHUpstream) doHPost(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 	client := u.httpClient()
 	payload, err := q.Pack()
 	if err != nil {
@@ -451,21 +571,64 @@ func (u *DoHUpstream) Forward(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 	req.Header.Set("Accept", "application/dns-message")
 	resp, err := client.Do(req)
 	if err != nil {
-		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH round trip: %w", err))
+		return nil, fmt.Errorf("resolver: DoH round trip: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH status %d", resp.StatusCode))
+		return nil, fmt.Errorf("resolver: DoH status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH body: %w", err))
+		return nil, fmt.Errorf("resolver: DoH body: %w", err)
 	}
 	out := new(dns.Msg)
 	if err := out.Unpack(body); err != nil {
-		return u.fallbackOr(ctx, q, fmt.Errorf("resolver: DoH response unpack: %w", err))
+		return nil, fmt.Errorf("resolver: DoH response unpack: %w", err)
 	}
 	return out, nil
+}
+
+// Ping rides the shared client with one minimal throwaway query (root NS)
+// and ignores the outcome: the round trip is the point. The daemon calls it
+// on a ticker so the pooled TLS connection never idles past the transport's
+// IdleConnTimeout — otherwise every query after a quiet period paid a fresh
+// TCP+TLS handshake, and on stateful middleboxes (NAT, DPI, IPS) a cold
+// flow can stall outright (the desktop 2026-09-18 cold-lookup incident).
+// It never touches the plaintext fallback: a ping is not a resolution.
+func (u *DoHUpstream) Ping() {
+	if u == nil || u.URL == "" {
+		return
+	}
+	q := new(dns.Msg)
+	q.SetQuestion(".", dns.TypeNS)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = u.doHPost(ctx, q)
+}
+
+// markDoHDegraded announces the degraded state (plaintext answering) once
+// per transition; the follow-up hedged wins stay silent.
+func (u *DoHUpstream) markDoHDegraded(dohErr error) {
+	if !u.degraded.CompareAndSwap(false, true) {
+		return // already announced
+	}
+	if u.Logger != nil {
+		if dohErr != nil {
+			u.Logger.Warn("doh upstream degraded — answers served via hedged plaintext fallback", "url", u.URL, "doh_error", dohErr)
+		} else {
+			u.Logger.Warn("doh upstream slow — answers served via hedged plaintext fallback", "url", u.URL)
+		}
+	}
+}
+
+// markDoHLive announces recovery from a degraded stretch (once).
+func (u *DoHUpstream) markDoHLive() {
+	if !u.degraded.CompareAndSwap(true, false) {
+		return
+	}
+	if u.Logger != nil {
+		u.Logger.Info("doh upstream recovered — plaintext fallback idle again", "url", u.URL)
+	}
 }
 
 // httpClient returns the client DoH requests go out on. A caller-supplied

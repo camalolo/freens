@@ -50,6 +50,23 @@ func TestIsReservedTLD(t *testing.T) {
 	}
 }
 
+// TestIsPublicTLD pins the §9.4 rescue-gate boundary: the delegated-TLD /
+// special-use data WITHOUT the project's own "freens" namespace — "freens"
+// is reserved for registration (§7.7) but is not public DNS; it is exactly
+// the connection suffix the suffix rescue must keep stripping (v0.19.5).
+func TestIsPublicTLD(t *testing.T) {
+	for _, pub := range []string{"com", "net", "org", "de", "arpa", "localhost", "onion", "example"} {
+		if !IsPublicTLD(pub) {
+			t.Errorf("IsPublicTLD(%q) = false, want true", pub)
+		}
+	}
+	for _, priv := range []string{"freens", "camalolo", "minipc", "lan"} {
+		if IsPublicTLD(priv) {
+			t.Errorf("IsPublicTLD(%q) = true, want false", priv)
+		}
+	}
+}
+
 // TestReservedTLDsDataSanity: the whole embedded set must be lowercase LDH
 // (every entry is itself a VALID alias — the gate refuses names that would
 // otherwise pass ValidateAlias), free of duplicates, and big enough that a

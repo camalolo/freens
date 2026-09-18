@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.19.5 — the fast-cold-lookup release (hedged DoH fallback, DoH keepalive, suffix-rescue public-suffix gate)
+
+The desktop "cold lookups regressed 87 ms → 2.4 s" report, chased to two
+independent defects in the forwarded-DNS path and fixed at the root
+(live-verified on desktop: fresh-domain lookups 2066–4108 ms → 79–101 ms):
+
+- **suffix-rescue public-suffix gate (the user-visible 2 s):** the
+  `[options] suffix-rescue` interposer fired on EVERY upstream NXDOMAIN —
+  including real-DNS-shaped names under public TLDs — and stripped the
+  name's last TLD label into a freens alias lookup (`fresh.wikipedia.org`
+  → alias `wikipedia`), sending a full DHT claim walk for a junk alias on
+  every fresh public NXDOMAIN: ~2 s per lookup on a node whose DHT table
+  held stale contacts. The rescue now runs only when the name's last label
+  is NOT a delegated ICANN TLD / IANA special-use name
+  (`naming.IsPublicTLD` — the §7.7 data WITHOUT the project's own
+  `freens` namespace, which is the designed connection-suffix case and
+  still rescues). Public-TLD names keep the ordinary dns-first path,
+  whose reserved-alias gate answers NXDOMAIN without a walk.
+- **hedged DoH fallback (the serial-failure latent):** with `[upstream]
+  doh` set, the plaintext fallback was awaited strictly serially — one
+  slow-but-alive DoH leg (rate limiting, DPI tarpits, stateful-middlebox
+  cold flows) held every forwarded lookup for the full DoH timeout before
+  the rescue started, and a DoH failure that ended in a plaintext answer
+  was completely silent (no log, no way to see it). The fallback is now
+  RACED after a 200 ms hedge budget (`DoHUpstream.HedgeAfter`; negative
+  disables — the `freens doh` health check pins the old semantics so it
+  keeps testing the DoH leg itself); the first good answer wins, the
+  loser is cancelled, and a fast DoH failure starts the fallback
+  immediately. Degradation is a logged TRANSITION (one WARN entering the
+  hedged state, one INFO on recovery — never per query). A healthy DoH
+  leg answers within the budget, so conventional names never leak to
+  plaintext in normal operation.
+- **DoH connection keepalive:** the daemon rides one throwaway root-NS
+  query through the shared DoH client every 30 s (`Ping`), so the pooled
+  TLS connection never idles out — a query after a quiet stretch no
+  longer pays a fresh TCP+TLS handshake (or a stalled cold flow on NAT/DPI
+  middleboxes). Best-effort, outcome ignored, never touches the fallback.
+- spec §9.3 (hedge rule + keepalive rule) and §9.3 routing (rescue gate)
+  amended; config doc updated.
+
 ## Unreleased — the audit-hardening pass (fleet-review fixes: bugs, races, dead code, dedup)
 
 A full-tree review (all 24 packages) found and this pass fixes, grouped by

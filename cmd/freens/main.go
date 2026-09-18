@@ -583,7 +583,7 @@ func run(args []string) error {
 	plain := &resolver.DNSUpstream{Servers: cfg.UpstreamServers}
 	var upstream resolver.Upstream = plain
 	if cfg.UpstreamDoH != "" {
-		upstream = &resolver.DoHUpstream{URL: cfg.UpstreamDoH, Fallback: plain}
+		upstream = &resolver.DoHUpstream{URL: cfg.UpstreamDoH, Fallback: plain, Logger: logger}
 	}
 	upRef := resolver.NewUpstreamRef(upstream)
 	res := resolver.New(cfg, freens, upRef)
@@ -658,7 +658,7 @@ func run(args []string) error {
 			plain2 := &resolver.DNSUpstream{Servers: cfg2.UpstreamServers}
 			var up2 resolver.Upstream = plain2
 			if cfg2.UpstreamDoH != "" {
-				up2 = &resolver.DoHUpstream{URL: cfg2.UpstreamDoH, Fallback: plain2}
+				up2 = &resolver.DoHUpstream{URL: cfg2.UpstreamDoH, Fallback: plain2, Logger: logger}
 			}
 			upRef.Set(up2)
 			if cfg2.UpstreamDoH != "" {
@@ -779,6 +779,33 @@ func run(args []string) error {
 	// forever (restarts covered by the persisted cache, idle gaps by the
 	// §10.4 stale window, and this closes the gap beyond both).
 	go res.RunRefreshSweeper(bgStop)
+	// DoH connection keepalive (v0.19.5): one throwaway root-NS query rides
+	// the shared client every dohKeepaliveInterval so the pooled TLS
+	// connection never idles past the transport's IdleConnTimeout (90 s) —
+	// otherwise the first query after every quiet stretch paid a fresh
+	// TCP+TLS handshake, and on stateful middleboxes (NAT, DPI) a cold flow
+	// can stall outright (desktop 2026-09-18: ~1 s dead wait per cold
+	// upstream query). The ticker re-reads the CURRENT upstream, so a
+	// `freens doh upstream` / Settings hot-swap is respected; a swap back
+	// to plain DNS simply pings nothing. Outcome ignored — it is a ping.
+	go func() {
+		pingOnce := func() {
+			if du, ok := upRef.Get().(*resolver.DoHUpstream); ok {
+				du.Ping()
+			}
+		}
+		pingOnce() // pre-warm at boot: the first real query never pays the handshake
+		t := time.NewTicker(dohKeepaliveInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-bgStop:
+				return
+			case <-t.C:
+				pingOnce()
+			}
+		}
+	}()
 	// UPnP renewal: routers forget mappings across reboots/resets, and
 	// external addresses change (dynamic PPPoE). Probe every 5 minutes,
 	// re-map when the entry vanished, follow address changes — the node's
@@ -1948,6 +1975,13 @@ func boolGauge(b bool) float64 {
 // external-address changes). Five minutes bounds router-reboot downtime
 // without meaningful SOAP chatter.
 const upnpRenewInterval = 5 * time.Minute
+
+// dohKeepaliveInterval is how often the daemon pings the DoH endpoint's
+// pooled connection. It must stay under the shared transport's
+// IdleConnTimeout (90 s) so the connection is never closed for idling;
+// 30 s is one tiny query per quiet half-minute — negligible traffic, and
+// it doubles as continuous reachability monitoring for the encrypted leg.
+const dohKeepaliveInterval = 30 * time.Second
 
 // dhtPort extracts the UDP port of a -dht listen address (":15353",
 // "0.0.0.0:15353"); the protocol default when absent.
