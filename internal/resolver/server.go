@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -378,6 +379,28 @@ func ensureDNSPort(srv string) string {
 		return srv
 	}
 	return srv + ":53"
+}
+
+// SplitListenAddrs splits a [listen] value into its bind addresses. Since
+// v0.19.6 the value may be a comma-separated list ("127.0.0.1:53, [::1]:53")
+// so a daemon can serve BOTH loopback families — a Windows adapter wired
+// with the v6 DNS entry (::1) must find a listener there, or every OS query
+// to that entry dies (refused or timed out) before the failover servers are
+// tried. Bracketed IPv6 literals contain no commas, so a plain split is
+// safe; entries are trimmed, empty entries dropped, and an empty input
+// yields nil (the caller's default governs).
+func SplitListenAddrs(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // DoHUpstream is an Upstream that forwards over RFC 8484 DNS-over-HTTPS

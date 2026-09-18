@@ -44,8 +44,15 @@ const DefaultRoute = RouteDNSFirst
 
 // Config is the parsed §9.3 resolver configuration.
 type Config struct {
-	ListenUDP       string            // default "127.0.0.1:53"
-	ListenTCP       string            // default "127.0.0.1:53"
+	// ListenUDP mirrors [listen] "udp" (default "127.0.0.1:53"). Since
+	// v0.19.6 the value may be a COMMA-SEPARATED LIST of addresses —
+	// "127.0.0.1:53, [::1]:53" binds both loopback families so an OS
+	// resolver wired with a v6 DNS entry (::1) is served, never timed out.
+	// See SplitListenAddrs.
+	ListenUDP string
+	// ListenTCP mirrors [listen] "tcp" (default "127.0.0.1:53"); same
+	// comma-list form as ListenUDP.
+	ListenTCP       string
 	UpstreamServers []string          // comma/space list from [upstream]
 	UpstreamDoH     string            // optional DoH URL from [upstream]
 	TLDRoutes       map[string]Route  // alias -> Route; "*" always present

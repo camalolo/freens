@@ -30,6 +30,7 @@ import (
 	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/certmgr"
 	"github.com/camalolo/freens/internal/home"
+	"github.com/camalolo/freens/internal/resolver"
 )
 
 // daemonDNSCheckTimeout bounds the doctor DNS self-check.
@@ -70,6 +71,14 @@ func effectiveDNSAddr() string {
 		}
 		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "udp" {
 			if v = strings.TrimSpace(v); v != "" {
+				// v0.19.6: the value may be a comma-separated LIST
+				// ("127.0.0.1:53, [::1]:53") — the doctor dials ONE
+				// address, so return the first (the primary). Returning
+				// the raw list made every check dial the literal string
+				// as a hostname and fail on multi-listen daemons.
+				if addrs := resolver.SplitListenAddrs(v); len(addrs) > 0 {
+					return addrs[0]
+				}
 				return v
 			}
 		}

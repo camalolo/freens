@@ -721,19 +721,32 @@ func run(args []string) error {
 		go persistDNSCacheLoop(cache, dnsCachePath, logger, dnsCacheStop)
 	}
 
-	udpSrv := resolver.NewServer(cfg.ListenUDP, "udp", res)
-	tcpSrv := resolver.NewServer(cfg.ListenTCP, "tcp", res)
-	// One shared counter for both transports: the label set is {qtype,status}
-	// (no transport dimension), so a duplicate registration per server would
-	// panic — hence the setter takes the counter, not the registry.
-	udpSrv.SetQueryCounter(dnsQueriesCounter)
-	tcpSrv.SetQueryCounter(dnsQueriesCounter)
+	// v0.19.6: [listen] values may be comma-separated lists ("127.0.0.1:53,
+	// [::1]:53") — a daemon serving only 127.0.0.1 leaves a wired ::1 DNS
+	// entry dead on IPv6-capable machines. Every address in the list gets
+	// its own server; all bind concurrently and share the query counter.
+	buildServers := func(addrs string, network string) []*resolver.Server {
+		var srvs []*resolver.Server
+		for _, a := range resolver.SplitListenAddrs(addrs) {
+			s := resolver.NewServer(a, network, res)
+			s.SetQueryCounter(dnsQueriesCounter)
+			srvs = append(srvs, s)
+		}
+		return srvs
+	}
+	udpSrvs := buildServers(cfg.ListenUDP, "udp")
+	tcpSrvs := buildServers(cfg.ListenTCP, "tcp")
 
-	// Start both servers concurrently; both get a chance to bind even if one
-	// fails (spec §9.1: "still attempt"). A bind failure surfaces immediately.
-	errCh := make(chan error, 2) // buffered so goroutines never block on send
-	go func() { errCh <- udpSrv.ListenAndServe() }()
-	go func() { errCh <- tcpSrv.ListenAndServe() }()
+	// Start all servers concurrently; every one gets a chance to bind even
+	// if another fails (spec §9.1: "still attempt"). A bind failure surfaces
+	// immediately.
+	errCh := make(chan error, len(udpSrvs)+len(tcpSrvs)) // buffered so goroutines never block on send
+	for _, s := range udpSrvs {
+		go func(s *resolver.Server) { errCh <- s.ListenAndServe() }(s)
+	}
+	for _, s := range tcpSrvs {
+		go func(s *resolver.Server) { errCh <- s.ListenAndServe() }(s)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -909,21 +922,20 @@ func run(args []string) error {
 
 	if firstErr != nil {
 		logger.Error("a DNS server failed to start", "error", firstErr)
-		if isPort53(cfg.ListenUDP) || isPort53(cfg.ListenTCP) {
+		if anyListenOnPort53(cfg.ListenUDP) || anyListenOnPort53(cfg.ListenTCP) {
 			logger.Error("hint: binding port 53 may require privileges; use a high port " +
 				"(-listen 127.0.0.1:5300) with an iptables/systemd redirect, or grant " +
 				"CAP_NET_BIND_SERVICE (setcap) / run as root (spec §9.1)")
 		}
 	}
 
-	// Idempotent shutdown of both servers (one may already be stopped). Log
+	// Idempotent shutdown of every server (some may already be stopped). Log
 	// non-nil shutdown errors but do NOT override firstErr: a server-shutdown
 	// failure is informational and must not mask an earlier bind/serve failure.
-	if err := udpSrv.Shutdown(); err != nil {
-		logger.Error("udp server shutdown error", "error", err)
-	}
-	if err := tcpSrv.Shutdown(); err != nil {
-		logger.Error("tcp server shutdown error", "error", err)
+	for _, s := range append(append([]*resolver.Server{}, udpSrvs...), tcpSrvs...) {
+		if err := s.Shutdown(); err != nil {
+			logger.Error("dns server shutdown error", "error", err)
+		}
 	}
 	// Stop the background goroutines (gauge refresh, SIGHUP reload) and the
 	// metrics endpoint alongside the servers.
@@ -2011,6 +2023,17 @@ func splitCSV(s string) []string {
 // spec §9.1 privileged-port guidance on bind failure).
 func isPort53(addr string) bool {
 	return strings.HasSuffix(addr, ":53") || addr == ":53"
+}
+
+// anyListenOnPort53 reports whether any address in a [listen] value (a
+// single address or the v0.19.6 comma-list form) binds port 53.
+func anyListenOnPort53(listenValue string) bool {
+	for _, a := range resolver.SplitListenAddrs(listenValue) {
+		if isPort53(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // persistDNSCacheLoop saves the response cache every 60 s (dirty caches

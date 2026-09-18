@@ -284,3 +284,34 @@ func TestDecodeBase32TLDIDTolerant(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitListenAddrs pins the v0.19.6 comma-list form of [listen]: a
+// daemon must be able to serve both loopback families ("127.0.0.1:53,
+// [::1]:53") so a wired ::1 DNS entry finds a listener. Bracketed IPv6
+// literals contain no commas; entries are trimmed; empty input yields nil.
+func TestSplitListenAddrs(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"127.0.0.1:53", []string{"127.0.0.1:53"}},
+		{"127.0.0.1:53, [::1]:53", []string{"127.0.0.1:53", "[::1]:53"}},
+		{"[::1]:53,127.0.0.1:53", []string{"[::1]:53", "127.0.0.1:53"}},
+		{"  127.0.0.1:53 ,   [::1]:53  ", []string{"127.0.0.1:53", "[::1]:53"}},
+		{"127.0.0.1:53,,[::1]:53,", []string{"127.0.0.1:53", "[::1]:53"}},
+		{"", nil},
+		{"   ", nil},
+	}
+	for _, c := range cases {
+		got := SplitListenAddrs(c.in)
+		if c.want == nil {
+			if got != nil {
+				t.Errorf("SplitListenAddrs(%q) = %v, want nil", c.in, got)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("SplitListenAddrs(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}

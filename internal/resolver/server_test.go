@@ -11,7 +11,10 @@ package resolver
 import (
 	"bytes"
 	"errors"
+	"net"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/metrics"
@@ -200,3 +203,51 @@ func TestResponseCacheNilMetricsUninstrumented(t *testing.T) {
 
 // Compile-time interface check for the shared fake writer (cache_test.go).
 var _ dns.ResponseWriter = (*fakeResponseWriter)(nil)
+
+// TestMultipleListenAddrsServeBothFamilies is the v0.19.6 multi-listen
+// regression test: a [listen] list ("127.0.0.1:0, [::1]:0") binds EVERY
+// address and each answers — the desktop IPv6 incident had a wired ::1 DNS
+// entry with no v6 listener behind it (every OS query to that entry died
+// before the failover servers were tried).
+func TestMultipleListenAddrsServeBothFamilies(t *testing.T) {
+	w := newFreensWorld(t)
+	lookup := newFakeLookup()
+	lookup.put(w.tldEnv)
+	lookup.put(w.wwwEnv)
+	up := &fakeUpstream{rcode: dns.RcodeNameError}
+	res := newResolver(configFor(t, w, RouteFREENS), lookup, up)
+
+	addrs := SplitListenAddrs("127.0.0.1:0, [::1]:0")
+	srvs := make([]*dns.Server, 0, len(addrs))
+	bound := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		srv := NewServer(a, "udp", res)
+		pc, err := net.ListenPacket("udp", a)
+		if err != nil {
+			if strings.Contains(a, ":1]") || strings.Contains(a, "[::1]") {
+				t.Skipf("IPv6 loopback unavailable on this host: %v", err)
+			}
+			t.Fatalf("bind %s: %v", a, err)
+		}
+		srv.DNSServer().PacketConn = pc
+		srvs = append(srvs, srv.DNSServer())
+		bound = append(bound, pc.LocalAddr().String())
+		go func(s *dns.Server) { _ = s.ActivateAndServe() }(srv.DNSServer())
+	}
+	defer func() {
+		for _, s := range srvs {
+			_ = s.Shutdown()
+		}
+	}()
+
+	for _, addr := range bound {
+		c := &dns.Client{Net: "udp", Timeout: 2 * time.Second}
+		resp, _, err := c.Exchange(new(dns.Msg).SetQuestion("www.footld.", dns.TypeA), addr)
+		if err != nil {
+			t.Fatalf("query %s: %v", addr, err)
+		}
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Fatalf("query %s: rcode=%d answers=%d; want one answered A", addr, resp.Rcode, len(resp.Answer))
+		}
+	}
+}
