@@ -3045,6 +3045,13 @@ func (n *Node) sweepIdleContacts(now int64) {
 				"confirmed_at", c.ConfirmedAt, "ttl", n.contactIdleTTL.String())
 		}
 	}
+	// The alt half of the same hygiene: never-confirmed alternates age out
+	// at twice the contact TTL (see PruneStaleAlts — the "never-listening
+	// mappings" residue the transient flag cannot touch, since
+	// multi-homing learned them from real exchanges).
+	if dropped := n.rt.PruneStaleAlts(now, 2*ttl); dropped > 0 {
+		n.log.Info("dht: pruned stale never-confirmed alts", "count", dropped)
+	}
 }
 
 // Publish stores env on the R closest nodes to its key (§6.4 PUT), obtaining a

@@ -568,6 +568,41 @@ func (rt *RoutingTable) allContactsLocked() []*NodeContact {
 	return out
 }
 
+// PruneStaleAlts drops never-confirmed alternate addresses that no DIRECT
+// exchange has touched for olderThan seconds. NAT-mapped ephemeral
+// addresses accumulate as multi-homed alts (v0.13.3): every rotation
+// leaves the old mapping listed forever, and walks probe alts as filler
+// after citizens — each dead alt burns an RPC timeout in exactly the
+// keyspaces the debris dominates. This is the "faster aging of
+// never-listening mappings" half of the ghost fix (designed alongside the
+// transient flag, which killed the CREATION side; this retires the STOCK).
+// Alts that were ever directly confirmed are never touched here — a
+// once-working address is the cheap retry path after a NAT change, and
+// only the contact-level idle sweep may retire those. Returns the number
+// of alts dropped. Safe for concurrent use.
+func (rt *RoutingTable) PruneStaleAlts(now, olderThan int64) int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	dropped := 0
+	for _, b := range rt.Buckets {
+		for _, c := range b.Nodes {
+			if len(c.Alts) == 0 {
+				continue
+			}
+			kept := c.Alts[:0]
+			for _, a := range c.Alts {
+				if a.ConfirmedAt == 0 && now-a.LastSeen > olderThan {
+					dropped++
+					continue
+				}
+				kept = append(kept, a)
+			}
+			c.Alts = kept
+		}
+	}
+	return dropped
+}
+
 // Size returns the total number of contacts across all buckets. Safe for
 // concurrent use.
 func (rt *RoutingTable) Size() int {
