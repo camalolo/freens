@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased — v0.19.7 material: the transient wire flag (one-shot verbs stop planting ghost contacts)
+## v0.19.8 — chunked peer transfer: the fleet as its own update CDN
+
+github's release CDN serves some routes (HiNet, measured live) at
+65–75 KB/s — minutes per upgrade. Upgrades now pull the tarball from
+fleet peers, BitTorrent-shaped, with the trust anchor untouched:
+
+- CI attaches a per-platform chunk manifest (`cmd/genmanifest`):
+  `{tag, asset, size, chunk_size, sha256, chunks[]}`. The upgrade verb
+  fetches the manifest FROM GITHUB ORIGIN; chunks need no signatures —
+  a forged slice fails its manifest hash. (Signing the manifest with a
+  CI key is the separate "survive a github compromise" upgrade.)
+- Non-passive daemons cache the archives they download (`home/blobs`,
+  bounded) and answer the new `blob.get` RPC — write-token gated (a
+  token requires a completed round trip from the true source, so the
+  48 KiB answers cannot become a UDP reflection amplifier) and
+  per-source rate limited. `[dht] blob-serve = false` disables.
+- The upgrade verb assembles the tarball round-robin from confirmed
+  daemon peers, verifying every chunk against the manifest,
+  blacklisting wrong-slice peers, and falling back to the
+  origin/mirror path on ANY failure. The swarm client is a transient
+  one-shot (v0.19.7) so it plants no ghosts while it works.
+- Assembled bytes are re-verified against the manifest digest and —
+  when present — origin's SHA256SUMS, then staged exactly as a direct
+  download always was.
+
+## v0.19.7 — the transient wire flag: one-shot verbs stop planting ghost contacts
 
 Watch item #2, the NAT-mapping ghost class (root-caused 2026-09-18): a
 CLI one-shot node dies seconds after its verb, but every peer's daemon
