@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/camalolo/freens/internal/admin"
@@ -128,22 +129,40 @@ func cmdStatus(args []string) error {
 	case len(aliases) == 0:
 		fmt.Printf("names: none yet — claim one with: %s register <name>\n", ProgName)
 	default:
-		for _, a := range aliases {
-			r, err := c.Resolve(ctx, a)
-			switch {
-			case err != nil:
-				fmt.Printf("%s → error: %v\n", a, err)
-			case r != nil && r.Revoked:
-				fmt.Printf("%s → revoked (dead by owner choice)\n", a)
-			case r == nil || !r.Found:
-				fmt.Printf("%s → not published yet (did `register` finish?)\n", a)
-			default:
-				ip := firstAdminIP(r.RRset)
-				if ip == "" {
-					ip = "no address record"
+		// Fan the resolves out: each is an admin RPC that may walk the DHT
+		// (a debris alias costs ~1s of degraded probes — measured in the
+		// 2026-09-18 verb audit, where 2 debris names turned a 20 ms status
+		// into 2.0 s, strictly serial). Total = slowest, not the sum; the
+		// daemon serves concurrent requests, and lines print in alias order.
+		lines := make([]string, len(aliases))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for i, a := range aliases {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, a string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				r, err := c.Resolve(ctx, a)
+				switch {
+				case err != nil:
+					lines[i] = fmt.Sprintf("%s → error: %v", a, err)
+				case r != nil && r.Revoked:
+					lines[i] = fmt.Sprintf("%s → revoked (dead by owner choice)", a)
+				case r == nil || !r.Found:
+					lines[i] = fmt.Sprintf("%s → not published yet (did `register` finish?)", a)
+				default:
+					ip := firstAdminIP(r.RRset)
+					if ip == "" {
+						ip = "no address record"
+					}
+					lines[i] = fmt.Sprintf("%s → %s · healthy", a, ip)
 				}
-				fmt.Printf("%s → %s · healthy\n", a, ip)
-			}
+			}(i, a)
+		}
+		wg.Wait()
+		for _, line := range lines {
+			fmt.Println(line)
 		}
 		if hasRecoveryKeys(aliases[0]) {
 			fmt.Printf("backup: recovery keys exist — run `%s backup` and store the file off this machine\n", ProgName)
@@ -255,86 +274,75 @@ func cmdDoctor(args []string) error {
 		check(false, "daemon version: no daemon (start one with: freens setup)")
 	}
 
-	// 3. DNS path through the daemon: a known upstream name resolves via
-	//    the daemon's CONFIGURED listen address — exercising the
-	//    conventional-DNS fallback.
-	dnsAddr := effectiveDNSAddr()
-	check(checkDNSFallback(dnsAddr), "DNS: example.com resolves via %s (fallback path)", dnsAddr)
-
-	// 4. freens path: each keychain alias's apex resolves via the daemon.
-	// While the daemon is WARMING UP (peerbook loaded, no contact confirmed
-	// yet) resolution legitimately fails — the hint keeps that from being
-	// mistaken for a broken install (found live 2026-09-01: post-upgrade
-	// restarts looked broken for their first minutes).
+	// ---- Checks 3-11: the independent network checks run CONCURRENTLY.
+	// Doctor's wall time used to be the SUM of its slow checks (measured in
+	// the 2026-09-18 verb audit: 5.4 s on a CLEAN box — the DNS probe, the
+	// per-alias apex resolves, the network-lease walk, the clock HTTPS
+	// probe, the TLS snapshot and the DoH probe are mutually independent).
+	// They fan out below; results print in the original check order through
+	// the same check()/warn() helpers, so the output and the failure
+	// counting are byte-identical. Wall time becomes the slowest check, not
+	// their sum. effectiveDNSAddr is read ONCE (it re-parses freens.conf on
+	// every call; the old code called it up to six times a run).
 	warming := peers > 0 && confirmedPeers == 0
 	aliases := keychainAliases()
 	if len(aliases) == 0 {
 		warn("no keychain aliases (~/.freens/keys) — nothing to resolve; register one")
-	} else if c != nil {
-		ctx, cancel := adminCtx()
-		for _, a := range aliases {
-			r, err := c.Resolve(ctx, a)
-			switch {
-			case err != nil:
-				if warming {
-					check(false, "alias %s resolves (apex): %v — still warming up", a, err)
-				} else {
-					check(false, "alias %s resolves (apex): %v", a, err)
-				}
-			case r != nil && r.Revoked:
-				warn("alias %s is REVOKED (deliberate; un-revoke with register/name or drop the key)", a)
+	}
+	dnsAddr := effectiveDNSAddr()
+	printLines := func(lines []doctorLine) {
+		for _, l := range lines {
+			switch l.kind {
+			case 1:
+				warn("%s", l.text)
+			case 2:
+				fmt.Printf("✔ %s\n", l.text)
 			default:
-				check(err == nil && r != nil && r.Found, "alias %s resolves (apex)", a)
+				check(l.ok, "%s", l.text)
 			}
 		}
-		cancel()
 	}
+	var (
+		wg       sync.WaitGroup
+		dnsOK    bool
+		aliasLns []doctorLine
+		netLns   []doctorLine
+		skewLns  []doctorLine
+		tlsLns   []doctorLine
+		dohLns   []doctorLine
+	)
+	wg.Add(6)
+	go func() { defer wg.Done(); dnsOK = checkDNSFallback(dnsAddr) }()
+	go func() { defer wg.Done(); aliasLns = aliasApexLines(c, aliases, warming) }()
+	go func() { defer wg.Done(); netLns = networkLeaseLines(c, aliases, warming) }()
+	go func() { defer wg.Done(); skewLns = clockSkewLines() }()
+	go func() { defer wg.Done(); tlsLns = tlsLines(c) }()
+	go func() { defer wg.Done(); dohLns = doctorDoHLines(c) }()
+	wg.Wait()
 
-	// 4b. the NETWORK view of the first alias. Owner-local resolution (4)
-	// can be green while the network has lost the lease: the 2026-09-02
-	// camalolo incident NXDOMAINed the name from every other box for ~7 h
-	// while every check on the owner stayed green. The network view walks
-	// peers with the daemon's own store excluded — a foreign resolver's
-	// answer. Renewals are owner-only and sequence-monotonic, so a missing
-	// or expired network claim is definitive, not transient (degraded
-	// walks are skipped as inconclusive).
-	if len(aliases) > 0 && c != nil && !warming {
-		a := aliases[0]
-		// The network view walks BOTH storage keys; in a keyspace with
-		// young one-shot contacts those legs can legitimately take tens of
-		// seconds (each dead probe costs its budget), so this check gets a
-		// dedicated budget just under the daemon's 30 s request cap instead
-		// of the shared admin timeout — a slow-but-honest walk is a PASS,
-		// not a warning.
-		nvCtx, nvCancel := context.WithTimeout(context.Background(), 29*time.Second)
-		nvClient := *c
-		nvClient.Timeout = 29 * time.Second // the shared adminTimeout (15s) kills slow-but-honest walks
-		r, nerr := nvClient.ResolveNetwork(nvCtx, a)
-		nvCancel()
-		nv := func() *admin.NetworkView {
-			if r != nil {
-				return r.Network
-			}
-			return nil
-		}()
-		switch {
-		case nerr != nil:
-			warn("alias %s network view: %v (skipped)", a, nerr)
-		case nv == nil:
-			warn("alias %s network view unavailable (daemon predates v0.14.3?) — upgrade", a)
-		case nv.Degraded:
-			warn("alias %s network view inconclusive (degraded walk) — recheck on the next run", a)
-		case !nv.ClaimFound || nv.ClaimExpires <= uint64(time.Now().Unix()):
-			check(false,
-				"alias %s holds a LIVE network lease (local copy resolves, the network's is %s) — run `freens renew -force %s`",
-				a,
-				networkLeaseState(nv),
-				a)
-		default:
-			check(true, "alias %s network lease live (seq %d, expires in %d m)",
-				a, nv.ClaimSequence, (int64(nv.ClaimExpires)-time.Now().Unix())/60)
-		}
-	}
+	// 3. DNS path through the daemon: a known upstream name resolves via
+	//    the daemon's CONFIGURED listen address — exercising the
+	//    conventional-DNS fallback. (Computed concurrently above.)
+	check(dnsOK, "DNS: example.com resolves via %s (fallback path)", dnsAddr)
+
+	// 4. freens path: each keychain alias's apex resolves via the daemon
+	//    (fanned out above — a debris alias costs ~1 s of degraded probes).
+	//    While the daemon is WARMING UP (peerbook loaded, no contact
+	//    confirmed yet) resolution legitimately fails — the hint keeps
+	//    that from being mistaken for a broken install (found live
+	//    2026-09-01: post-upgrade restarts looked broken for their first
+	//    minutes).
+	printLines(aliasLns)
+
+	// 4b. the NETWORK view of the first alias (computed concurrently
+	//     above). Owner-local resolution (4) can be green while the
+	//     network has lost the lease: the 2026-09-02 camalolo incident
+	//     NXDOMAINed the name from every other box for ~7 h while every
+	//     check on the owner stayed green. Renewals are owner-only and
+	//     sequence-monotonic, so a missing or expired network claim is
+	//     definitive, not transient (degraded walks are skipped as
+	//     inconclusive).
+	printLines(netLns)
 
 	// 5. peers. Confirmed contacts are the honest signal: the table fills
 	// from the persisted peerbook instantly, but until a contact answers a
@@ -355,94 +363,24 @@ func cmdDoctor(args []string) error {
 
 	// 7. OS resolver + the :53 redirect that makes the wiring complete.
 	if points, redirect := osResolverPointsAtDaemon(); points && redirect {
-		fmt.Printf("✔ OS resolver points at the daemon (127.0.0.1 + :53 -> %s redirect)\n", effectiveDNSAddr())
+		fmt.Printf("✔ OS resolver points at the daemon (127.0.0.1 + :53 -> %s redirect)\n", dnsAddr)
 	} else if points {
-		warn("resolv.conf points at 127.0.0.1 but the :53 -> %s redirect is MISSING — re-run `freens setup` (or freens doctor --fix)", effectiveDNSAddr())
+		warn("resolv.conf points at 127.0.0.1 but the :53 -> %s redirect is MISSING — re-run `freens setup` (or freens doctor --fix)", dnsAddr)
 	} else {
 		warn("OS resolver does not point at the daemon yet (setup wires it; DNS still works via the daemon port)")
 	}
 
-	// 8. Clock sanity (warn-only): freens cryptography is wall-clock
-	//    dependent (record validity windows, §7.4 claim ordering, witness
-	//    timestamp bounds) — a badly skewed clock registers badly and
-	//    resolves badly. Measured against an HTTP Date header; offline or
-	//    unreachable is a skip, not a failure.
-	if skew, ok := clockSkew(); ok {
-		switch {
-		case skew < 2*time.Minute:
-			fmt.Printf("✔ clock sane (skew %s against internet time)\n", skew.Round(time.Second))
-		case skew < 1*time.Hour:
-			warn("clock is %s off internet time — fix NTP (records/claims misbehave under skew)", skew.Round(time.Second))
-		default:
-			warn("clock is %s off internet time — registrations from this machine will misbehave; fix NTP NOW", skew.Round(time.Minute))
-		}
-	} else {
-		warn("could not check clock skew (no internet time source reachable)")
-	}
+	// 8. Clock sanity (warn-only, computed concurrently above): freens
+	//    cryptography is wall-clock dependent (record validity windows,
+	//    §7.4 claim ordering, witness timestamp bounds) — a badly skewed
+	//    clock registers badly and resolves badly. Measured against an
+	//    HTTP Date header; offline or unreachable is a skip, not a failure.
+	printLines(skewLns)
 
-	// 9. §9.5 TLS trust sync: local root present, and (daemon permitting)
-	//    which namespaces are cross-certified.
-	rootPath := filepath.Join(home.Dir(), "tls", "root.crt")
-	rootOK := sysStatExists(rootPath)
-	if !rootOK {
-		check(false, "TLS local trust root missing (%s) — run `freens trust-install`", rootPath)
-	} else if c == nil {
-		warn("TLS local trust root present (daemon down: cross-cert state unknown)")
-	} else {
-		ctx, cancel := adminCtx()
-		fp, cross, terr := c.TLSSnapshot(ctx)
-		cancel()
-		switch {
-		case terr != nil:
-			warn("TLS trust sync state unavailable (older daemon or disabled: %v)", terr)
-		default:
-			check(true, "TLS trust root %s…", shortHash(fp))
-			if len(cross) == 0 {
-				warn("TLS: no namespaces cross-certified yet — resolve a freens name with a TLSCA record (§9.5.5: first https visit may need one retry)")
-			} else {
-				names := make([]string, 0, len(cross))
-				stale := 0
-				now := time.Now()
-				for _, x := range cross {
-					names = append(names, x.Alias)
-					// Expiry watch (v0.16.7): a cross-cert's whole lifecycle
-					// is "expires ~daily → traffic re-mints it", so an
-					// expired entry is NORMAL between visits — but it is
-					// exactly the state that turned into a post-upgrade
-					// "verify=19" mystery on 2026-09-14 (nanopi: cert swept
-					// at 12:17, nothing resolved the name until 21:40
-					// because the TLS checks used --resolve literal IPs,
-					// which BYPASS the resolver). Surface it where an
-					// operator looks BEFORE upgrade day: expired or
-					// never-installed entries warn with the one-command
-					// fix. Quarantined/rotating states have their own
-					// §9.5.4 semantics — not staleness, skip them.
-					if x.Status == "quarantined" || x.Status == "rotating" {
-						continue
-					}
-					na := time.Unix(x.NotAfter, 0)
-					switch {
-					case x.NotAfter == 0:
-						// older daemon, no expiry data: skip silently
-					case na.Before(now):
-						stale++
-						warn("TLS cross-cert %s EXPIRED %s ago — https to %s fails until re-minted: resolve the name once (e.g. `dig %s`) while the daemon runs",
-							x.Alias, now.Sub(na).Round(time.Hour), x.Alias, x.Alias)
-					case !systemTrustCurrent(x):
-						stale++
-						warn("TLS cross-cert %s not current in the system store — https from curl/other apps fails: run `freens trust-install` (or check the trust bridge)",
-							x.Alias)
-					}
-				}
-				if stale == 0 {
-					fmt.Printf("✔ TLS: %d namespace(s) cross-certified: %s\n", len(cross), strings.Join(names, ", "))
-				} else {
-					fmt.Printf("✔ TLS: %d namespace(s) cross-certified (%d stale, see above): %s\n",
-						len(cross), stale, strings.Join(names, ", "))
-				}
-			}
-		}
-	}
+	// 9. §9.5 TLS trust sync (computed concurrently above): local root
+	//    present, and (daemon permitting) which namespaces are
+	//    cross-certified.
+	printLines(tlsLns)
 
 	// 10. Tracked certificates (certmgr): served files present and not
 	//     (nearly) expired. Warn-only BY DESIGN: the daily renewal timer
@@ -466,17 +404,182 @@ func cmdDoctor(args []string) error {
 		}
 	}
 
-	// 11. §9.6 DoH (warn-only, v0.14.0): when the box actually uses DoH —
-	//     as upstream or serve — prove the configured pieces still answer.
-	//     Silent otherwise; never paints the health unit red (the upstream
-	//     has a plaintext fallback, the serve face is LAN-only).
-	doctorDoH(c)
+	// 11. §9.6 DoH (warn-only, v0.14.0, computed concurrently above): when
+	//     the box actually uses DoH — as upstream or serve — prove the
+	//     configured pieces still answer. Silent otherwise; never paints
+	//     the health unit red (the upstream has a plaintext fallback, the
+	//     serve face is LAN-only).
+	printLines(dohLns)
 
 	if failed > 0 {
 		return fmt.Errorf("doctor: %d check(s) failed", failed)
 	}
 	fmt.Println("doctor: all checks passed")
 	return nil
+}
+
+// doctorLine is one pre-rendered doctor output line (the concurrent
+// precompute produces these; the sequential printer emits them in check
+// order through the same check()/warn() marks).
+type doctorLine struct {
+	kind int // 0 = check(ok), 1 = warn (✱), 2 = plain ✔ line
+	ok   bool
+	text string
+}
+
+// aliasApexLines renders doctor check 4 (per-alias apex resolve) as
+// pre-formatted lines, fanning the resolves out (each may walk the DHT;
+// the sum-vs-max win is the point of the concurrent precompute).
+func aliasApexLines(c *admin.Client, aliases []string, warming bool) []doctorLine {
+	if c == nil || len(aliases) == 0 {
+		return nil
+	}
+	ctx, cancel := adminCtx()
+	defer cancel()
+	type res struct {
+		r *admin.Resolved
+		e error
+	}
+	results := make([]res, len(aliases))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, a := range aliases {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, a string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r, err := c.Resolve(ctx, a)
+			results[i] = res{r, err}
+		}(i, a)
+	}
+	wg.Wait()
+	lines := make([]doctorLine, 0, len(aliases))
+	for i, a := range aliases {
+		r, err := results[i].r, results[i].e
+		switch {
+		case err != nil:
+			if warming {
+				lines = append(lines, doctorLine{kind: 0, ok: false, text: fmt.Sprintf("alias %s resolves (apex): %v — still warming up", a, err)})
+			} else {
+				lines = append(lines, doctorLine{kind: 0, ok: false, text: fmt.Sprintf("alias %s resolves (apex): %v", a, err)})
+			}
+		case r != nil && r.Revoked:
+			lines = append(lines, doctorLine{kind: 1, text: fmt.Sprintf("alias %s is REVOKED (deliberate; un-revoke with register/name or drop the key)", a)})
+		default:
+			lines = append(lines, doctorLine{kind: 0, ok: err == nil && r != nil && r.Found, text: fmt.Sprintf("alias %s resolves (apex)", a)})
+		}
+	}
+	return lines
+}
+
+// networkLeaseLines renders doctor check 4b (the network view of the
+// first alias) as pre-formatted lines. Semantics preserved verbatim from
+// the inline original, including the 29 s dedicated budget (a slow-but-
+// honest walk is a PASS, not a warning).
+func networkLeaseLines(c *admin.Client, aliases []string, warming bool) []doctorLine {
+	if len(aliases) == 0 || c == nil || warming {
+		return nil
+	}
+	a := aliases[0]
+	nvCtx, nvCancel := context.WithTimeout(context.Background(), 29*time.Second)
+	nvClient := *c
+	nvClient.Timeout = 29 * time.Second // the shared adminTimeout (15s) kills slow-but-honest walks
+	r, nerr := nvClient.ResolveNetwork(nvCtx, a)
+	nvCancel()
+	nv := func() *admin.NetworkView {
+		if r != nil {
+			return r.Network
+		}
+		return nil
+	}()
+	switch {
+	case nerr != nil:
+		return []doctorLine{{kind: 1, text: fmt.Sprintf("alias %s network view: %v (skipped)", a, nerr)}}
+	case nv == nil:
+		return []doctorLine{{kind: 1, text: fmt.Sprintf("alias %s network view unavailable (daemon predates v0.14.3?) — upgrade", a)}}
+	case nv.Degraded:
+		return []doctorLine{{kind: 1, text: fmt.Sprintf("alias %s network view inconclusive (degraded walk) — recheck on the next run", a)}}
+	case !nv.ClaimFound || nv.ClaimExpires <= uint64(time.Now().Unix()):
+		return []doctorLine{{kind: 0, ok: false, text: fmt.Sprintf("alias %s holds a LIVE network lease (local copy resolves, the network's is %s) — run `freens renew -force %s`",
+			a, networkLeaseState(nv), a)}}
+	default:
+		return []doctorLine{{kind: 0, ok: true, text: fmt.Sprintf("alias %s network lease live (seq %d, expires in %d m)",
+			a, nv.ClaimSequence, (int64(nv.ClaimExpires)-time.Now().Unix())/60)}}
+	}
+}
+
+// clockSkewLines renders doctor check 8 (clock sanity, warn-only).
+func clockSkewLines() []doctorLine {
+	if skew, ok := clockSkew(); ok {
+		switch {
+		case skew < 2*time.Minute:
+			return []doctorLine{{kind: 2, text: fmt.Sprintf("clock sane (skew %s against internet time)", skew.Round(time.Second))}}
+		case skew < 1*time.Hour:
+			return []doctorLine{{kind: 1, text: fmt.Sprintf("clock is %s off internet time — fix NTP (records/claims misbehave under skew)", skew.Round(time.Second))}}
+		default:
+			return []doctorLine{{kind: 1, text: fmt.Sprintf("clock is %s off internet time — registrations from this machine will misbehave; fix NTP NOW", skew.Round(time.Minute))}}
+		}
+	}
+	return []doctorLine{{kind: 1, text: "could not check clock skew (no internet time source reachable)"}}
+}
+
+// tlsLines renders doctor check 9 (§9.5 TLS trust sync).
+func tlsLines(c *admin.Client) []doctorLine {
+	rootPath := filepath.Join(home.Dir(), "tls", "root.crt")
+	rootOK := sysStatExists(rootPath)
+	if !rootOK {
+		return []doctorLine{{kind: 0, ok: false, text: fmt.Sprintf("TLS local trust root missing (%s) — run `freens trust-install`", rootPath)}}
+	}
+	if c == nil {
+		return []doctorLine{{kind: 1, text: "TLS local trust root present (daemon down: cross-cert state unknown)"}}
+	}
+	ctx, cancel := adminCtx()
+	fp, cross, terr := c.TLSSnapshot(ctx)
+	cancel()
+	if terr != nil {
+		return []doctorLine{{kind: 1, text: fmt.Sprintf("TLS trust sync state unavailable (older daemon or disabled: %v)", terr)}}
+	}
+	lines := []doctorLine{{kind: 0, ok: true, text: fmt.Sprintf("TLS trust root %s…", shortHash(fp))}}
+	if len(cross) == 0 {
+		return append(lines, doctorLine{kind: 1, text: "TLS: no namespaces cross-certified yet — resolve a freens name with a TLSCA record (§9.5.5: first https visit may need one retry)"})
+	}
+	names := make([]string, 0, len(cross))
+	stale := 0
+	now := time.Now()
+	for _, x := range cross {
+		names = append(names, x.Alias)
+		// Expiry watch (v0.16.7): a cross-cert's whole lifecycle is
+		// "expires ~daily → traffic re-mints it", so an expired entry is
+		// NORMAL between visits — but it is exactly the state that turned
+		// into a post-upgrade "verify=19" mystery on 2026-09-14 (nanopi:
+		// cert swept at 12:17, nothing resolved the name until 21:40
+		// because the TLS checks used --resolve literal IPs, which BYPASS
+		// the resolver). Quarantined/rotating states have their own
+		// §9.5.4 semantics — not staleness, skip them.
+		if x.Status == "quarantined" || x.Status == "rotating" {
+			continue
+		}
+		na := time.Unix(x.NotAfter, 0)
+		switch {
+		case x.NotAfter == 0:
+			// older daemon, no expiry data: skip silently
+		case na.Before(now):
+			stale++
+			lines = append(lines, doctorLine{kind: 1, text: fmt.Sprintf("TLS cross-cert %s EXPIRED %s ago — https to %s fails until re-minted: resolve the name once (e.g. `dig %s`) while the daemon runs",
+				x.Alias, now.Sub(na).Round(time.Hour), x.Alias, x.Alias)})
+		case !systemTrustCurrent(x):
+			stale++
+			lines = append(lines, doctorLine{kind: 1, text: fmt.Sprintf("TLS cross-cert %s not current in the system store — https from curl/other apps fails: run `freens trust-install` (or check the trust bridge)",
+				x.Alias)})
+		}
+	}
+	if stale == 0 {
+		lines = append(lines, doctorLine{kind: 2, text: fmt.Sprintf("TLS: %d namespace(s) cross-certified: %s", len(cross), strings.Join(names, ", "))})
+	} else {
+		lines = append(lines, doctorLine{kind: 2, text: fmt.Sprintf("TLS: %d namespace(s) cross-certified (%d stale, see above): %s", len(cross), stale, strings.Join(names, ", "))})
+	}
+	return lines
 }
 
 // systemTrustCurrent reports whether the system CA store actually holds a

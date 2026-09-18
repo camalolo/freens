@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/camalolo/freens/internal/admin"
@@ -204,9 +205,36 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		if res, err := s.d.Resolve(r.Context(), aliases[0]); err == nil && res != nil {
 			d.DNSOK = res.Found
 		}
-		for _, a := range aliases {
-			n := dashName{Alias: a, TldIDB32: s.aliasTldB32(a)}
-			if res, err := s.d.Resolve(r.Context(), a); err == nil && res != nil {
+		// Fan the per-alias work out (each entry = one admin resolve that
+		// may walk the DHT + one keyfile derive; serial, these made the
+		// dashboard pay the sum — the 2026-09-18 verb audit). Results are
+		// assembled in alias order.
+		type dashEntry struct {
+			n   dashName
+			err error
+			res *admin.Resolved
+		}
+		entries := make([]dashEntry, len(aliases))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for i, a := range aliases {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, a string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				res, err := s.d.Resolve(r.Context(), a)
+				entries[i] = dashEntry{
+					n:   dashName{Alias: a, TldIDB32: s.aliasTldB32(a)},
+					res: res,
+					err: err,
+				}
+			}(i, a)
+		}
+		wg.Wait()
+		for i := range entries {
+			n := entries[i].n
+			if res, err := entries[i].res, entries[i].err; err == nil && res != nil {
 				if res.Revoked {
 					n.Revoked = true
 				} else if res.Found {
@@ -265,22 +293,41 @@ func (s *Server) handleNames(w http.ResponseWriter, r *http.Request) {
 		Names []nameCard
 	}
 	p := page{basePage: s.base("Names", "names")}
-	for _, a := range keychain.Aliases(s.keysDir) {
-		c := nameCard{Alias: a, TldIDB32: s.aliasTldB32(a), Encrypted: keychain.IsEncryptedPath(keychain.OwnerKeyPath(s.keysDir, a))}
-		if res, err := s.d.Resolve(r.Context(), a); err == nil && res != nil {
-			if res.Revoked {
-				c.Revoked = true
-				c.ExpiryText = "revoked"
-			} else if res.Found {
-				c.Healthy = true
-				c.IP = firstIP(res.RRset)
-				c.ExpiryText = "live"
+	aliases := keychain.Aliases(s.keysDir)
+	// Fan out (see the dashboard note: per-alias resolve + keyfile derive
+	// in parallel, assembled in alias order).
+	type nameEntry struct {
+		c nameCard
+	}
+	entries := make([]nameEntry, len(aliases))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, a := range aliases {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, a string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			entries[i] = nameEntry{c: nameCard{Alias: a, TldIDB32: s.aliasTldB32(a), Encrypted: keychain.IsEncryptedPath(keychain.OwnerKeyPath(s.keysDir, a))}}
+			if res, err := s.d.Resolve(r.Context(), a); err == nil && res != nil {
+				c := &entries[i].c
+				if res.Revoked {
+					c.Revoked = true
+					c.ExpiryText = "revoked"
+				} else if res.Found {
+					c.Healthy = true
+					c.IP = firstIP(res.RRset)
+					c.ExpiryText = "live"
+				}
 			}
-		}
-		if c.IP == "" {
-			c.IP = "—"
-		}
-		p.Names = append(p.Names, c)
+			if entries[i].c.IP == "" {
+				entries[i].c.IP = "—"
+			}
+		}(i, a)
+	}
+	wg.Wait()
+	for i := range entries {
+		p.Names = append(p.Names, entries[i].c)
 	}
 	s.render(w, http.StatusOK, "names", p)
 }

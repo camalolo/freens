@@ -257,41 +257,43 @@ func doctorWarn(format string, args ...any) {
 // doctorDoH is doctor's §9.6 block (warn-only, like certmgr's): when DoH is
 // in use, prove the configured pieces still answer. Silent when the box
 // doesn't use DoH at all — doctor's job is the operator's actual setup.
-func doctorDoH(c *admin.Client) {
+// doctorDoHLines renders doctor's §9.6 block as pre-formatted lines so it
+// can run concurrently with the other network checks (the 2026-09-18 verb
+// audit: its upstream probe is a full HTTPS round trip). Output identical
+// to the old printing doctorDoH.
+func doctorDoHLines(c *admin.Client) []doctorLine {
 	conf := home.ConfPath()
 	upURL, hasUp, err := confedit.Get(conf, "upstream", "doh")
 	if err != nil {
-		doctorWarn("doh: config unreadable (%v)", err)
-		return
+		return []doctorLine{{kind: 1, text: fmt.Sprintf("doh: config unreadable (%v)", err)}}
 	}
 	serve, hasServe, err := confedit.Get(conf, "doh", "serve")
 	if err != nil {
-		doctorWarn("doh: config unreadable (%v)", err)
-		return
+		return []doctorLine{{kind: 1, text: fmt.Sprintf("doh: config unreadable (%v)", err)}}
 	}
 	if !hasUp && !parseServe(serve, hasServe) {
-		return // DoH unused on this box; nothing to check
+		return nil // DoH unused on this box; nothing to check
 	}
 
+	var lines []doctorLine
 	if hasUp {
 		ok := dohUpstreamAnswers(upURL, conf)
 		if ok {
-			fmt.Printf("✔ DoH upstream answers (%s)\n", upURL)
+			lines = append(lines, doctorLine{kind: 2, text: fmt.Sprintf("DoH upstream answers (%s)", upURL)})
 		} else {
-			doctorWarn("DoH upstream %s did not answer — queries fall back to plain DNS until it recovers", upURL)
+			lines = append(lines, doctorLine{kind: 1, text: fmt.Sprintf("DoH upstream %s did not answer — queries fall back to plain DNS until it recovers", upURL)})
 		}
 	}
 	if parseServe(serve, hasServe) {
 		if c == nil {
-			doctorWarn("DoH serve is on but the daemon is down — the webui relay will answer SERVFAIL")
-			return
+			return append(lines, doctorLine{kind: 1, text: "DoH serve is on but the daemon is down — the webui relay will answer SERVFAIL"})
 		}
 		q := new(dns.Msg)
 		q.SetQuestion("example.com.", dns.TypeA)
 		q.RecursionDesired = true
 		payload, perr := q.Pack()
 		if perr != nil {
-			return
+			return lines
 		}
 		ctx, cancel := adminCtx()
 		defer cancel()
@@ -299,13 +301,14 @@ func doctorDoH(c *admin.Client) {
 		resp := new(dns.Msg)
 		switch {
 		case qerr != nil:
-			doctorWarn("DoH relay check failed (admin /dns-query): %v", qerr)
+			lines = append(lines, doctorLine{kind: 1, text: fmt.Sprintf("DoH relay check failed (admin /dns-query): %v", qerr)})
 		case resp.Unpack(raw) != nil || resp.Rcode != dns.RcodeSuccess:
-			doctorWarn("DoH relay answered but the resolver path is unhealthy")
+			lines = append(lines, doctorLine{kind: 1, text: "DoH relay answered but the resolver path is unhealthy"})
 		default:
-			fmt.Println("✔ DoH relay (daemon side) answers — the HTTPS leg is the webui Test button")
+			lines = append(lines, doctorLine{kind: 2, text: "DoH relay (daemon side) answers — the HTTPS leg is the webui Test button"})
 		}
 	}
+	return lines
 }
 
 // dohUpstreamAnswers fires one real A query at the configured DoH endpoint

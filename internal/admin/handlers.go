@@ -626,7 +626,7 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	} else if tldID == nil {
 		out := Resolved{Found: false} // no claim for alias
 		if req.Network {
-			out.Network = s.networkView(ctx, labels, alias)
+			out.Network = s.networkView(ctx, labels, alias, nil)
 		}
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -640,7 +640,7 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	var netView *NetworkView
 	if req.Network {
-		netView = s.networkView(ctx, labels, alias)
+		netView = s.networkView(ctx, labels, alias, tldID)
 	}
 	var env *wire.SignedEnvelope
 	if s.lookup != nil {
@@ -687,35 +687,60 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 // a peer walk with the daemon's own store/pool excluded. Best-effort: an
 // inconclusive walk sets Degraded and leaves the fields at zero rather
 // than guessing — callers must treat Degraded as "unknown", not "missing".
-func (s *Server) networkView(ctx context.Context, labels []string, alias string) *NetworkView {
+func (s *Server) networkView(ctx context.Context, labels []string, alias string, tldID []byte) *NetworkView {
 	if s.node == nil {
 		return nil
 	}
 	v := &NetworkView{}
-	// Record leg: walk the name key. tldID is not re-derived here — the
-	// caller resolved it already; without it (pin-less apex miss) the
-	// record leg is skipped and only the claim leg answers.
+	// The two legs are INDEPENDENT peer walks, so they run concurrently —
+	// they were back-to-back serial, and each is seconds on a busy or
+	// ghost-dense keyspace (doctor's network-lease check pays this on
+	// every run; found in the 2026-09-18 verb audit).
+	//
+	// Record leg: walk the name key using the CALLER's tld_id (resolving
+	// the claim hop a second time here was a redundant extra walk — also
+	// found in the audit). Without it (pin-less apex miss) the record leg
+	// is skipped and only the claim leg answers.
 	v.ClaimFound = false
-	env, err := s.walkKeyForLabels(ctx, labels, alias)
-	if err != nil {
+	var (
+		wg        sync.WaitGroup
+		recordEnv *wire.SignedEnvelope
+		recordErr error
+		claimEnvs []*wire.SignedEnvelope
+		claimErr  error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		recordEnv, recordErr = s.walkKeyForLabels(ctx, labels, alias, tldID)
+	}()
+	go func() {
+		defer wg.Done()
+		if len(labels) != 0 {
+			return // sub-names carry no claim of their own
+		}
+		// Claim leg: the network's live claim envelopes for the alias,
+		// local offers excluded. Renewals are owner-only and sequence-
+		// monotonic, so the max-sequence envelope IS the current
+		// generation.
+		claimEnvs, _, claimErr = s.node.CollectClaimsRemote(ctx, alias)
+	}()
+	wg.Wait()
+	if recordErr != nil {
 		v.Degraded = true
-	} else if env != nil && env.Record != nil {
+	} else if recordEnv != nil && recordEnv.Record != nil {
 		v.RecordFound = true
-		v.RecordSequence = env.Record.Sequence
-		v.RecordExpires = env.Record.Expires
+		v.RecordSequence = recordEnv.Record.Sequence
+		v.RecordExpires = recordEnv.Record.Expires
 	}
 	if len(labels) != 0 {
 		return v // sub-names carry no claim of their own
 	}
-	// Claim leg: the network's live claim envelopes for the alias, local
-	// offers excluded. Renewals are owner-only and sequence-monotonic, so
-	// the max-sequence envelope IS the current generation.
-	envs, _, err := s.node.CollectClaimsRemote(ctx, alias)
-	if err != nil {
+	if claimErr != nil {
 		v.Degraded = true
 		return v
 	}
-	for _, e := range envs {
+	for _, e := range claimEnvs {
 		if e == nil || e.Record == nil {
 			continue
 		}
@@ -733,11 +758,7 @@ func (s *Server) networkView(ctx context.Context, labels []string, alias string)
 // held. The tld_id comes from the caller's claim/pin hop; when it cannot
 // be re-derived the record leg reports degraded rather than inventing a
 // miss.
-func (s *Server) walkKeyForLabels(ctx context.Context, labels []string, alias string) (*wire.SignedEnvelope, error) {
-	tldID, err := s.claimTLDID(ctx, alias)
-	if err != nil {
-		return nil, err
-	}
+func (s *Server) walkKeyForLabels(ctx context.Context, labels []string, alias string, tldID []byte) (*wire.SignedEnvelope, error) {
 	if tldID == nil {
 		return nil, nil
 	}

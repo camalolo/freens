@@ -51,6 +51,9 @@ type daemonClient struct {
 	statusMu sync.Mutex
 	status   *admin.Status
 	statusAt time.Time
+
+	resolveMu sync.Mutex
+	resolves  map[string]resolveCacheEntry
 }
 
 // NewDaemonClient wraps the daemon's admin socket as a Daemon.
@@ -80,8 +83,48 @@ func (d *daemonClient) Peers(ctx context.Context) ([]dht.Peer, error) {
 	return d.c.Peers(ctx)
 }
 
+// resolveTTL bounds a cached resolve. The dashboard/names pages resolve
+// every keychain alias per render; each resolve may walk the DHT (a debris
+// alias costs ~1 s of degraded probes — the 2026-09-18 verb audit), so
+// every poller tick re-paying that is waste. 10 s is well inside the 30 s
+// dashboard poller cadence while still noticing renewals/revocations
+// within one poll. Failures are NEVER cached (a daemon coming back is
+// noticed within one request).
+const resolveTTL = 10 * time.Second
+
+type resolveCacheEntry struct {
+	res *admin.Resolved
+	at  time.Time
+}
+
 func (d *daemonClient) Resolve(ctx context.Context, name string) (*admin.Resolved, error) {
-	return d.c.Resolve(ctx, name)
+	d.resolveMu.Lock()
+	if e, ok := d.resolves[name]; ok && time.Since(e.at) < resolveTTL {
+		d.resolveMu.Unlock()
+		return e.res, nil
+	}
+	d.resolveMu.Unlock()
+	res, err := d.c.Resolve(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	d.resolveMu.Lock()
+	if d.resolves == nil {
+		d.resolves = make(map[string]resolveCacheEntry)
+	}
+	// Bound the map: it keys on queried names, which on these pages is
+	// the keychain alias set (small). Drop expired entries when it grows
+	// beyond a sane cap regardless.
+	if len(d.resolves) > 256 {
+		for k, e := range d.resolves {
+			if time.Since(e.at) >= resolveTTL {
+				delete(d.resolves, k)
+			}
+		}
+	}
+	d.resolves[name] = resolveCacheEntry{res: res, at: time.Now()}
+	d.resolveMu.Unlock()
+	return res, nil
 }
 
 func (d *daemonClient) Publish(ctx context.Context, env *wire.SignedEnvelope) (int, error) {
