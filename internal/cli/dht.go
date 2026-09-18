@@ -25,14 +25,17 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/camalolo/freens/internal/blacklist"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/dht"
+	"github.com/camalolo/freens/internal/home"
 	"github.com/camalolo/freens/internal/naming"
 	"github.com/camalolo/freens/internal/wire"
 )
@@ -40,6 +43,18 @@ import (
 // cliTimeout bounds every live-network subcommand (publish / resolve / get):
 // a one-shot CLI run must terminate even against a black-holed network.
 const cliTimeout = 30 * time.Second
+
+// openBlacklistLedger loads <home>/blacklist.json for a one-shot verb
+// (shared with the daemon; merge-on-write preserves both writers' rows).
+// Any failure returns nil — a missing/unreadable ledger degrades to "no
+// blacklist", never "no verb".
+func openBlacklistLedger() *blacklist.Ledger {
+	l, err := blacklist.Open(filepath.Join(home.Dir(), "blacklist.json"))
+	if err != nil {
+		return nil
+	}
+	return l
+}
 
 // ---------------------------------------------------------------------------
 // shared plumbing: -peers parsing + the one-shot CLI node
@@ -101,6 +116,10 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 		ListenAddr: listenAddr,
 		Store:      dht.NewEnvelopeStore(0, nil),
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// The proven-violation ledger (see openBlacklistLedger): one-shot
+		// verbs fetch nothing from flagged peers and the upgrade swarm
+		// records wrong-slice proof into the shared file.
+		Blacklist: openBlacklistLedger(),
 		// A one-shot CLI node neither refreshes buckets (§6.2) nor
 		// republishes (§6.4 step 4 — the daemon's job); both background
 		// loops are disabled.

@@ -41,6 +41,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/camalolo/freens/internal/blacklist"
 	"io"
 	"net"
 	"net/http"
@@ -381,6 +382,21 @@ func upgradePeerList() ([]dht.Peer, error) {
 	return out, nil
 }
 
+// filterBlacklisted drops peers carrying a live proven-violation flag in
+// the local ledger (client-side containment: never fetch from a peer this
+// node has cryptographically proven hostile — a wrong slice from an
+// earlier run must not cost this run its retries). nil ledger ⇒ no-op.
+func filterBlacklisted(node *dht.Node, peers []dht.Peer) []dht.Peer {
+	out := make([]dht.Peer, 0, len(peers))
+	for _, p := range peers {
+		if node.PeerBlacklisted(p.ID()) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // fetchTarballFromPeers assembles the manifest's asset from peer-served
 // chunks into workDir. Chunks are fetched round-robin from the peer set
 // by a small worker pool; every chunk is verified against the manifest.
@@ -437,7 +453,7 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		// drained it, the worker EXITED, and requeued chunks stranded
 		// while live seeders still existed. One shared rotation: a
 		// worker only starves when every peer is genuinely out.
-		live    = append([]dht.Peer(nil), peers...)
+		live    = filterBlacklisted(node, peers)
 		liveIdx int
 		strikes = map[string]int{}
 		// throttleGen graduates concurrent workers' throttle backoffs so
@@ -574,10 +590,14 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 				sum := sha256.Sum256(data)
 				if hex.EncodeToString(sum[:]) != man.Chunks[i] {
 					// A WRONG byte-slice is the hostile case: stop asking
-					// this peer anything, retry the chunk elsewhere.
+					// this peer anything, retry the chunk elsewhere, and
+					// persist the verdict — the ledger is the cross-run
+					// form of this per-run hostile set.
 					mu.Lock()
 					hostile[p.Addr] = true
 					mu.Unlock()
+					node.RecordViolation(p.ID(), blacklist.ClassWrongSlice,
+						fmt.Sprintf("chunk %d failed its manifest hash", i), data)
 					strikeN(p, 5)
 					requeue(i)
 					continue
@@ -1852,7 +1872,7 @@ func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer)
 	outPath := filepath.Join(workDir, "release.tar.gz")
 
 	var lastErr error
-	for _, p := range peers {
+	for _, p := range filterBlacklisted(node, peers) {
 		if err := ctx.Err(); err != nil {
 			return "", "", err
 		}
@@ -1876,6 +1896,7 @@ func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer)
 		// piece must hash to the manifest's digest for that chunk. The
 		// final piece is short. A short read (EOF early) fails the piece.
 		good := true
+		hostile := false
 		for ci := 0; ci < len(man.Chunks) && good; ci++ {
 			piece := make([]byte, man.ChunkLen(ci))
 			if _, err := io.ReadFull(r, piece); err != nil {
@@ -1886,6 +1907,7 @@ func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer)
 			sum := sha256.Sum256(piece)
 			if hex.EncodeToString(sum[:]) != man.Chunks[ci] {
 				good = false
+				hostile = true
 				lastErr = fmt.Errorf("chunk %d failed its manifest hash from %s", ci, p.Addr)
 				break
 			}
@@ -1899,6 +1921,13 @@ func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer)
 		out.Close()
 		if !good {
 			os.Remove(outPath)
+			// Only a hash MISMATCH is proven corruption (the bytes
+			// travelled a verified TCP flow from that peer); a short
+			// stream is just a broken peer — pacing handles brokenness,
+			// the ledger only records proof.
+			if hostile {
+				node.RecordViolation(p.ID(), blacklist.ClassWrongSlice, lastErr.Error(), nil)
+			}
 			continue // hostile or broken peer: next candidate
 		}
 		if total != man.Size {

@@ -50,6 +50,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/camalolo/freens/internal/blacklist"
 	"io"
 	"log/slog"
 	"net"
@@ -306,6 +307,17 @@ func run(args []string) error {
 	// Release-blob cache + DHT node references hoisted for the background
 	// wiring below (the TCP blob channel starts next to the other loops).
 	var blobCache *dht.BlobCache
+	// The proven-violation ledger (<home>/blacklist.json): enforcement
+	// gates on put/witness/blob.get, {nodes} filtering, and the swarm's
+	// client-side skips all read it. [dht] blacklist = false opts out.
+	var black *blacklist.Ledger
+	if !dhtCfg.BlacklistOff {
+		if bl, err := blacklist.Open(filepath.Join(home.Dir(), "blacklist.json")); err != nil {
+			logger.Warn("blacklist ledger unavailable — enforcement off", "err", err)
+		} else {
+			black = bl
+		}
+	}
 
 	// Seed the store from the load dir: an explicit -load, else the persist
 	// dir (the persistence round trip — snapshots reload on restart).
@@ -406,6 +418,7 @@ func run(args []string) error {
 			TurnServer:    turnSrvCfg,
 			AllowReserved: cfg.AllowReserved,
 			BlobCache:     blobCache,
+			Blacklist:     black,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)

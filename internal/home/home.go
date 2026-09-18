@@ -52,6 +52,10 @@ func StoreDir() string { return filepath.Join(Dir(), "store") }
 
 func KeysDir() string { return filepath.Join(Dir(), "keys") }
 
+// BlacklistPath is the proven-violation peer ledger (internal/blacklist),
+// shared by the daemon and one-shot CLI verbs (merge-on-write).
+func BlacklistPath() string { return filepath.Join(Dir(), "blacklist.json") }
+
 func PeersDir() string { return filepath.Join(Dir(), "peers") }
 
 func PeerbookPath() string { return filepath.Join(PeersDir(), "book.json") }

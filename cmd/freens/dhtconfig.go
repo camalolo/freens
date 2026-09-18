@@ -36,6 +36,12 @@ type dhtConfig struct {
 	// BlobTCPOff mirrors [dht] "blob-tcp = false": disables the TCP blob
 	// channel (whole-file streaming; the fast path of peer transfer).
 	BlobTCPOff bool
+	// BlacklistOff mirrors [dht] "blacklist = false": disables the
+	// proven-violation peer ledger and every enforcement gate that reads
+	// it (put/witness/blob.get refusals, {nodes} filtering, client-side
+	// fetch skips). Default ON — only provable violations are ever
+	// recorded, and entries decay.
+	BlacklistOff bool
 }
 
 // parseDHTConfig extracts the [dht] section of an INI-style config (same
@@ -110,6 +116,12 @@ func parseDHTConfig(text string) (*dhtConfig, error) {
 				cfg.BlobTCPOff = true
 			} else if val != "true" {
 				return nil, fmt.Errorf("[dht] config: blob-tcp = %q (want true|false)", val)
+			}
+		case "blacklist":
+			if val == "false" {
+				cfg.BlacklistOff = true
+			} else if val != "true" {
+				return nil, fmt.Errorf("[dht] config: blacklist = %q (want true|false)", val)
 			}
 		default:
 			return nil, fmt.Errorf("[dht] config: unknown key %q", key)

@@ -1,5 +1,49 @@
 # Changelog
 
+## unreleased — the peer blacklist (v1): exclusion only for proof
+
+Rate limiting is bandwidth triage; exclusion is a different tool for a
+different attack class (corruption, forged data, double-signing — things
+pacing can never stop). The ledger (internal/blacklist) is v1 of the
+designed peer-reputation system:
+
+- **Identities, never IPs**: UDP source addresses are spoofable, so an
+  IP blacklist is slanderable (an attacker frames any IP by sending
+  garbage with that source) and NAT-churn makes IP stability a
+  false-positive machine. Every wire message already carries a verified
+  Ed25519 identity — the ledger keys on that. Discipline: the recorded
+  party is ALWAYS the transport-verified sender, never a payload field
+  (an envelope's Signer or a claim's Claimant is attacker-chosen; an
+  attacker must not be able to frame the key named in the bytes).
+- **Only cryptographically provable violations are recorded**: a wrong
+  blob slice (origin-manifest hash mismatch, UDP swarm or TCP stream),
+  a relayed envelope whose signature does not verify, a witness request
+  with fabricated proof-of-work, a witness request for a reserved-TLD
+  claim. Volume/flood stays in the rate limiter — pacing for ambiguity,
+  exclusion only for proof. A single proven instance flags (each class
+  is self-evidencing); the flag persists per NodeID with the SHA-256 of
+  the offending bytes as reproducible evidence.
+- **Containment, not partition**: flagged peers lose put/witness/
+  blob.get (error 403) and are never advertised onward in {nodes}, and
+  their liveness is no longer refreshed — but reads, walks, and pings
+  are still served, because a wrong verdict must not partition the
+  network. Client-side, blob fetches (UDP swarm + TCP channel) skip
+  flagged peers entirely.
+- **TTL + decay**: flags expire 24 h after the last violation (re-
+  violation re-arms) — one-off bugs and reformed peers recover. The
+  ledger (<home>/blacklist.json, 0600, atomic writes) is shared by the
+  daemon and one-shot CLI verbs with merge-on-write, so neither writer
+  drops the other's evidence.
+- **Operator surface**: `freens blacklist ls [-json]` and
+  `freens blacklist rm <nodeid-prefix>` (pardon). `[dht] blacklist =
+  false` opts a node out entirely; a failed ledger open degrades to
+  "no blacklist", never "no node".
+- NOT in v1 (deliberate): propagation (v2 ships shared evidence as
+  signed, witness-quorum-gated records only after local evidence has
+  run long enough to trust the classes), double-signing detection (no
+  clean site yet), and the TCP blob channel's server-side identity gate
+  (its token binds to IP; the client-side skip covers the swarm).
+
 ## v0.19.8 — chunked peer transfer: the fleet as its own update CDN
 
 github's release CDN serves some routes (HiNet, measured live) at

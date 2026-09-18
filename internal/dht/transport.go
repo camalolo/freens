@@ -59,6 +59,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/camalolo/freens/internal/blacklist"
 	"github.com/camalolo/freens/internal/claims"
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
@@ -169,7 +170,10 @@ const (
 // a wrong slice is hostile.
 var (
 	ErrBlobThrottled = errors.New("dht: blob.get throttled")
-	ErrBlobAbsent    = errors.New("dht: blob not cached")
+	// ErrBlacklisted: the peer carries a live flag in the local blacklist
+	// ledger (proven protocol violation; decays after the ledger TTL).
+	ErrBlacklisted = errors.New("dht: peer is blacklisted")
+	ErrBlobAbsent  = errors.New("dht: blob not cached")
 )
 
 // Default GLOBAL inbound packet budget (v0.9.2). The per-source-IP buckets
@@ -384,6 +388,14 @@ type NodeConfig struct {
 	// BlobBurst is the token-bucket burst paired with BlobRateLimit.
 	// Zero ⇒ 20.
 	BlobBurst int
+	// Blacklist, when set, is the proven-violation peer ledger: flagged
+	// identities are refused put/witness/blob service, never advertised
+	// onward, and their liveness is no longer refreshed (containment
+	// WITHOUT routing exclusion — reads/walks still work; a wrong verdict
+	// must not partition the network). Entries decay after the ledger's
+	// TTL; only cryptographically provable violations are ever recorded.
+	// nil (the zero value) disables the feature entirely.
+	Blacklist *blacklist.Ledger
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -414,12 +426,13 @@ type Node struct {
 	store     *EnvelopeStore
 	rt        *RoutingTable
 	tokens    *TokenStore
-	claims    *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
-	diff      *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
-	getLim    *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
-	putLim    *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
-	blobLim   *rateLimiter     // per-source-IP blob.get throttle; nil = off
-	blobCache *BlobCache       // release-blob store for blob.get; nil = serving off
+	claims    *ClaimPool        // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
+	diff      *difficultyState  // Appendix A.4 own difficulty + observed ring (gossip.go)
+	getLim    *rateLimiter      // per-source-IP get/find_node throttle (§12); nil = off
+	putLim    *rateLimiter      // per-source-IP put throttle (see defaultPutRateLimit); nil = off
+	blobLim   *rateLimiter      // per-source-IP blob.get throttle; nil = off
+	blobCache *BlobCache        // release-blob store for blob.get; nil = serving off
+	black     *blacklist.Ledger // proven-violation peer ledger; nil = off
 
 	blobTCPMu sync.Mutex
 	blobTCPLn net.Listener  // the TCP blob channel listener (StartBlobTCP)
@@ -757,6 +770,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		putLim:         putLim,
 		blobLim:        blobLim,
 		blobCache:      cfg.BlobCache,
+		black:          cfg.Blacklist,
 		pktLim:         pktLim,
 		walkSem:        walkSem,
 		log:            log,
@@ -776,6 +790,37 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 // ID returns this node's 32-byte Node ID (= SHA-256(Public)).
 func (n *Node) ID() []byte { return append([]byte(nil), n.id...) }
 
+// flagged reports whether the wire-verified sender identity is currently
+// blacklisted (nil-ledger safe; also the lazy TTL decay point).
+func (n *Node) flagged(id []byte) bool { return n.black.Flagged(id) }
+
+// PeerBlacklisted is the client-side check: has THIS node's ledger a live
+// proven-violation flag against the peer identity? Callers skip such
+// peers when fetching (containment mirrors the server-side gates).
+func (n *Node) PeerBlacklisted(peerID []byte) bool { return n.black.Flagged(peerID) }
+
+// RecordViolation accrues one cryptographically provable violation against
+// a sender identity. The recorded party is ALWAYS the transport-verified
+// identity — never a payload field (an envelope's Signer or a claim's
+// Claimant is attacker-chosen; only the message signature binds an identity
+// to bytes, which is what makes the ledger slander-proof). Callers pass
+// proof bytes (hashable evidence); the ledger stores only their SHA-256.
+// Returns true if the identity is flagged after this call.
+func (n *Node) RecordViolation(senderID []byte, class blacklist.Class, detail string, proof []byte) bool {
+	if n.black == nil || len(senderID) != constants.NodeIDLen {
+		return false
+	}
+	flagged, err := n.black.Record(senderID, class, detail, proof)
+	if err != nil {
+		n.log.Warn("blacklist: record failed", "err", err)
+	}
+	if flagged {
+		n.log.Warn("blacklist: peer flagged — proven protocol violation",
+			"node", fmt.Sprintf("%x…", senderID[:8]), "class", string(class), "detail", detail)
+	}
+	return flagged
+}
+
 // maxBlobChunkLen caps one blob.get answer: comfortably inside one UDP
 // datagram (the hard ceiling is ~64 KiB) while amortizing per-request
 // overhead. The manifest's chunk_size must not exceed this.
@@ -789,6 +834,9 @@ const maxBlobChunkLen = 64 * 1024
 // Answers are read straight from the BlobCache file (disk, bounded by the
 // cache's entry cap) and the per-source limiter runs BEFORE the read.
 func (n *Node) hBlobGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	if n.black.Flagged(m.ID) {
+		return n.errResp(m, 403, "blacklisted")
+	}
 	if n.blobCache == nil {
 		return n.errResp(m, 301, "blob serving disabled")
 	}
@@ -900,8 +948,14 @@ func (s *BlobSession) RefreshToken(ctx context.Context, peer Peer) ([]byte, erro
 	return s.refreshToken(ctx, peer)
 }
 
-// Get fetches one [off, off+length) slice of the cached blob id.
+// Get fetches one [off, off+length) slice of the cached blob id. Peers
+// the local ledger has flagged for a PROVEN violation (wrong slice) are
+// refused up front — the ledger is the persistent form of the swarm's
+// per-run hostile set.
 func (s *BlobSession) Get(ctx context.Context, peer Peer, id []byte, off, length int) (data []byte, total int64, err error) {
+	if s.n.black.Flagged(peerID(peer)) {
+		return nil, 0, ErrBlacklisted
+	}
 	addr, aerr := net.ResolveUDPAddr("udp", peer.Addr)
 	if aerr != nil {
 		return nil, 0, aerr
@@ -963,6 +1017,10 @@ func peerID(p Peer) []byte {
 	id, _ := crypto.NodeID(p.PublicKey)
 	return id
 }
+
+// ID returns the Peer's Node ID (public key hashed) — the blacklist
+// ledger's identity key.
+func (p Peer) ID() []byte { return peerID(p) }
 
 // Transient reports whether this node flags its queries as transient
 // (§6.3 field 8 — NodeConfig.Transient; the CLI's one-shot verbs).
@@ -1307,7 +1365,10 @@ func (n *Node) handle(data []byte, raddr *net.UDPAddr) {
 	// citizen for an hour, degrading walks in exactly the keyspaces the
 	// verb touched (the NAT-mapping ghost class).
 	adv, _ := m.A["advertise"].(string)
-	if !m.X {
+	// A blacklisted sender is still served per the per-path gates below
+	// (containment, not partition) but never re-confirmed: its contact
+	// ages out of the table like any idle peer.
+	if !m.X && !n.black.Flagged(m.ID) {
 		n.learnPeer(m.PK, raddr, adv)
 	}
 	switch m.Y {
@@ -1681,6 +1742,9 @@ func (n *Node) advertiseableNodes(contacts []*NodeContact) []any {
 		if c.ConfirmedAt == 0 && now-c.LastSeen > int64(adFreshWindow/time.Second) {
 			continue
 		}
+		if n.black.FlaggedID(hex.EncodeToString(c.NodeID)) {
+			continue // containment: a flagged peer does not spread via {nodes}
+		}
 		keep = append(keep, c)
 	}
 	return encodeNodes(keep)
@@ -1858,6 +1922,9 @@ func (n *Node) reAttestArgs(key []byte, pooled []*wire.SignedEnvelope) []any {
 // retained by the pool answers SUCCESS, not 304 — the node did keep it;
 // 304 is reserved for an envelope retained nowhere.
 func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	if n.black.Flagged(m.ID) {
+		return n.errResp(m, 403, "blacklisted")
+	}
 	if n.passive {
 		return n.errResp(m, 301, "passive node")
 	}
@@ -1886,6 +1953,12 @@ func (n *Node) hPut(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		return n.errResp(m, 305, "invalid record")
 	}
 	if !env.VerifySignature() {
+		// Provable: a well-formed envelope whose Ed25519 signature does
+		// not verify. Honest publish paths verify BEFORE relay, so this
+		// flags the sender's identity (the transport-verified one — the
+		// envelope's Signer field is attacker-chosen and must not be
+		// recorded against).
+		n.RecordViolation(m.ID, blacklist.ClassBadEnvelope, "put envelope signature invalid", envBytes)
 		return n.errResp(m, 303, "invalid signature")
 	}
 	key, err := n.putKeyFor(m, env)
@@ -2066,6 +2139,9 @@ func (n *Node) putKeyFor(m *wire.Message, env *wire.SignedEnvelope) ([]byte, err
 // stores nothing, so it is participation only in the weak §7 sense this node
 // already opted into by joining the network.
 func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	if n.black.Flagged(m.ID) {
+		return n.errResp(m, 403, "blacklisted")
+	}
 	// (1) §12 per-source-IP throttle, shared with get/find_node.
 	if !n.allowRead(raddr) {
 		return n.errResp(m, 301, "throttled")
@@ -2089,6 +2165,7 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 	// other witnesses' gates are unchanged. Error family 305 like the other
 	// claim-content refusals: permanent for this claim, not retryable.
 	if naming.IsReservedTLD(aliasN) && !n.allowReserved {
+		n.RecordViolation(m.ID, blacklist.ClassReservedClaim, "witness request for reserved alias", []byte(aliasN))
 		n.log.Info("witness refused: reserved alias (spec §7.7)", "alias", aliasN)
 		return n.errResp(m, 305, "reserved alias refused (spec §7.7)")
 	}
@@ -2115,6 +2192,10 @@ func (n *Node) hWitness(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 		ClaimantPK: claimant,
 		PowHash:    powHash,
 	}).VerifyPoW(claims.InferDifficulty) {
+		// Provable: the nonce does not hash to the claimed prefix at the
+		// inferred difficulty. Mining precedes every honest registration,
+		// so only a fabricated claim lands here.
+		n.RecordViolation(m.ID, blacklist.ClassBadPoW, "witness request PoW fails verification", append(append([]byte{}, prefixHash...), nonce...))
 		return n.errResp(m, 305, "invalid proof-of-work")
 	}
 

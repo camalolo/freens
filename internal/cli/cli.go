@@ -101,6 +101,7 @@ var dispatch = map[string]func([]string) error{
 	"backup":          cmdBackup,
 	"status":          cmdStatus,
 	"peers":           cmdPeers,
+	"blacklist":       cmdBlacklist,
 	"keys":            cmdKeys,
 	"store":           cmdStore,
 	"doctor":          cmdDoctor,
@@ -285,6 +286,9 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  trust ls               every cross-certified namespace this box holds, with its trust status")
 	fmt.Fprintln(w, "                         (installed / quarantined / rotating — spec 9.5.4)")
 	fmt.Fprintln(w, "  trust remove <alias>   purge a namespace's cross-cert from this box's trust stores")
+	fmt.Fprintln(w, "  blacklist ls           peers flagged for PROVEN protocol violations (wrong blob slices,")
+	fmt.Fprintln(w, "                         forged signatures, fabricated PoW) — identities, 24h decay; -json")
+	fmt.Fprintln(w, "  blacklist rm <nodeid>  clear one peer's flag (pardon) — reads/walks were never blocked")
 	fmt.Fprintln(w, "  doh                    DNS-over-HTTPS (spec 9.6): `doh` shows state, `doh upstream <quad9|cloudflare|")
 	fmt.Fprintln(w, "                         google|URL|off>` encrypts upstream forwarding (applied live), `doh serve <on|off>`")
 	fmt.Fprintln(w, "                         exposes https://<this-box>:8090/dns-query, `doh test [name]` self-checks")
