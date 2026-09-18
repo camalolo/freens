@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.19.11 — the global foreign-LAN dial filter + the seed as last-resort bootstrap
+
+User-reported during the v0.19.10 roll (the friend's WAN VPS): the
+upgrade swarm dialed other LANs' 192.168.1.x — unreachable by
+construction from a WAN vantage — and listed the impossible dials as
+peer failures.
+
+- **Global dial filter (dht)**: `sendQuery` (the single chokepoint for
+  every outbound UDP RPC — walk probes, publishes, witness rounds,
+  bootstrap pings) and the TCP blob client refuse addresses that are
+  private/loopback/link-local AND uncovered by any local interface,
+  INSTANTLY. A WAN node sheds foreign-LAN candidates in microseconds
+  instead of burning an RPC timeout per probe. Loopback is local on
+  every machine (the on-box heal pattern keeps working); the vantage
+  map refreshes on the 1-minute sweep tick (interfaces change);
+  learning is untouched — multi-homed contacts keep their addresses,
+  and the never-confirmed alt aging prunes the dead ones.
+- **Upgrade verb**: per-peer dial plans (viable addresses in order;
+  peer-level answers end the attempt, transport errors advance to the
+  next address); peers with no viable address drop from the rotation
+  before reaching any failure list; a hostile wrong-slice verdict skips
+  the whole peer.
+- **checked-0 killer**: with an empty peerbook AND a cold live set
+  (fresh install, restrictive-NAT burst box), the upgrade verb falls
+  back to the PINNED COMMUNITY SEED compiled into the binary.
+
 ## v0.19.10 — the DNS/DHT decoupling + the verb-performance audit
 
 ### Conventional resolution never contends with freens work
