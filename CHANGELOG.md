@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.19.13 — the first mover seeds every platform
+
+The last gap in "the fleet is its own update CDN": each box cached only
+its OWN platform's archive, so windows/arm64 consumers could never
+peer-download (no Linux box ever cached the windows tarball — desktop
+and the friend's VPS fell to origin every release).
+
+- The release's FIRST MOVER (the box that downloaded from origin)
+  prefetches the other platforms' archives into its blob cache:
+  windows first, then the other linux arch, darwin last; budget-capped
+  (3 min), every byte manifest-verified, run after the services are
+  back so it never delays the upgrade itself.
+- The blob cache widens 2 → 8 entries: room for every platform's
+  current-release archive.
+
 ## v0.19.12 — the peerbook flushes its corpses: peer transfer works everywhere, not just between clean tables
 
 THE DISEASE the user finally named ("I have never seen the fast
