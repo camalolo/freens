@@ -1331,13 +1331,27 @@ func cmdUpgrade(args []string) error {
 		peers, perr := upgradePeerList()
 		if perr == nil && len(peers) > 0 {
 			t0 := time.Now()
-			if p2p, ferr := fetchTarballFromPeers(work, man, peers); ferr != nil {
-				fmt.Printf("peer transfer unavailable after %s (%v) — downloading from origin instead\n", time.Since(t0).Round(time.Millisecond), ferr)
-			} else {
+			// FAST PATH: TCP whole-file streaming — one connection, the
+			// seeder paced by kernel flow control (no rate bucket to
+			// tune, no datagram ceiling). Verified chunk-by-chunk against
+			// the origin manifest as bytes arrive.
+			if p2p, via, ferr := fetchTarballViaTCP(work, man, peers); ferr == nil {
 				tarPath = p2p
-				fmt.Printf("assembled %s from %d peer-served, manifest-verified chunks in %s (%s/s)\n",
-					asset.Name, len(man.Chunks), time.Since(t0).Round(time.Millisecond),
+				fmt.Printf("streamed %s over TCP from %s in %s (%s/s), manifest-verified\n",
+					asset.Name, via, time.Since(t0).Round(time.Millisecond),
 					humanBytesPerSec(man.Size, time.Since(t0)))
+			} else {
+				fmt.Printf("tcp streaming unavailable after %s (%v)\n", time.Since(t0).Round(time.Millisecond), ferr)
+				// FALLBACK: the UDP chunk swarm (48-60 KiB datagrams).
+				t1 := time.Now()
+				if p2p, ferr := fetchTarballFromPeers(work, man, peers); ferr != nil {
+					fmt.Printf("peer transfer unavailable after %s (%v) — downloading from origin instead\n", time.Since(t1).Round(time.Millisecond), ferr)
+				} else {
+					tarPath = p2p
+					fmt.Printf("assembled %s from %d peer-served, manifest-verified chunks in %s (%s/s)\n",
+						asset.Name, len(man.Chunks), time.Since(t1).Round(time.Millisecond),
+						humanBytesPerSec(man.Size, time.Since(t1)))
+				}
 			}
 		}
 	}
@@ -1813,4 +1827,90 @@ func humanBytesPerSec(size int64, d time.Duration) string {
 	default:
 		return fmt.Sprintf("%.0f B", bps)
 	}
+}
+
+// fetchTarballViaTCP streams the WHOLE asset over one TCP connection
+// (the dht blob channel: kernel flow control paces the seeder, so there
+// is no rate bucket to tune and no datagram ceiling) and verifies every
+// manifest chunk as its bytes arrive. Peers are tried in order; the
+// first that serves a fully-verified stream wins. A hash failure is
+// hostile — that peer is skipped, not retried.
+func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer) (string, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	node, err := startCLINode(ctx, "", ":0", peers)
+	if err != nil {
+		return "", "", err
+	}
+	defer node.Close()
+	session := node.BlobSession()
+
+	id, err := hex.DecodeString(man.SHA256)
+	if err != nil || len(id) != constants.SHA256Len {
+		return "", "", fmt.Errorf("manifest digest")
+	}
+	outPath := filepath.Join(workDir, "release.tar.gz")
+
+	var lastErr error
+	for _, p := range peers {
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
+		token, terr := session.RefreshToken(ctx, p)
+		if terr != nil {
+			lastErr = terr
+			continue
+		}
+		t0 := time.Now()
+		r, total, gerr := node.BlobTCPGet(ctx, p, token, id, 0, uint64(man.Size))
+		if gerr != nil {
+			lastErr = gerr
+			continue
+		}
+		out, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			r.Close()
+			return "", "", err
+		}
+		// Stream-verify: read exactly one manifest chunk at a time; every
+		// piece must hash to the manifest's digest for that chunk. The
+		// final piece is short. A short read (EOF early) fails the piece.
+		good := true
+		for ci := 0; ci < len(man.Chunks) && good; ci++ {
+			piece := make([]byte, man.ChunkLen(ci))
+			if _, err := io.ReadFull(r, piece); err != nil {
+				good = false
+				lastErr = fmt.Errorf("stream short at chunk %d: %v", ci, err)
+				break
+			}
+			sum := sha256.Sum256(piece)
+			if hex.EncodeToString(sum[:]) != man.Chunks[ci] {
+				good = false
+				lastErr = fmt.Errorf("chunk %d failed its manifest hash from %s", ci, p.Addr)
+				break
+			}
+			if _, err := out.Write(piece); err != nil {
+				r.Close()
+				out.Close()
+				return "", "", err
+			}
+		}
+		r.Close()
+		out.Close()
+		if !good {
+			os.Remove(outPath)
+			continue // hostile or broken peer: next candidate
+		}
+		if total != man.Size {
+			os.Remove(outPath)
+			lastErr = fmt.Errorf("blob size %d != manifest %d", total, man.Size)
+			continue
+		}
+		fmt.Printf("  streamed %d bytes from %s in %s\n", man.Size, p.Addr, time.Since(t0).Round(time.Millisecond))
+		return outPath, p.Addr, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no candidate peers")
+	}
+	return "", "", lastErr
 }

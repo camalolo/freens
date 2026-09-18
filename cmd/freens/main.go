@@ -303,6 +303,10 @@ func run(args []string) error {
 	// and the get/put RPCs, and caches records fetched from peers (spec §6.4).
 	store := dht.NewEnvelopeStore(0, nil)
 
+	// Release-blob cache + DHT node references hoisted for the background
+	// wiring below (the TCP blob channel starts next to the other loops).
+	var blobCache *dht.BlobCache
+
 	// Seed the store from the load dir: an explicit -load, else the persist
 	// dir (the persistence round trip — snapshots reload on restart).
 	if loadEffective != "" {
@@ -381,7 +385,7 @@ func run(args []string) error {
 		// [dht] blob-serve = false turns the whole thing off. Wired only
 		// for non-passive nodes: a passive node already refuses writes, and
 		// serving update blobs IS a write-shaped favor to the network.
-		var blobCache *dht.BlobCache
+		blobCache = nil
 		if !passiveEffective && !dhtCfg.BlobServeOff {
 			if bc, bcerr := dht.NewBlobCache(filepath.Join(home.Dir(), "blobs")); bcerr != nil {
 				logger.Warn("blob cache unavailable — blob serving disabled", "error", bcerr)
@@ -835,6 +839,23 @@ func run(args []string) error {
 			}
 		}
 	}()
+	// TCP blob channel (v0.19.9): whole-file streaming for peer transfer —
+	// kernel flow control paces the seeder, so no rate bucket guessing.
+	// Shares the DHT port number (TCP alongside UDP); token-gated like the
+	// UDP path; [dht] blob-tcp = false opts out. Desktop note: a new
+	// inbound TCP port on the Windows firewall needs the user to allow it.
+	if dhtNode != nil && blobCache != nil && !dhtCfg.BlobTCPOff {
+		blobCtx, blobCancel := context.WithCancel(context.Background())
+		go func() {
+			<-bgStop
+			blobCancel()
+		}()
+		if terr := dhtNode.StartBlobTCP(blobCtx, dhtEffective); terr != nil {
+			logger.Warn("blob TCP channel unavailable — UDP blob.get only", "error", terr)
+		} else {
+			logger.Info("blob TCP channel listening", "addr", dhtNode.BlobTCPAddr())
+		}
+	}
 	// UPnP renewal: routers forget mappings across reboots/resets, and
 	// external addresses change (dynamic PPPoE). Probe every 5 minutes,
 	// re-map when the entry vanished, follow address changes — the node's

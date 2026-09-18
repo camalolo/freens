@@ -420,8 +420,11 @@ type Node struct {
 	putLim    *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
 	blobLim   *rateLimiter     // per-source-IP blob.get throttle; nil = off
 	blobCache *BlobCache       // release-blob store for blob.get; nil = serving off
-	pktLim    *packetBudget    // GLOBAL pre-verify inbound packet budget; nil = off
-	walkSem   chan struct{}    // outbound walk concurrency cap (nil = uncapped)
+
+	blobTCPMu sync.Mutex
+	blobTCPLn net.Listener  // the TCP blob channel listener (StartBlobTCP)
+	pktLim    *packetBudget // GLOBAL pre-verify inbound packet budget; nil = off
+	walkSem   chan struct{} // outbound walk concurrency cap (nil = uncapped)
 	log       *slog.Logger
 	nowFn     func() int64
 
@@ -885,6 +888,16 @@ func (s *BlobSession) refreshToken(ctx context.Context, peer Peer) ([]byte, erro
 	s.tokens[peer.Addr] = token
 	s.mu.Unlock()
 	return token, nil
+}
+
+// RefreshToken forces a fresh write token for peer (the TCP blob channel
+// consumes it as its connection handshake; the UDP mint requires a
+// completed round trip from the true source).
+func (s *BlobSession) RefreshToken(ctx context.Context, peer Peer) ([]byte, error) {
+	s.mu.Lock()
+	delete(s.tokens, peer.Addr)
+	s.mu.Unlock()
+	return s.refreshToken(ctx, peer)
 }
 
 // Get fetches one [off, off+length) slice of the cached blob id.
