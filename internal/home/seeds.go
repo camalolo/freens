@@ -61,6 +61,24 @@ func ParseSeeds(path string) []dht.Peer {
 	return out
 }
 
+// ParseSeedsText parses seed entries from a string (same format and
+// tolerance as ParseSeeds) — used by the upgrade verb to fall back to the
+// PINNED DEFAULT seed when the peerbook and the live daemon set are both
+// empty (a fresh install or a cold restart had "checked 0" peers).
+func ParseSeedsText(text string) []dht.Peer {
+	var out []dht.Peer
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if p, ok := parseSeedEntry(line); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // parseSeedEntry parses one "host:port#<64-hex-pk>" seed line. ok is false
 // for a missing "#", a bad host:port shape, or a public key that is not
 // 64 hex chars (32 bytes) — same tolerance as cmd/freens' -peers parsing.

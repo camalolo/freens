@@ -252,6 +252,14 @@ func (p *bytePacer) wait(n int) {
 // token via the UDP DHT — see BlobSession.RefreshToken). The connection
 // is closed when the reader is closed.
 func (n *Node) BlobTCPGet(ctx context.Context, peer Peer, token, id []byte, offset, length uint64) (io.ReadCloser, int64, error) {
+	// The global vantage filter (see ErrUnreachableVantage): the TCP
+	// channel dials peer.Addr directly, so the same foreign-LAN rule
+	// applies as for UDP RPCs.
+	if host, _, herr := net.SplitHostPort(peer.Addr); herr == nil {
+		if !n.viableIP(net.ParseIP(host)) {
+			return nil, 0, ErrUnreachableVantage
+		}
+	}
 	if len(token) != 32 || len(id) != 32 {
 		return nil, 0, errors.New("dht: blob TCP request needs a 32-byte token and 32-byte id")
 	}

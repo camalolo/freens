@@ -445,10 +445,14 @@ type Node struct {
 	// witness / blob.get) off the single-threaded read loop; nil (never
 	// started) means everything runs inline as before.
 	handlerPool chan func()
-	pktLim      *packetBudget // GLOBAL pre-verify inbound packet budget; nil = off
-	walkSem     chan struct{} // outbound walk concurrency cap (nil = uncapped)
-	log         *slog.Logger
-	nowFn       func() int64
+	// localNets is this machine's interface subnets (set at Start,
+	// refreshed by the 1-minute idle sweep — interfaces come and go):
+	// the vantage for the foreign-LAN dial filter. Guarded by n.mu.
+	localNets []*net.IPNet
+	pktLim    *packetBudget // GLOBAL pre-verify inbound packet budget; nil = off
+	walkSem   chan struct{} // outbound walk concurrency cap (nil = uncapped)
+	log       *slog.Logger
+	nowFn     func() int64
 
 	// advertise is the validated §6.2 advertised address ("" ⇒ peers learn
 	// the observed source). Parsed from NodeConfig.Advertise once at Start;
@@ -1206,6 +1210,9 @@ func (n *Node) Start() error {
 	n.startSTUN()
 	go n.readLoop()
 	n.startHandlerPool(defaultHandlerPoolWorkers)
+	n.mu.Lock()
+	n.localNets = interfaceNets()
+	n.mu.Unlock()
 
 	// (d) Co-located TURN server (community relay tier): nodes with spare
 	// bandwidth relay for the network. A listen failure fails Start — the
@@ -2552,7 +2559,78 @@ func claimPrefixHash(alias string, tldID, claimantPK []byte, ts uint64) ([]byte,
 // sendQuery transmits a signed query to addr and awaits the matching response
 // (correlated by txid via readLoop→deliver). Returns ErrTimeout on no response
 // within RPC_TIMEOUT, or ctx.Err() if the caller's context expires first.
+// ErrUnreachableVantage is the GLOBAL foreign-LAN dial filter's instant
+// refusal: the address is private/loopback/link-local and NO local
+// interface shares its subnet, so the dial can never succeed. Failing
+// FAST (instead of after the RPC timeout) is the point — a WAN node
+// probing a LAN-heavy table sheds those candidates in microseconds
+// instead of burning seconds per probe, and the impossible dials stop
+// polluting failure accounting (user-reported 2026-09-19: the friend's
+// VPS listed other LANs' 192.168.1.x as peer failures). Learning is
+// UNAFFECTED — multi-homed contacts keep their addresses (same-LAN peers
+// need them; the never-confirmed alt aging prunes the dead ones); only
+// DIALING is vantage-filtered.
+var ErrUnreachableVantage = errors.New("dht: address unreachable from this machine's vantage (foreign private subnet)")
+
+// interfaceNets enumerates this machine's interface subnets.
+func interfaceNets() []*net.IPNet {
+	var out []*net.IPNet
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			switch v := a.(type) {
+			case *net.IPNet:
+				out = append(out, v)
+			case *net.IPAddr:
+				bits := 128
+				if v.IP.To4() != nil {
+					bits = 32
+				}
+				out = append(out, &net.IPNet{IP: v.IP, Mask: net.CIDRMask(bits, bits)})
+			}
+		}
+	}
+	return out
+}
+
+// viableIP applies the vantage rule to one address: public addresses
+// always pass; private/loopback/link-local pass only when a local
+// interface covers them (loopback does on every machine — the on-box
+// heal pattern keeps working).
+func (n *Node) viableIP(ip net.IP) bool {
+	if ip == nil {
+		return true // let the dial report the real error
+	}
+	if ip.IsLoopback() {
+		return true // loopback is local on every machine (on-box heal pattern)
+	}
+	if !ip.IsPrivate() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() {
+		return true
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, netw := range n.localNets {
+		if netw.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []byte, method string, args map[string]any) (*wire.Message, error) {
+	// The GLOBAL vantage filter (see ErrUnreachableVantage): an instant
+	// refusal costs the caller microseconds; a dialed one costs the full
+	// RPC timeout and poisons failure accounting.
+	if !n.viableIP(addr.IP) {
+		return nil, ErrUnreachableVantage
+	}
 	// §6.2 advertised address: stamp it on every outbound query so the peer
 	// learns THIS node at the advertised (public) address, not a NAT'd
 	// private observed source. The map is copied, never the caller's.
@@ -3818,6 +3896,13 @@ func (n *Node) idleSweepLoop(ctx context.Context) {
 	for {
 		select {
 		case <-t.C:
+			// Refresh the vantage map on every tick (NOT at the startup
+			// call — Start seeded it and a racing re-seed would clobber a
+			// test's synthetic set): interfaces change (DHCP, VPN
+			// up/down) and the dial filter must follow.
+			n.mu.Lock()
+			n.localNets = interfaceNets()
+			n.mu.Unlock()
 			n.sweepIdleContacts(n.now())
 		case <-ctx.Done():
 			return

@@ -373,6 +373,17 @@ func upgradePeerList() ([]dht.Peer, error) {
 			add(live)
 		}
 	}
+	// Last-resort bootstrap: the PINNED COMMUNITY SEED. A fresh install
+	// (or a box whose daemon never held confirmed contacts — restrictive
+	// NAT burst boxes) has an empty peerbook and, mid-restart, an empty
+	// live set: "no peers reachable (checked 0)" fell back to origin even
+	// though the seed is compiled into the binary. Found live 2026-09-19
+	// on the friend's VPS during the v0.19.10 roll.
+	if len(out) == 0 {
+		if seeds := home.ParseSeedsText(home.DefaultSeeds()); len(seeds) > 0 {
+			add(seeds)
+		}
+	}
 	if len(out) > 12 {
 		out = out[:12]
 	}
@@ -380,6 +391,126 @@ func upgradePeerList() ([]dht.Peer, error) {
 		return nil, errors.New("no known peers (peerbook empty and daemon unreachable)")
 	}
 	return out, nil
+}
+
+// localNets enumerates this machine's interface subnets — the vantage for
+// the LAN-address viability decision (once per verb run).
+func localNets() []*net.IPNet {
+	var out []*net.IPNet
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			switch v := a.(type) {
+			case *net.IPNet:
+				out = append(out, v)
+			case *net.IPAddr:
+				bits := 128
+				if v.IP.To4() != nil {
+					bits = 32
+				}
+				out = append(out, &net.IPNet{IP: v.IP, Mask: net.CIDRMask(bits, bits)})
+			}
+		}
+	}
+	return out
+}
+
+// addrViable reports whether addr is worth dialing FROM THIS MACHINE:
+// public (and hostname) addresses always; private/loopback/link-local
+// addresses only when a local interface shares the subnet. A WAN box
+// dialing another LAN's 192.168.1.x can never succeed — counting those
+// dials as peer evidence filled the friend's VPS failure list with LAN
+// IPs during the v0.19.10 roll (user-reported). Loopback lives on every
+// machine, so the on-box heal pattern (-peers 127.0.0.1:15353#pk) stays
+// viable, and hostnames (the pinned seed) pass for resolution.
+func addrViable(addr string, nets []*net.IPNet) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return true // unparseable: let the dial report the real error
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true // hostname: resolvable; viability unknown until dialed
+	}
+	if !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() {
+		return true
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// dialPlan returns the peer's addresses worth dialing from this machine,
+// preferred first then viable alternates, deduplicated. Multi-homing
+// keeps LAN addresses LEARNED (same-LAN peers need them, and the
+// never-confirmed alt aging prunes the useless ones) — this only decides
+// what we DIAL.
+func dialPlan(p dht.Peer, nets []*net.IPNet) []string {
+	plan := make([]string, 0, 1+len(p.Alts))
+	add := func(a string) {
+		if a == "" || !addrViable(a, nets) {
+			return
+		}
+		for _, have := range plan {
+			if have == a {
+				return
+			}
+		}
+		plan = append(plan, a)
+	}
+	add(p.Addr)
+	for _, alt := range p.Alts {
+		add(alt.Addr)
+	}
+	return plan
+}
+
+// viablePeers keeps only peers with at least one dialable address from
+// this machine's vantage (counting the drops).
+func viablePeers(peers []dht.Peer, nets []*net.IPNet, skipped *int) []dht.Peer {
+	out := make([]dht.Peer, 0, len(peers))
+	for _, p := range peers {
+		if len(dialPlan(p, nets)) == 0 {
+			*skipped++
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// getViaPlan fetches one chunk trying the peer's viable addresses in
+// order. Errors that are the PEER's answer — absent (never cached),
+// throttled (pacing), blacklisted (refused) — return immediately: every
+// address serves the same node. Only TRANSPORT failures are address-level
+// and justify the next address.
+func getViaPlan(ctx context.Context, sess *dht.BlobSession, p dht.Peer, plan []string, id []byte, off, length int) ([]byte, int64, error) {
+	var last error
+	for i, a := range plan {
+		pp := p
+		pp.Addr = a
+		data, total, err := sess.Get(ctx, pp, id, off, length)
+		if err == nil {
+			return data, total, nil
+		}
+		switch err {
+		case dht.ErrBlobAbsent, dht.ErrBlobThrottled, dht.ErrBlacklisted:
+			return data, total, err // the node answered: address is done
+		}
+		last = err
+		_ = i
+	}
+	return nil, 0, last
 }
 
 // filterBlacklisted drops peers carrying a live proven-violation flag in
@@ -442,6 +573,8 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		return "", err
 	}
 
+	nets := localNets()
+	skippedUnviable := 0
 	var (
 		mu          sync.Mutex
 		next        int
@@ -453,7 +586,7 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		// drained it, the worker EXITED, and requeued chunks stranded
 		// while live seeders still existed. One shared rotation: a
 		// worker only starves when every peer is genuinely out.
-		live    = filterBlacklisted(node, peers)
+		live    = viablePeers(filterBlacklisted(node, peers), nets, &skippedUnviable)
 		liveIdx int
 		strikes = map[string]int{}
 		// throttleGen graduates concurrent workers' throttle backoffs so
@@ -549,7 +682,7 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 				var data []byte
 				attempts := 0
 				for {
-					data, _, err = session.Get(ctx, p, id, int(off), int(remain))
+					data, _, err = getViaPlan(ctx, session, p, dialPlan(p, nets), id, int(off), int(remain))
 					if err != dht.ErrBlobThrottled {
 						break
 					}
@@ -611,6 +744,9 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 	}
 	wg.Wait()
 
+	if skippedUnviable > 0 {
+		fmt.Printf("  skipped %d peer(s) whose addresses are unreachable from this machine (LAN-only seen from a WAN vantage)\n", skippedUnviable)
+	}
 	// Whole-file verification: the manifest's own digest over what we
 	// assembled — belt and braces over the per-chunk checks, and the
 	// origin SHA256SUMS check (when present) vouches a third time.
@@ -1877,77 +2013,105 @@ func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer)
 	if err != nil || len(id) != constants.SHA256Len {
 		return "", "", fmt.Errorf("manifest digest")
 	}
-	outPath := filepath.Join(workDir, "release.tar.gz")
-
 	var lastErr error
+	tcpNets := localNets()
+peerLoop:
 	for _, p := range filterBlacklisted(node, peers) {
 		if err := ctx.Err(); err != nil {
 			return "", "", err
 		}
-		token, terr := session.RefreshToken(ctx, p)
-		if terr != nil {
-			lastErr = terr
-			continue
-		}
-		t0 := time.Now()
-		r, total, gerr := node.BlobTCPGet(ctx, p, token, id, 0, uint64(man.Size))
-		if gerr != nil {
-			lastErr = gerr
-			continue
-		}
-		out, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-		if err != nil {
-			r.Close()
-			return "", "", err
-		}
-		// Stream-verify: read exactly one manifest chunk at a time; every
-		// piece must hash to the manifest's digest for that chunk. The
-		// final piece is short. A short read (EOF early) fails the piece.
-		good := true
-		hostile := false
-		for ci := 0; ci < len(man.Chunks) && good; ci++ {
-			piece := make([]byte, man.ChunkLen(ci))
-			if _, err := io.ReadFull(r, piece); err != nil {
-				good = false
-				lastErr = fmt.Errorf("stream short at chunk %d: %v", ci, err)
-				break
+		// The same vantage rule as the UDP swarm: only dial addresses
+		// this machine can possibly reach. A hostile verdict (proven
+		// corruption) is about the NODE — every address serves it — so
+		// that continue breaks out of the whole peer; transport errors
+		// try the next address.
+		for _, a := range dialPlan(p, tcpNets) {
+			p.Addr = a
+			path, via, err := tcpStreamFrom(workDir, man, node, session, p, id, &lastErr, ctx)
+			if err == nil {
+				return path, via, nil
 			}
-			sum := sha256.Sum256(piece)
-			if hex.EncodeToString(sum[:]) != man.Chunks[ci] {
-				good = false
-				hostile = true
-				lastErr = fmt.Errorf("chunk %d failed its manifest hash from %s", ci, p.Addr)
-				break
+			if errors.Is(err, errHostilePeer) {
+				continue peerLoop // proven corruption: skip the whole node
 			}
-			if _, err := out.Write(piece); err != nil {
-				r.Close()
-				out.Close()
-				return "", "", err
-			}
+			// address-level failure: try the peer's next viable address
 		}
-		r.Close()
-		out.Close()
-		if !good {
-			os.Remove(outPath)
-			// Only a hash MISMATCH is proven corruption (the bytes
-			// travelled a verified TCP flow from that peer); a short
-			// stream is just a broken peer — pacing handles brokenness,
-			// the ledger only records proof.
-			if hostile {
-				node.RecordViolation(p.ID(), blacklist.ClassWrongSlice, lastErr.Error(), nil)
-			}
-			continue // hostile or broken peer: next candidate
-		}
-		if total != man.Size {
-			os.Remove(outPath)
-			lastErr = fmt.Errorf("blob size %d != manifest %d", total, man.Size)
-			continue
-		}
-		fmt.Printf("  streamed %d bytes from %s in %s\n", man.Size, p.Addr, time.Since(t0).Round(time.Millisecond))
-		return outPath, p.Addr, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no candidate peers")
 	}
 	return "", "", lastErr
+}
+
+// errHostilePeer signals a PROVEN wrong-slice verdict: skip every address
+// of this peer (they all serve the same node).
+var errHostilePeer = errors.New("peer served a hostile blob slice")
+
+// tcpStreamFrom is one fetchTarballViaTCP attempt against ONE address of
+// one peer: token handshake, whole-file stream, per-chunk verification.
+func tcpStreamFrom(workDir string, man *blobman.Manifest, node *dht.Node, session *dht.BlobSession, p dht.Peer, id []byte, lastErr *error, ctx context.Context) (string, string, error) {
+	token, terr := session.RefreshToken(ctx, p)
+	if terr != nil {
+		*lastErr = terr
+		return "", "", terr
+	}
+	t0 := time.Now()
+	r, total, gerr := node.BlobTCPGet(ctx, p, token, id, 0, uint64(man.Size))
+	if gerr != nil {
+		*lastErr = gerr
+		return "", "", gerr
+	}
+	outPath := filepath.Join(workDir, "release.tar.gz")
+	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		r.Close()
+		return "", "", err
+	}
+	// Stream-verify: read exactly one manifest chunk at a time; every
+	// piece must hash to the manifest's digest for that chunk. The final
+	// piece is short. A short read (EOF early) fails the piece.
+	good := true
+	hostile := false
+	for ci := 0; ci < len(man.Chunks) && good; ci++ {
+		piece := make([]byte, man.ChunkLen(ci))
+		if _, err := io.ReadFull(r, piece); err != nil {
+			good = false
+			*lastErr = fmt.Errorf("stream short at chunk %d: %v", ci, err)
+			break
+		}
+		sum := sha256.Sum256(piece)
+		if hex.EncodeToString(sum[:]) != man.Chunks[ci] {
+			good = false
+			hostile = true
+			*lastErr = fmt.Errorf("chunk %d failed its manifest hash from %s", ci, p.Addr)
+			break
+		}
+		if _, err := out.Write(piece); err != nil {
+			r.Close()
+			out.Close()
+			return "", "", err
+		}
+	}
+	r.Close()
+	out.Close()
+	if !good {
+		os.Remove(outPath)
+		// Only a hash MISMATCH is proven corruption (the bytes travelled
+		// a verified TCP flow from that peer); a short stream is just a
+		// broken peer — pacing handles brokenness, the ledger only
+		// records proof. A hostile verdict is about the NODE (every
+		// address serves it): skip the whole peer.
+		if hostile {
+			node.RecordViolation(p.ID(), blacklist.ClassWrongSlice, (*lastErr).Error(), nil)
+			return "", "", errHostilePeer
+		}
+		return "", "", *lastErr
+	}
+	if total != man.Size {
+		os.Remove(outPath)
+		*lastErr = fmt.Errorf("blob size %d != manifest %d", total, man.Size)
+		return "", "", *lastErr
+	}
+	fmt.Printf("  streamed %d bytes from %s in %s\n", man.Size, p.Addr, time.Since(t0).Round(time.Millisecond))
+	return outPath, p.Addr, nil
 }
