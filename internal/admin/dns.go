@@ -114,6 +114,21 @@ func (s *Server) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
 // hot-swappable parts. The response names what changed; the error text is
 // the config problem when the re-read itself failed.
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	// Check mode: /reload?check=1 answers "is a reload-capable daemon
+	// here" WITHOUT re-running the reloader. A mere `freens doh` status
+	// probe used to cold-start the box's DoH path (the real reload
+	// discards the warm shared HTTPS client and its pooled TLS session —
+	// the next forwarded query paid a fresh handshake; verb-audit
+	// finding #10). Unknown to older daemons, which 404 — exactly the
+	// version-detection semantics the probe wants.
+	if r.URL.Query().Get("check") != "" {
+		if s.reloader() == nil {
+			writeErr(w, http.StatusServiceUnavailable, "reload not available")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"reloaded": "check"})
+		return
+	}
 	fn := s.reloader()
 	if fn == nil {
 		writeErr(w, http.StatusServiceUnavailable, "reload not available")

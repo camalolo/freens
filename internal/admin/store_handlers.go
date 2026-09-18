@@ -87,9 +87,10 @@ func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
 		for _, rr := range rec.RRset {
 			entry.RRs = append(entry.RRs, rrJSON(rr))
 		}
-		if b, err := e.Env.Bytes(); err == nil {
-			entry.Bytes = len(b)
-		}
+		// Size comes from the store (captured at put time) — marshaling
+		// every envelope per request just to size it was the /store
+		// endpoint's dominant cost (verb-audit finding #5).
+		entry.Bytes = e.Size
 		out.Entries = append(out.Entries, entry)
 	}
 	out.Count = len(out.Entries)

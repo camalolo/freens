@@ -525,6 +525,24 @@ func (rt *RoutingTable) AllContacts() []*NodeContact {
 	return rt.allContactsLocked()
 }
 
+// CountConfirmed reports how many contacts have EVER been directly
+// confirmed (ConfirmedAt > 0) without cloning the table — /status polls
+// this every second from the webui, and the old path cloned every contact
+// just to count (verb-audit finding #10c). One RLock, zero allocations.
+func (rt *RoutingTable) CountConfirmed() int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	n := 0
+	for _, b := range rt.Buckets {
+		for _, c := range b.Nodes {
+			if c.ConfirmedAt > 0 {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 // Citizens returns the contacts eligible to hold replica puts: directly
 // confirmed at least once (ConfirmedAt > 0), whose confirmation AND last
 // exchange are both fresher than maxFresh seconds, and that this node has

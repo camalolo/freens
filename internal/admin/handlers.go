@@ -275,11 +275,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// (found live 2026-09-01: an upgrade health check reported 7 peers
 		// while the box was talking to no one). Consumers distinguish
 		// "warming up" from "broken" with this.
-		for _, ct := range n.RoutingTable().AllContacts() {
-			if ct.ConfirmedAt > 0 {
-				st.ConfirmedPeers++
-			}
-		}
+		st.ConfirmedPeers = n.RoutingTable().CountConfirmed()
 		st.StoreEnvs, st.HistoryEnvs = s.storeCounts()
 		st.RelayMode = n.RelayedMode()
 		if ts := n.TURNServer(); ts != nil {

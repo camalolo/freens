@@ -447,6 +447,10 @@ func (s *EnvelopeStore) Keys() [][]byte {
 type StoreEntry struct {
 	Key []byte
 	Env *wire.SignedEnvelope
+	// Size is the canonical-CBOR byte length of Env, captured at put time
+	// (so consumers — the admin /store listing — never re-marshal every
+	// envelope per request just to size it; verb-audit finding #5).
+	Size int
 }
 
 // Entries returns a snapshot of the ALIVE entries at time now (§6.4 step 4:
@@ -466,7 +470,7 @@ func (s *EnvelopeStore) Entries(now int64) []StoreEntry {
 		}
 		key := make([]byte, constants.SHA256Len)
 		copy(key, k[:])
-		out = append(out, StoreEntry{Key: key, Env: e.env})
+		out = append(out, StoreEntry{Key: key, Env: e.env, Size: e.size})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return bytes.Compare(out[i].Key, out[j].Key) < 0

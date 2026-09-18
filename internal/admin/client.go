@@ -459,6 +459,19 @@ func (c *Client) DNSQuery(ctx context.Context, wireQuery []byte) ([]byte, error)
 // (the [upstream] forwarder; v0.14.0 §9.6). Returns the daemon's summary of
 // what changed. An old daemon (no endpoint) errors with "reload not
 // available" — callers fall back to "restart the daemon to apply".
+// ReloadCheck probes for a reload-capable daemon WITHOUT triggering a
+// reload (side-effect-free on daemons that support it; older daemons
+// return an error, which is the version signal).
+func (c *Client) ReloadCheck(ctx context.Context) (string, error) {
+	var out struct {
+		Reloaded string `json:"reloaded"`
+	}
+	if _, err := c.do(ctx, http.MethodPost, "/reload?check=1", nil, &out); err != nil {
+		return "", err
+	}
+	return out.Reloaded, nil
+}
+
 func (c *Client) Reload(ctx context.Context) (string, error) {
 	var out struct {
 		Reloaded string `json:"reloaded"`

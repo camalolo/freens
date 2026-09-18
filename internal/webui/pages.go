@@ -384,6 +384,14 @@ func (s *Server) subNames(ctx context.Context, alias, tldB32 string) []string {
 	if err != nil || st == nil {
 		return nil
 	}
+	return subNamesInStore(st, alias, tldB32)
+}
+
+// subNamesInStore filters an ALREADY-FETCHED store dump for the sub-names
+// of one alias — the certs page needs this per alias, and each Store() RPC
+// is an O(entries) daemon-side render (fetch once, filter N times; the
+// 2026-09-18 verb audit finding #4).
+func subNamesInStore(st *admin.StoreResponse, alias, tldB32 string) []string {
 	var out []string
 	for _, e := range st.Entries {
 		if e.TldIDB32 == "" || tldB32 == "" || e.TldIDB32 != tldB32 {

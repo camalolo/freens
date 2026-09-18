@@ -101,7 +101,10 @@ func dohStatus() error {
 	if c := maybeAdmin(); c != nil {
 		ctx, cancel := adminCtx()
 		defer cancel()
-		if _, err := c.Reload(ctx); err == nil {
+		// The check probe, NOT a real reload: reloading here cold-started
+		// the daemon's DoH path just to print a status line (verb-audit
+		// finding #10).
+		if _, err := c.ReloadCheck(ctx); err == nil {
 			fmt.Println("daemon:   running (reload endpoint available)")
 		} else {
 			fmt.Printf("daemon:   running (older daemon — upstream changes need a restart: %v)\n", err)
