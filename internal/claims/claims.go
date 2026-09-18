@@ -47,6 +47,7 @@ import (
 	"github.com/camalolo/freens/internal/constants"
 	"github.com/camalolo/freens/internal/crypto"
 	"github.com/camalolo/freens/internal/naming"
+	"github.com/camalolo/freens/internal/wire"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -218,7 +219,9 @@ func (w *WitnessAttestation) Verify(claimPrefixHash []byte) bool {
 	if err != nil {
 		return false
 	}
-	return crypto.Verify(w.NodePK, w.Sig, msg)
+	// Content-keyed memo (wire.VerifyMemoized): witness attestations are
+	// re-verified on every claim re-check over identical bytes.
+	return wire.VerifyMemoized(w.NodePK, w.Sig, msg)
 }
 
 // CanonicalBytes returns the canonical CBOR encoding of this attestation.

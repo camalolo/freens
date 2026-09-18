@@ -522,7 +522,10 @@ func (e *SignedEnvelope) VerifySignature() bool {
 	if err != nil {
 		return false
 	}
-	return crypto.Verify(e.Signer, e.Sig, cb)
+	// Content-keyed memo (sigmemo.go): the same envelope re-decoded from
+	// the store/peer payload re-verifies for free instead of paying the
+	// Ed25519 round trip again.
+	return VerifyMemoized(e.Signer, e.Sig, cb)
 }
 
 // IsRevoked reports whether field 12 (revoke) is set to true (§8.5).

@@ -203,14 +203,15 @@ func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, st
 	if now < e.expiresAt {
 		e.lastHit = now
 		remaining := uint32(e.expiresAt - now)
-		out := make([]dns.RR, len(e.rrs))
-		for i, rr := range e.rrs {
-			cp := dns.Copy(rr)
-			cp.Header().Ttl = remaining
-			out[i] = cp
-		}
+		// Copy OUTSIDE the lock: the stored RR slices are immutable after
+		// put (put deep-copies; nothing mutates them in place), so the
+		// local slice pointer stays valid even if the entry is replaced
+		// behind us — the dns.Copy loop no longer runs under the one mutex
+		// every query contends on (verb-audit finding #7a).
+		rrs := e.rrs
 		rcode, aa = e.rcode, e.aa
 		c.mu.Unlock()
+		out := copyWithTTL(rrs, remaining)
 		c.countHit()
 		return out, rcode, aa, cacheFresh
 	}
@@ -222,14 +223,10 @@ func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, st
 		if remaining > staleTTL {
 			remaining = staleTTL
 		}
-		out := make([]dns.RR, len(e.rrs))
-		for i, rr := range e.rrs {
-			cp := dns.Copy(rr)
-			cp.Header().Ttl = remaining
-			out[i] = cp
-		}
+		rrs := e.rrs
 		rcode, aa = e.rcode, e.aa
 		c.mu.Unlock()
+		out := copyWithTTL(rrs, remaining)
 		c.countStale()
 		return out, rcode, aa, cacheStale
 	}
@@ -251,6 +248,18 @@ func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, st
 //
 // Non-freens outcomes (aa == false: DNS-forwarded, DENY) are ignored — §10.4
 // covers only freens answers.
+// copyWithTTL deep-copies RRs and stamps each copy with ttl. Called
+// WITHOUT the cache mutex held (see get2).
+func copyWithTTL(rrs []dns.RR, ttl uint32) []dns.RR {
+	out := make([]dns.RR, len(rrs))
+	for i, rr := range rrs {
+		cp := dns.Copy(rr)
+		cp.Header().Ttl = ttl
+		out[i] = cp
+	}
+	return out
+}
+
 // putAnswer caches a resolution outcome for key. Freens-sourced outcomes
 // (aa) cache exactly as before — positives by TTL, NXDOMAIN/NODATA at
 // NegTTL. Upstream-forwarded outcomes (NOT aa) now cache too — the
@@ -398,35 +407,42 @@ func (c *ResponseCache) SaveIfDirty(path string) (bool, error) {
 		return false, nil
 	}
 	c.dirty = false
-	saved := c.snapshotLocked()
-	c.mu.Unlock()
-	if err := writePersisted(path, saved); err != nil {
-		c.markDirty() // the state is still unsaved — retry next tick
-		return false, err
-	}
-	return true, nil
-}
-
-// snapshotLocked freezes the entries for serialization. Caller holds c.mu.
-func (c *ResponseCache) snapshotLocked() *persistedCache {
+	// Freeze under the lock; PACK outside it. PackRR allocates a 64 KiB
+	// scratch buffer per RR, and doing that under the one mutex every
+	// query contends on stalled hits for the length of a periodic save
+	// (verb-audit finding #7c). Entries are immutable after put, so the
+	// pointer snapshot is consistent.
 	pc := &persistedCache{SavedAt: c.now(), Entries: make([]persistedEntry, 0, len(c.entries))}
+	type freeze struct {
+		pe  *persistedEntry
+		rrs []dns.RR
+	}
+	frozen := make([]freeze, 0, len(c.entries))
 	for k, e := range c.entries {
 		pe := persistedEntry{
 			Name: k.name, Qtype: k.qtype, Qclass: k.qclass,
 			Rcode: e.rcode, AA: e.aa, ExpiresAt: e.expiresAt,
 			RRs: make([][]byte, 0, len(e.rrs)),
 		}
-		for _, rr := range e.rrs {
+		pc.Entries = append(pc.Entries, pe)
+		frozen = append(frozen, freeze{pe: &pc.Entries[len(pc.Entries)-1], rrs: e.rrs})
+	}
+	c.mu.Unlock()
+	for _, f := range frozen {
+		for _, rr := range f.rrs {
 			buf := make([]byte, 65535)
 			n, err := dns.PackRR(rr, buf, 0, nil, false)
 			if err != nil || n <= 0 {
 				continue // one unparsable RR must not drop the entry
 			}
-			pe.RRs = append(pe.RRs, buf[:n])
+			f.pe.RRs = append(f.pe.RRs, buf[:n])
 		}
-		pc.Entries = append(pc.Entries, pe)
 	}
-	return pc
+	if err := writePersisted(path, pc); err != nil {
+		c.markDirty() // the state is still unsaved — retry next tick
+		return false, err
+	}
+	return true, nil
 }
 
 // LoadFrom restores entries saved by SaveIfDirty. Entries already past their

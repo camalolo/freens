@@ -57,6 +57,12 @@ func cmdRenew(args []string) error {
 		return err
 	}
 	now := time.Now().Unix()
+	// ONE standalone node for the whole run (verb-audit finding #9: the
+	// per-name path paid a full node lifecycle — bootstrap pings plus a
+	// cold table — per name, strictly serial). The first name bootstraps;
+	// the rest renew on the warmed table.
+	kn := &renewNodes{tr: tr}
+	defer kn.close()
 	failed := 0
 	for _, display := range names {
 		labels, alias, err := naming.DecomposeName(display)
@@ -65,7 +71,7 @@ func cmdRenew(args []string) error {
 			failed++
 			continue
 		}
-		if err := renewOne(tr, labels, alias, display, *force, now); err != nil {
+		if err := renewOne(tr, kn, labels, alias, display, *force, now); err != nil {
 			fmt.Printf("%s: %v\n", display, err)
 			failed++
 		}
@@ -76,10 +82,42 @@ func cmdRenew(args []string) error {
 	return nil
 }
 
+// renewNodes lazily builds the standalone renew node and REUSES it across
+// names (the keeper owns its lifecycle for the whole run).
+type renewNodes struct {
+	tr     *transport
+	node   *dht.Node
+	cancel context.CancelFunc
+}
+
+func (k *renewNodes) get() (*dht.Node, error) {
+	if k.node != nil {
+		return k.node, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	node, err := startCLINode(ctx, "", "", k.tr.peers)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	k.node, k.cancel = node, cancel
+	return node, nil
+}
+
+func (k *renewNodes) close() {
+	if k.node != nil {
+		k.node.Close()
+	}
+	if k.cancel != nil {
+		k.cancel()
+	}
+}
+
 // renewOne extends one name's lease: load the owner key, fetch the current
 // record, decide freshness, re-sign at seq+1, publish at every legitimate
-// key (K_tld/K_name + K_claim when a claim rides along).
-func renewOne(tr *transport, labels []string, alias, display string, force bool, now int64) error {
+// key (K_tld/K_name + K_claim when a claim rides along). Standalone mode
+// reuses kn's shared node across names.
+func renewOne(tr *transport, kn *renewNodes, labels []string, alias, display string, force bool, now int64) error {
 	keyPath := ownerKeyPath(alias)
 	if _, err := os.Stat(keyPath); err != nil {
 		return fmt.Errorf("no owner key in the keychain (only the owner can renew)")
@@ -124,14 +162,13 @@ func renewOne(tr *transport, labels []string, alias, display string, force bool,
 			return fmt.Errorf("sequence discovery failed: %w (nothing renewed — retry)", gerr)
 		}
 	} else {
-		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 2*cliTimeout)
-		defer nodeCancel()
-		node, nerr := startCLINode(nodeCtx, "", "", tr.peers)
+		node, nerr := kn.get()
 		if nerr != nil {
 			return nerr
 		}
 		standalone = node
-		defer node.Close()
+		nodeCtx, nodeCancel := context.WithTimeout(context.Background(), 2*cliTimeout)
+		defer nodeCancel()
 		// §6.2: bootstrap peers alone cap sequence discovery at THEIR stores —
 		// a peer answering a get from its store omits {nodes}, so the walk
 		// can never learn the true closest-set and the freshly minted

@@ -492,28 +492,82 @@ func (rt *RoutingTable) Get(nodeID []byte) *NodeContact {
 func (rt *RoutingTable) Closest(target []byte, n int) []*NodeContact {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	total := 0
-	for i := range rt.Buckets {
-		total += len(rt.Buckets[i].Nodes)
+	if n <= 0 {
+		return nil
 	}
-	ptrs := make([]*NodeContact, 0, total)
+	// Bounded max-heap selection: keep the n best by XOR distance while
+	// sweeping the buckets once — O(total · log n) comparisons and ONLY
+	// the n survivors get cloned. (The old path gathered every contact,
+	// full-table stable-sorted it, then cloned the top n — called per
+	// inbound get/find_node on the single read loop, so the whole-table
+	// sort and the all-contact gather were serial-loop tax; the
+	// 2026-09-18 verb audit's finding #6, bench-pinned in
+	// closest_bench_test.go.)
+	h := closestHeap{target: target, cap: n}
 	for i := range rt.Buckets {
-		ptrs = append(ptrs, rt.Buckets[i].Nodes...)
+		for _, c := range rt.Buckets[i].Nodes {
+			if len(h.items) < h.cap {
+				h.items = append(h.items, c)
+				h.up(len(h.items) - 1)
+			} else if CompareDistance(target, c.NodeID, h.items[0].NodeID) < 0 {
+				h.items[0] = c
+				h.down(0)
+			}
+		}
 	}
-	sort.SliceStable(ptrs, func(i, j int) bool {
-		return CompareDistance(target, ptrs[i].NodeID, ptrs[j].NodeID) < 0
+	out := make([]*NodeContact, len(h.items))
+	for i := range h.items {
+		out[i] = h.items[i].clone()
+	}
+	// Distance-ascending order (the old full sort's contract); sorting n
+	// survivors is trivial.
+	sort.Slice(out, func(i, j int) bool {
+		return CompareDistance(target, out[i].NodeID, out[j].NodeID) < 0
 	})
-	if n < 0 {
-		n = 0
-	}
-	if n > len(ptrs) {
-		n = len(ptrs)
-	}
-	out := make([]*NodeContact, n)
-	for i := 0; i < n; i++ {
-		out[i] = ptrs[i].clone()
-	}
 	return out
+}
+
+// closestHeap is a fixed-capacity binary max-heap on XOR distance: the
+// root is the FARTHEST of the currently-held best candidates.
+type closestHeap struct {
+	target []byte
+	items  []*NodeContact
+	cap    int
+}
+
+// farther reports whether items[i] is strictly farther from the target
+// than items[j] (the max-heap ordering: root = farthest).
+func (h *closestHeap) farther(i, j int) bool {
+	return CompareDistance(h.target, h.items[i].NodeID, h.items[j].NodeID) > 0
+}
+
+func (h *closestHeap) up(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !h.farther(parent, i) {
+			return
+		}
+		h.items[parent], h.items[i] = h.items[i], h.items[parent]
+		i = parent
+	}
+}
+
+func (h *closestHeap) down(i int) {
+	for {
+		l, r := 2*i+1, 2*i+2
+		big := i
+		if l < len(h.items) && h.farther(l, big) {
+			big = l
+		}
+		if r < len(h.items) && h.farther(r, big) {
+			big = r
+		}
+		if big == i {
+			return
+		}
+		h.items[big], h.items[i] = h.items[i], h.items[big]
+		i = big
+	}
 }
 
 // AllContacts returns cloned copies of every contact in storage order (bucket
