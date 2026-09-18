@@ -1245,11 +1245,27 @@ func savePeerbook(node *dht.Node, logger *slog.Logger) {
 // exchange (ConfirmedAt > 0 — the routing table's anti-ghost invariant) and
 // converts them to the persistence form, CARRYING the confirmation age so
 // a restart resumes probation instead of resetting it (issue #2).
+// peerBookRecency bounds what the PERSISTED peerbook keeps: a contact
+// confirmed once but silent for more than this leaves the book at the
+// next save. Before this bound the book was grow-only for once-confirmed
+// ghosts — every pre-v0.19.7 one-shot corpse (and every rotated NAT
+// mapping) persisted FOREVER, and the upgrade verb's bootstrap list was
+// ghost-dominated on exactly the boxes that most need peer transfer
+// (desktop and the friend's VPS during the v0.19.10/11 rolls: twelve
+// dead addresses, "context deadline exceeded" on every dial, origin
+// fallback every time). 48h comfortably covers the daily renewal/
+// confirmation cadence; a peer that went quiet for two days is
+// re-learned through the seed or any live peer within minutes anyway.
+const peerBookRecency = 48 * time.Hour
+
 func confirmedPeers(contacts []*dht.NodeContact, now int64) []dht.Peer {
 	var out []dht.Peer
 	for _, c := range contacts {
 		if c.ConfirmedAt <= 0 {
 			continue // never directly confirmed: do not persist
+		}
+		if now-c.ConfirmedAt > int64(peerBookRecency/time.Second) {
+			continue // once-confirmed, long silent: a corpse, do not re-arm it
 		}
 		out = append(out, dht.Peer{Addr: c.Addr, PublicKey: c.PublicKey, Confirmed: c.ConfirmedAt})
 	}

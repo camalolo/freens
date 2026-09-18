@@ -364,7 +364,9 @@ func upgradePeerList() ([]dht.Peer, error) {
 			out = append(out, p)
 		}
 	}
-	add(home.LoadPeerbook())
+	// Peerbook first (disk survives restarts), then the live daemon set.
+	book := home.LoadPeerbook()
+	add(book)
 	client := &admin.Client{Sock: home.AdminSock(), Timeout: 5 * time.Second}
 	if admin.Alive(home.AdminSock()) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -373,17 +375,28 @@ func upgradePeerList() ([]dht.Peer, error) {
 			add(live)
 		}
 	}
-	// Last-resort bootstrap: the PINNED COMMUNITY SEED. A fresh install
-	// (or a box whose daemon never held confirmed contacts — restrictive
-	// NAT burst boxes) has an empty peerbook and, mid-restart, an empty
-	// live set: "no peers reachable (checked 0)" fell back to origin even
-	// though the seed is compiled into the binary. Found live 2026-09-19
-	// on the friend's VPS during the v0.19.10 roll.
-	if len(out) == 0 {
-		if seeds := home.ParseSeedsText(home.DefaultSeeds()); len(seeds) > 0 {
-			add(seeds)
-		}
+	// THE PINNED COMMUNITY SEED is always in the list — not just as an
+	// empty-list fallback. Its HOSTNAME resolves to the seed's CURRENT
+	// public address, which makes it the one entry that cannot go stale:
+	// boxes whose book is dominated by dead NAT mappings and one-shot
+	// ephemeral ports (desktop and the friend's VPS during the v0.19.10/11
+	// rolls — "context deadline exceeded" against twelve corpses) still
+	// get one always-fresh bootstrap. Confirmed-fresh entries keep their
+	// places ahead of it; stale ones come after.
+	if seeds := home.ParseSeedsText(home.DefaultSeeds()); len(seeds) > 0 {
+		add(seeds)
 	}
+	// Confirmation-recency ordering: live-confirmed first (freshest
+	// first), never-confirmed last. The 12-cap then keeps the freshest
+	// candidates instead of whichever the book listed first — a
+	// ghost-dominated book must not crowd out the live seed.
+	sort.SliceStable(out, func(i, j int) bool {
+		ci, cj := out[i].Confirmed > 0, out[j].Confirmed > 0
+		if ci != cj {
+			return ci
+		}
+		return out[i].Confirmed > out[j].Confirmed
+	})
 	if len(out) > 12 {
 		out = out[:12]
 	}
