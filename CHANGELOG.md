@@ -1,6 +1,42 @@
 # Changelog
 
-## unreleased — the peer blacklist (v1): exclusion only for proof
+## v0.19.9 — the TCP blob channel + the peer blacklist (v1)
+
+### TCP whole-file streaming: the datagram ceiling falls
+
+The chunk swarm's floor is one UDP datagram per 48 KiB — 13 MB ≈ 220
+RPCs, with limiter + scheduling putting the LAN floor at tens of
+seconds. TCP deletes the ceiling: ONE connection streams the whole
+archive, kernel flow control paces the seeder (no rate bucket to
+tune), and chunks verify against the origin manifest as bytes arrive.
+
+- Server: `StartBlobTCP` listens on the DHT port number (TCP alongside
+  UDP); `[dht] blob-tcp = false` opts out. Token-gated (the UDP-minted
+  write token is the connection handshake — bulk pulls stay tied to a
+  completed round trip from the true source), per-IP 2 / global 8
+  connection caps, 10 s handshake / 10 min transfer deadlines, and a
+  32 MiB/s per-connection pace as the abuse ceiling. No TLS — origin-
+  manifest hashes make injected bytes fail verification, and TCP's own
+  handshake removes the spoofed-source reflection question
+  structurally.
+- Client: the upgrade verb tries TCP whole-file streaming FIRST (per-
+  manifest-chunk hash verification on the wire), then the UDP chunk
+  swarm, then the origin mirror.
+- Swarm fixes found live during the 48 KiB era, all shipped here: the
+  peer list reads the PERSISTED peerbook first (a post-restart daemon
+  has an empty confirmation state — disk is the resume source);
+  throttled peers are retried IN PLACE (graduated backoff) instead of
+  being requeued-and-blacklisted (a busy limiter is pacing, not
+  failure — requeueing burned the retry budget and starved swarms
+  behind the fleet's only healthy seeder); bootstrap pings fan out in
+  parallel; 4 MiB socket buffers (12 concurrent 48 KiB answers
+  silently dropped at 1 MiB — phantom RPC timeouts that struck out
+  live seeders); 60 KB CI chunks for future manifests.
+- Live: 13,019,426 bytes streamed server←minipc in 393 ms (~31 MB/s),
+  all 265 chunks manifest-verified, whole upgrade verb 20 s vs 3 m40 s
+  from origin the same hour.
+
+### The peer blacklist (v1): exclusion only for proof
 
 Rate limiting is bandwidth triage; exclusion is a different tool for a
 different attack class (corruption, forged data, double-signing — things
