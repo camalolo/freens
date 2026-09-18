@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — v0.19.7 material: the transient wire flag (one-shot verbs stop planting ghost contacts)
+
+Watch item #2, the NAT-mapping ghost class (root-caused 2026-09-18): a
+CLI one-shot node dies seconds after its verb, but every peer's daemon
+had learned it as a CONFIRMED contact at exchange time — a citizen-
+ranked corpse that fills the closest-8 of new keyspaces, degrades walks
+into "degraded miss" on dead NAT mappings, and loses witness/put
+ID-distance races to the live fleet (witness registration was capped at
+3/5 fleet-wide by exactly this mechanism).
+
+- §6.3 wire field 8 (`x`, bool, omitempty, UNSIGNED transport hygiene
+  metadata like y): a Transient-configured node stamps every outbound
+  query; receivers serve the query but skip learnPeer entirely.
+- startCLINode — the one-shot chokepoint behind every standalone CLI
+  verb — sets the flag.
+- Compat: the field is omitted when false, so unflagged nodes emit
+  byte-identical packets to the pre-v0.19.7 encoding, and pre-v0.19.7
+  receivers ignore the unknown key — rolling-fleet safe in both
+  directions.
+- Tests: wire roundtrip + omission + old-peer compat in both
+  directions; dht served-but-never-learned with a normal-peer control.
+
 ## v0.19.6 — [listen] comma lists: serve both loopback families
 
 The desktop PPPoE/IPv6 field test: the machine's OS resolver carried a
