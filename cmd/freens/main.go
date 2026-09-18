@@ -375,6 +375,21 @@ func run(args []string) error {
 		if turnEffective != "" {
 			turnSrvCfg = &turn.ServerConfig{ListenAddr: turnEffective, Log: logger}
 		}
+		// Release-blob cache (v0.19.7): the storage half of chunked peer
+		// transfer — this daemon answers blob.get for the archives it has
+		// downloaded. Token-gated + rate-limited server-side (see hBlobGet);
+		// [dht] blob-serve = false turns the whole thing off. Wired only
+		// for non-passive nodes: a passive node already refuses writes, and
+		// serving update blobs IS a write-shaped favor to the network.
+		var blobCache *dht.BlobCache
+		if !passiveEffective && !dhtCfg.BlobServeOff {
+			if bc, bcerr := dht.NewBlobCache(filepath.Join(home.Dir(), "blobs")); bcerr != nil {
+				logger.Warn("blob cache unavailable — blob serving disabled", "error", bcerr)
+			} else {
+				blobCache = bc
+				logger.Info("blob serving enabled", "cache", filepath.Join(home.Dir(), "blobs"))
+			}
+		}
 		node, err := dht.NewNode(dht.NodeConfig{
 			Keypair:       nodeKP,
 			ListenAddr:    dhtEffective,
@@ -386,6 +401,7 @@ func run(args []string) error {
 			TurnRelay:     turnRelayEffective,
 			TurnServer:    turnSrvCfg,
 			AllowReserved: cfg.AllowReserved,
+			BlobCache:     blobCache,
 		})
 		if err != nil {
 			return fmt.Errorf("dht node: %w", err)

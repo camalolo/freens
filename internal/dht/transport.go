@@ -49,6 +49,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sort"
@@ -157,6 +158,8 @@ const (
 const (
 	defaultPutRateLimit = 10.0 // req/s per source IP
 	defaultPutBurst     = 20   // back-to-back puts per idle source
+	defaultBlobRateLimit = 10.0 // blob.get req/s per source IP (48 KiB each)
+	defaultBlobBurst     = 20   // pipelining headroom for the swarm client
 )
 
 // Default GLOBAL inbound packet budget (v0.9.2). The per-source-IP buckets
@@ -357,6 +360,20 @@ type NodeConfig struct {
 	// walk degradation; the NAT-mapping ghost class, watch item #2).
 	// Long-lived daemons leave this false.
 	Transient bool
+	// BlobCache, when set, lets this node answer `blob.get` RPCs for the
+	// release archives it has cached (the storage half of chunked peer
+	// transfer — the fleet as its own update CDN). Requests are write-
+	// token gated (kills UDP reflection amplification: a token requires
+	// a completed round trip from the true source) and per-source rate
+	// limited; nil (the zero value) disables serving entirely.
+	BlobCache *BlobCache
+	// BlobRateLimit caps blob.get requests per observed source IP
+	// (requests/second; each answer carries up to 48 KiB). Zero ⇒ 10.
+	// Negative disables throttling.
+	BlobRateLimit float64
+	// BlobBurst is the token-bucket burst paired with BlobRateLimit.
+	// Zero ⇒ 20.
+	BlobBurst int
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -391,6 +408,8 @@ type Node struct {
 	diff    *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
 	getLim  *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
 	putLim  *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
+	blobLim *rateLimiter     // per-source-IP blob.get throttle; nil = off
+	blobCache *BlobCache     // release-blob store for blob.get; nil = serving off
 	pktLim  *packetBudget    // GLOBAL pre-verify inbound packet budget; nil = off
 	walkSem chan struct{}    // outbound walk concurrency cap (nil = uncapped)
 	log     *slog.Logger
@@ -692,6 +711,19 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		}
 		walkSem = make(chan struct{}, cap)
 	}
+	// Per-source-IP blob.get throttle: negative rate ⇒ disabled.
+	var blobLim *rateLimiter
+	if cfg.BlobRateLimit >= 0 {
+		rate := cfg.BlobRateLimit
+		if rate == 0 {
+			rate = defaultBlobRateLimit
+		}
+		burst := cfg.BlobBurst
+		if burst <= 0 {
+			burst = defaultBlobBurst
+		}
+		blobLim = newRateLimiter(rate, burst)
+	}
 	return &Node{
 		kp:             cfg.Keypair,
 		id:             id,
@@ -710,6 +742,8 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		diff:           newDifficultyState(now()),
 		getLim:         getLim,
 		putLim:         putLim,
+		blobLim:        blobLim,
+		blobCache:      cfg.BlobCache,
 		pktLim:         pktLim,
 		walkSem:        walkSem,
 		log:            log,
@@ -728,6 +762,108 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 
 // ID returns this node's 32-byte Node ID (= SHA-256(Public)).
 func (n *Node) ID() []byte { return append([]byte(nil), n.id...) }
+
+// maxBlobChunkLen caps one blob.get answer: comfortably inside one UDP
+// datagram (the hard ceiling is ~64 KiB) while amortizing per-request
+// overhead. The manifest's chunk_size must not exceed this.
+const maxBlobChunkLen = 64 * 1024
+
+// hBlobGet serves one slice of a cached release archive (the storage half
+// of chunked peer transfer, v0.19.7). The request MUST carry a write
+// token minted for the requester's source IP — a token requires a
+// completed ping/get round trip from the true source, so a spoofed UDP
+// address can never turn this RPC into a 48-KiB reflection amplifier.
+// Answers are read straight from the BlobCache file (disk, bounded by the
+// cache's entry cap) and the per-source limiter runs BEFORE the read.
+func (n *Node) hBlobGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
+	if n.blobCache == nil {
+		return n.errResp(m, 301, "blob serving disabled")
+	}
+	if n.blobLim != nil && !n.blobLim.allow(normIP(raddr.IP)) {
+		return n.errResp(m, 301, "throttled")
+	}
+	token, _ := m.A["token"].([]byte)
+	if !n.tokens.Verify(normIP(raddr.IP), token, 1) {
+		return n.errResp(m, 302, "invalid token")
+	}
+	id, _ := m.A["id"].([]byte)
+	if len(id) != constants.SHA256Len {
+		return n.errResp(m, 304, "bad blob id")
+	}
+	off, _ := m.A["off"].(uint64)
+	length, _ := m.A["len"].(uint64)
+	if length == 0 || length > maxBlobChunkLen {
+		return n.errResp(m, 304, "bad length")
+	}
+	f, size, err := n.blobCache.Open(id)
+	if err != nil {
+		return n.errResp(m, 404, "blob not cached")
+	}
+	defer f.Close()
+	if off >= uint64(size) {
+		return n.errResp(m, 304, "offset past end")
+	}
+	if r := uint64(size) - off; length > r {
+		length = r // the final chunk may be short
+	}
+	buf := make([]byte, length)
+	if _, err := f.ReadAt(buf, int64(off)); err != nil && err != io.EOF {
+		return n.errResp(m, 301, "read failed")
+	}
+	return n.okResp(m, map[string]any{"data": buf, "total": uint64(size)})
+}
+
+// BlobGet fetches one slice of a cached release archive from peer — the
+// client half of chunked peer transfer. It obtains the peer's write
+// token the same way putToPeer does (a prior get, falling back to ping),
+// so a server only answers sources it has actually round-tripped with.
+// The CALLER verifies the returned bytes against the manifest's chunk
+// hash — this method authenticates the TRANSPORT (the response is signed
+// by the peer), never the CONTENT.
+func (n *Node) BlobGet(ctx context.Context, peer Peer, id []byte, off, length int) (data []byte, total int64, err error) {
+	addr, aerr := net.ResolveUDPAddr("udp", peer.Addr)
+	if aerr != nil {
+		return nil, 0, aerr
+	}
+	resp, err := n.sendQuery(ctx, addr, peerID(peer), "get", map[string]any{"key": make([]byte, 32)})
+	if err != nil || resp == nil {
+		return nil, 0, ErrTimeout
+	}
+	token, _ := resp.A["token"].([]byte)
+	if len(token) == 0 {
+		pr, perr := n.sendQuery(ctx, addr, peerID(peer), "ping", map[string]any{})
+		if perr != nil || pr == nil {
+			return nil, 0, ErrTimeout
+		}
+		token, _ = pr.A["token"].([]byte)
+	}
+	br, err := n.sendQuery(ctx, addr, peerID(peer), "blob.get", map[string]any{
+		"token": token,
+		"id":    id,
+		"off":   uint64(off),
+		"len":   uint64(length),
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if br == nil || br.Y == wire.MsgTypeError {
+		return nil, 0, fmt.Errorf("dht: blob.get rejected")
+	}
+	data, _ = br.A["data"].([]byte)
+	if v, ok := br.A["total"].(uint64); ok {
+		total = int64(v)
+	}
+	if len(data) == 0 {
+		return nil, 0, errors.New("dht: blob.get returned no data")
+	}
+	return data, total, nil
+}
+
+// peerID derives the recipient Node ID of a Peer (its public key hashed).
+func peerID(p Peer) []byte {
+	id, _ := crypto.NodeID(p.PublicKey)
+	return id
+}
 
 // Transient reports whether this node flags its queries as transient
 // (§6.3 field 8 — NodeConfig.Transient; the CLI's one-shot verbs).
@@ -1373,6 +1509,8 @@ func (n *Node) handleQuery(m *wire.Message, raddr *net.UDPAddr) {
 		resp = n.hPut(m, raddr)
 	case "witness":
 		resp = n.hWitness(m, raddr)
+	case "blob.get":
+		resp = n.hBlobGet(m, raddr)
 	default:
 		resp = n.errResp(m, 301, "unknown method")
 	}

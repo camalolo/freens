@@ -7,7 +7,11 @@ package cli
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -646,4 +650,108 @@ func mustSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return info.Size()
+}
+
+// ---------------------------------------------------------------------------
+// The download mirror (v0.19.7+): [upgrade] mirror rewrites the BIG tarball
+// fetch onto a fast base while SHA256SUMS.txt — fetched from GITHUB ORIGIN —
+// pins integrity. Found live 2026-09-18: github's release CDN serves a HiNet
+// box at 65-75 KB/s (minutes per upgrade); the mirror path fixes throughput
+// without trusting the mirror.
+// ---------------------------------------------------------------------------
+
+func TestMirrorAssetURL(t *testing.T) {
+	gh := "https://github.com/camalolo/freens/releases/download/v0.19.7/freens-windows-amd64.tar.gz"
+	want := "https://gh.example.com/camalolo/freens/releases/download/v0.19.7/freens-windows-amd64.tar.gz"
+	if got := mirrorAssetURL("https://gh.example.com/", gh); got != want {
+		t.Errorf("mirrorAssetURL = %q, want %q (trailing slash trimmed)", got, want)
+	}
+	if got := mirrorAssetURL("", gh); got != gh {
+		t.Errorf("empty mirror must pass through, got %q", got)
+	}
+	// The API endpoint is kilobytes — it must NEVER ride the mirror.
+	api := "https://api.github.com/repos/camalolo/freens/releases/latest"
+	if got := mirrorAssetURL("https://gh.example.com", api); got != api {
+		t.Errorf("api url rewritten: %q", got)
+	}
+	// A foreign github repo's asset is not ours to rewrite.
+	foreign := "https://github.com/other/repo/releases/download/v1/x.tar.gz"
+	if got := mirrorAssetURL("https://gh.example.com", foreign); got != foreign {
+		t.Errorf("foreign repo rewritten: %q", got)
+	}
+}
+
+func TestUpgradeMirrorConfigAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FREENS_HOME", dir) // home.ConfPath() = <dir>/freens.conf
+	conf := filepath.Join(dir, "freens.conf")
+	if err := os.WriteFile(conf, []byte("[upgrade]\nmirror = https://cf.example.com\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FREENS_UPGRADE_MIRROR", "")
+	if got := upgradeMirror(); got != "https://cf.example.com" {
+		t.Errorf("upgradeMirror() = %q, want the conf value", got)
+	}
+	// Env wins over the conf (the emergency bypass).
+	t.Setenv("FREENS_UPGRADE_MIRROR", "https://bypass.example.com")
+	if got := upgradeMirror(); got != "https://bypass.example.com" {
+		t.Errorf("env override ignored: %q", got)
+	}
+	// No config anywhere: empty (origin downloads).
+	t.Setenv("FREENS_HOME", filepath.Join(dir, "absent"))
+	t.Setenv("FREENS_UPGRADE_MIRROR", "")
+	if got := upgradeMirror(); got != "" {
+		t.Errorf("upgradeMirror() with no conf = %q, want empty", got)
+	}
+}
+
+func TestFetchChecksumsParsesAndSkips(t *testing.T) {
+	// No checksums asset (pre-v0.19.7 releases): nil, nil — skip, not error.
+	rel := &ghRelease{TagName: "v0.19.6", Assets: []ghAsset{{Name: "freens-linux-amd64.tar.gz"}}}
+	sums, err := fetchChecksums(rel)
+	if err != nil || sums != nil {
+		t.Fatalf("missing sums asset: (%v, %v), want (nil, nil)", sums, err)
+	}
+
+	// Present: fetched from its browser_download_url (an httptest origin)
+	// and parsed into filename → hex.
+	body := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  freens-linux-amd64.tar.gz\n" + //nolint:lll
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  freens-darwin-arm64.tar.gz\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	rel.Assets = append(rel.Assets, ghAsset{Name: checksumsAssetName, BrowserDownload: srv.URL})
+	sums, err = fetchChecksums(rel)
+	if err != nil {
+		t.Fatalf("fetchChecksums: %v", err)
+	}
+	if len(sums) != 2 {
+		t.Fatalf("parsed %d entries, want 2", len(sums))
+	}
+	if sums["freens-linux-amd64.tar.gz"] == "" {
+		t.Error("linux-amd64 entry missing")
+	}
+}
+
+func TestVerifyChecksum(t *testing.T) {
+	payload := []byte("tarball bytes")
+	dir := t.TempDir()
+	p := filepath.Join(dir, "freens-linux-amd64.tar.gz")
+	if err := os.WriteFile(p, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	name := "freens-linux-amd64.tar.gz"
+	good := map[string]string{name: hex.EncodeToString(sum[:])}
+	if err := verifyChecksum(p, name, good); err != nil {
+		t.Fatalf("matching checksum rejected: %v", err)
+	}
+	bad := map[string]string{name: strings.Repeat("ab", 32)}
+	if err := verifyChecksum(p, name, bad); err == nil {
+		t.Fatal("MISMATCHED checksum accepted — tampered mirrors must abort")
+	}
+	if err := verifyChecksum(p, "unlisted.tar.gz", good); err == nil {
+		t.Fatal("asset with no checksum entry accepted — refusing is the design")
+	}
 }

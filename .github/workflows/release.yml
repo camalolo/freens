@@ -28,10 +28,21 @@ jobs:
             CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens-cli$ext" ./cmd/freens-cli
             CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "$LDFLAGS" -o "$dir/freens-web$ext" ./cmd/freens-web
             tar -czf "dist/freens-${goos}-${goarch}.tar.gz" -C dist "freens-${goos}-${goarch}"
+            # Chunk manifest for peer transfer: the upgrade verb fetches
+            # this from origin and verifies every peer-served chunk
+            # against it (internal/blobman; see fetchTarballFromPeers).
+            go run ./cmd/genmanifest -asset "freens-${goos}-${goarch}.tar.gz" -tag "$VER" -out "dist/freens-manifest-${goos}-${goarch}.json" "dist/freens-${goos}-${goarch}.tar.gz"
           done
+          # SHA256SUMS.txt is the ORIGIN-side integrity anchor for mirrored
+          # downloads: `freens upgrade` with [upgrade] mirror set fetches
+          # this file from github (small) and refuses to stage a mirrored
+          # tarball whose bytes do not reproduce it (see upgrade.go).
+          (cd dist && sha256sum freens-*.tar.gz > SHA256SUMS.txt)
           ls -la dist/
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/freens-manifest-*.json
+            dist/SHA256SUMS.txt

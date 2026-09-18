@@ -28,6 +28,11 @@ type dhtConfig struct {
 	Persist   string // -persist
 	Passive   bool   // -passive
 	UPnPOff   bool   // [dht] upnp = false (only the off switch is useful in a file)
+	// BlobServeOff mirrors [dht] "blob-serve = false": disables answering
+	// blob.get for cached release archives (the storage half of chunked
+	// peer transfer — default ON for non-passive nodes, token-gated and
+	// rate-limited; see dht.NodeConfig.BlobCache).
+	BlobServeOff bool
 }
 
 // parseDHTConfig extracts the [dht] section of an INI-style config (same
@@ -90,6 +95,12 @@ func parseDHTConfig(text string) (*dhtConfig, error) {
 				cfg.UPnPOff = true
 			} else if val != "true" {
 				return nil, fmt.Errorf("[dht] config: upnp = %q (want true|false)", val)
+			}
+		case "blob-serve":
+			if val == "false" {
+				cfg.BlobServeOff = true
+			} else if val != "true" {
+				return nil, fmt.Errorf("[dht] config: blob-serve = %q (want true|false)", val)
 			}
 		default:
 			return nil, fmt.Errorf("[dht] config: unknown key %q", key)

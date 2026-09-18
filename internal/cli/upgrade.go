@@ -31,10 +31,12 @@ package cli
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -49,7 +51,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/camalolo/freens/internal/blobman"
+	"github.com/camalolo/freens/internal/confedit"
+	"github.com/camalolo/freens/internal/constants"
+	"github.com/camalolo/freens/internal/dht"
 
 	"github.com/camalolo/freens/internal/admin"
 	"github.com/camalolo/freens/internal/home"
@@ -178,6 +186,340 @@ var upgradeFetchRelease = func(url string) (*ghRelease, error) {
 // GOOS/GOARCH with the three binaries inside.
 func releaseAssetName() string {
 	return "freens-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz"
+}
+
+// checksumsAssetName is the SHA256SUMS.txt file release.yml attaches to
+// every release (v0.19.7+). When present, a MIRROR-downloaded tarball is
+// verified against it before anything is staged — the checksum travels
+// from GitHub origin (a few hundred bytes; the slow path is irrelevant)
+// so a compromised or misbehaving mirror cannot serve a tampered binary
+// that merely REPORTS the right version.
+const checksumsAssetName = "SHA256SUMS.txt"
+
+// upgradeMirror returns the configured download-mirror base URL ("" ⇒
+// download from GitHub origin). Env FREENS_UPGRADE_MIRROR wins over the
+// [upgrade] mirror config key — an emergency bypass that works even when
+// the config is stale or the mirror is temporarily broken.
+func upgradeMirror() string {
+	if m := strings.TrimSpace(os.Getenv("FREENS_UPGRADE_MIRROR")); m != "" {
+		return strings.TrimRight(m, "/")
+	}
+	if m, found, err := confedit.Get(home.ConfPath(), "upgrade", "mirror"); err == nil && found {
+		return strings.TrimRight(strings.TrimSpace(m), "/")
+	}
+	return ""
+}
+
+// mirrorAssetURL rewrites a GitHub release-download URL onto the mirror
+// base, preserving the full github path: <mirror>/<owner>/<repo>/releases/
+// download/... A mirror is therefore a TRANSPARENT github proxy (a worker
+// or reverse proxy prepends https://github.com to the request path).
+// Non-release URLs, foreign repos, and an empty mirror pass through
+// unchanged — the API calls stay on github.com regardless (they are
+// kilobytes).
+func mirrorAssetURL(mirror, ghURL string) string {
+	if mirror == "" {
+		return ghURL
+	}
+	rest, ok := strings.CutPrefix(ghURL, "https://github.com/")
+	if !ok || !strings.HasPrefix(rest, githubOwnerRepo+"/releases/download/") {
+		return ghURL
+	}
+	return strings.TrimRight(mirror, "/") + "/" + rest
+}
+
+// fetchChecksums downloads SHA256SUMS.txt for the release FROM THE ORIGIN
+// (never the mirror) and parses it into filename → sha256-hex. A missing
+// asset (pre-v0.19.7 releases) yields nil, nil — verification is skipped
+// and the mirror relies on the staged-version check alone.
+func fetchChecksums(rel *ghRelease) (map[string]string, error) {
+	var url string
+	for i := range rel.Assets {
+		if rel.Assets[i].Name == checksumsAssetName {
+			url = rel.Assets[i].BrowserDownload
+			break
+		}
+	}
+	if url == "" {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := upgradeHTTPGet(ctx, url, "")
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", checksumsAssetName, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s: %s", checksumsAssetName, resp.Status)
+	}
+	sums := make(map[string]string)
+	sc := bufio.NewScanner(io.LimitReader(resp.Body, 1<<20))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		sums[fields[1]] = strings.ToLower(fields[0])
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", checksumsAssetName, err)
+	}
+	return sums, nil
+}
+
+// verifyChecksum compares the downloaded tarball's SHA-256 with the
+// release's published digest. A mismatch is a hard stop: a mirror that
+// cannot reproduce origin's bytes must never reach staging.
+func verifyChecksum(tarPath, assetName string, sums map[string]string) error {
+	want, ok := sums[assetName]
+	if !ok {
+		return fmt.Errorf("%s has no checksum entry — refusing to stage from a mirror without one", assetName)
+	}
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != want {
+		return fmt.Errorf("checksum MISMATCH for %s: got %s, want %s — the download did not come from origin's bytes; aborting", assetName, got, want)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Chunked peer transfer (v0.19.7): the upgrade verb as a mini-swarm client.
+// Peers are UNTRUSTED caches — every chunk is verified against the origin
+// manifest before assembly, any failure falls back to origin — so the fleet
+// becomes its own fast CDN without moving the trust anchor an inch.
+// ---------------------------------------------------------------------------
+
+// upgradeManifestAssetName is the CI naming scheme (release.yml): one chunk
+// manifest per platform tarball.
+func upgradeManifestAssetName() string {
+	return "freens-manifest-" + runtime.GOOS + "-" + runtime.GOARCH + ".json"
+}
+
+// fetchUpgradeManifest pulls this platform's chunk manifest from GITHUB
+// ORIGIN and validates it. nil (no error) when the release predates
+// manifests — peer transfer simply doesn't engage.
+func fetchUpgradeManifest(rel *ghRelease) *blobman.Manifest {
+	var raw string
+	for i := range rel.Assets {
+		if rel.Assets[i].Name == upgradeManifestAssetName() {
+			raw = rel.Assets[i].BrowserDownload
+			break
+		}
+	}
+	if raw == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resp, err := upgradeHTTPGet(ctx, raw, "")
+	if err != nil {
+		return nil // manifest fetch is best-effort: origin fallback below
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil
+	}
+	m, err := blobman.Parse(body)
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
+// upgradePeerList asks the LOCAL daemon for confirmed contacts — the
+// boxes most likely to hold the previous release's cache. The daemon
+// being down simply disables peer transfer (the origin path carries on).
+func upgradePeerList() ([]dht.Peer, error) {
+	c := &admin.Client{Sock: home.AdminSock(), Timeout: 5 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	all, err := c.Peers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	confirmed := make([]dht.Peer, 0, len(all))
+	for _, p := range all {
+		if p.Confirmed != 0 {
+			confirmed = append(confirmed, p)
+		}
+	}
+	if len(confirmed) > 8 {
+		confirmed = confirmed[:8]
+	}
+	return confirmed, nil
+}
+
+// fetchTarballFromPeers assembles the manifest's asset from peer-served
+// chunks into workDir. Chunks are fetched round-robin from the peer set
+// by a small worker pool; any chunk that fails its manifest hash
+// blacklists the serving peer and requeues. Every worker writes its
+// chunks straight into the output file at their offsets (order-free).
+func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Peer) (string, error) {
+	if len(man.Chunks) > 1<<16 {
+		return "", fmt.Errorf("manifest too large")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// The transient one-shot node: every query it sends carries the §6.3
+	// transient flag (v0.19.7), so this very verb stops planting the
+	// ghosts that motivated the feature.
+	node, err := startCLINode(ctx, "", ":0", nil)
+	if err != nil {
+		return "", err
+	}
+	defer node.Close()
+
+	id, err := hex.DecodeString(man.SHA256)
+	if err != nil || len(id) != constants.SHA256Len {
+		return "", fmt.Errorf("manifest digest")
+	}
+
+	outPath := filepath.Join(workDir, "release.tar.gz")
+	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+	// Pre-size the file so out-of-order chunk writes land at real offsets.
+	if err := out.Truncate(man.Size); err != nil {
+		return "", err
+	}
+
+	// pending hands out chunk indexes; failures requeue (a chunk served
+	// wrong once may be right from another peer).
+	var mu sync.Mutex
+	next := 0
+	requeued := map[int]bool{}
+	blacklisted := map[string]bool{}
+	failures := 0
+	pop := func() (int, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if next < len(man.Chunks) {
+			i := next
+			next++
+			return i, true
+		}
+		return 0, false
+	}
+	requeue := func(i int) {
+		mu.Lock()
+		defer mu.Unlock()
+		failures++
+		// A bounded number of total retries keeps a hostile/lossy swarm
+		// from spinning forever; origin fallback below is the answer to
+		// a swarm that cannot finish.
+		if failures <= 3*len(man.Chunks) {
+			if next > i {
+				next = i // rewind the cursor to retry this index
+			}
+			requeued[i] = true
+		}
+	}
+
+	workers := len(peers)
+	if workers > 6 {
+		workers = 6
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(cursor int) {
+			defer wg.Done()
+			live := make([]dht.Peer, len(peers))
+			copy(live, peers)
+			for {
+				i, ok := pop()
+				if !ok {
+					return
+				}
+				if len(live) == 0 {
+					requeue(i)
+					return
+				}
+				p := live[cursor%len(live)]
+				cursor++
+				off := int64(i) * int64(man.ChunkSize)
+				data, _, err := node.BlobGet(ctx, p, id, int(off), int(man.ChunkLen(i)))
+				if err != nil {
+					mu.Lock()
+					blacklisted[p.Addr] = true
+					mu.Unlock()
+					keep := live[:0]
+					for _, q := range live {
+						if q.Addr != p.Addr {
+							keep = append(keep, q)
+						}
+					}
+					live = keep
+					requeue(i)
+					if len(live) == 0 {
+						return
+					}
+					continue
+				}
+				sum := sha256.Sum256(data)
+				if hex.EncodeToString(sum[:]) != man.Chunks[i] {
+					// A WRONG byte-slice is the hostile case: stop asking
+					// this peer anything, retry the chunk elsewhere.
+					mu.Lock()
+					blacklisted[p.Addr] = true
+					mu.Unlock()
+					keep := live[:0]
+					for _, q := range live {
+						if q.Addr != p.Addr {
+							keep = append(keep, q)
+						}
+					}
+					live = keep
+					requeue(i)
+					if len(live) == 0 {
+						return
+					}
+					continue
+				}
+				if _, err := out.WriteAt(data, off); err != nil {
+					requeue(i)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	// Whole-file verification: the manifest's own digest over what we
+	// assembled — belt and braces over the per-chunk checks, and the
+	// origin SHA256SUMS check (when present) vouches a third time.
+	f, err := os.Open(outPath)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	f.Close()
+	if err != nil {
+		return "", err
+	}
+	if hex.EncodeToString(h.Sum(nil)) != man.SHA256 {
+		os.Remove(outPath)
+		return "", fmt.Errorf("assembled tarball failed its manifest digest (%d blacklisted peers)", len(blacklisted))
+	}
+	return outPath, nil
 }
 
 // assetFor picks this platform's tarball from the release.
@@ -865,10 +1207,77 @@ func cmdUpgrade(args []string) error {
 	}
 	defer os.RemoveAll(work)
 
-	fmt.Printf("downloading %s (%s) ...\n", asset.Name, humanBytes(asset.Size))
-	tarPath, err := upgradeDownload(asset.BrowserDownload, work)
-	if err != nil {
-		return err
+	// The tarball may ride a MIRROR ([upgrade] mirror / FREENS_UPGRADE_
+	// MIRROR — github's release CDN is bandwidth-starved on some routes,
+	// found live 2026-09-18: 65-75 KB/s from a HiNet box, i.e. minutes
+	// per upgrade). Integrity travels the ORIGIN path: SHA256SUMS.txt is
+	// fetched from github (a few hundred bytes) and the mirrored tarball
+	// must reproduce its bytes or the upgrade aborts before staging.
+	mirror := upgradeMirror()
+	var sums map[string]string
+	if mirror != "" {
+		sums, err = fetchChecksums(rel)
+		if err != nil {
+			return err
+		}
+		if sums == nil {
+			return fmt.Errorf("mirror %s is configured but this release carries no %s — remove the mirror or pin a v0.19.7+ release", mirror, checksumsAssetName)
+		}
+	}
+
+	// CHUNKED PEER TRANSFER (v0.19.7): when the release carries a chunk
+	// manifest, the tarball is pulled from fleet peers (each serving the
+	// copy it downloaded) with every chunk verified against the manifest
+	// BEFORE assembly. Peers are pure acceleration: any failure — no
+	// responsive peers, a blacklisted bad actor, a timeout — falls back
+	// to the origin/mirror path below. The trust anchor never moves: the
+	// manifest comes from GITHUB ORIGIN, and origin's SHA256SUMS still
+	// vouches for the assembled bytes.
+	man := fetchUpgradeManifest(rel)
+	tarPath := ""
+	if man != nil {
+		peers, perr := upgradePeerList()
+		if perr == nil && len(peers) > 0 {
+			if p2p, ferr := fetchTarballFromPeers(work, man, peers); ferr != nil {
+				fmt.Printf("peer transfer unavailable (%v) — downloading from origin instead\n", ferr)
+			} else {
+				tarPath = p2p
+				fmt.Printf("assembled %s from %d peer-served, manifest-verified chunks\n", asset.Name, len(man.Chunks))
+			}
+		}
+	}
+	if tarPath == "" {
+		fmt.Printf("downloading %s (%s)%s ...\n", asset.Name, humanBytes(asset.Size),
+			func() string {
+				if mirror != "" {
+					return " via mirror " + mirror
+				}
+				return ""
+			}())
+		url := mirrorAssetURL(mirror, asset.BrowserDownload)
+		p, err := upgradeDownload(url, work)
+		if err != nil {
+			return err
+		}
+		tarPath = p
+	}
+	// Cache the tarball for the fleet (v0.19.7): every box that upgrades
+	// becomes a seeder for the next one. Best-effort — a full or missing
+	// cache directory must never fail an upgrade.
+	if man != nil {
+		if id, derr := hex.DecodeString(man.SHA256); derr == nil {
+			if bc, bcerr := dht.NewBlobCache(filepath.Join(home.Dir(), "blobs")); bcerr == nil {
+				if serr := bc.Store(id, tarPath); serr == nil {
+					fmt.Println("cached release archive for peer transfer")
+				}
+			}
+		}
+	}
+	if sums != nil {
+		fmt.Printf("verifying %s against %s (origin) ...\n", asset.Name, checksumsAssetName)
+		if err := verifyChecksum(tarPath, asset.Name, sums); err != nil {
+			return err
+		}
 	}
 	staged, err := stageTarball(tarPath, filepath.Join(work, "stage"))
 	if err != nil {
