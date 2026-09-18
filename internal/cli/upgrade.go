@@ -432,6 +432,17 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		retries     int // total requeues (bounded: a non-converging swarm hands over to origin)
 		absentCount = map[string]bool{}
 		hostile     = map[string]bool{}
+		// GLOBAL peer rotation with strikes (v0.19.8-live fix): the
+		// first cut gave each worker its own rotation — dead peers
+		// drained it, the worker EXITED, and requeued chunks stranded
+		// while live seeders still existed. One shared rotation: a
+		// worker only starves when every peer is genuinely out.
+		live    = append([]dht.Peer(nil), peers...)
+		liveIdx int
+		strikes = map[string]int{}
+		// throttleGen graduates concurrent workers' throttle backoffs so
+		// they do not all sleep the same 250 ms and re-fire in unison.
+		throttleGen int
 	)
 	pop := func() (int, bool) {
 		mu.Lock()
@@ -442,6 +453,36 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 			return i, true
 		}
 		return 0, false
+	}
+	nextPeer := func() (dht.Peer, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(live) == 0 {
+			return dht.Peer{}, false
+		}
+		p := live[liveIdx%len(live)]
+		liveIdx++
+		return p, true
+	}
+	// strike counts a failure against a peer; two strikes (or one
+	// deliberate/hard failure) removes it from the shared rotation.
+	strikeN := func(p dht.Peer, n int) {
+		mu.Lock()
+		defer mu.Unlock()
+		strikes[p.Addr] += n
+		if strikes[p.Addr] < 2 || len(live) == 0 {
+			return
+		}
+		keep := live[:0]
+		for _, q := range live {
+			if q.Addr != p.Addr {
+				keep = append(keep, q)
+			}
+		}
+		live = keep
+		if len(live) > 0 {
+			liveIdx %= len(live)
+		}
 	}
 	requeue := func(i int) {
 		mu.Lock()
@@ -455,6 +496,9 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		}
 	}
 
+	// 6 workers: 6 x 48 KiB in flight keeps the client's socket buffer
+	// and the path's fragment reassembly comfortably inside their
+	// budgets while saturating the server-side rate limiter.
 	workers := len(peers)
 	if workers > 6 {
 		workers = 6
@@ -462,28 +506,52 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func(cursor int) {
+		go func() {
 			defer wg.Done()
-			live := make([]dht.Peer, len(peers))
-			copy(live, peers)
 			for {
 				i, ok := pop()
 				if !ok {
 					return
 				}
-				if len(live) == 0 {
+				p, ok2 := nextPeer()
+				if !ok2 {
+					// Every peer is out of the rotation (absent/hostile/
+					// struck-out): the swarm cannot finish these chunks —
+					// the origin path takes over.
 					requeue(i)
 					return
 				}
-				p := live[cursor%len(live)]
-				cursor++
 				off := int64(i) * int64(man.ChunkSize)
-				data, _, err := session.Get(ctx, p, id, int(off), int(man.ChunkLen(i)))
-				if err == dht.ErrBlobThrottled {
-					// A live seeder having a busy moment: WAIT for it and
-					// retry later. Blacklisting here discarded the fleet's
-					// only cache (found live, 2026-09-18).
-					time.Sleep(500 * time.Millisecond)
+				// Throttle pacing: a busy limiter is a PACING signal, not
+				// a failure — the worker retries the SAME chunk in place
+				// (graduated backoff) instead of requeueing it. The
+				// requeue-retry budget exists for real failures only;
+				// letting throttle cycles consume it starved whole swarms
+				// while a perfectly healthy seeder sat at its 50/s limit
+				// (the 54 s / absent=3 / digest-fail cascade).
+				remain := man.ChunkLen(i)
+				var data []byte
+				attempts := 0
+				for {
+					data, _, err = session.Get(ctx, p, id, int(off), int(remain))
+					if err != dht.ErrBlobThrottled {
+						break
+					}
+					attempts++
+					if attempts > 200 { // a stuck limiter: give this worker's chunk to the pool
+						break
+					}
+					mu.Lock()
+					n := throttleGen
+					throttleGen++
+					mu.Unlock()
+					back := 20 * time.Millisecond
+					for k := 0; k < n%4 && back < 160*time.Millisecond; k++ {
+						back *= 2
+					}
+					time.Sleep(back)
+				}
+				if attempts > 200 {
 					requeue(i)
 					continue
 				}
@@ -491,22 +559,16 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 					mu.Lock()
 					absentCount[p.Addr] = true
 					mu.Unlock()
-					live = dropPeer(live, p.Addr)
+					strikeN(p, 2) // hard: this peer will never have this blob
 					requeue(i)
-					if len(live) == 0 {
-						return
-					}
 					continue
 				}
 				if err != nil {
-					// Timeout/transport: stop using the peer for now but
-					// do not blacklist globally (one flaky RTT is not
-					// hostility); the retry bound still applies.
-					live = dropPeer(live, p.Addr)
+					// Timeout/transport: one strike (three strikes and
+					// the peer leaves the rotation — a burst-induced
+					// datagram drop must not evict a live seeder).
+					strikeN(p, 1)
 					requeue(i)
-					if len(live) == 0 {
-						return
-					}
 					continue
 				}
 				sum := sha256.Sum256(data)
@@ -516,11 +578,8 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 					mu.Lock()
 					hostile[p.Addr] = true
 					mu.Unlock()
-					live = dropPeer(live, p.Addr)
+					strikeN(p, 5)
 					requeue(i)
-					if len(live) == 0 {
-						return
-					}
 					continue
 				}
 				if _, err := out.WriteAt(data, off); err != nil {
@@ -528,7 +587,7 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 					return
 				}
 			}
-		}(w)
+		}()
 	}
 	wg.Wait()
 
@@ -553,18 +612,6 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 			len(absentCount), len(hostile), len(peers))
 	}
 	return outPath, nil
-}
-
-// dropPeer returns live without addr (order-preserving; safe to share the
-// backing array within one worker goroutine).
-func dropPeer(live []dht.Peer, addr string) []dht.Peer {
-	keep := live[:0]
-	for _, q := range live {
-		if q.Addr != addr {
-			keep = append(keep, q)
-		}
-	}
-	return keep
 }
 
 // assetFor picks this platform's tarball from the release.
