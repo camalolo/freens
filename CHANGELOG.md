@@ -1,5 +1,34 @@
 # Changelog
 
+## unreleased — the DNS/DHT decoupling: conventional resolution never contends with freens work
+
+PROVEN LIVE: baseline google.com answered in 60 ms (20/20); under an
+80-query freens walk storm, 20/20 SERVFAIL — one shared 64-slot
+resolution semaphore gated every cache-miss query, and the OS then
+failed over to slower secondaries, which is why the class surfaced as
+"DNS latency varies" instead of outages (corroborated in the field:
+Chromium's wpad probe answered in 4.3 s; A-queries through ::1 spiked
+400-700 ms against 40 ms direct).
+
+- **Two resolver pools**: resSem (64) now gates only questions whose
+  FIRST leg is a DHT walk (freens, freens-first, rescue-gated dns);
+  upstream forwards get fwdSem (256) and never contend with walks.
+- **Upstream answers are cached**: positives by their own TTL (capped
+  like freens answers), NODATA at the negative TTL — a repeat lookup of
+  a conventional name no longer pays a fresh upstream round trip.
+  Upstream NXDOMAIN is never cached (no SOA minimums; must not pin a
+  fast-flipping domain).
+- **Saturation is visible**: one WARN per saturation episode (re-armed
+  on recovery) — the SERVFAIL storm was previously silent.
+- **The DHT read loop breathes**: the documented single-threaded loop
+  now delegates the heavy handlers — put (envelope decode + Ed25519 +
+  PoW + W witness verifies), witness, blob.get (disk) — to a bounded
+  pool (8 workers, 64 queue) with INLINE fallback when saturated;
+  backpressure degrades to the old behavior, never drops a packet.
+  Cheap handlers (ping/find_node/get) stay on the loop, and the moved
+  handlers keep the founding invariant (answer from local state, never
+  dial) so pooling cannot self-deadlock.
+
 ## v0.19.9 — the TCP blob channel + the peer blacklist (v1)
 
 ### TCP whole-file streaming: the datagram ceiling falls
