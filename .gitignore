@@ -29,3 +29,4 @@ reattprobe
 # stray working litter (test tarball, throwaway probe output)
 /f8.tar.gz
 /fetched.json
+genmanifest
