@@ -2265,7 +2265,7 @@ func TestResolveQuestionContestedWinnerTTLCapped(t *testing.T) {
 	clock := fixedNow
 	cache := NewResponseCache(16, func() int64 { return clock })
 	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
-	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
+	cache.putAnswer(cacheKeyFor(q), rrs, rcode, true)
 	if _, _, _, status := cache.get2(cacheKeyFor(q)); status != cacheFresh {
 		t.Fatal("contested entry missing from cache immediately after put")
 	}
@@ -2298,7 +2298,7 @@ func TestResolveQuestionUncontestedWinnerNotCapped(t *testing.T) {
 	clock := fixedNow
 	cache := NewResponseCache(16, func() int64 { return clock })
 	q := dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
-	cache.putFreens(cacheKeyFor(q), rrs, rcode, true)
+	cache.putAnswer(cacheKeyFor(q), rrs, rcode, true)
 	clock += contestedClaimTTLCap + 1
 	if _, _, _, status := cache.get2(cacheKeyFor(q)); status != cacheFresh {
 		t.Error("uncontested alias answer wrongly evicted within the §10.4 6 h allowance")

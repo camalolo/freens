@@ -155,7 +155,7 @@ func TestResponseCacheMetrics(t *testing.T) {
 	}
 	// Hit: stored freens outcome retrieved.
 	rr := &dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
-	c.putFreens(key, []dns.RR{rr}, dns.RcodeSuccess, true)
+	c.putAnswer(key, []dns.RR{rr}, dns.RcodeSuccess, true)
 	if _, _, _, status := c.get2(key); status != cacheFresh {
 		t.Fatal("second get should hit")
 	}
@@ -195,7 +195,7 @@ func TestResponseCacheNilMetricsUninstrumented(t *testing.T) {
 		t.Fatal("empty cache must miss")
 	}
 	rr := &dns.A{Hdr: dns.RR_Header{Name: "a.b.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}}
-	c.putFreens(key, []dns.RR{rr}, dns.RcodeSuccess, true)
+	c.putAnswer(key, []dns.RR{rr}, dns.RcodeSuccess, true)
 	if _, _, _, status := c.get2(key); status != cacheFresh {
 		t.Fatal("stored entry must hit")
 	}

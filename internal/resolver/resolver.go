@@ -244,6 +244,22 @@ type Resolver struct {
 	// without the lock). nil ⇒ unlimited.
 	resSem chan struct{}
 
+	// fwdSem bounds pure-upstream forwards (questions that cannot reach
+	// freensResolve — no DHT walk possible). Kept SEPARATE from resSem so
+	// freens walk load can never starve conventional resolution (the
+	// 2026-09-18 live find: one shared pool turned 80 concurrent freens
+	// lookups into 20/20 SERVFAIL for google.com). Lazily initialized
+	// under flightMu like resSem.
+	fwdSem chan struct{}
+
+	// MaxConcurrentForwards bounds fwdSem. Zero ⇒ 256. Negative ⇒
+	// unlimited.
+	MaxConcurrentForwards int
+
+	// busyWarned deduplicates the saturation WARN (one line per
+	// saturation episode, re-armed on recovery); guarded by flightMu.
+	busyWarned bool
+
 	// TLSSync is the OPTIONAL §9.5.4 trust-sync sink (nil ⇒ disabled). It is
 	// notified — asynchronously, never blocking the answer — whenever a
 	// VERIFIED winning apex record carries a TLSCA RR (OnOwnerCA; the
@@ -268,6 +284,12 @@ type TLSTrustSync interface {
 	OnOwnerCA(alias string, tldID []byte, caDER []byte, recordExpires int64, claimYoung bool)
 	OnAliasDead(alias string, tldID []byte)
 }
+
+// defaultForwardConcurrency is fwdSem's default capacity: an order of
+// magnitude above any realistic local resolver's concurrent forwards,
+// while still bounding a flood's goroutine/fd footprint. The upstream
+// client's own connection pool is the practical bound.
+const defaultForwardConcurrency = 256
 
 // errResolverBusy is resolveShared's overload refusal: maps to SERVFAIL,
 // which ServeDNS never caches, so an honest client transparently retries.
@@ -378,6 +400,42 @@ func New(cfg *Config, freens RecordLookup, upstream Upstream) *Resolver {
 	return &Resolver{Cfg: cfg, Freens: freens, Upstream: upstream}
 }
 
+// canWalkFreens reports whether the question can reach freensResolve —
+// i.e. whether resolving it may cost a DHT walk (seconds) and therefore
+// must pay the walk semaphore. RouteDNS questions qualify ONLY through
+// the suffix-rescue interposer (enabled AND the last label is not a
+// delegated ICANN TLD — the v0.19.5 public-suffix gate), so plain
+// ICANN resolution never contends with walks. Must agree with
+// ResolveQuestion's routing: when this returns false, ResolveQuestion's
+// freens branch is unreachable for the question.
+func (r *Resolver) canWalkFreens(q dns.Question) bool {
+	if r.Freens == nil || q.Qclass != dns.ClassINET {
+		return false // the freens branch misses instantly / REFUSED
+	}
+	labels, alias, err := naming.DecomposeName(unescapeName(q.Name))
+	if err != nil {
+		return false // instant NXDOMAIN
+	}
+	// Pool assignment follows the FIRST leg: questions that START with a
+	// DHT walk pay the walk pool; questions that START upstream pay the
+	// (much larger) forward pool even though a dns-first NXDOMAIN may
+	// later walk — starving conventional resolution is the one outcome
+	// this split exists to make impossible, and a walk under a fwdSem
+	// slot stays bounded by the pool capacity.
+	switch RouteFor(r.Cfg, alias) {
+	case RouteFREENS, RouteFREENSFirst:
+		return true
+	case RouteDNS:
+		if r.Cfg == nil || !r.Cfg.SuffixRescue || len(labels) == 0 {
+			return false
+		}
+		// A public-TLD last label can never be rescued (v0.19.5 gate).
+		return !naming.IsPublicTLD(labels[len(labels)-1])
+	default:
+		return false // RouteDNSFirst (upstream first) and DENY
+	}
+}
+
 // resolveShared runs ResolveQuestion with per-question single-flight:
 // concurrent queries with the same (qname, qtype, qclass) — the cache-expiry
 // stampede, a fan-out of N client goroutines at once — share ONE resolution
@@ -432,21 +490,58 @@ func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKe
 		}
 		return f.rrs, f.rcode, f.aa, f.err
 	}
-	// Leader path: lazily build the semaphore, then acquire a slot
+	// Leader path: lazily build the semaphore(s), then acquire a slot
 	// non-blocking (an overloaded resolver REFUSES; it never queues, which
 	// would pile one goroutine per waiting query onto the flood).
-	if r.resSem == nil && r.MaxConcurrentResolutions >= 0 {
-		n := r.MaxConcurrentResolutions
-		if n == 0 {
-			n = 64
+	//
+	// TWO pools (the 2026-09-18 decoupling): only questions that can reach
+	// freensResolve — a DHT walk costing seconds — pay resSem (default 64).
+	// Pure upstream forwards (conventional ICANN resolution, ~50 ms,
+	// bounded by the upstream client + fwdSem) NEVER contend with walks:
+	// before the split, 80 concurrent freens lookups SERVFAILed 20/20
+	// google.com queries through the one shared pool (proven live on the
+	// test fleet; the OS then failed over to slower secondary resolvers,
+	// which is why the class surfaced as "DNS latency varies").
+	freensCapable := r.canWalkFreens(q)
+	sem := r.resSem
+	if freensCapable {
+		if r.resSem == nil && r.MaxConcurrentResolutions >= 0 {
+			n := r.MaxConcurrentResolutions
+			if n == 0 {
+				n = 64
+			}
+			r.resSem = make(chan struct{}, n)
 		}
-		r.resSem = make(chan struct{}, n)
+		sem = r.resSem
+	} else {
+		if r.fwdSem == nil && r.MaxConcurrentForwards >= 0 {
+			n := r.MaxConcurrentForwards
+			if n == 0 {
+				n = defaultForwardConcurrency
+			}
+			r.fwdSem = make(chan struct{}, n)
+		}
+		sem = r.fwdSem
 	}
-	if r.resSem != nil {
+	if sem != nil {
 		select {
-		case r.resSem <- struct{}{}:
+		case sem <- struct{}{}:
+			if freensCapable && r.busyWarned {
+				r.busyWarned = false // recovered: re-arm the saturation warn
+			}
 		default:
 			r.flightMu.Unlock()
+			if !r.busyWarned {
+				r.busyWarned = true
+				if r.Logger != nil {
+					pool := "freens-walk"
+					if !freensCapable {
+						pool = "forward"
+					}
+					r.Logger.Warn("resolver saturated — refusing until the pool drains (SERVFAIL, never cached)",
+						"pool", pool, "cap", cap(sem))
+				}
+			}
 			return nil, dns.RcodeServerFailure, false, errResolverBusy
 		}
 	}
@@ -476,15 +571,13 @@ func (r *Resolver) resolveShared(ctx context.Context, q dns.Question, ck cacheKe
 		close(f.done)
 	}()
 
-	defer func() {
-		if r.resSem != nil {
-			<-r.resSem
-		}
-	}()
+	if sem != nil {
+		defer func() { <-sem }()
+	}
 
 	f.rrs, f.rcode, f.aa, f.err = r.ResolveQuestion(ctx, q)
 	if r.Cache != nil {
-		r.Cache.putFreens(ck, f.rrs, f.rcode, f.aa)
+		r.Cache.putAnswer(ck, f.rrs, f.rcode, f.aa)
 	}
 
 	return f.rrs, f.rcode, f.aa, f.err

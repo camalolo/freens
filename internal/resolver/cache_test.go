@@ -205,12 +205,18 @@ func TestServeDNSNegativeCacheNODATA(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DNS-forwarded answers are never cached (§10.4 covers freens only).
+// Forwarded DNS answers: POSITIVES cached by their own TTL (the 2026-09-18
+// latency decoupling — a repeat lookup must not pay a fresh upstream round
+// trip), NXDOMAIN never (no SOA minimums; must not pin a fast-flip domain).
 // ---------------------------------------------------------------------------
 
-func TestServeDNSDoesNotCacheForwardedDNS(t *testing.T) {
+func TestServeDNSCachesForwardedPositives(t *testing.T) {
 	w := newFreensWorld(t)
-	rr := &dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.IPv4(93, 184, 216, 34)}
+	// TTL 300: above the 60 s prefetch window, so the second query is a
+	// plain cache hit and no BACKGROUND refresh goroutine re-forwards
+	// behind the assertion (the kick would be benign for correctness but
+	// races len(up.seen) here).
+	rr := &dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300}, A: net.IPv4(93, 184, 216, 34)}
 	up := &fakeUpstream{answer: []dns.RR{rr}, rcode: dns.RcodeSuccess}
 	r := newResolver(configFor(t, w, RouteDNS), nil, up)
 	r.Cache = NewResponseCache(0, nil)
@@ -221,17 +227,40 @@ func TestServeDNSDoesNotCacheForwardedDNS(t *testing.T) {
 			t.Fatalf("query %d: rcode %d, %d answers", i, resp.Rcode, len(resp.Answer))
 		}
 	}
+	if got := len(up.seen); got != 1 {
+		t.Errorf("upstream saw %d queries, want 1 (the second answers from cache)", got)
+	}
+	if got := r.Cache.Len(); got != 1 {
+		t.Errorf("cache holds %d entries, want 1", got)
+	}
+}
+
+func TestServeDNSDoesNotCacheForwardedNXDOMAIN(t *testing.T) {
+	w := newFreensWorld(t)
+	up := &fakeUpstream{rcode: dns.RcodeNameError}
+	r := newResolver(configFor(t, w, RouteDNS), nil, up)
+	r.Cache = NewResponseCache(0, nil)
+
+	for i := 0; i < 2; i++ {
+		// "nope.footld." rides the PURE RouteDNS alias (no freens
+		// fallthrough — an "example"-alias name would fall through to a
+		// freens-authoritative NXDOMAIN, which IS legitimately cacheable).
+		resp := serveOnce(t, r, "nope.footld.", dns.TypeA)
+		if resp.Rcode != dns.RcodeNameError {
+			t.Fatalf("query %d: rcode %d, want NXDOMAIN", i, resp.Rcode)
+		}
+	}
 	if got := len(up.seen); got != 2 {
-		t.Errorf("upstream saw %d queries, want 2 (forwarded answers must not be cached)", got)
+		t.Errorf("upstream saw %d queries, want 2 (upstream NXDOMAIN must not be cached)", got)
 	}
 	if got := r.Cache.Len(); got != 0 {
-		t.Errorf("cache holds %d entries after forwarded answers, want 0", got)
+		t.Errorf("cache holds %d entries after upstream NXDOMAIN, want 0", got)
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Direct ResponseCache unit tests: bound + oldest eviction, zero-TTL skip,
-// and putFreens policy classes.
+// and putAnswer policy classes.
 // ---------------------------------------------------------------------------
 
 func testKey(i int) cacheKey {
@@ -251,7 +280,7 @@ func TestResponseCacheBoundEvictsOldest(t *testing.T) {
 	c := NewResponseCache(4, func() int64 { return clock })
 
 	for i := 0; i < 5; i++ {
-		c.putFreens(testKey(i), []dns.RR{testA(t, 600)}, dns.RcodeSuccess, true)
+		c.putAnswer(testKey(i), []dns.RR{testA(t, 600)}, dns.RcodeSuccess, true)
 	}
 	if got := c.Len(); got != 4 {
 		t.Fatalf("Len = %d, want 4 (bound enforced)", got)
@@ -270,19 +299,27 @@ func TestResponseCachePolicy(t *testing.T) {
 	c := NewResponseCache(0, func() int64 { return clock })
 
 	// Zero-TTL positives are not cached (do-not-cache convention).
-	c.putFreens(testKey(0), []dns.RR{testA(t, 0)}, dns.RcodeSuccess, true)
+	c.putAnswer(testKey(0), []dns.RR{testA(t, 0)}, dns.RcodeSuccess, true)
 	if _, _, _, status := c.get2(testKey(0)); status != cacheMiss {
 		t.Error("TTL-0 answer must not be cached")
 	}
 
-	// aa=false (DNS-forwarded / policy) is ignored entirely.
-	c.putFreens(testKey(1), []dns.RR{testA(t, 60)}, dns.RcodeSuccess, false)
-	if _, _, _, status := c.get2(testKey(1)); status != cacheMiss {
-		t.Error("non-freens outcome must not be cached")
+	// aa=false POSITIVE is cached by its own TTL (the 2026-09-18 policy:
+	// a repeat lookup must not re-pay the upstream round trip).
+	c.putAnswer(testKey(1), []dns.RR{testA(t, 60)}, dns.RcodeSuccess, false)
+	if rrs, rcode, gotAA, status := c.get2(testKey(1)); status != cacheFresh || rcode != dns.RcodeSuccess || len(rrs) != 1 || gotAA {
+		t.Errorf("forwarded positive = %v rcode %d aa %v, want cached non-authoritative hit", status, rcode, gotAA)
+	}
+
+	// aa=false upstream NXDOMAIN is never cached (must not pin a
+	// fast-flipping domain; no SOA minimums available at this layer).
+	c.putAnswer(testKey(4), nil, dns.RcodeNameError, false)
+	if _, _, _, status := c.get2(testKey(4)); status != cacheMiss {
+		t.Error("upstream NXDOMAIN must not be cached")
 	}
 
 	// SERVFAIL is transient → never cached.
-	c.putFreens(testKey(2), nil, dns.RcodeServerFailure, true)
+	c.putAnswer(testKey(2), nil, dns.RcodeServerFailure, true)
 	if _, _, _, status := c.get2(testKey(2)); status != cacheMiss {
 		t.Error("SERVFAIL must not be cached")
 	}
@@ -290,7 +327,7 @@ func TestResponseCachePolicy(t *testing.T) {
 	// A positive entry expires after its min TTL — but stays RETAINED for
 	// the §10.4 serve-stale window (get2 reports cacheStale, not a drop):
 	// the entry only vanishes once the window itself passes.
-	c.putFreens(testKey(3), []dns.RR{testA(t, 60)}, dns.RcodeSuccess, true)
+	c.putAnswer(testKey(3), []dns.RR{testA(t, 60)}, dns.RcodeSuccess, true)
 	if _, _, _, status := c.get2(testKey(3)); status != cacheFresh {
 		t.Fatal("fresh positive entry should hit")
 	}
@@ -298,15 +335,17 @@ func TestResponseCachePolicy(t *testing.T) {
 	if _, _, _, status := c.get2(testKey(3)); status != cacheStale {
 		t.Errorf("expired positive inside the window = %v, want cacheStale", status)
 	}
-	if got := c.Len(); got != 1 {
-		t.Errorf("Len inside the stale window = %d, want 1 (retained for revalidation)", got)
+	// testKey(1) (the cached forwarded positive) is still fresh here, so
+	// the stale-window retention count includes it.
+	if got := c.Len(); got != 2 {
+		t.Errorf("Len inside the stale window = %d, want 2 (key 3 retained for revalidation + key 1 fresh)", got)
 	}
 	clock += int64(constants.StaleServeSecs)
 	if _, _, _, status := c.get2(testKey(3)); status != cacheMiss {
 		t.Error("positive entry must drop once the stale window passes")
 	}
-	if got := c.Len(); got != 0 {
-		t.Errorf("Len after the stale window = %d, want 0", got)
+	if got := c.Len(); got != 1 {
+		t.Errorf("Len after the stale window = %d, want 1 (only key 1, the forwarded positive, remains)", got)
 	}
 }
 
@@ -574,10 +613,10 @@ func TestResponseCachePersistRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dns-cache.json")
 	c := NewResponseCache(0, func() int64 { return 1_000 })
 	ck := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
-	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
+	c.putAnswer(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 600},
 		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
 	nk := cacheKeyFor(dns.Question{Name: "gone.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
-	c.putFreens(nk, nil, dns.RcodeNameError, true)
+	c.putAnswer(nk, nil, dns.RcodeNameError, true)
 
 	if saved, err := c.SaveIfDirty(path); err != nil || !saved {
 		t.Fatalf("save = %v, %v", saved, err)
@@ -680,7 +719,7 @@ func TestResponseCacheLoadCorruptIgnored(t *testing.T) {
 	}
 	// The cache stays fully usable after a failed load.
 	ck := cacheKeyFor(dns.Question{Name: "www.footld.", Qtype: dns.TypeA, Qclass: dns.ClassINET})
-	c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+	c.putAnswer(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "www.footld.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 		A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
 	if _, _, _, status := c.get2(ck); status != cacheFresh {
 		t.Fatal("cache unusable after a corrupt load")
@@ -763,7 +802,7 @@ func TestResponseCacheSweepCandidates(t *testing.T) {
 	}
 	put := func(name string, ttl int64, hitAt int64) {
 		ck := mk(name, ttl)
-		c.putFreens(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)},
+		c.putAnswer(ck, []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(ttl)},
 			A: net.IPv4(203, 0, 113, 9)}}, dns.RcodeSuccess, true)
 		// age the entry's lastHit to hitAt by direct surgery (putFreens
 		// stamps now; the sweep contract is about lastHit, not creation)
@@ -775,7 +814,7 @@ func TestResponseCacheSweepCandidates(t *testing.T) {
 	put("warm.footld.", 300, sweepAt-3600)                             // hit an hour ago, expired → sweep
 	put("cold.footld.", 300, sweepAt-100_000)                          // hit >24h ago → NOT in the warm set
 	put("fresh.footld.", 3000, sweepAt-60)                             // still fresh → prefetch covers it
-	c.putFreens(mk("dead.footld.", 60), nil, dns.RcodeNameError, true) // negative → never
+	c.putAnswer(mk("dead.footld.", 60), nil, dns.RcodeNameError, true) // negative → never
 
 	got := c.SweepCandidates(sweepAt, 24*3600, 100)
 	names := map[string]bool{}
@@ -879,7 +918,7 @@ func TestPutFreensRefreshDoesNotReArmWarmSet(t *testing.T) {
 	}
 
 	// Client era: one resolved query, then abandonment.
-	c.putFreens(ck, ans(), dns.RcodeSuccess, true)
+	c.putAnswer(ck, ans(), dns.RcodeSuccess, true)
 
 	// The sweeper keeps revalidating past the horizon only while the name
 	// is warm — here it is NOT, so every tick's re-put must leave the entry
@@ -887,7 +926,7 @@ func TestPutFreensRefreshDoesNotReArmWarmSet(t *testing.T) {
 	now += int64(refreshSweepHorizon) + 1
 	for i := 0; i < 4; i++ {
 		now += 400 // past the 300 s TTL: every refresh replaces an expired entry
-		c.putFreens(ck, ans(), dns.RcodeSuccess, true)
+		c.putAnswer(ck, ans(), dns.RcodeSuccess, true)
 	}
 	now += 301 // the last refresh's data expires too
 	if got := c.SweepCandidates(now, refreshSweepHorizon, 100); len(got) != 0 {
@@ -895,7 +934,7 @@ func TestPutFreensRefreshDoesNotReArmWarmSet(t *testing.T) {
 	}
 
 	// A genuine client hit re-warms it: the name is swept again.
-	c.putFreens(ck, ans(), dns.RcodeSuccess, true) // e.g. a fresh walk re-cached it
+	c.putAnswer(ck, ans(), dns.RcodeSuccess, true) // e.g. a fresh walk re-cached it
 	if _, _, _, status := c.get2(ck); status != cacheFresh {
 		t.Fatalf("client get = %v, want cacheFresh", status)
 	}

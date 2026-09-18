@@ -32,8 +32,12 @@
 // (a) delivers responses (y="r"/"e") to the per-txid pending-response channel
 // of the issuing sendQuery call, and (b) dispatches inbound queries (y="q") to
 // the handlers, which answer from local state only (no nested network RPCs, so
-// the loop never self-deadlocks). Client-side iterative lookups run on the
-// caller's goroutine and block on sendQuery, which is fed by readLoop.
+// the loop never self-deadlocks). The CPU/IO-heavy handlers (put/witness/
+// blob.get) are dispatched to a bounded worker pool (startHandlerPool) —
+// inline as fallback when the pool is saturated; the loop itself stays
+// responsible for per-packet signature verification and the cheap handlers.
+// Client-side iterative lookups run on the caller's goroutine and block on
+// sendQuery, which is fed by readLoop.
 //
 // This file is pure stdlib (net, crypto, sync) plus internal/{constants,crypto,
 // naming,wire}; it does not import internal/resolver (the RecordLookup adapter
@@ -420,6 +424,7 @@ type Node struct {
 	contactIdleTTL time.Duration // resolved: >0 = run the idle sweep
 	pingTimeout    time.Duration // resolved: §6.2 eviction-ping deadline
 	bgCancel       context.CancelFunc
+	bgCtxVal       context.Context // canceled with bgCancel; pool workers exit on it
 	bgOnce         sync.Once
 	bgWg           sync.WaitGroup
 
@@ -435,11 +440,15 @@ type Node struct {
 	black     *blacklist.Ledger // proven-violation peer ledger; nil = off
 
 	blobTCPMu sync.Mutex
-	blobTCPLn net.Listener  // the TCP blob channel listener (StartBlobTCP)
-	pktLim    *packetBudget // GLOBAL pre-verify inbound packet budget; nil = off
-	walkSem   chan struct{} // outbound walk concurrency cap (nil = uncapped)
-	log       *slog.Logger
-	nowFn     func() int64
+	blobTCPLn net.Listener // the TCP blob channel listener (StartBlobTCP)
+	// handlerPool carries the CPU/IO-heavy inbound handlers (put /
+	// witness / blob.get) off the single-threaded read loop; nil (never
+	// started) means everything runs inline as before.
+	handlerPool chan func()
+	pktLim      *packetBudget // GLOBAL pre-verify inbound packet budget; nil = off
+	walkSem     chan struct{} // outbound walk concurrency cap (nil = uncapped)
+	log         *slog.Logger
+	nowFn       func() int64
 
 	// advertise is the validated §6.2 advertised address ("" ⇒ peers learn
 	// the observed source). Parsed from NodeConfig.Advertise once at Start;
@@ -1196,6 +1205,7 @@ func (n *Node) Start() error {
 	// discovery fallback.
 	n.startSTUN()
 	go n.readLoop()
+	n.startHandlerPool(defaultHandlerPoolWorkers)
 
 	// (d) Co-located TURN server (community relay tier): nodes with spare
 	// bandwidth relay for the network. A listen failure fails Start — the
@@ -1228,6 +1238,9 @@ func (n *Node) Start() error {
 func (n *Node) Close() error {
 	n.stopBackground()
 	n.closed.Store(true)
+	// The handler pool shuts down via bgCancel (stopBackground above);
+	// its channel is deliberately never closed so an in-flight
+	// dispatchHeavy can never send on a closed channel.
 	var errs []error
 	if n.turnServer != nil {
 		if err := n.turnServer.Close(); err != nil {
@@ -1660,7 +1673,99 @@ func (n *Node) evictCandidate(ctx context.Context, c *NodeContact) {
 		"addr", oldest.Addr, "err", err)
 }
 
+// defaultHandlerPoolWorkers bounds the heavy-handler pool: enough to keep
+// several disks/verifiers busy on fleet-sized hardware, small enough that
+// a burst cannot balloon goroutines (the v0.16.3 wedge taught the cost of
+// unbounded parking).
+const defaultHandlerPoolWorkers = 8
+
+// handlerPoolQueue caps the pending tasks before dispatch falls back to
+// inline execution — backpressure DEGRADES to the old behavior, it never
+// drops a peer's packet.
+const handlerPoolQueue = 64
+
+// startHandlerPool spins up the heavy-handler workers. Safe to skip (nil
+// pool): every dispatch site falls back to inline execution.
+func (n *Node) startHandlerPool(workers int) {
+	if workers <= 0 {
+		return
+	}
+	pool := make(chan func(), handlerPoolQueue)
+	n.mu.Lock()
+	n.handlerPool = pool
+	n.mu.Unlock()
+	ctx := n.bgCtxVal
+	if ctx == nil { // pool somehow started before startBackground
+		c, cancel := context.WithCancel(context.Background())
+		cancel()
+		ctx = c
+	}
+	for i := 0; i < workers; i++ {
+		// Workers close over the LOCAL pool, never the field: the field is
+		// only for dispatchHeavy's (mutex-guarded) read, and Close never
+		// closes the channel (bgCancel retires the workers instead).
+		go func() {
+			for {
+				select {
+				case task := <-pool:
+					task()
+				case <-ctx.Done():
+					// Drain what is already queued, then exit: queued
+					// tasks belong to responses whose askers are gone,
+					// but running them is free and keeps Close simple.
+					for {
+						select {
+						case task := <-n.handlerPool:
+							task()
+						default:
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+}
+
+// dispatchHeavy queues a heavy-handler task, reporting whether it was
+// pooled (false ⇒ the caller must run it inline — the pool is nil or
+// saturated).
+func (n *Node) dispatchHeavy(task func()) bool {
+	n.mu.Lock()
+	pool := n.handlerPool
+	n.mu.Unlock()
+	if pool == nil {
+		return false
+	}
+	select {
+	case pool <- task:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleQuery answers an inbound query. Cheap handlers (ping/find_node/
+// get: memory + a token mint) run on the read loop as before; the HEAVY
+// ones — put (envelope decode + Ed25519 + PoW + W witness verifies),
+// witness (claim verification), blob.get (disk read) — run on the bounded
+// handler pool so a burst cannot stall the loop that feeds every other
+// peer's RPC (found live 2026-09-18: the loop is documented single-
+// threaded, and a swarm plus a witness round serialized all answering).
+// The moved handlers keep the loop's founding invariant — they answer
+// from local state only and never dial — so pooling cannot self-deadlock.
 func (n *Node) handleQuery(m *wire.Message, raddr *net.UDPAddr) {
+	switch m.Q {
+	case "put", "witness", "blob.get":
+		if n.dispatchHeavy(func() { n.answerQuery(m, raddr) }) {
+			return
+		}
+	}
+	n.answerQuery(m, raddr)
+}
+
+// answerQuery dispatches one query to its handler and writes the reply.
+func (n *Node) answerQuery(m *wire.Message, raddr *net.UDPAddr) {
 	var resp *wire.Message
 	switch m.Q {
 	case "ping":
@@ -3687,6 +3792,7 @@ func (n *Node) putToPeer(ctx context.Context, key, envBytes, evidence []byte, c 
 func (n *Node) startBackground() {
 	ctx, cancel := context.WithCancel(context.Background())
 	n.bgCancel = cancel
+	n.bgCtxVal = ctx
 	n.bgWg.Add(1)
 	go n.evictionLoop(ctx)
 	if n.refreshEvery > 0 {

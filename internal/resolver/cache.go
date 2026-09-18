@@ -251,13 +251,24 @@ func (c *ResponseCache) get2(key cacheKey) (rrs []dns.RR, rcode int, aa bool, st
 //
 // Non-freens outcomes (aa == false: DNS-forwarded, DENY) are ignored — §10.4
 // covers only freens answers.
-func (c *ResponseCache) putFreens(key cacheKey, rrs []dns.RR, rcode int, aa bool) {
-	if !aa {
-		return // DNS-forwarded / policy answers are not freens outcomes.
-	}
+// putAnswer caches a resolution outcome for key. Freens-sourced outcomes
+// (aa) cache exactly as before — positives by TTL, NXDOMAIN/NODATA at
+// NegTTL. Upstream-forwarded outcomes (NOT aa) now cache too — the
+// 2026-09-18 latency audit found every repeat lookup of a conventional
+// name paid a fresh upstream round trip forever (~60 ms where peers
+// answer in ~5 ms). Upstream caching is deliberately NARROW: positives
+// by their own TTL (same cap as freens) and NODATA at NegTTL; upstream
+// NXDOMAIN is NEVER cached (no SOA minimums available here, and a
+// negative answer must not pin a fast-flipping domain), nor REFUSED/
+// SERVFAIL (transient).
+func (c *ResponseCache) putAnswer(key cacheKey, rrs []dns.RR, rcode int, aa bool) {
 	now := c.now()
 	var e *cacheEntry
 	switch {
+	// Upstream-forwarded NODATA: cached at NegTTL like a freens negative
+	// (halves the queries for v4-only hosts' AAAA records).
+	case !aa && rcode == dns.RcodeSuccess && len(rrs) == 0:
+		e = &cacheEntry{rrs: nil, rcode: rcode, aa: false, expiresAt: now + int64(constants.NegTTL), lastHit: now}
 	case rcode == dns.RcodeSuccess && len(rrs) > 0:
 		ttl := int64(^uint32(0) >> 1) // start from "infinity" (max int32)
 		for _, rr := range rrs {
@@ -278,11 +289,14 @@ func (c *ResponseCache) putFreens(key cacheKey, rrs []dns.RR, rcode int, aa bool
 			stored[i] = dns.Copy(rr)
 		}
 		e = &cacheEntry{rrs: stored, rcode: rcode, aa: aa, expiresAt: now + ttl, lastHit: now}
-	case rcode == dns.RcodeNameError || (rcode == dns.RcodeSuccess && len(rrs) == 0):
+	case aa && (rcode == dns.RcodeNameError || (rcode == dns.RcodeSuccess && len(rrs) == 0)):
 		// §9.2 step 3: NXDOMAIN/NODATA negative-cached 60 s (§10.4 line 852).
 		e = &cacheEntry{rrs: nil, rcode: rcode, aa: aa, expiresAt: now + int64(constants.NegTTL), lastHit: now}
 	default:
-		return // REFUSED / SERVFAIL are transient; never cached.
+		// Upstream NXDOMAIN (never cache — no SOA minimums here, and a
+		// negative must not pin a fast-flipping domain) and REFUSED /
+		// SERVFAIL on either path (transient).
+		return
 	}
 
 	c.mu.Lock()
