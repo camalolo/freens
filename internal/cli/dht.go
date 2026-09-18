@@ -105,6 +105,11 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 		// loops are disabled.
 		BucketRefreshInterval: -1,
 		RepublishInterval:     -1,
+		// v0.19.7 §6.3 field 8: this node dies when the verb exits — ask
+		// receivers not to learn it as a contact. Without the flag every
+		// verb planted a confirmed ephemeral-port ghost in every peer's
+		// table (the fresh-keyspace walk degradation class).
+		Transient: true,
 	})
 	if err != nil {
 		return nil, err

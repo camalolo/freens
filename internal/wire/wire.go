@@ -804,12 +804,27 @@ func VerifyAuthorityChain(chain []*SignedEnvelope) bool {
 //	  5: id   bstr(32)               sender Node ID = SHA-256(pk)
 //	  6: pk   bstr(32)               sender public key
 //	  7: sig  bstr(64)               Ed25519 over SigningInput
+//	  8: x    bool                   sender is transient (optional, v0.19.7)
 //	}
 //
 // Node identity is verified on receipt (id == SHA-256(pk), §6.2). The signature
 // covers the canonical CBOR array [t, id, recipient_id, a] (§6.3 line 437);
 // recipient_id is the receiving node's 32-byte ID (transport context), supplied
 // to Sign/Verify rather than carried in the message body.
+//
+// The TRANSIENT FLAG (field 8, v0.19.7 — watch item #2, the NAT-mapping ghost
+// fix): a short-lived node (CLI one-shots: standalone register/renew/publish/
+// get) sets it on every query so receiving daemons NEVER learn the sender as a
+// routing-table contact. Without it, every CLI verb planted a confirmed
+// ephemeral-port contact in every peer's table — a corpse that ranks as a
+// citizen for an hour, degrades walks, and loses witness/put ID-distance races
+// to the live fleet (the 2026-09-18 fresh-keyspace walk degradation). The flag
+// is UNSIGNED transport hygiene metadata, like y: the worst a forger can do is
+// strip it (the historical behavior) or flag its own traffic (its own choice).
+// Field is omitempty: nodes that never set it emit byte-identical packets to
+// the pre-v0.19.7 encoding, and receivers that predate the field ignore the
+// unknown key (fxamacker/cbor default decoding) — full rolling-fleet
+// compatibility in both directions.
 type Message struct {
 	Y   string         `cbor:"1,keyasint"`
 	T   []byte         `cbor:"2,keyasint"`
@@ -818,6 +833,7 @@ type Message struct {
 	ID  []byte         `cbor:"5,keyasint"`
 	PK  []byte         `cbor:"6,keyasint"`
 	Sig []byte         `cbor:"7,keyasint"`
+	X   bool           `cbor:"8,keyasint,omitempty"`
 }
 
 // SigningInput returns the bytes the signature covers: the canonical CBOR of

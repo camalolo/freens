@@ -347,6 +347,16 @@ type NodeConfig struct {
 	// renewals and re-publishes of an already-held name never re-witness, so
 	// existing holders are unaffected either way.
 	AllowReserved bool
+	// Transient marks a SHORT-LIVED node (the CLI's one-shot verbs):
+	// every outbound query carries the §6.3 wire flag (field 8) asking
+	// receivers NOT to learn this node as a routing-table contact. A
+	// one-shot dies seconds later; without the flag every verb planted a
+	// confirmed ephemeral-port corpse in every peer's table — a
+	// citizen-ranked ghost that degrades walks and loses witness/put
+	// ID-distance races to the live fleet (the 2026-09-18 fresh-keyspace
+	// walk degradation; the NAT-mapping ghost class, watch item #2).
+	// Long-lived daemons leave this false.
+	Transient bool
 }
 
 // Node is one freens DHT participant: a UDP socket, an identity, a routing
@@ -365,6 +375,7 @@ type Node struct {
 	closed         atomic.Bool
 	passive        bool
 	allowReserved  bool          // §7.7 override: witness reserved-alias claims anyway
+	transient      bool          // §6.3 field-8 sender flag: one-shot node, never learn me
 	refreshEvery   time.Duration // resolved: >0 = run refresh loop
 	republishEvery time.Duration // resolved: >0 = run republish loop
 	contactIdleTTL time.Duration // resolved: >0 = run the idle sweep
@@ -687,6 +698,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		listenAddr:     cfg.ListenAddr,
 		passive:        cfg.Passive,
 		allowReserved:  cfg.AllowReserved,
+		transient:      cfg.Transient,
 		refreshEvery:   refreshEvery,
 		republishEvery: republishEvery,
 		contactIdleTTL: contactIdleTTL,
@@ -716,6 +728,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 
 // ID returns this node's 32-byte Node ID (= SHA-256(Public)).
 func (n *Node) ID() []byte { return append([]byte(nil), n.id...) }
+
+// Transient reports whether this node flags its queries as transient
+// (§6.3 field 8 — NodeConfig.Transient; the CLI's one-shot verbs).
+func (n *Node) Transient() bool { return n.transient }
 
 // LocalAddr returns the bound UDP address (useful when ListenAddr was ":0" or
 // ":port" and the concrete address is needed to configure peers).
@@ -1047,8 +1063,14 @@ func (n *Node) handle(data []byte, raddr *net.UDPAddr) {
 	// Learn/refresh the sender in the routing table from any signed traffic.
 	// A peer with a validated Advertise (§6.2) stamps it on its queries; a
 	// syntactically bad value is ignored in favor of the observed source.
+	// TRANSIENT senders (§6.3 field 8 — CLI one-shots) are served but never
+	// learned: they die seconds later, and a learned corpse ranks as a
+	// citizen for an hour, degrading walks in exactly the keyspaces the
+	// verb touched (the NAT-mapping ghost class).
 	adv, _ := m.A["advertise"].(string)
-	n.learnPeer(m.PK, raddr, adv)
+	if !m.X {
+		n.learnPeer(m.PK, raddr, adv)
+	}
 	switch m.Y {
 	case wire.MsgTypeResponse, wire.MsgTypeError:
 		n.deliver(m)
@@ -2123,6 +2145,10 @@ func (n *Node) sendQuery(ctx context.Context, addr *net.UDPAddr, recipientID []b
 	if err != nil {
 		return nil, err
 	}
+	// §6.3 field 8: a transient node (CLI one-shot) stamps every query so
+	// receivers skip learning it (see NodeConfig.Transient). Unsigned
+	// hygiene metadata — set after Sign, which never covers it.
+	msg.X = n.transient
 	data, err := msg.Bytes()
 	if err != nil {
 		return nil, err
