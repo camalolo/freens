@@ -21,11 +21,12 @@ import (
 )
 
 // DefaultChunkSize balances two UDP realities: a chunk must fit ONE
-// datagram (48 KiB sits far under the 64 KiB UDP ceiling), and fewer,
-// larger chunks mean fewer loss-exposed round trips. 48 KiB ≈ 33 IP
-// fragments at 1500 MTU — lossy links retry per chunk, pipelined clients
-// hide the latency.
-const DefaultChunkSize = 48 * 1024
+// datagram (60 KiB rides just under the 64 KiB UDP ceiling inside a
+// signed response, so every chunk is exactly one max-size round trip),
+// and fewer, larger chunks mean fewer loss-exposed round trips and a
+// 5x smaller manifest than the 48 KiB first cut. Lossy links retry per
+// chunk; pipelined clients hide the latency.
+const DefaultChunkSize = 60 * 1024
 
 // Manifest describes one release tarball as hashed chunks. Chunks are
 // ALIGNED: chunk i covers bytes [i*ChunkSize, min((i+1)*ChunkSize, Size)).

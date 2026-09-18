@@ -27,6 +27,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/camalolo/freens/internal/constants"
@@ -122,18 +123,40 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 		return nil, e
 	}
 	reachable := 0
-	for _, p := range peers {
-		if err := node.AddPeer(p.PublicKey, p.Addr); err != nil {
-			return fail(err)
+	// Parallel bootstrap pings (v0.19.8): the serial loop paid up to
+	// RPCTimeout per DEAD peer before the first live exchange — a
+	// 12-peer list with 7 stale entries stalled every swarm ~35 s. The
+	// pings carry the transient flag, so fanning them out plants
+	// nothing anywhere.
+	{
+		type pingOutcome struct {
+			p   dht.Peer
+			err error
 		}
-		c, cancel := context.WithTimeout(ctx, time.Duration(constants.RPCTimeoutSec)*time.Second)
-		err = node.Ping(c, p)
-		cancel()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: warning: peer %s unreachable (%v)\n", ProgName, p.Addr, err)
-			continue
+		outcomes := make(chan pingOutcome, len(peers))
+		var wg sync.WaitGroup
+		for _, p := range peers {
+			if err := node.AddPeer(p.PublicKey, p.Addr); err != nil {
+				return fail(err)
+			}
+			wg.Add(1)
+			go func(p dht.Peer) {
+				defer wg.Done()
+				c, cancel := context.WithTimeout(ctx, time.Duration(constants.RPCTimeoutSec)*time.Second)
+				err := node.Ping(c, p)
+				cancel()
+				outcomes <- pingOutcome{p: p, err: err}
+			}(p)
 		}
-		reachable++
+		wg.Wait()
+		close(outcomes)
+		for o := range outcomes {
+			if o.err != nil {
+				fmt.Fprintf(os.Stderr, "%s: warning: peer %s unreachable (%v)\n", ProgName, o.p.Addr, o.err)
+				continue
+			}
+			reachable++
+		}
 	}
 	if reachable == 0 {
 		return fail(fmt.Errorf("no peers reachable (checked %d)", len(peers)))

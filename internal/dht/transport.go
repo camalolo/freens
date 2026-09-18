@@ -156,10 +156,10 @@ const (
 // share; excess puts are answered with error 301 "throttled" like reads
 // (explicit backpressure beats silence).
 const (
-	defaultPutRateLimit  = 10.0 // req/s per source IP
-	defaultPutBurst      = 20   // back-to-back puts per idle source
-	defaultBlobRateLimit = 50.0 // blob.get req/s per source IP (48 KiB each)
-	defaultBlobBurst     = 100  // pipelining headroom for the swarm client
+	defaultPutRateLimit  = 10.0  // req/s per source IP
+	defaultPutBurst      = 20    // back-to-back puts per idle source
+	defaultBlobRateLimit = 500.0 // blob.get req/s per source IP (<=64 KiB each)
+	defaultBlobBurst     = 500   // pipelining headroom for the swarm client
 )
 
 // Blob errors are CLASSIFIED so the swarm client can react differently:
@@ -1073,8 +1073,12 @@ func (n *Node) Start() error {
 	// the assertion doubles as the guard — tunneled conns skip it. (On THIS
 	// path conn is always the direct UDP socket; the swap happens below.)
 	if u, ok := n.conn.(*net.UDPConn); ok {
-		_ = u.SetReadBuffer(1 << 20)
-		_ = u.SetWriteBuffer(1 << 20)
+		// 4 MiB: the blob swarm fires up to a dozen 48 KiB responses at a
+		// client concurrently — a 1 MiB buffer silently dropped the
+		// overflow datagrams, which surfaced as RPC timeouts and got live
+		// seeders struck out of the rotation (v0.19.8 first swarms).
+		_ = u.SetReadBuffer(4 << 20)
+		_ = u.SetWriteBuffer(4 << 20)
 	}
 
 	// (b) TURN client relay (§6.2 dialable address via the RFC 8656 subset
