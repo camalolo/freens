@@ -377,8 +377,11 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 
 	// The transient one-shot node: every query it sends carries the §6.3
 	// transient flag (v0.19.7), so this very verb stops planting the
-	// ghosts that motivated the feature.
-	node, err := startCLINode(ctx, "", ":0", nil)
+	// ghosts that motivated the feature. The swarm's peers ride in as
+	// BOOTSTRAPS — startCLINode pings each (reachability gate: with zero
+	// reachable peers the swarm cannot possibly run) and the flagged
+	// pings plant no ghosts on them.
+	node, err := startCLINode(ctx, "", ":0", peers)
 	if err != nil {
 		return "", err
 	}
