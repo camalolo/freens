@@ -15,8 +15,11 @@ import (
 	"sort"
 )
 
-// maxBlobCacheEntries bounds the cache dir (newest-mtime win).
-const maxBlobCacheEntries = 2
+// maxBlobCacheEntries bounds the cache dir (newest-mtime win). 8 = room
+// for EVERY platform's archive of the current release (the first mover
+// prefetches them all — see prefetchPeerTransferAssets — so any box can
+// swarm any platform from the fleet; ~13 MB each).
+const maxBlobCacheEntries = 8
 
 // BlobCache is a directory of tarballs keyed by their whole-file SHA-256
 // (hex). Safe for concurrent use.

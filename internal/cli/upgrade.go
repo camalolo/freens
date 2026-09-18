@@ -807,8 +807,17 @@ func assetFor(rel *ghRelease) (*ghAsset, error) {
 // download runs with a generous budget (a v0.x tarball is ~20 MiB; slow
 // links are the norm on LAN test boxes). Swapped by tests.
 var upgradeDownload = func(url, dir string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
+	return upgradeDownloadCtx(context.Background(), url, dir)
+}
+
+// upgradeDownloadCtx is upgradeDownload with a caller-owned budget (the
+// prefetch's deadline must be able to interrupt a slow download).
+var upgradeDownloadCtx = func(ctx context.Context, url, dir string) (string, error) {
+	if ctx.Err() == nil && ctx.Done() == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 15*time.Minute)
+		defer cancel()
+	}
 	resp, err := upgradeHTTPGet(ctx, url, "")
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
@@ -1524,7 +1533,9 @@ func cmdUpgrade(args []string) error {
 			}
 		}
 	}
+	fromOrigin := false
 	if tarPath == "" {
+		fromOrigin = true
 		fmt.Printf("downloading %s (%s)%s ...\n", asset.Name, humanBytes(asset.Size),
 			func() string {
 				if mirror != "" {
@@ -1704,6 +1715,18 @@ func cmdUpgrade(args []string) error {
 		}
 	}
 
+	// THE FIRST MOVER BECOMES THE RELEASE'S UNIVERSAL SEEDER: this box
+	// downloaded its own archive from origin (the slow path) — prefetch
+	// the OTHER platforms' archives into the blob cache now (budget-
+	// capped, best-effort) so boxes that could NEVER peer-download — no
+	// Linux box ever cached the windows tarball; desktop and the friend's
+	// VPS fell to origin every release — can swarm from the fleet.
+	// Budget-capped so a slow first mover cannot hang the verb forever;
+	// a partial prefetch still helps. Runs after the services are back.
+	if fromOrigin && man != nil {
+		fmt.Println("peer-transfer prefetch (first mover): caching the other platforms' archives for the fleet ...")
+		prefetchPeerTransferAssets(rel, asset.Name, work, 3*time.Minute)
+	}
 	fmt.Println("upgrade complete. previous binaries kept as <binary>.freens-prev (copy back + restart to roll back).")
 	return nil
 }
@@ -2054,6 +2077,106 @@ peerLoop:
 		lastErr = errors.New("no candidate peers")
 	}
 	return "", "", lastErr
+}
+
+// prefetchPeerTransferAssets downloads every OTHER platform's release
+// archive into the local blob cache (budget-capped, best-effort): the
+// first origin mover pays the origin cost once and the whole fleet —
+// including platforms no Linux box ever cached — swarms from it
+// afterwards. Priority: windows first (its consumer always fell to
+// origin), then the non-own linux arch, then darwin.
+func prefetchPeerTransferAssets(rel *ghRelease, ownAsset, work string, budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	prio := func(name string) int {
+		switch {
+		case strings.Contains(name, "windows"):
+			return 0
+		case strings.Contains(name, "linux"):
+			return 1
+		default:
+			return 2 // darwin last: the rarest upgrader
+		}
+	}
+	type cand struct {
+		name, tarURL, manifestURL string
+	}
+	var cands []cand
+	for i := range rel.Assets {
+		name := rel.Assets[i].Name
+		if !strings.HasSuffix(name, ".tar.gz") || name == ownAsset {
+			continue
+		}
+		plat := strings.TrimSuffix(strings.TrimPrefix(name, "freens-"), ".tar.gz")
+		c := cand{name: plat}
+		for j := range rel.Assets {
+			switch rel.Assets[j].Name {
+			case "freens-manifest-" + plat + ".json":
+				c.manifestURL = rel.Assets[j].BrowserDownload
+			case name:
+				c.tarURL = rel.Assets[j].BrowserDownload
+			}
+		}
+		if c.tarURL != "" && c.manifestURL != "" {
+			cands = append(cands, c)
+		}
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return prio(cands[i].name) < prio(cands[j].name) })
+	bc, bcerr := dht.NewBlobCache(filepath.Join(home.Dir(), "blobs"))
+	if bcerr != nil {
+		return
+	}
+	for _, c := range cands {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return
+		}
+		mctx, mcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		resp, err := upgradeHTTPGet(mctx, c.manifestURL, "")
+		mcancel()
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		man, err := blobman.Parse(body)
+		if err != nil {
+			continue
+		}
+		id, err := hex.DecodeString(man.SHA256)
+		if err != nil || len(id) != constants.SHA256Len {
+			continue
+		}
+		if _, _, err := bc.Open(id); err == nil {
+			continue // already cached (this or an earlier run)
+		}
+		dl := remain
+		if dl > 6*time.Minute {
+			dl = 6 * time.Minute
+		}
+		tctx, tcancel := context.WithTimeout(context.Background(), dl)
+		tarPath, err := upgradeDownloadCtx(tctx, c.tarURL, work)
+		tcancel()
+		if err != nil {
+			continue
+		}
+		f, ferr := os.Open(tarPath)
+		if ferr != nil {
+			continue
+		}
+		h := sha256.New()
+		_, cerr := io.Copy(h, f)
+		f.Close()
+		if cerr != nil || hex.EncodeToString(h.Sum(nil)) != man.SHA256 {
+			os.Remove(tarPath) // integrity: never cache unverified bytes
+			continue
+		}
+		if serr := bc.Store(id, tarPath); serr == nil {
+			fmt.Printf("  prefetch %s: cached for peer transfer\n", c.name)
+		}
+	}
 }
 
 // errHostilePeer signals a PROVEN wrong-slice verdict: skip every address
