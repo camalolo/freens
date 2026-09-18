@@ -1699,6 +1699,14 @@ func cmdUpgradeMigrate(args []string) error {
 		fmt.Printf("config: %s (since %s): %s\n", p.id, p.since, p.desc)
 	}
 
+	// Firewall convergence rides the same run-through-the-new-binary
+	// moment (windows-only; no-op elsewhere): rules the CURRENT binary
+	// needs — e.g. the v0.19.9 TCP blob channel's inbound 15353 — must
+	// reach boxes that upgrade without ever re-running setup.
+	if err := ensureFirewallRulesOnMigrate(); err != nil {
+		exe, _ := os.Executable()
+		fmt.Printf("firewall: rule ensure skipped (%v) — manual: netsh advfirewall firewall add rule \"name=freens DHT TCP\" dir=in action=allow program=\"%s\" protocol=tcp localport=15353\n", err, exe)
+	}
 	if applied == 0 {
 		fmt.Println("config: no patches needed")
 		return nil

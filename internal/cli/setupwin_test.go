@@ -315,16 +315,24 @@ func TestSetupInstallWindowsFlow(t *testing.T) {
 		t.Logf("service binary = %s", installedSvc.Binary)
 	}
 	// Firewall: delete-then-add for all three rules (idempotent re-runs).
-	if len(firewallCmds) != 6 || firewallCmds[0][0] != "netsh" ||
-		!strings.Contains(strings.Join(firewallCmds[3], " "), "15353") {
-		t.Fatalf("firewall commands = %v; want 3 delete + 3 add (DHT, outbound, web UI)", firewallCmds)
+	// 4 deletes (UDP DHT, TCP DHT, outbound, web UI) + 4 adds, same order.
+	if len(firewallCmds) != 8 || firewallCmds[0][0] != "netsh" ||
+		!strings.Contains(strings.Join(firewallCmds[4], " "), "15353") {
+		t.Fatalf("firewall commands = %v; want 4 delete + 4 add (DHT UDP, DHT TCP, outbound, web UI)", firewallCmds)
 	}
-	if !strings.Contains(strings.Join(firewallCmds[4], " "), "dir=out") {
-		t.Fatalf("second add rule = %v; want the outbound allow", firewallCmds[4])
-	}
-	if !strings.Contains(strings.Join(firewallCmds[5], " "), "8090") ||
+	// The v0.19.9 TCP blob channel rule: same port, protocol=tcp (a
+	// UDP-only rule silently drops the TCP listener).
+	if !strings.Contains(strings.Join(firewallCmds[5], " "), "protocol=tcp") ||
+		!strings.Contains(strings.Join(firewallCmds[5], " "), "15353") ||
 		!strings.Contains(strings.Join(firewallCmds[5], " "), "dir=in") {
-		t.Fatalf("third add rule = %v; want the web UI inbound allow on :8090", firewallCmds[5])
+		t.Fatalf("second add rule = %v; want the DHT TCP inbound allow on :15353", firewallCmds[5])
+	}
+	if !strings.Contains(strings.Join(firewallCmds[6], " "), "dir=out") {
+		t.Fatalf("third add rule = %v; want the outbound allow", firewallCmds[6])
+	}
+	if !strings.Contains(strings.Join(firewallCmds[7], " "), "8090") ||
+		!strings.Contains(strings.Join(firewallCmds[7], " "), "dir=in") {
+		t.Fatalf("fourth add rule = %v; want the web UI inbound allow on :8090", firewallCmds[7])
 	}
 	// Web UI service: installed with the freens-web binary next to the exe.
 	if installedWebSvc == nil || !strings.HasSuffix(installedWebSvc.Binary, "freens-web.exe") {

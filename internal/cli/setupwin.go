@@ -45,6 +45,14 @@ import (
 // scoped, DHT UDP port only). setup -uninstall deletes it by name.
 const windowsFirewallRuleName = "freens DHT"
 
+// windowsFirewallTCPRuleName is the inbound TCP twin of the DHT rule: the
+// daemon listens on the DHT port over BOTH protocols since v0.19.9 (the
+// TCP blob channel streams whole release archives; UDP carries the chunk
+// RPCs). Defender treats protocols separately — a UDP-only rule silently
+// drops the TCP listener, so peers fall back to slow paths when fetching
+// from this box (found live on the desktop test box, 2026-09-18).
+const windowsFirewallTCPRuleName = "freens DHT TCP"
+
 // windowsFirewallOutboundRuleName is the outbound twin (program-scoped,
 // all protocols) — hardened machines run BlockOutbound by default, and the
 // daemon must reach upstream resolvers, DHT peers and GitHub.
@@ -326,10 +334,13 @@ func wireOSResolverWindows() string {
 }
 
 // windowsFirewallRule adds/deletes the program-scoped firewall rules.
-// Two of them:
+// Four of them:
 //
 //	inbound  "freens DHT"      — UDP 15353 to this binary (Defender
 //	                             silently drops DHT inbound otherwise)
+//	inbound  "freens DHT TCP"  — TCP 15353, the blob channel's whole-
+//	                             file streaming listener (v0.19.9; the
+//	                             UDP rule does not cover it)
 //	inbound  "freens-web UI"   — TCP 8090, the LAN management UI served
 //	                             by the freens-web service
 //	outbound "freens outbound" — all traffic FROM this binary (upstream
@@ -341,7 +352,7 @@ func wireOSResolverWindows() string {
 //	                             per program — curl etc. worked, so this
 //	                             was invisible until a real daemon ran).
 //
-// Both are scoped to the freens executable, so the machine's default-deny
+// All are scoped to the freens executable, so the machine's default-deny
 // posture stays intact for everything else. netsh via windowsRelay so
 // tests (and exotic shells) can intercept.
 func windowsFirewallRule(addOrDelete, exe string) error {
@@ -350,7 +361,7 @@ func windowsFirewallRule(addOrDelete, exe string) error {
 		// Delete-then-add: netsh "add" happily creates DUPLICATE rules on a
 		// setup re-run (same name), so make every install idempotent the
 		// same way the systemd unit write is.
-		for _, name := range []string{windowsFirewallRuleName, windowsFirewallOutboundRuleName, windowsFirewallWebUIRuleName} {
+		for _, name := range []string{windowsFirewallRuleName, windowsFirewallTCPRuleName, windowsFirewallOutboundRuleName, windowsFirewallWebUIRuleName} {
 			_ = windowsRelay("netsh", "advfirewall", "firewall", "delete", "rule", "name="+name)
 		}
 		ruleSets = [][]string{
@@ -359,6 +370,12 @@ func windowsFirewallRule(addOrDelete, exe string) error {
 				"dir=in", "action=allow",
 				"program=" + exe,
 				"protocol=udp", "localport=15353",
+				"profile=any"},
+			{"netsh", "advfirewall", "firewall", "add", "rule",
+				"name=" + windowsFirewallTCPRuleName,
+				"dir=in", "action=allow",
+				"program=" + exe,
+				"protocol=tcp", "localport=15353",
 				"profile=any"},
 			{"netsh", "advfirewall", "firewall", "add", "rule",
 				"name=" + windowsFirewallOutboundRuleName,
@@ -375,6 +392,8 @@ func windowsFirewallRule(addOrDelete, exe string) error {
 		ruleSets = [][]string{
 			{"netsh", "advfirewall", "firewall", "delete", "rule",
 				"name=" + windowsFirewallRuleName},
+			{"netsh", "advfirewall", "firewall", "delete", "rule",
+				"name=" + windowsFirewallTCPRuleName},
 			{"netsh", "advfirewall", "firewall", "delete", "rule",
 				"name=" + windowsFirewallOutboundRuleName},
 			{"netsh", "advfirewall", "firewall", "delete", "rule",
@@ -497,7 +516,7 @@ func uninstallWindowsCore() {
 	if err := windowsFirewallRule("delete", ""); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: warning: firewall rule removal failed (%v)\n", ProgName, err)
 	} else {
-		fmt.Println("removed: firewall rules (freens DHT / freens outbound / freens-web UI)")
+		fmt.Println("removed: firewall rules (freens DHT / freens DHT TCP / freens outbound / freens-web UI)")
 	}
 
 	// Adapter DNS restore (captured lists; best effort).
