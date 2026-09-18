@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.19.6 — [listen] comma lists: serve both loopback families
+
+The desktop PPPoE/IPv6 field test: the machine's OS resolver carried a
+wired `::1` DNS entry while the daemon bound `127.0.0.1` only — every
+OS query to the dead v6 entry failed over to public resolvers and the
+box silently LEFT freens (hosts-file pins compensating).
+
+- `[listen] udp/tcp` now accept comma-separated address lists
+  ("127.0.0.1:53, [::1]:53"): every address gets its own server
+  (concurrent bind, shared query counter, per-server shutdown, all-fail
+  hint preserved). Single-address values unchanged.
+- `effectiveDNSAddr` (doctor/status wiring) returns the FIRST list
+  entry — the raw list was dialed as a hostname and failed every DNS
+  check on multi-listen daemons.
+- Tests: SplitListenAddrs table; dual-family bind-and-answer (127.0.0.1
+  + ::1 both serve).
+
 ## v0.19.5 — the fast-cold-lookup release (hedged DoH fallback, DoH keepalive, suffix-rescue public-suffix gate)
 
 The desktop "cold lookups regressed 87 ms → 2.4 s" report, chased to two
