@@ -38,6 +38,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -340,27 +341,44 @@ func fetchUpgradeManifest(rel *ghRelease) *blobman.Manifest {
 	return m
 }
 
-// upgradePeerList asks the LOCAL daemon for confirmed contacts — the
-// boxes most likely to hold the previous release's cache. The daemon
-// being down simply disables peer transfer (the origin path carries on).
+// upgradePeerList gathers candidate peers for the swarm. DISK FIRST
+// (the BitTorrent-resume rule, and the user's 20-year-old instinct is
+// exactly right): the persisted peerbook already knows the fleet and
+// survives restarts ON DISK — gating on the live daemon's freshly-warmed
+// confirmation state made every post-restart upgrade swarm-blind (found
+// live 2026-09-18: /peers showed 8 confirmed while the verb, started
+// seconds after a daemon restart, saw zero and fell back to the slow
+// origin path it existed to avoid). The live daemon's confirmed set is
+// merged in when reachable. No confirmed-filtering: dead entries fail
+// fast in the swarm's reachability gate and drop per-chunk.
 func upgradePeerList() ([]dht.Peer, error) {
-	c := &admin.Client{Sock: home.AdminSock(), Timeout: 5 * time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	all, err := c.Peers(ctx)
-	if err != nil {
-		return nil, err
-	}
-	confirmed := make([]dht.Peer, 0, len(all))
-	for _, p := range all {
-		if p.Confirmed != 0 {
-			confirmed = append(confirmed, p)
+	seen := map[string]bool{}
+	var out []dht.Peer
+	add := func(ps []dht.Peer) {
+		for _, p := range ps {
+			if p.Addr == "" || seen[p.Addr] {
+				continue
+			}
+			seen[p.Addr] = true
+			out = append(out, p)
 		}
 	}
-	if len(confirmed) > 8 {
-		confirmed = confirmed[:8]
+	add(home.LoadPeerbook())
+	client := &admin.Client{Sock: home.AdminSock(), Timeout: 5 * time.Second}
+	if admin.Alive(home.AdminSock()) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if live, err := client.Peers(ctx); err == nil {
+			add(live)
+		}
 	}
-	return confirmed, nil
+	if len(out) > 12 {
+		out = out[:12]
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no known peers (peerbook empty and daemon unreachable)")
+	}
+	return out, nil
 }
 
 // fetchTarballFromPeers assembles the manifest's asset from peer-served
@@ -1265,11 +1283,14 @@ func cmdUpgrade(args []string) error {
 	if man != nil {
 		peers, perr := upgradePeerList()
 		if perr == nil && len(peers) > 0 {
+			t0 := time.Now()
 			if p2p, ferr := fetchTarballFromPeers(work, man, peers); ferr != nil {
-				fmt.Printf("peer transfer unavailable (%v) — downloading from origin instead\n", ferr)
+				fmt.Printf("peer transfer unavailable after %s (%v) — downloading from origin instead\n", time.Since(t0).Round(time.Millisecond), ferr)
 			} else {
 				tarPath = p2p
-				fmt.Printf("assembled %s from %d peer-served, manifest-verified chunks\n", asset.Name, len(man.Chunks))
+				fmt.Printf("assembled %s from %d peer-served, manifest-verified chunks in %s (%s/s)\n",
+					asset.Name, len(man.Chunks), time.Since(t0).Round(time.Millisecond),
+					humanBytesPerSec(man.Size, time.Since(t0)))
 			}
 		}
 	}
@@ -1729,4 +1750,20 @@ func iniLines(conf string) []iniLine {
 		out = append(out, iniLine{text: line, start: start, end: off})
 	}
 	return out
+}
+
+// humanBytesPerSec formats size/duration for the transfer log line.
+func humanBytesPerSec(size int64, d time.Duration) string {
+	if d <= 0 {
+		return "?"
+	}
+	bps := float64(size) / d.Seconds()
+	switch {
+	case bps >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", bps/(1<<20))
+	case bps >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", bps/(1<<10))
+	default:
+		return fmt.Sprintf("%.0f B", bps)
+	}
 }
