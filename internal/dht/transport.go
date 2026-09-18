@@ -156,10 +156,20 @@ const (
 // share; excess puts are answered with error 301 "throttled" like reads
 // (explicit backpressure beats silence).
 const (
-	defaultPutRateLimit = 10.0 // req/s per source IP
-	defaultPutBurst     = 20   // back-to-back puts per idle source
-	defaultBlobRateLimit = 10.0 // blob.get req/s per source IP (48 KiB each)
-	defaultBlobBurst     = 20   // pipelining headroom for the swarm client
+	defaultPutRateLimit  = 10.0 // req/s per source IP
+	defaultPutBurst      = 20   // back-to-back puts per idle source
+	defaultBlobRateLimit = 50.0 // blob.get req/s per source IP (48 KiB each)
+	defaultBlobBurst     = 100  // pipelining headroom for the swarm client
+)
+
+// Blob errors are CLASSIFIED so the swarm client can react differently:
+// a throttled peer must be waited on (it is a seeder having a busy
+// moment — blacklisting it threw away the only cache in the fleet, found
+// live 2026-09-18), an absent peer is legitimately useless this run, and
+// a wrong slice is hostile.
+var (
+	ErrBlobThrottled = errors.New("dht: blob.get throttled")
+	ErrBlobAbsent    = errors.New("dht: blob not cached")
 )
 
 // Default GLOBAL inbound packet budget (v0.9.2). The per-source-IP buckets
@@ -401,19 +411,19 @@ type Node struct {
 	bgOnce         sync.Once
 	bgWg           sync.WaitGroup
 
-	store   *EnvelopeStore
-	rt      *RoutingTable
-	tokens  *TokenStore
-	claims  *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
-	diff    *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
-	getLim  *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
-	putLim  *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
-	blobLim *rateLimiter     // per-source-IP blob.get throttle; nil = off
-	blobCache *BlobCache     // release-blob store for blob.get; nil = serving off
-	pktLim  *packetBudget    // GLOBAL pre-verify inbound packet budget; nil = off
-	walkSem chan struct{}    // outbound walk concurrency cap (nil = uncapped)
-	log     *slog.Logger
-	nowFn   func() int64
+	store     *EnvelopeStore
+	rt        *RoutingTable
+	tokens    *TokenStore
+	claims    *ClaimPool       // §7.4 "storing nodes keep the top 2 by ordering" (claims_pool.go)
+	diff      *difficultyState // Appendix A.4 own difficulty + observed ring (gossip.go)
+	getLim    *rateLimiter     // per-source-IP get/find_node throttle (§12); nil = off
+	putLim    *rateLimiter     // per-source-IP put throttle (see defaultPutRateLimit); nil = off
+	blobLim   *rateLimiter     // per-source-IP blob.get throttle; nil = off
+	blobCache *BlobCache       // release-blob store for blob.get; nil = serving off
+	pktLim    *packetBudget    // GLOBAL pre-verify inbound packet budget; nil = off
+	walkSem   chan struct{}    // outbound walk concurrency cap (nil = uncapped)
+	log       *slog.Logger
+	nowFn     func() int64
 
 	// advertise is the validated §6.2 advertised address ("" ⇒ peers learn
 	// the observed source). Parsed from NodeConfig.Advertise once at Start;
@@ -814,49 +824,125 @@ func (n *Node) hBlobGet(m *wire.Message, raddr *net.UDPAddr) *wire.Message {
 }
 
 // BlobGet fetches one slice of a cached release archive from peer — the
-// client half of chunked peer transfer. It obtains the peer's write
-// token the same way putToPeer does (a prior get, falling back to ping),
-// so a server only answers sources it has actually round-tripped with.
-// The CALLER verifies the returned bytes against the manifest's chunk
-// hash — this method authenticates the TRANSPORT (the response is signed
-// by the peer), never the CONTENT.
+// one-shot convenience wrapper around BlobSession (a fresh token per
+// call). The CALLER verifies the returned bytes against the manifest's
+// chunk hash — this method authenticates the TRANSPORT (the response is
+// signed by the peer), never the CONTENT.
 func (n *Node) BlobGet(ctx context.Context, peer Peer, id []byte, off, length int) (data []byte, total int64, err error) {
+	return n.BlobSession().Get(ctx, peer, id, off, length)
+}
+
+// BlobSession is a per-client chunk-fetch session: it caches each peer's
+// write token so a chunk swarm does not pay a token round trip (a get/
+// ping pair) for every 48 KiB slice. Get classifies server refusals:
+// ErrBlobAbsent (blacklist the peer — it will never have this blob),
+// ErrBlobThrottled (WAIT and retry the same peer: blacklisting a live
+// seeder over a busy moment threw away the fleet's only cache, found
+// live 2026-09-18), and a single token-refresh retry on an auth hiccup.
+type BlobSession struct {
+	n      *Node
+	mu     sync.Mutex
+	tokens map[string][]byte // peer addr → last known write token
+}
+
+// BlobSession returns the node's chunk-fetch session (lazily created;
+// safe for concurrent use).
+func (n *Node) BlobSession() *BlobSession {
+	return &BlobSession{n: n, tokens: make(map[string][]byte)}
+}
+
+func (s *BlobSession) token(ctx context.Context, peer Peer) ([]byte, error) {
+	s.mu.Lock()
+	tok := s.tokens[peer.Addr]
+	s.mu.Unlock()
+	if len(tok) > 0 {
+		return tok, nil
+	}
+	return s.refreshToken(ctx, peer)
+}
+
+func (s *BlobSession) refreshToken(ctx context.Context, peer Peer) ([]byte, error) {
+	addr, aerr := net.ResolveUDPAddr("udp", peer.Addr)
+	if aerr != nil {
+		return nil, aerr
+	}
+	resp, err := s.n.sendQuery(ctx, addr, peerID(peer), "get", map[string]any{"key": make([]byte, 32)})
+	if err != nil || resp == nil {
+		return nil, ErrTimeout
+	}
+	token, _ := resp.A["token"].([]byte)
+	if len(token) == 0 {
+		pr, perr := s.n.sendQuery(ctx, addr, peerID(peer), "ping", map[string]any{})
+		if perr != nil || pr == nil {
+			return nil, ErrTimeout
+		}
+		token, _ = pr.A["token"].([]byte)
+	}
+	if len(token) == 0 {
+		return nil, errors.New("dht: peer minted no write token")
+	}
+	s.mu.Lock()
+	s.tokens[peer.Addr] = token
+	s.mu.Unlock()
+	return token, nil
+}
+
+// Get fetches one [off, off+length) slice of the cached blob id.
+func (s *BlobSession) Get(ctx context.Context, peer Peer, id []byte, off, length int) (data []byte, total int64, err error) {
 	addr, aerr := net.ResolveUDPAddr("udp", peer.Addr)
 	if aerr != nil {
 		return nil, 0, aerr
 	}
-	resp, err := n.sendQuery(ctx, addr, peerID(peer), "get", map[string]any{"key": make([]byte, 32)})
-	if err != nil || resp == nil {
-		return nil, 0, ErrTimeout
-	}
-	token, _ := resp.A["token"].([]byte)
-	if len(token) == 0 {
-		pr, perr := n.sendQuery(ctx, addr, peerID(peer), "ping", map[string]any{})
-		if perr != nil || pr == nil {
+	for attempt := 0; attempt < 2; attempt++ {
+		token, terr := s.token(ctx, peer)
+		if terr != nil {
+			return nil, 0, terr
+		}
+		br, err := s.n.sendQuery(ctx, addr, peerID(peer), "blob.get", map[string]any{
+			"token": token,
+			"id":    id,
+			"off":   uint64(off),
+			"len":   uint64(length),
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+		if br == nil {
 			return nil, 0, ErrTimeout
 		}
-		token, _ = pr.A["token"].([]byte)
+		if br.Y == wire.MsgTypeError {
+			code, _ := br.A["code"].(uint64)
+			msg, _ := br.A["msg"].(string)
+			switch {
+			case code == 404:
+				return nil, 0, ErrBlobAbsent
+			case code == 302:
+				// Token expired/rotated: refresh exactly once.
+				s.mu.Lock()
+				delete(s.tokens, peer.Addr)
+				s.mu.Unlock()
+				if attempt == 0 {
+					if _, rerr := s.refreshToken(ctx, peer); rerr == nil {
+						continue
+					}
+				}
+				return nil, 0, fmt.Errorf("dht: blob.get rejected: %s", msg)
+			case code == 301 && strings.Contains(msg, "throttled"):
+				return nil, 0, ErrBlobThrottled
+			default:
+				return nil, 0, fmt.Errorf("dht: blob.get refused (%d %s)", code, msg)
+			}
+		}
+		data, _ = br.A["data"].([]byte)
+		if v, ok := br.A["total"].(uint64); ok {
+			total = int64(v)
+		}
+		if len(data) == 0 {
+			return nil, 0, errors.New("dht: blob.get returned no data")
+		}
+		return data, total, nil
 	}
-	br, err := n.sendQuery(ctx, addr, peerID(peer), "blob.get", map[string]any{
-		"token": token,
-		"id":    id,
-		"off":   uint64(off),
-		"len":   uint64(length),
-	})
-	if err != nil {
-		return nil, 0, err
-	}
-	if br == nil || br.Y == wire.MsgTypeError {
-		return nil, 0, fmt.Errorf("dht: blob.get rejected")
-	}
-	data, _ = br.A["data"].([]byte)
-	if v, ok := br.A["total"].(uint64); ok {
-		total = int64(v)
-	}
-	if len(data) == 0 {
-		return nil, 0, errors.New("dht: blob.get returned no data")
-	}
-	return data, total, nil
+	return nil, 0, errors.New("dht: blob.get unfinished")
 }
 
 // peerID derives the recipient Node ID of a Peer (its public key hashed).

@@ -365,9 +365,13 @@ func upgradePeerList() ([]dht.Peer, error) {
 
 // fetchTarballFromPeers assembles the manifest's asset from peer-served
 // chunks into workDir. Chunks are fetched round-robin from the peer set
-// by a small worker pool; any chunk that fails its manifest hash
-// blacklists the serving peer and requeues. Every worker writes its
-// chunks straight into the output file at their offsets (order-free).
+// by a small worker pool; every chunk is verified against the manifest.
+// Peer failures are CLASSIFIED (v0.19.8-live fix): ErrBlobThrottled means
+// "wait, this seeder is alive" (blacklisting it discarded the fleet's
+// only cache and broke every swarm), ErrBlobAbsent means "useless for
+// this run" (blacklist), and a WRONG SLICE is hostile (blacklist). All
+// failure modes requeue the chunk; bounded total retries hand over to
+// the origin path when the swarm cannot finish.
 func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Peer) (string, error) {
 	if len(man.Chunks) > 1<<16 {
 		return "", fmt.Errorf("manifest too large")
@@ -386,6 +390,7 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		return "", err
 	}
 	defer node.Close()
+	session := node.BlobSession()
 
 	id, err := hex.DecodeString(man.SHA256)
 	if err != nil || len(id) != constants.SHA256Len {
@@ -403,13 +408,13 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		return "", err
 	}
 
-	// pending hands out chunk indexes; failures requeue (a chunk served
-	// wrong once may be right from another peer).
-	var mu sync.Mutex
-	next := 0
-	requeued := map[int]bool{}
-	blacklisted := map[string]bool{}
-	failures := 0
+	var (
+		mu          sync.Mutex
+		next        int
+		retries     int // total requeues (bounded: a non-converging swarm hands over to origin)
+		absentCount = map[string]bool{}
+		hostile     = map[string]bool{}
+	)
 	pop := func() (int, bool) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -423,15 +428,12 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 	requeue := func(i int) {
 		mu.Lock()
 		defer mu.Unlock()
-		failures++
+		retries++
 		// A bounded number of total retries keeps a hostile/lossy swarm
 		// from spinning forever; origin fallback below is the answer to
 		// a swarm that cannot finish.
-		if failures <= 3*len(man.Chunks) {
-			if next > i {
-				next = i // rewind the cursor to retry this index
-			}
-			requeued[i] = true
+		if retries <= 3*len(man.Chunks) && next > i {
+			next = i // rewind the cursor to retry this index
 		}
 	}
 
@@ -458,18 +460,31 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 				p := live[cursor%len(live)]
 				cursor++
 				off := int64(i) * int64(man.ChunkSize)
-				data, _, err := node.BlobGet(ctx, p, id, int(off), int(man.ChunkLen(i)))
-				if err != nil {
+				data, _, err := session.Get(ctx, p, id, int(off), int(man.ChunkLen(i)))
+				if err == dht.ErrBlobThrottled {
+					// A live seeder having a busy moment: WAIT for it and
+					// retry later. Blacklisting here discarded the fleet's
+					// only cache (found live, 2026-09-18).
+					time.Sleep(500 * time.Millisecond)
+					requeue(i)
+					continue
+				}
+				if err == dht.ErrBlobAbsent {
 					mu.Lock()
-					blacklisted[p.Addr] = true
+					absentCount[p.Addr] = true
 					mu.Unlock()
-					keep := live[:0]
-					for _, q := range live {
-						if q.Addr != p.Addr {
-							keep = append(keep, q)
-						}
+					live = dropPeer(live, p.Addr)
+					requeue(i)
+					if len(live) == 0 {
+						return
 					}
-					live = keep
+					continue
+				}
+				if err != nil {
+					// Timeout/transport: stop using the peer for now but
+					// do not blacklist globally (one flaky RTT is not
+					// hostility); the retry bound still applies.
+					live = dropPeer(live, p.Addr)
 					requeue(i)
 					if len(live) == 0 {
 						return
@@ -481,15 +496,9 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 					// A WRONG byte-slice is the hostile case: stop asking
 					// this peer anything, retry the chunk elsewhere.
 					mu.Lock()
-					blacklisted[p.Addr] = true
+					hostile[p.Addr] = true
 					mu.Unlock()
-					keep := live[:0]
-					for _, q := range live {
-						if q.Addr != p.Addr {
-							keep = append(keep, q)
-						}
-					}
-					live = keep
+					live = dropPeer(live, p.Addr)
 					requeue(i)
 					if len(live) == 0 {
 						return
@@ -519,10 +528,25 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 		return "", err
 	}
 	if hex.EncodeToString(h.Sum(nil)) != man.SHA256 {
+		mu.Lock()
+		defer mu.Unlock()
 		os.Remove(outPath)
-		return "", fmt.Errorf("assembled tarball failed its manifest digest (%d blacklisted peers)", len(blacklisted))
+		return "", fmt.Errorf("assembled tarball failed its manifest digest — absent=%d hostile=%d (of %d peers)",
+			len(absentCount), len(hostile), len(peers))
 	}
 	return outPath, nil
+}
+
+// dropPeer returns live without addr (order-preserving; safe to share the
+// backing array within one worker goroutine).
+func dropPeer(live []dht.Peer, addr string) []dht.Peer {
+	keep := live[:0]
+	for _, q := range live {
+		if q.Addr != addr {
+			keep = append(keep, q)
+		}
+	}
+	return keep
 }
 
 // assetFor picks this platform's tarball from the release.
@@ -1265,13 +1289,25 @@ func cmdUpgrade(args []string) error {
 		tarPath = p
 	}
 	// Cache the tarball for the fleet (v0.19.7): every box that upgrades
-	// becomes a seeder for the next one. Best-effort — a full or missing
-	// cache directory must never fail an upgrade.
+	// becomes a seeder for the next one. ONLY verified bytes are cached —
+	// caching an unverified origin download under the manifest's ID would
+	// poison the fleet's swarm with permanently-failing chunks (found
+	// live 2026-09-18). Best-effort: a cache failure never fails an
+	// upgrade.
 	if man != nil {
 		if id, derr := hex.DecodeString(man.SHA256); derr == nil {
-			if bc, bcerr := dht.NewBlobCache(filepath.Join(home.Dir(), "blobs")); bcerr == nil {
-				if serr := bc.Store(id, tarPath); serr == nil {
-					fmt.Println("cached release archive for peer transfer")
+			if f, ferr := os.Open(tarPath); ferr == nil {
+				h := sha256.New()
+				_, cerr := io.Copy(h, f)
+				f.Close()
+				if cerr == nil && hex.EncodeToString(h.Sum(nil)) == man.SHA256 {
+					if bc, bcerr := dht.NewBlobCache(filepath.Join(home.Dir(), "blobs")); bcerr == nil {
+						if serr := bc.Store(id, tarPath); serr == nil {
+							fmt.Println("cached release archive for peer transfer")
+						}
+					}
+				} else {
+					fmt.Println("not caching the release archive: bytes do not match the manifest (integrity)")
 				}
 			}
 		}
