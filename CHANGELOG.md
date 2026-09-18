@@ -1,6 +1,8 @@
 # Changelog
 
-## unreleased — the DNS/DHT decoupling: conventional resolution never contends with freens work
+## v0.19.10 — the DNS/DHT decoupling + the verb-performance audit
+
+### Conventional resolution never contends with freens work
 
 PROVEN LIVE: baseline google.com answered in 60 ms (20/20); under an
 80-query freens walk storm, 20/20 SERVFAIL — one shared 64-slot
@@ -28,6 +30,60 @@ Chromium's wpad probe answered in 4.3 s; A-queries through ::1 spiked
   Cheap handlers (ping/find_node/get) stay on the loop, and the moved
   handlers keep the founding invariant (answer from local state, never
   dial) so pooling cannot self-deadlock.
+
+### The ghost fix's second half: never-listening mappings age out
+
+The transient flag (v0.19.7) killed the CREATION of one-shot ghost
+contacts; multi-homed contacts still kept every address a peer ever
+had, and NAT rotation turned each old mapping into a never-confirmed
+alternate that never aged. `PruneStaleAlts` drops never-confirmed alts
+untouched by any DIRECT exchange for 2× the contact idle TTL, from the
+same 1-minute sweep. Once-confirmed alts are never pruned here (the
+cheap NAT-change retry path). Caveat: the persisted peerbook carries
+no alts, so each restart starts the live table's alts EMPTY — restarts
+reset the 2h prune clock.
+
+### Windows firewall: setup (and every upgrade) covers the TCP blob channel
+
+The daemon has listened on TCP 15353 alongside UDP since v0.19.9, but
+netsh rules are per-protocol — the setup-era UDP-only rule silently
+dropped the TCP listener. `setup` now creates FOUR program-scoped
+rules (DHT UDP + DHT TCP + outbound + web UI), and `upgrade-migrate`
+ensures the TCP rule so upgrade-only boxes converge without re-running
+setup (best-effort; refusal prints the manual netsh and never fails an
+upgrade).
+
+### The verb-performance audit: three batches
+
+Every verb the application accepts (35 CLI + 13 admin + 25 webui)
+profiled; the serving layer measured <1ms — the bottlenecks were in
+VERB COMPOSITION (serial work that could be parallel or cached):
+
+- `/resolve {"network":true}` runs its record + remote-claim legs
+  CONCURRENTLY and reuses the caller's tld_id (the redundant claim
+  re-walk is gone) — doctor's network-lease check's dominant cost.
+- `doctor`'s six independent network checks fan out — wall time is the
+  slowest check, not their sum (measured 6.3s → 1.05s on the test
+  fleet's 3-name box); output byte-identical.
+- `status`/doctor alias resolves fan out; webui dashboard/names fan
+  out with a 10s resolve cache (failures never cached).
+- The certs page fetches ONE store dump per view (was one per alias);
+  `GET /store` sizes from the store's put-time entry (no per-request
+  CBOR marshal); `/status` counts confirmed peers with zero
+  allocations (was a full table clone per 1s poll).
+- `freens doh` status probes `/reload?check=1` instead of triggering a
+  real reload (which cold-started the daemon's DoH TLS session).
+- `rt.Closest` heap-selects instead of full-table sorting per inbound
+  get/find_node on the read loop (2.1× at 64 contacts, 3.2× at 1024).
+- The resolver cache copies RRs and packs persistence saves OUTSIDE
+  the one mutex every query contends on.
+- Ed25519 verification is memoized by CONTENT (a process-global
+  pure-function cache keyed by the sha256 of pk‖sig‖message — planting
+  a colliding entry requires breaking SHA-256) for envelope and
+  witness signatures; wire-message verification deliberately stays
+  uncached (unique txid per packet, zero hit rate).
+- `freens renew` reuses ONE standalone node across names instead of a
+  full node lifecycle per name.
 
 ## v0.19.9 — the TCP blob channel + the peer blacklist (v1)
 
