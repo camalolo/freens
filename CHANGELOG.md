@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.19.12 — the peerbook flushes its corpses: peer transfer works everywhere, not just between clean tables
+
+THE DISEASE the user finally named ("I have never seen the fast
+upgrade"): the persisted peerbook was grow-only for ONCE-CONFIRMED
+ghosts — every pre-v0.19.7 one-shot corpse and every rotated NAT
+mapping persisted forever, so the upgrade verb's bootstrap list on
+exactly the boxes that most need peer transfer was a list of the dead
+(desktop's roll log: the server's IP at ephemeral ports, a loopback
+corpse, an ancient address; every dial timed out; origin fallback every
+time). The 400 ms TCP streams only ever ran between the two boxes with
+clean tables.
+
+- **The book heals**: a contact confirmed once but silent for 48 h
+  stops being re-persisted. 48 h comfortably covers the daily
+  renewal/confirmation cadence; a peer gone quiet for two days is
+  re-learned through the seed or any live peer within minutes.
+- **The seed is ALWAYS in the bootstrap list** (its hostname resolves
+  to the seed's current address — the one entry that cannot go stale),
+  and the list is ordered confirmation-recency-first before the 12-cap.
+
 ## v0.19.11 — the global foreign-LAN dial filter + the seed as last-resort bootstrap
 
 User-reported during the v0.19.10 roll (the friend's WAN VPS): the
