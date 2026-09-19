@@ -41,7 +41,10 @@ import (
 // seeds.conf (host:port#node-pubkey-hex). Updated v0.3.7: the promoted
 // community node on freens.camalolo.com (the machine holds its public IP
 // directly — no NAT between it and the internet).
-const defaultSeedLine = "freens.camalolo.com:15353#38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6"
+// defaultSeedLine aliases the CANONICAL seed constant (internal/home) —
+// two diverged copies of this line existed for weeks (scar documented on
+// home.DefaultSeedLine); there must be exactly one.
+const defaultSeedLine = home.DefaultSeedLine
 
 // daemonDNSAddr is the high port the daemon's resolver listens on (53 needs
 // privileges; the OS is pointed here instead).

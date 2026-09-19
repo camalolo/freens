@@ -39,14 +39,24 @@ import (
 // answering on the very same address from a book entry with the right
 // key. If the seed's identity EVER changes again, this constant and the
 // fleet's seeds.conf files must move together.
+
+// DefaultSeedLine is THE canonical seed entry — the single source of
+// truth for the community seed. SCAR (2026-09-19): TWO copies of this
+// line existed (here and in cli/setup.go) and had DIVERGED for weeks —
+// this package carried a stale pubkey (780494a3…, an old keychain-era
+// node) while cli/setup.go carried the live one. Every seeds.conf was
+// therefore correct (setup reads cli's copy) while the upgrade verb's
+// compiled-in entry — which reads THIS package — dialed a node that did
+// not exist. Any seed identity change moves exactly this constant.
+const DefaultSeedLine = "freens.camalolo.com:15353#38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6"
+
 func DefaultSeeds() string {
 	return `# freens bootstrap seeds - one "host:port#<64-hex-node-pk>" per line.
 # Blank lines and #-comment lines are ignored; malformed lines are skipped
 # silently (seeds are best-effort hints, not config). Used only when the
 # daemon is started with neither -peers nor -peers-file; learned peers are
 # remembered separately in peers/book.json and boot alongside this file.
-freens.camalolo.com:15353#38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6
-`
+` + DefaultSeedLine + "\n"
 }
 
 // ParseSeeds reads the seed list at path: one "host:port#<64-hex-pk>" entry
