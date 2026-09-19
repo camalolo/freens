@@ -30,15 +30,19 @@ import (
 // "Seed node: DDNS + hostname advertise") — peers re-resolve it, so the
 // entry survives the seed's PPPoE address changes without edits here.
 //
-// SCAR (2026-09-19): this constant carried the seed's PRE-CLEANUP public
-// key (780494a3…, replaced during the 2026-08-31 identity cleanup) while
-// every fleet seeds.conf had been hand-fixed — so the compiled fallback
-// pointed at a node that does not exist, and every verb run's seed entry
-// (and every fresh install's first bootstrap) timed out against a live,
-// healthy seed: "unreachable (context deadline exceeded)" with the seed
-// answering on the very same address from a book entry with the right
-// key. If the seed's identity EVER changes again, this constant and the
-// fleet's seeds.conf files must move together.
+// SCAR (2026-09-19, corrected after git archaeology): this function's
+// seed line has carried pubkey 780494a3… — an OLD keychain-era node —
+// since the day it was created (a544c4b, 2026-08-16). It was NOT the
+// 2026-08-31 cleanup that changed the key: TWO constants were born and
+// DIVERGED — cli/setup.go's defaultSeedLine always held the live key
+// (38c5d5b3…, what every seeds.conf got from setup) while this package's
+// copy held the stale one (what the upgrade verb's compiled-in entry
+// used, once v0.19.12 wired it in). Result: every verb run's pinned-seed
+// entry was addressed to a node that does not exist — "unreachable
+// (context deadline exceeded)" against a live, healthy seed that
+// answered on the very same address from a book entry with the right
+// key. ONE constant now (DefaultSeedLine, aliased by cli/setup); any
+// seed identity change moves exactly it.
 
 // DefaultSeedLine is THE canonical seed entry — the single source of
 // truth for the community seed. SCAR (2026-09-19): TWO copies of this
