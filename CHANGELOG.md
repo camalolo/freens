@@ -1,5 +1,20 @@
 # Changelog
 
+## unreleased — hostname peers resolve outside the ping budget
+
+Found live on the friend's VPS: "peer freens.camalolo.com:15353
+unreachable (context deadline exceeded)" while the SAME server at a
+literal-IP book entry pinged fine and streamed the release seconds
+later. Node.Ping resolved peer.Addr INSIDE its own RPC-timeout
+context, so resolver latency or a stale upstream A record consumed the
+seed's entire budget — the one peer that cannot go stale (the pinned
+seed, found via traditional DNS) was judged dead on its name lookup.
+
+The bootstrap gate resolves hostname peers once, in parallel, under a
+dedicated 4-second DNS budget before any ping; pings dial the resolved
+IP (display keeps the hostname); a resolution failure is reported AS a
+DNS failure, never as an unreachable peer.
+
 ## unreleased — UPnP forwards TCP by default, and the verb asks the seed for peers
 
 User directives, 2026-09-19:
