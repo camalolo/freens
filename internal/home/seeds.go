@@ -29,13 +29,23 @@ import (
 // The seed advertises a HOSTNAME (DDNS-fronted, see contrib/README.md
 // "Seed node: DDNS + hostname advertise") — peers re-resolve it, so the
 // entry survives the seed's PPPoE address changes without edits here.
+//
+// SCAR (2026-09-19): this constant carried the seed's PRE-CLEANUP public
+// key (780494a3…, replaced during the 2026-08-31 identity cleanup) while
+// every fleet seeds.conf had been hand-fixed — so the compiled fallback
+// pointed at a node that does not exist, and every verb run's seed entry
+// (and every fresh install's first bootstrap) timed out against a live,
+// healthy seed: "unreachable (context deadline exceeded)" with the seed
+// answering on the very same address from a book entry with the right
+// key. If the seed's identity EVER changes again, this constant and the
+// fleet's seeds.conf files must move together.
 func DefaultSeeds() string {
 	return `# freens bootstrap seeds - one "host:port#<64-hex-node-pk>" per line.
 # Blank lines and #-comment lines are ignored; malformed lines are skipped
 # silently (seeds are best-effort hints, not config). Used only when the
 # daemon is started with neither -peers nor -peers-file; learned peers are
 # remembered separately in peers/book.json and boot alongside this file.
-freens.camalolo.com:15353#780494a338d831d94b371c9a1d9351885753df071ba4e60e23283282d33fe2c7
+freens.camalolo.com:15353#38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6
 `
 }
 

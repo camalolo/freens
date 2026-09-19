@@ -35,7 +35,7 @@ func TestParseSeedsGoodBadAndComments(t *testing.T) {
 	path := filepath.Join(dir, "seeds.conf")
 	content := `# full-line comment
 
-freens.camalolo.com:15353#780494a338d831d94b371c9a1d9351885753df071ba4e60e23283282d33fe2c7
+freens.camalolo.com:15353#38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6
 203.0.113.7:15353#0000000000000000000000000000000000000000000000000000000000000000
 
 no-hash-separator.example:15353
@@ -53,7 +53,7 @@ no-hash-separator.example:15353
 		t.Fatalf("ParseSeeds returned %d peers, want 3: %+v", len(peers), peers)
 	}
 	// The pinned seed, byte for byte.
-	seedPK, err := hex.DecodeString("780494a338d831d94b371c9a1d9351885753df071ba4e60e23283282d33fe2c7")
+	seedPK, err := hex.DecodeString("38c5d5b399d3df19c33c7de69c06054f9b608b1a84782508879f8454b6195fd6")
 	if err != nil {
 		t.Fatalf("decode pinned seed pk: %v", err)
 	}
