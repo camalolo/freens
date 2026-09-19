@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.19.15 — the seed always rides: bootstrap lists cannot be crowded by corpses
+
+Desktop's v0.19.14 rolls still bootstrapped against twelve dead
+addresses: the daemon-side 48h peerbook flush applies at SAVE time, but
+a freshly restarted daemon loads the UNFLUSHED book — and the corpses
+are public addresses (viable, once-confirmed), so they passed every
+filter while the seed — sorting last, no confirmation stamp — was
+quietly dropped by the 12-cap.
+
+- The bootstrap list mirrors the peerbook's 48h recency at construction
+  time (a long-silent confirmed entry is a corpse, whatever the book
+  still holds).
+- The pinned community seed is held OUT of the cap and appended after
+  it: the one entry that cannot go stale always rides.
+- Also: the closest-set heap's inverted sift-up (caught by CI's ghost
+  fixture + a new brute-force property test vs the full-sort reference)
+  and the ci-gate gofmt nit are fixed on this line.
+
 ## v0.19.14 — the learn-side vantage filter: foreign LANs simply do not exist
 
 The user's directive, second pass: v0.19.11's dial-side filtering left
