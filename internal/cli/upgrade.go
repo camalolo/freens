@@ -650,7 +650,8 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 	if len(man.Chunks) > 1<<16 {
 		return "", fmt.Errorf("manifest too large")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// 60-second budget (see fetchTarballViaTCP): accelerator, not prerequisite.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// The transient one-shot node: every query it sends carries the §6.3
@@ -2138,8 +2139,14 @@ func humanBytesPerSec(size int64, d time.Duration) string {
 // first that serves a fully-verified stream wins. A hash failure is
 // hostile — that peer is skipped, not retried.
 func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer) (string, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// 90-second TOTAL budget: the phase is an accelerator, not a prerequisite
+	// — when the box's UDP egress is in a loss window (found live on the
+	// friend's VPS: EVERY DHT dial timed out at once while TCP-based origin
+	// downloads worked), origin must take over quickly, and a silent phase
+	// must never read as a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	fmt.Printf("  tcp streaming: trying %d peer(s) (90s budget)...\n", len(peers))
 	node, err := startCLINode(ctx, "", ":0", peers)
 	if err != nil {
 		return "", "", err
