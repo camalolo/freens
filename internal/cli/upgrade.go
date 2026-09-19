@@ -1786,7 +1786,7 @@ func cmdUpgrade(args []string) error {
 	// a partial prefetch still helps. Runs after the services are back.
 	if fromOrigin && man != nil {
 		fmt.Println("peer-transfer prefetch (first mover): caching the other platforms' archives for the fleet ...")
-		prefetchPeerTransferAssets(rel, asset.Name, work, 3*time.Minute)
+		prefetchPeerTransferAssets(rel, asset.Name, work, 12*time.Minute)
 	}
 	fmt.Println("upgrade complete. previous binaries kept as <binary>.freens-prev (copy back + restart to roll back).")
 	return nil
