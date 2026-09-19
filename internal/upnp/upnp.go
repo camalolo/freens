@@ -518,6 +518,16 @@ type Mapping struct {
 	internalIP   net.IP
 	internalPort int
 	desc         string // mapping description, reused by EnsureFresh re-maps
+	proto        string // "UDP" (the DHT transport) or "TCP" (the blob channel)
+}
+
+// protoOrDefault keeps zero-value Compatibility (tests construct Mappings
+// directly): the historical mapping kind is UDP.
+func (m *Mapping) protoOrDefault() string {
+	if m.proto == "" {
+		return "UDP"
+	}
+	return m.proto
 }
 
 // probeMapping asks GetSpecificPortMappingEntry whether externalPort is
@@ -531,6 +541,87 @@ func (g *Gateway) probeMapping(ctx context.Context, externalPort int) error {
 		"NewRemoteHost":   "",
 		"NewExternalPort": strconv.Itoa(externalPort),
 		"NewProtocol":     "UDP",
+	})
+	return err
+}
+
+// probeMappingProto is probeMapping for a specific protocol (the TCP blob
+// channel's mapping is probed with TCP — probing it as UDP answers 714
+// "no such entry" forever and would trip the reboot-heal re-map).
+func (g *Gateway) probeMappingProto(ctx context.Context, externalPort int, proto string) error {
+	_, err := g.soapCall(ctx, "GetSpecificPortMappingEntry", map[string]string{
+		"NewRemoteHost":   "",
+		"NewExternalPort": strconv.Itoa(externalPort),
+		"NewProtocol":     proto,
+	})
+	return err
+}
+
+// MapTCPExact forwards the TCP blob channel: an EXACT-port TCP mapping on
+// the external port peers already dial (the advertised UDP port number —
+// the blob channel listens on the same port number as the DHT). AddAnyPort
+// cannot pin a port, so this is the IGDv1 exact AddPortMapping; a 718
+// conflict (external port taken by another lease) is a warn-and-skip: the
+// blob channel then stays LAN-only on this box (the UDP DHT is unaffected).
+func (g *Gateway) MapTCPExact(ctx context.Context, externalPort, internalPort int, description string) (*Mapping, error) {
+	internalIP, err := g.lanIP()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := g.soapCall(ctx, "AddPortMapping", map[string]string{
+		"NewProtocol":               "TCP",
+		"NewExternalPort":           strconv.Itoa(externalPort),
+		"NewInternalPort":           strconv.Itoa(internalPort),
+		"NewInternalClient":         internalIP.String(),
+		"NewEnabled":                "1",
+		"NewPortMappingDescription": description,
+		"NewLeaseDuration":          "0",
+	}); err != nil {
+		return nil, err
+	}
+	ip, iperr := g.externalIP(ctx)
+	if iperr != nil {
+		return nil, iperr
+	}
+	return &Mapping{gw: g, externalIP: ip, externalPort: externalPort, internalIP: internalIP, internalPort: internalPort, desc: description, proto: "TCP"}, nil
+}
+
+// MapTCP forwards the TCP blob channel on THIS mapping's external port
+// (the one peers already dial).
+func (m *Mapping) MapTCP(ctx context.Context, internalPort int) (*Mapping, error) {
+	return m.gw.MapTCPExact(ctx, m.externalPort, internalPort, m.desc)
+}
+
+// EnsureFreshTCP re-validates the TCP mapping and heals it after router
+// events (same semantics as Mapping.EnsureFresh, TCP protocol).
+func (m *Mapping) EnsureFreshTCP(ctx context.Context) (*Mapping, bool, error) {
+	err := m.gw.probeMappingProto(ctx, m.externalPort, "TCP")
+	if err != nil {
+		var se *soapError
+		if errors.As(err, &se) && se.Code == 714 {
+			nm, merr := m.gw.MapTCPExact(ctx, m.externalPort, m.internalPort, m.desc)
+			if merr != nil {
+				return nil, false, nil
+			}
+			return nm, true, nil
+		}
+		return nil, false, err
+	}
+	if ip, err := m.gw.externalIP(ctx); err == nil && !ip.Equal(m.externalIP) {
+		nm := *m
+		nm.externalIP = ip
+		return &nm, true, nil
+	}
+	return m, false, nil
+}
+
+// ReleaseTCP releases the TCP mapping (the generic Release works for both
+// protocols; kept for symmetry at the shutdown site).
+func (m *Mapping) ReleaseTCP(ctx context.Context) error {
+	_, err := m.gw.soapCall(ctx, "DeletePortMapping", map[string]string{
+		"NewRemoteHost":   "",
+		"NewExternalPort": strconv.Itoa(m.externalPort),
+		"NewProtocol":     "TCP",
 	})
 	return err
 }

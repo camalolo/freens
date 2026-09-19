@@ -512,6 +512,39 @@ func dialPlan(p dht.Peer, nets []*net.IPNet) []string {
 	return plan
 }
 
+// askSeedForPeers walks ONE find_node round toward the blob key through
+// the already-reachable bootstrap node: the seed (always in the bootstrap
+// list — its hostname resolves to the fleet's one stable WAN address)
+// answers with its CURRENT view of the fleet, so a stale local book
+// cannot hide live seeders. The walk's reached set is verified-alive
+// (every contact just answered a probe) — the user's directive 2026-09-19:
+// "couldn't we ask the seeding nodes for peers before the upgrade?"
+// Cost: one walk round (~0.2-1 s), paid once per upgrade.
+func askSeedForPeers(node *dht.Node, id []byte, peers []dht.Peer) []dht.Peer {
+	reached := node.IterativeFindNode(context.Background(), id, constants.RReplication)
+	if len(reached) == 0 {
+		return peers
+	}
+	out := append([]dht.Peer(nil), peers...)
+	seen := make(map[string]bool, len(peers)+len(reached))
+	for _, p := range out {
+		seen[p.Addr] = true
+	}
+	added := 0
+	for _, rc := range reached {
+		if rc == nil || rc.Addr == "" || seen[rc.Addr] {
+			continue
+		}
+		seen[rc.Addr] = true
+		out = append(out, dht.Peer{Addr: rc.Addr, PublicKey: rc.PublicKey, Confirmed: time.Now().Unix()})
+		added++
+	}
+	if added > 0 {
+		fmt.Printf("  %d live peer(s) learned from the seed's view\n", added)
+	}
+	return out
+}
+
 // viablePeers keeps only peers with at least one dialable address from
 // this machine's vantage (counting the drops).
 func viablePeers(peers []dht.Peer, nets []*net.IPNet, skipped *int) []dht.Peer {
@@ -598,6 +631,10 @@ func fetchTarballFromPeers(workDir string, man *blobman.Manifest, peers []dht.Pe
 	if err != nil || len(id) != constants.SHA256Len {
 		return "", fmt.Errorf("manifest digest")
 	}
+	// ASK THE SEED FOR PEERS (before assembling the rotation): the walk
+	// fills this node's view with the seed's CURRENT fleet (live, viable,
+	// just-verified) — a stale local book stops hiding seeders.
+	peers = askSeedForPeers(node, id, peers)
 
 	outPath := filepath.Join(workDir, "release.tar.gz")
 	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -2073,6 +2110,8 @@ func fetchTarballViaTCP(workDir string, man *blobman.Manifest, peers []dht.Peer)
 	if err != nil || len(id) != constants.SHA256Len {
 		return "", "", fmt.Errorf("manifest digest")
 	}
+	peers = askSeedForPeers(node, id, peers)
+
 	var lastErr error
 	tcpNets := localNets()
 peerLoop:

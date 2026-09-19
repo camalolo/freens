@@ -340,6 +340,7 @@ func run(args []string) error {
 	// the renewal goroutine may replace it, and the metrics ticker reads it,
 	// so access goes through upnpMu.
 	var upnpMapping *upnp.Mapping
+	var upnpTCPMapping *upnp.Mapping
 	var upnpMu sync.Mutex
 	var freens resolver.RecordLookup = dht.NewStoreLookup(store)
 	// -turn / -turn-relay both require the DHT transport; warn-and-ignore
@@ -371,6 +372,23 @@ func run(args []string) error {
 			m, merr := upnp.Map(mctx, port, "freens", logger)
 			mcancel()
 			if merr == nil {
+				// THE BLOB CHANNEL'S TCP FORWARD (user directive 2026-09-19:
+				// "UPnP forward should include TCP by default on any
+				// setup") — the TCP blob channel listens on the same port
+				// number as the DHT, so WAN peers can only stream from
+				// this box when the router forwards TCP too. Same
+				// external port as the UDP mapping (the advertised one);
+				// best-effort: a refusal leaves TCP LAN-only.
+				tctx, tcancel := context.WithTimeout(context.Background(), 6*time.Second)
+				if tm, terr := m.MapTCP(tctx, port); terr != nil {
+					logger.Debug("upnp: TCP forward refused — blob channel stays LAN-only", "error", terr)
+				} else {
+					upnpMu.Lock()
+					upnpTCPMapping = tm
+					upnpMu.Unlock()
+					logger.Info("upnp: TCP forward active (blob channel WAN-reachable)", "external_port", port)
+				}
+				tcancel()
 				upnpMu.Lock()
 				upnpMapping = m
 				upnpMu.Unlock()
@@ -887,12 +905,22 @@ func run(args []string) error {
 			}
 			upnpMu.Lock()
 			m := upnpMapping
+			tm := upnpTCPMapping
 			upnpMu.Unlock()
 			if m == nil || dhtNode == nil {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			nm, changed, err := m.EnsureFresh(ctx)
+			if tm != nil {
+				// The TCP forward heals with its own protocol (probing it
+				// as UDP answers 714 forever and would trip re-maps).
+				if ntm, _, terr := tm.EnsureFreshTCP(ctx); terr == nil && ntm != nil {
+					upnpMu.Lock()
+					upnpTCPMapping = ntm
+					upnpMu.Unlock()
+				}
+			}
 			cancel()
 			if err != nil {
 				logger.Debug("upnp: renewal probe failed; keeping mapping", "error", err)
@@ -1012,6 +1040,7 @@ func run(args []string) error {
 	// the shutdown over).
 	upnpMu.Lock()
 	mapping := upnpMapping
+	tcpMapping := upnpTCPMapping
 	upnpMu.Unlock()
 	if mapping != nil {
 		if err := mapping.Release(); err != nil {
@@ -1019,6 +1048,15 @@ func run(args []string) error {
 		} else {
 			logger.Info("upnp: port mapping released")
 		}
+	}
+	if tcpMapping != nil {
+		rctx, rcancel := context.WithTimeout(context.Background(), 8*time.Second)
+		if err := tcpMapping.ReleaseTCP(rctx); err != nil {
+			logger.Debug("upnp: TCP forward release failed", "error", err)
+		} else {
+			logger.Info("upnp: TCP forward released")
+		}
+		rcancel()
 	}
 	// Final peerbook snapshot AFTER the DHT node stopped (mirrors the
 	// final -persist below): the book reflects every contact learned
