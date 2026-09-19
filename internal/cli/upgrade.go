@@ -375,20 +375,31 @@ func upgradePeerList() ([]dht.Peer, error) {
 			add(live)
 		}
 	}
-	// THE PINNED COMMUNITY SEED is always in the list — not just as an
-	// empty-list fallback. Its HOSTNAME resolves to the seed's CURRENT
-	// public address, which makes it the one entry that cannot go stale:
-	// boxes whose book is dominated by dead NAT mappings and one-shot
-	// ephemeral ports (desktop and the friend's VPS during the v0.19.10/11
-	// rolls — "context deadline exceeded" against twelve corpses) still
-	// get one always-fresh bootstrap. Confirmed-fresh entries keep their
-	// places ahead of it; stale ones come after.
-	if seeds := home.ParseSeedsText(home.DefaultSeeds()); len(seeds) > 0 {
-		add(seeds)
+	// THE PINNED COMMUNITY SEED is always in the list — held OUT of the
+	// 12-cap and appended after it: the seed's HOSTNAME resolves to the
+	// seed's CURRENT public address, making it the one entry that cannot
+	// go stale, and a ghost-heavy book must never crowd it out (it sorts
+	// last — no confirmation stamp — and the old cap quietly dropped it
+	// exactly on the boxes that most need it).
+	seedPeers := home.ParseSeedsText(home.DefaultSeeds())
+	// Long-dead entries bootstrap nothing: a book-loaded contact whose
+	// last confirmation is 48h+ old is a corpse. The DAEMON-side peerbook
+	// flush applies the same bound at save time, but a freshly restarted
+	// daemon loads the UNFLUSHED book — the list must not inherit it
+	// (desktop's v0.19.13->14 rolls: twelve corpses, every dial timed
+	// out, origin fallback, every time).
+	now := time.Now().Unix()
+	fresh := make([]dht.Peer, 0, len(out))
+	for _, p := range out {
+		if p.Confirmed > 0 && now-p.Confirmed > int64((48*time.Hour)/time.Second) {
+			continue
+		}
+		fresh = append(fresh, p)
 	}
+	out = fresh
 	// VIABILITY BEFORE THE CAP: peers with no dialable address from this
 	// machine drop out HERE, so foreign-LAN junk cannot consume slots in
-	// the 12-cap (the user's original complaint: his bootstrap list was
+	// the cap (the user's original complaint: his bootstrap list was
 	// crowded with 192.168.1.x entries he can never reach while real
 	// candidates got capped out).
 	nets := localNets()
@@ -400,9 +411,7 @@ func upgradePeerList() ([]dht.Peer, error) {
 	}
 	out = viable
 	// Confirmation-recency ordering: live-confirmed first (freshest
-	// first), never-confirmed last. The 12-cap then keeps the freshest
-	// candidates instead of whichever the book listed first — a
-	// ghost-dominated book must not crowd out the live seed.
+	// first), never-confirmed last.
 	sort.SliceStable(out, func(i, j int) bool {
 		ci, cj := out[i].Confirmed > 0, out[j].Confirmed > 0
 		if ci != cj {
@@ -410,9 +419,11 @@ func upgradePeerList() ([]dht.Peer, error) {
 		}
 		return out[i].Confirmed > out[j].Confirmed
 	})
-	if len(out) > 12 {
-		out = out[:12]
+	// Cap at 11 and APPEND the seed after it: the seed always rides.
+	if len(out) > 11 {
+		out = out[:11]
 	}
+	add(seedPeers)
 	if len(out) == 0 {
 		return nil, errors.New("no known peers (peerbook empty and daemon unreachable)")
 	}
