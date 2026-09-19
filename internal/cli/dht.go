@@ -147,31 +147,99 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 	// 12-peer list with 7 stale entries stalled every swarm ~35 s. The
 	// pings carry the transient flag, so fanning them out plants
 	// nothing anywhere.
+	//
+	// HOSTNAME PEERS RESOLVE OUTSIDE THE PING BUDGET (2026-09-19, found
+	// live on the friend's VPS): Node.Ping resolves peer.Addr INSIDE its
+	// own RPC-timeout context, so resolver latency or a stale upstream A
+	// record ate the seed's entire budget — "freens.camalolo.com
+	// unreachable (context deadline exceeded)" while the SAME server at a
+	// literal-IP book entry pinged fine and streamed the release seconds
+	// later. Hostnames (the pinned seed — the one peer that cannot go
+	// stale) are resolved ONCE here under a dedicated budget, before any
+	// ping; a resolution failure is reported AS a DNS failure.
 	{
+		type dial struct {
+			p    dht.Peer
+			addr *net.UDPAddr // pre-resolved hostname peer; nil = literal
+			dns  bool         // resolution failed
+		}
+		dials := make([]dial, 0, len(peers))
+		resolved := make([]*net.UDPAddr, len(peers))
+		dnsFailed := make([]bool, len(peers))
+		var hostnames []int
+		for i, p := range peers {
+			if host, _, err := net.SplitHostPort(p.Addr); err == nil && net.ParseIP(host) == nil {
+				hostnames = append(hostnames, i)
+			}
+		}
+		if len(hostnames) > 0 {
+			dnsCtx, dnsCancel := context.WithTimeout(context.Background(), 4*time.Second)
+			var rwg sync.WaitGroup
+			for _, i := range hostnames {
+				rwg.Add(1)
+				go func(i int) {
+					defer rwg.Done()
+					host, port, serr := net.SplitHostPort(peers[i].Addr)
+					if serr != nil {
+						dnsFailed[i] = true
+						return
+					}
+					r, err := net.DefaultResolver.LookupIPAddr(dnsCtx, host)
+					if err != nil || len(r) == 0 {
+						dnsFailed[i] = true
+						return
+					}
+					if a, aerr := net.ResolveUDPAddr("udp", net.JoinHostPort(r[0].IP.String(), port)); aerr == nil {
+						resolved[i] = a
+					} else {
+						dnsFailed[i] = true
+					}
+				}(i)
+			}
+			rwg.Wait()
+			dnsCancel()
+		}
+		for i, p := range peers {
+			dials = append(dials, dial{p: p, addr: resolved[i], dns: dnsFailed[i]})
+		}
+
 		type pingOutcome struct {
 			p   dht.Peer
 			err error
+			dns bool
 		}
-		outcomes := make(chan pingOutcome, len(peers))
+		outcomes := make(chan pingOutcome, len(dials))
 		var wg sync.WaitGroup
-		for _, p := range peers {
-			if err := node.AddPeer(p.PublicKey, p.Addr); err != nil {
+		for _, d := range dials {
+			if err := node.AddPeer(d.p.PublicKey, d.p.Addr); err != nil {
 				return fail(err)
 			}
 			wg.Add(1)
-			go func(p dht.Peer) {
+			go func(d dial) {
 				defer wg.Done()
+				if d.dns {
+					outcomes <- pingOutcome{p: d.p, dns: true}
+					return
+				}
+				pp := d.p
+				if d.addr != nil {
+					pp.Addr = d.addr.String() // dial the resolved IP; display keeps the hostname
+				}
 				c, cancel := context.WithTimeout(ctx, time.Duration(constants.RPCTimeoutSec)*time.Second)
-				err := node.Ping(c, p)
+				err := node.Ping(c, pp)
 				cancel()
-				outcomes <- pingOutcome{p: p, err: err}
-			}(p)
+				outcomes <- pingOutcome{p: d.p, err: err}
+			}(d)
 		}
 		wg.Wait()
 		close(outcomes)
 		for o := range outcomes {
-			if o.err != nil {
-				fmt.Fprintf(os.Stderr, "%s: warning: peer %s unreachable (%v)\n", ProgName, o.p.Addr, o.err)
+			if o.err != nil || o.dns {
+				if o.dns {
+					fmt.Fprintf(os.Stderr, "%s: warning: seed %s: DNS lookup failed — continuing with the remaining peers\n", ProgName, o.p.Addr)
+				} else {
+					fmt.Fprintf(os.Stderr, "%s: warning: peer %s unreachable (%v)\n", ProgName, o.p.Addr, o.err)
+				}
 				continue
 			}
 			reachable++
