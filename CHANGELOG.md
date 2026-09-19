@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.19.14 — the learn-side vantage filter: foreign LANs simply do not exist
+
+The user's directive, second pass: v0.19.11's dial-side filtering left
+foreign-LAN addresses in the table, the bootstrap lists, and the
+warning output.
+
+- `learnContact` never STORES a contact at a private/link-local address
+  not covered by a local interface; `learnPeer` adopts a peer's
+  advertised address only when viable from here (the peer is still
+  learned at the observed source). Public identities are kept; LAN
+  addresses are re-learned naturally if this node ever joins that
+  subnet.
+- The upgrade verb's bootstrap list applies viability BEFORE the
+  12-cap, so unreachable junk cannot crowd out real candidates and the
+  seed.
+
 ## v0.19.13 — the first mover seeds every platform
 
 The last gap in "the fleet is its own update CDN": each box cached only
