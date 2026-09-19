@@ -103,21 +103,60 @@ type ghRelease struct {
 	Assets  []ghAsset `json:"assets"`
 }
 
+// syntheticRelease builds the release struct for a PINNED tag without the
+// GitHub API: every asset name is deterministic (the CI release job and
+// genmanifest both use exactly these shapes) and download URLs follow the
+// fixed /releases/download/<tag>/<asset> form.
+func syntheticRelease(tag string) *ghRelease {
+	base := "https://github.com/" + githubOwnerRepo + "/releases/download/" + tag + "/"
+	plat := []string{"linux-amd64", "linux-arm64", "darwin-amd64", "darwin-arm64", "windows-amd64"}
+	names := []string{"SHA256SUMS.txt"}
+	for _, p := range plat {
+		names = append(names, "freens-"+p+".tar.gz", "freens-manifest-"+p+".json")
+	}
+	rel := &ghRelease{TagName: tag}
+	for _, n := range names {
+		rel.Assets = append(rel.Assets, ghAsset{Name: n, BrowserDownload: base + n})
+	}
+	return rel
+}
+
 // fetchRelease resolves the release to install: the -version tag if given
 // (a missing leading "v" is added: the repo tags releases v-prefixed),
 // else the newest release/branch-carrying tag (releases/latest, which
 // GitHub defines as non-draft, non-prerelease, newest by semver).
+//
+// A PINNED tag never touches the GitHub API: release asset URLs are
+// deterministic (/releases/download/<tag>/<asset>), so the release struct
+// is synthesized — removing the api.github.com dependency (and its DNS)
+// from every scripted upgrade. Found live 2026-09-19: the verb's first
+// act was an API call resolved through the box's OWN freens daemon, so a
+// momentary resolver SERVFAIL killed the verb before the peer machinery
+// could even start.
 func fetchRelease(tag string) (*ghRelease, error) {
-	url := upgradeReleaseURL
 	if tag != "" {
 		if !strings.HasPrefix(tag, "v") {
 			tag = "v" + tag
 		}
-		url = upgradeTagURLBase + tag
+		return syntheticRelease(tag), nil
 	}
-	rel, err := upgradeFetchRelease(url)
-	if err != nil {
-		return nil, err
+	url := upgradeReleaseURL // releases/latest (tag pins never reach here — synthetic above)
+	// The discovery call rides the OS resolver (frequently THIS box's own
+	// freens daemon) — a momentary resolver SERVFAIL must not kill the
+	// verb: three attempts across ~9s rides out a resolver blip.
+	var rel *ghRelease
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 3 * time.Second)
+		}
+		rel, lastErr = upgradeFetchRelease(url)
+		if lastErr == nil {
+			break
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 	if rel.TagName == "" {
 		return nil, fmt.Errorf("release at %s has no tag_name", url)

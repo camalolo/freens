@@ -163,12 +163,14 @@ func TestFetchReleaseURLForms(t *testing.T) {
 	if _, err := fetchRelease(""); err != nil {
 		t.Fatal(err)
 	}
+	// A PINNED tag never touches the API (synthetic release; deterministic
+	// download URLs) — that is the 2026-09-19 decoupling: a resolver
+	// hiccup cannot kill a scripted upgrade before the peer machinery.
 	if _, err := fetchRelease("0.9.1"); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{upgradeReleaseURL, upgradeTagURLBase + "v0.9.1"}
-	if len(g.urls) != 2 || g.urls[0] != want[0] || g.urls[1] != want[1] {
-		t.Errorf("fetch URLs = %v; want %v", g.urls, want)
+	if len(g.urls) != 1 || g.urls[0] != upgradeReleaseURL {
+		t.Errorf("fetch URLs = %v; want only %v (the pinned tag is synthesized, no API call)", g.urls, upgradeReleaseURL)
 	}
 }
 

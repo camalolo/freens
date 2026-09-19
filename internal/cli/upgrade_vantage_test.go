@@ -9,6 +9,8 @@ package cli
 
 import (
 	"net"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/camalolo/freens/internal/dht"
@@ -80,5 +82,38 @@ func TestDialPlanAllUnviableIsEmpty(t *testing.T) {
 	}
 	if got := viablePeers([]dht.Peer{p}, nets, new(int)); len(got) != 0 {
 		t.Fatalf("viablePeers kept an unviable peer: %v", got)
+	}
+}
+
+// TestSyntheticReleaseCoversPlatform: a PINNED-tag upgrade never touches
+// the GitHub API — the synthesized release must carry every asset the
+// flow needs (own-platform tarball + manifest + SHA256SUMS) with
+// deterministic download URLs.
+func TestSyntheticReleaseCoversPlatform(t *testing.T) {
+	rel := syntheticRelease("v9.9.9")
+	if rel.TagName != "v9.9.9" {
+		t.Fatalf("tag = %q", rel.TagName)
+	}
+	need := map[string]bool{
+		"SHA256SUMS.txt":           false,
+		upgradeManifestAssetName(): false,
+		"freens-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz": false,
+	}
+	var urls []string
+	for _, a := range rel.Assets {
+		if _, ok := need[a.Name]; ok {
+			need[a.Name] = true
+		}
+		urls = append(urls, a.BrowserDownload)
+	}
+	for n, found := range need {
+		if !found {
+			t.Errorf("synthetic release missing asset %q", n)
+		}
+	}
+	for _, u := range urls {
+		if !strings.HasPrefix(u, "https://github.com/camalolo/freens/releases/download/v9.9.9/") {
+			t.Errorf("asset URL not the deterministic download form: %q", u)
+		}
 	}
 }
