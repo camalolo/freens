@@ -1461,6 +1461,7 @@ func waitWebUIBack(d time.Duration, want string) {
 //	-yes       skip the confirmation prompt (scripts, fleet ssh)
 func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	vverbose := fs.Bool("v", false, "show network probe diagnostics (unreachable bootstrap peers)")
 	check := fs.Bool("check", false, "only compare against the latest GitHub release; touch nothing")
 	force := fs.Bool("force", false, "install even when already up to date (or when the current binary has no release stamp)")
 	wantTag := fs.String("version", "", "install this exact release tag (default: latest)")
@@ -1468,6 +1469,7 @@ func cmdUpgrade(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	netWarnFlag = *vverbose
 	if len(fs.Args()) != 0 {
 		return usageErr("upgrade takes no positional arguments")
 	}

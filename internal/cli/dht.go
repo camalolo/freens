@@ -40,6 +40,22 @@ import (
 	"github.com/camalolo/freens/internal/wire"
 )
 
+// NetWarn reports whether network probe diagnostics (unreachable-peer
+// bootstrap warnings and the like) should be printed. Policy (user,
+// 2026-09-19): warnings that do not affect the outcome are NOISE — the
+// upgrade swarm routinely dials a dozen book corpses and still streams
+// in 400 ms, so nine "unreachable" lines above a success read like a
+// failure. Off by default; enabled by -v on the verb or FREENS_VERBOSE
+// in the environment.
+func NetWarn() bool {
+	if os.Getenv("FREENS_VERBOSE") != "" {
+		return true
+	}
+	return netWarnFlag
+}
+
+var netWarnFlag bool
+
 // cliTimeout bounds every live-network subcommand (publish / resolve / get):
 // a one-shot CLI run must terminate even against a black-holed network.
 const cliTimeout = 30 * time.Second
@@ -235,9 +251,12 @@ func startCLINode(ctx context.Context, nodeSeedHex, listenAddr string, peers []d
 		close(outcomes)
 		for o := range outcomes {
 			if o.err != nil || o.dns {
+				// Outcome-irrelevant noise by default (a dozen dead book
+				// entries above a 400 ms success reads like a failure);
+				// visible under -v / FREENS_VERBOSE.
 				if o.dns {
 					fmt.Fprintf(os.Stderr, "%s: warning: seed %s: DNS lookup failed — continuing with the remaining peers\n", ProgName, o.p.Addr)
-				} else {
+				} else if NetWarn() {
 					fmt.Fprintf(os.Stderr, "%s: warning: peer %s unreachable (%v)\n", ProgName, o.p.Addr, o.err)
 				}
 				continue
