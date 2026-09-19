@@ -1,5 +1,22 @@
 # Changelog
 
+## unreleased — UPnP forwards TCP by default, and the verb asks the seed for peers
+
+User directives, 2026-09-19:
+
+- **UPnP forwards the TCP blob channel by default on any setup**: the
+  mapping pins the SAME external port the advertised address already
+  uses (the blob channel listens on the DHT port number); the renewal
+  tick heals it with its own protocol; shutdown releases it. A port
+  conflict is warn-and-skip (blob channel stays LAN-only; UDP DHT
+  unaffected). Any NAT'd box becomes WAN-servable over TCP.
+- **The upgrade verb asks the seed for peers first**: one find_node
+  round toward the blob key — the seed answers with its CURRENT fleet
+  view, and the walk's reached set is verified-alive. A stale local
+  book (the friend's VPS dialing twelve corpses while live seeders
+  existed) can no longer hide them. Cost: one walk round, once per
+  upgrade.
+
 ## v0.19.15 — the seed always rides: bootstrap lists cannot be crowded by corpses
 
 Desktop's v0.19.14 rolls still bootstrapped against twelve dead
