@@ -123,3 +123,37 @@ func TestViableIPClassification(t *testing.T) {
 		}
 	}
 }
+
+// TestLearnContactDropsForeignLan: the learn-side vantage rule — a
+// foreign-LAN address is never STORED (the user's directive: from a WAN
+// node's point of view, other LANs' addresses should simply not exist).
+func TestLearnContactDropsForeignLan(t *testing.T) {
+	n := startVantageNode(t, publicOnlyNets())
+
+	mk := func(addr string) *NodeContact {
+		kp, err := crypto.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := crypto.NodeID(kp.Public())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := NewNodeContact(id, kp.Public(), addr, time.Now().Unix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	foreign := mk("192.168.1.32:15353") // foreign LAN: dropped entirely
+	n.learnContact(foreign)
+	if c := n.rt.Get(foreign.NodeID); c != nil {
+		t.Fatal("foreign-LAN contact was stored")
+	}
+	public := mk("93.184.216.34:15353") // public: stored
+	n.learnContact(public)
+	if c := n.rt.Get(public.NodeID); c == nil {
+		t.Fatal("public contact dropped")
+	}
+}

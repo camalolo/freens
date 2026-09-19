@@ -386,6 +386,19 @@ func upgradePeerList() ([]dht.Peer, error) {
 	if seeds := home.ParseSeedsText(home.DefaultSeeds()); len(seeds) > 0 {
 		add(seeds)
 	}
+	// VIABILITY BEFORE THE CAP: peers with no dialable address from this
+	// machine drop out HERE, so foreign-LAN junk cannot consume slots in
+	// the 12-cap (the user's original complaint: his bootstrap list was
+	// crowded with 192.168.1.x entries he can never reach while real
+	// candidates got capped out).
+	nets := localNets()
+	viable := make([]dht.Peer, 0, len(out))
+	for _, p := range out {
+		if len(dialPlan(p, nets)) > 0 {
+			viable = append(viable, p)
+		}
+	}
+	out = viable
 	// Confirmation-recency ordering: live-confirmed first (freshest
 	// first), never-confirmed last. The 12-cap then keeps the freshest
 	// candidates instead of whichever the book listed first — a

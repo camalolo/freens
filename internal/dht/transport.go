@@ -1446,7 +1446,13 @@ func (n *Node) learnPeer(pk []byte, raddr *net.UDPAddr, advertised string) {
 	addr := raddr.String()
 	if advertised != "" {
 		if a, ok := parseAdvertisedAddr(advertised); ok {
-			addr = a
+			// The advertised address is adopted ONLY when viable from
+			// here (same learn-side vantage rule as learnContact): a
+			// peer advertising a foreign-LAN address is still learned —
+			// at the observed source, which provably reaches us.
+			if host, _, herr := net.SplitHostPort(a); herr == nil && n.viableIP(net.ParseIP(host)) {
+				addr = a
+			}
 		}
 	}
 	c, err := NewNodeContact(id, pk, addr, n.now())
@@ -3128,6 +3134,23 @@ func (n *Node) getFromPeer(ctx context.Context, key []byte, c *NodeContact) ([]*
 func (n *Node) learnContact(c *NodeContact) {
 	if c == nil || bytes.Equal(c.NodeID, n.id) {
 		return
+	}
+	// THE LEARN-SIDE VANTAGE FILTER (user directive, 2026-09-19: foreign
+	// LANs "should simply NOT EXIST" from a WAN node's point of view —
+	// dial-side filtering alone left the addresses in the table, the
+	// bootstrap lists, and the warning output). A contact whose address
+	// is private/link-local AND not covered by any local interface is
+	// never STORED: a WAN node does not accumulate other LANs' addresses
+	// as table rows. If the identity is already known at a viable
+	// address, this skips a useless alt-merge; if unknown, the contact is
+	// dropped entirely and {nodes} re-teaching reintroduces it the moment
+	// this node can actually reach it (joining that subnet, VPN, ...).
+	// Loopback is exempt (local on every machine).
+	if host, _, err := net.SplitHostPort(c.Addr); err == nil {
+		if !n.viableIP(net.ParseIP(host)) {
+			n.log.Debug("dht: ignoring contact at an unreachable-from-here address", "addr", c.Addr)
+			return
+		}
 	}
 	c.LastSeen = n.now()
 	isNew := n.rt.Get(c.NodeID) == nil
