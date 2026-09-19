@@ -542,9 +542,15 @@ func (h *closestHeap) farther(i, j int) bool {
 }
 
 func (h *closestHeap) up(i int) {
+	// Sift UP while the child is FARTHER than its parent (max-heap:
+	// parents hold the farthest). The inverted condition here built a
+	// corrupted heap whose root was not the maximum — evictions then
+	// dropped the wrong contacts, and CI's ghost-fixture precondition
+	// caught a live peer inside the wrong closest-8 (caught by the
+	// brute-force property test before it could ship further).
 	for i > 0 {
 		parent := (i - 1) / 2
-		if !h.farther(parent, i) {
+		if !h.farther(i, parent) {
 			return
 		}
 		h.items[parent], h.items[i] = h.items[i], h.items[parent]
