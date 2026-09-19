@@ -48,10 +48,10 @@ func TestDialPlanOrderAndDedupe(t *testing.T) {
 	p := dht.Peer{
 		Addr: "192.168.1.32:15353",
 		Alts: []dht.AddrState{
-			{Addr: "192.168.1.32:15353"},                  // duplicate of preferred
-			{Addr: "10.9.9.9:15353"},                      // foreign LAN: dropped
-			{Addr: "61.223.34.65:15354"},                  // public alt: kept
-			{Addr: "192.168.1.32:15452"},                  // own-LAN chair port: kept
+			{Addr: "192.168.1.32:15353"}, // duplicate of preferred
+			{Addr: "10.9.9.9:15353"},     // foreign LAN: dropped
+			{Addr: "61.223.34.65:15354"}, // public alt: kept
+			{Addr: "192.168.1.32:15452"}, // own-LAN chair port: kept
 		},
 	}
 	plan := dialPlan(p, nets)
